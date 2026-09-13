@@ -88,6 +88,24 @@ async-trait = "0.1"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 
+[profile.dev]
+# Line tables instead of full DWARF. The dev profile links 157 test executables, each one
+# statically carrying its own copy of the debug info for the whole tree, and the default
+# `debug = true` makes that copy enormous: measured on debug/deps/console, a 410MB binary
+# held 315MB of debug sections, 271MB of it .debug_info and .debug_str. Stripped, the same
+# binary is 54MB. Multiply by the 34 test binaries over 100MB and it was 11.3GB of the
+# volume's 19GB deps directory.
+#
+# `line-tables-only` keeps .debug_line, which is what RUST_BACKTRACE=1 reads to print file
+# and line numbers, and drops the type and variable names that only a debugger consumes.
+# A panic in a test still names the file and the line. Stepping through Rust in gdb or lldb
+# is what this gives up; nobody on this repo was doing that.
+#
+# It buys link time as well as disk. The linker OOM that forces `-j 1` on `test` in
+# scripts/cargo.sh is the linker being handed 315MB of debug info per binary inside a
+# container with a 6.2GB ceiling. Less to write is less to hold.
+debug = "line-tables-only"
+
 [profile.release]
 # One binary on a small ARM box. Optimise for size and link-time work over compile speed.
 #
