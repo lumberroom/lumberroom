@@ -106,6 +106,20 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # container with a 6.2GB ceiling. Less to write is less to hold.
 debug = "line-tables-only"
 
+[profile.dev.package."*"]
+# No debug info at all for third-party crates. `line-tables-only` above still applies to this
+# workspace, so a backtrace keeps its file and line for every frame in code anybody here can edit.
+# What this drops is the line numbers on frames inside axum, sqlx, tokio and the rest, which are
+# not addresses anybody debugs by.
+#
+# Dependencies are most of the remaining weight. On debug/deps/console after line-tables-only,
+# 71MB of the 159MB binary was still debug sections, and .debug_line and .debug_str carry an entry
+# for every dependency frame linked in. There are 1,456 rlibs in this tree.
+#
+# `"*"` is every package that is not a workspace member, which is the whole point: it needs no
+# maintenance as dependencies come and go, unlike naming crates one at a time.
+debug = 0
+
 [profile.release]
 # One binary on a small ARM box. Optimise for size and link-time work over compile speed.
 #
