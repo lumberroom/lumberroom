@@ -609,6 +609,21 @@ async fn validate_supersedes_target(ctx: &Ctx, raw: &str) -> Result<(uuid::Uuid,
         }
     };
 
+    // A closed period has no successor to write. Decision 0017 made `occurred_until` reachable
+    // without a supersession, and a supersession over an expired row would end a period that has
+    // already ended and hand `forget`'s revive an end it did not write.
+    // Expired, spelled the way every other surface spells it: an end, and no supersession stamp.
+    // A row whose `superseded_at` is set was retired by a supersession, so a restore that lost the
+    // link leaves a replaceable row rather than an expired one. A future end still holds.
+    if target.superseded_at.is_none()
+        && target.occurred_until.is_some_and(|until| until <= Utc::now())
+    {
+        return Err(DomainError::conflict(format!(
+            "memory {raw} expired, so its period is already closed and it takes no successor. \
+             Write the new fact on its own, or bring the old one back first."
+        )));
+    }
+
     if target.superseded_by.is_some() {
         // Naming the live head is the whole point of the error: the caller retries against it in
         // the same turn instead of writing a third row beside the two that already disagree.

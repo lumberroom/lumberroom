@@ -124,12 +124,12 @@ const MAX_CHAIN_DEPTH: i32 = 64;
 /// read sites. A macro rather than a constant because `concat!` only accepts literals, so the
 /// whole statement has to be assembled inside one expansion.
 macro_rules! select_memory {
-    ($prefix:literal, $rest:literal) => {
+    ($prefix:literal, $rest:expr) => {
         select_memory!("", $prefix, $rest)
     };
     // The leading form exists for the one statement that needs a data-modifying CTE ahead of the
     // SELECT: Postgres allows INSERT ... RETURNING inside WITH and nowhere else.
-    ($pre:literal, $prefix:literal, $rest:literal) => {
+    ($pre:literal, $prefix:literal, $rest:expr) => {
         concat!(
             $pre,
             "SELECT ",
@@ -172,10 +172,13 @@ macro_rules! select_memory {
 
 /// Hybrid search, in four compile-time variants: two live-row predicates times two blends.
 ///
-/// The live-rows predicate is a literal in all four rather than a bound boolean. `superseded_by IS
-/// NULL` as written matches the `memory_live` partial index from migration 005; the same test
-/// spelled `($n OR superseded_by IS NULL)` leaves the planner unable to prove the index predicate
-/// holds under a generic plan, and quietly loses it on a store where history outweighs live rows.
+/// The live-rows predicate is a literal in all four rather than a bound boolean, and the live pair
+/// takes it from `live!()`: the link test and the period test, spelled once for the whole adapter.
+/// The link half as written matches the `memory_live` partial index from migration 005 and the
+/// conjunct is stronger, so the planner can still prove the index applies. The same test spelled
+/// `($n OR superseded_by IS NULL)` is weaker, leaves the planner unable to prove the predicate
+/// holds under a generic plan, and quietly loses the index on a store where history outweighs live
+/// rows.
 ///
 /// The blend arrives as four literals: what each arm adds to its select list, what `merged` carries
 /// through, and the score expression itself. `linear_search_sql!` passes empty strings for the first
@@ -187,7 +190,7 @@ macro_rules! select_memory {
 /// query text.
 macro_rules! search_sql {
     (
-        $live:literal,
+        $live:expr,
         $vec_rank:literal,
         $lex_rank:literal,
         $merged_ranks:literal,
@@ -283,7 +286,7 @@ macro_rules! search_sql {
 /// lexical match scores 0.259, which the 0.35 weight turns into 0.091, against a cosine near 0.7 at
 /// weight 1.0. The lexical arm supplies candidates and hardly reorders them.
 macro_rules! linear_search_sql {
-    ($live:literal) => {
+    ($live:expr) => {
         search_sql!(
             $live,
             "",
@@ -310,7 +313,7 @@ macro_rules! linear_search_sql {
 ///
 /// This variant binds a fourteenth parameter, `k`.
 macro_rules! rrf_search_sql {
-    ($live:literal) => {
+    ($live:expr) => {
         search_sql!(
             $live,
             r#",
@@ -347,11 +350,11 @@ macro_rules! rrf_search_sql {
     };
 }
 
-const SEARCH_LIVE: &str = linear_search_sql!("m.superseded_by IS NULL");
+const SEARCH_LIVE: &str = linear_search_sql!(live!());
 /// `include_superseded`. The decision log and `lumberroom review` read history by hand; nothing on a
 /// request path uses this, so losing the partial index here costs nothing that matters.
 const SEARCH_ALL: &str = linear_search_sql!("true");
-const SEARCH_RRF_LIVE: &str = rrf_search_sql!("m.superseded_by IS NULL");
+const SEARCH_RRF_LIVE: &str = rrf_search_sql!(live!());
 const SEARCH_RRF_ALL: &str = rrf_search_sql!("true");
 
 /// What held at one instant, on the valid-time axis. One statement per blend.
@@ -402,15 +405,16 @@ const SEARCH_RRF_AS_OF: &str = rrf_search_sql!(
 /// One page of facts, newest first, in two compile-time variants.
 ///
 /// The live-rows predicate is a literal rather than a bound boolean, for the reason `search_sql!`
-/// spells out: `superseded_by IS NULL` as written matches the `memory_live` partial index from
-/// migration 005, and `($n OR superseded_by IS NULL)` leaves the planner unable to prove the index
-/// predicate under a generic plan.
+/// spells out, and the live variant takes `live!()`: the link test matches the `memory_live`
+/// partial index from migration 005 and the period test rides above it as a filter, while
+/// `($n OR superseded_by IS NULL)` would leave the planner unable to prove the index predicate
+/// under a generic plan.
 ///
 /// The keyset comparison is a row comparison, so it rides the `(created_at, id)` ordering instead
 /// of counting rows the way an offset does. An offset page shifts by one whenever a write lands
 /// between two reads, and the reader sees a fact twice or never.
 macro_rules! recent_sql {
-    ($live:literal) => {
+    ($live:expr) => {
         concat!(
             r#"
             WITH reachable AS (
@@ -438,13 +442,19 @@ macro_rules! recent_sql {
     };
 }
 
-const RECENT_LIVE: &str = recent_sql!("m.superseded_by IS NULL");
+const RECENT_LIVE: &str = recent_sql!(live!());
 /// History alongside the live rows, so a correction reads as a revision in place.
 const RECENT_ALL: &str = recent_sql!("true");
 
-/// Rows retired inside a window, newest retirement first, with the row that retired them.
+/// Rows that left the live reads inside a window, newest first, with whatever retired them.
 ///
-/// Ordered by `superseded_at` rather than `created_at`, which is the whole point: a fact written in
+/// Two kinds of row. A supersession names the successor and stamps `superseded_at`. An expiry
+/// closes the period with no successor and stamps nothing, so `expired` tells the page which it is
+/// reading and `retired_at` takes whichever instant happened. Decision 0017 put the expired rows
+/// here: they are off every live read, and a list of what left that showed only half of them would
+/// send the owner looking in psql for the other half.
+///
+/// Ordered by that instant rather than `created_at`, which is the whole point: a fact written in
 /// March and retired yesterday belongs at the top of this list and nowhere near the top of `recent`.
 ///
 /// Both endpoints run through `reachable`. The successor is joined but never filtered on, because a
@@ -539,7 +549,8 @@ const TAG_HUB_LIMIT: i64 = 40;
 /// The fan-out cap is a window function outside any recursion, which is the reason this walks one
 /// hop per call rather than recursing: Postgres forbids LIMIT and window functions in a recursive
 /// term, so a per-parent cap cannot be expressed there. Depth two is two calls.
-const GRAPH_NEIGHBOURS_SQL: &str = r#"
+const GRAPH_NEIGHBOURS_SQL: &str = concat!(
+    r#"
     WITH granted AS (
         SELECT prefix, exact, sensitivity_rank(max) AS max_rank
           FROM unnest($3::text[], $4::bool[], $5::text[]) AS g(prefix, exact, max)
@@ -548,7 +559,9 @@ const GRAPH_NEIGHBOURS_SQL: &str = r#"
         SELECT m.id
           FROM memory m
          WHERE m.tenant_id = $1
-           AND ($8 OR m.superseded_by IS NULL)
+           AND ($8 OR ("#,
+    live!(),
+    r#"))
            AND EXISTS (
                  SELECT 1 FROM granted g
                   WHERE CASE WHEN g.exact
@@ -586,7 +599,8 @@ const GRAPH_NEIGHBOURS_SQL: &str = r#"
               FROM expanded
            ) t
      WHERE rn <= $7
-"#;
+"#
+);
 
 /// What supersession did to the periods it closed.
 ///
@@ -629,7 +643,8 @@ const PAIR_COUNTS_SQL: &str = r#"
 ///
 /// Live only. A retired row's missing start is not worth the owner's attention: nothing reads it as
 /// current, and filling it would move a boundary inside a chain that is already closed.
-const UNDATED_SQL: &str = r#"
+const UNDATED_SQL: &str = concat!(
+    r#"
     WITH reachable AS (
         SELECT namespace, min(sensitivity_rank(max)) AS max_rank
           FROM unnest($2::text[], $3::text[]) AS g(namespace, max)
@@ -644,10 +659,13 @@ const UNDATED_SQL: &str = r#"
      WHERE m.tenant_id = $1
        AND sensitivity_rank(m.sensitivity) <= rg.max_rank
        AND m.occurred_at IS NULL
-       AND m.superseded_by IS NULL
+       AND "#,
+    live!(),
+    r#"
      ORDER BY m.created_at DESC, m.id DESC
      LIMIT $4
-"#;
+"#
+);
 
 const RETIRED_SQL: &str = r#"
     WITH reachable AS (
@@ -655,8 +673,19 @@ const RETIRED_SQL: &str = r#"
           FROM unnest($2::text[], $3::text[]) AS g(namespace, max)
          GROUP BY namespace
     )
-    SELECT m.id, m.namespace, m.content, m.sensitivity, m.superseded_at, m.occurred_at,
+    SELECT m.id, m.namespace, m.content, m.sensitivity, m.occurred_at,
            m.occurred_until,
+           -- Two ways a fact leaves the live reads, and one list. A supersession stamps
+           -- `superseded_at`; an expiry closes the period and stamps nothing, so the instant this
+           -- page dates the row by comes from whichever of the two happened.
+           COALESCE(m.superseded_at, m.occurred_until) AS retired_at,
+           -- Expired reads off `superseded_at` rather than `superseded_by`. A restore that could
+           -- not relink a successor leaves a row carrying `superseded_at` and `occurred_until`
+           -- with a NULL link, and that row was retired by a supersession whose successor is
+           -- missing. Reading the link would file it as expired on every surface, take away its
+           -- replace form and refuse a supersession over it.
+           (m.superseded_at IS NULL AND m.occurred_until IS NOT NULL
+              AND m.occurred_until <= now()) AS expired,
            (m.occurred_at IS NOT NULL AND m.occurred_until IS NULL) AS end_open,
            s.id AS successor_id, s.namespace AS successor_namespace
       FROM memory m
@@ -664,9 +693,14 @@ const RETIRED_SQL: &str = r#"
       LEFT JOIN memory s ON s.id = m.superseded_by AND s.tenant_id = m.tenant_id
      WHERE m.tenant_id = $1
        AND sensitivity_rank(m.sensitivity) <= rg.max_rank
-       AND m.superseded_at IS NOT NULL
-       AND m.superseded_at >= $4
-     ORDER BY m.superseded_at DESC, m.id DESC
+       AND ((m.superseded_at IS NOT NULL AND m.superseded_at >= $4)
+         -- The expired arm. `occurred_until <= now()` is the negation of the period half of
+         -- `live!()`, so a row is on this page exactly when it is off every live read. A future
+         -- end is a fact that still holds and stays off the list. `superseded_at IS NULL` is what
+         -- keeps a supersession out of this arm; it is already in the one above.
+         OR (m.superseded_at IS NULL AND m.occurred_until IS NOT NULL
+             AND m.occurred_until <= now() AND m.occurred_until >= $4))
+     ORDER BY COALESCE(m.superseded_at, m.occurred_until) DESC, m.id DESC
      LIMIT $5
 "#;
 
@@ -675,16 +709,25 @@ const RETIRED_SQL: &str = r#"
 /// The same `reachable` join every other read carries. Without it this statement publishes a
 /// namespace name and a row count for a namespace the caller may not read, which is the digest
 /// inventory bug under a different name: the content refused, the name and the number handed over.
-const NAMESPACE_SUMMARY_SQL: &str = r#"
+const NAMESPACE_SUMMARY_SQL: &str = concat!(
+    r#"
     WITH reachable AS (
         SELECT namespace, min(sensitivity_rank(max)) AS max_rank
           FROM unnest($2::text[], $3::text[]) AS g(namespace, max)
          GROUP BY namespace
     )
     SELECT m.namespace,
-           count(*) FILTER (WHERE m.superseded_by IS NULL) AS live,
+           -- `live` is `live!()`, so it agrees with the digest's `by_namespace` arm. A row whose
+           -- period closed with no successor lands in neither `live` nor `retired`: the rail prints
+           -- two numbers per namespace in a column the width of a phrase, and a third would cost
+           -- more room than the state is worth. The retired page lists those rows and names them.
+           count(*) FILTER (WHERE "#,
+    live!(),
+    r#") AS live,
            count(*) FILTER (WHERE m.superseded_by IS NOT NULL) AS retired,
-           count(*) FILTER (WHERE m.superseded_by IS NULL
+           count(*) FILTER (WHERE "#,
+    live!(),
+    r#"
                               AND sensitivity_rank(m.sensitivity) > sensitivity_rank('open'))
              AS above_open,
            max(m.created_at) AS last_write
@@ -694,7 +737,8 @@ const NAMESPACE_SUMMARY_SQL: &str = r#"
        AND sensitivity_rank(m.sensitivity) <= rg.max_rank
      GROUP BY m.namespace
      ORDER BY m.namespace
-"#;
+"#
+);
 
 /// The recall monitor's probe sample: plaintext rows this caller may read.
 ///
@@ -725,7 +769,8 @@ const SAMPLE_CONTENT_SQL: &str = r#"
 /// subqueries skipped the namespace filter, and the leak path in a memory system is the convenience
 /// surface rather than the obvious one; the unit test at the bottom of this file counts the joins so
 /// a later edit cannot drop one silently.
-const DIGEST_SQL: &str = r#"
+const DIGEST_SQL: &str = concat!(
+    r#"
     WITH reachable AS (
         SELECT namespace, min(sensitivity_rank(max)) AS max_rank
           FROM unnest($6::text[], $7::text[]) AS g(namespace, max)
@@ -742,7 +787,9 @@ const DIGEST_SQL: &str = r#"
                 JOIN reachable rg ON rg.namespace = m.namespace
                WHERE m.tenant_id = $1
                  AND sensitivity_rank(m.sensitivity) <= rg.max_rank
-                 AND m.superseded_by IS NULL
+                 AND "#,
+    live!(),
+    r#"
                  -- 'global' is a namespace like any other and has to be granted. The join is what
                  -- enforces that; this line only narrows which granted namespaces are profile.
                  AND m.namespace IN ($2, 'global')
@@ -759,7 +806,9 @@ const DIGEST_SQL: &str = r#"
                 JOIN reachable rg ON rg.namespace = m.namespace
                WHERE m.tenant_id = $1
                  AND sensitivity_rank(m.sensitivity) <= rg.max_rank
-                 AND m.superseded_by IS NULL
+                 AND "#,
+    live!(),
+    r#"
                  AND $4::text IS NOT NULL AND m.namespace = $4
                ORDER BY m.created_at DESC
                LIMIT $5
@@ -774,7 +823,9 @@ const DIGEST_SQL: &str = r#"
                 JOIN reachable rg ON rg.namespace = m.namespace
                WHERE m.tenant_id = $1
                  AND sensitivity_rank(m.sensitivity) <= rg.max_rank
-                 AND m.superseded_by IS NULL
+                 AND "#,
+    live!(),
+    r#"
                  AND m.created_at > now() - ($8 || ' days')::interval
                ORDER BY m.created_at DESC
                LIMIT $9
@@ -797,7 +848,9 @@ const DIGEST_SQL: &str = r#"
               JOIN reachable rg ON rg.namespace = m.namespace
              WHERE m.tenant_id = $1
                AND sensitivity_rank(m.sensitivity) <= rg.max_rank
-               AND m.superseded_by IS NULL),
+               AND "#,
+    live!(),
+    r#"),
         'registry_count', (
             SELECT count(*) FROM registry e
               JOIN reachable rg ON rg.namespace = e.namespace
@@ -813,11 +866,14 @@ const DIGEST_SQL: &str = r#"
                 JOIN reachable rg ON rg.namespace = m.namespace
                WHERE m.tenant_id = $1
                  AND sensitivity_rank(m.sensitivity) <= rg.max_rank
-                 AND m.superseded_by IS NULL
+                 AND "#,
+    live!(),
+    r#"
                GROUP BY m.namespace
             ) c), '{}'::json)
     )
-"#;
+"#
+);
 
 /// Chain walk shared by the cycle check and by `supersession_head`.
 ///
@@ -988,6 +1044,46 @@ const RETIRE_PREDECESSOR_SQL: &str = r#"
            superseded_at  = now(),
            occurred_until = COALESCE(occurred_until, $4::timestamptz)
      WHERE tenant_id = $1 AND id = $2 AND superseded_by IS NULL
+       -- An expired row takes no successor. `write::validate_supersedes_target` refuses it first
+       -- and this is the same test inside the statement, spelled the way the state is defined
+       -- everywhere else: a row carrying `superseded_at` was retired by a supersession and is
+       -- still replaceable, a row carrying an end and no stamp expired and is not.
+       AND (superseded_at IS NOT NULL OR occurred_until IS NULL)
+"#;
+
+/// Close a row's validity with no successor.
+///
+/// `superseded_at` stays NULL, and that is the whole shape of the state. The column means "a
+/// successor retired this row", so writing it here made the retired page print "replaced by a row
+/// that has since been deleted" about a fact nothing had replaced. An expired row is neither live
+/// nor retired, and every surface that reads it says so in its own words.
+///
+/// `superseded_by IS NULL` keeps this path away from a supersession: a row a successor already
+/// retired has an end that supersession wrote, and moving it would rewrite the timeline under the
+/// row that replaced it. `occurred_until IS NULL` makes the statement idempotent, so a second call
+/// moves nothing and returns no row.
+const EXPIRE_SQL: &str = r#"
+    UPDATE memory
+       SET occurred_until = now()
+     WHERE tenant_id = $1 AND id = $2
+       AND superseded_by IS NULL AND occurred_until IS NULL
+    RETURNING occurred_until
+"#;
+
+/// Reopen a row, guarded on the instant that closed it.
+///
+/// One column, because `expire` wrote one. A statement that also cleared `superseded_at` would
+/// erase a supersession's own stamp if the guard ever admitted a superseded row.
+///
+/// `occurred_until = $3` does here what `superseded_by = $3` does in a guarded revive: a close
+/// somebody else wrote is not this caller's to undo, so the statement moves nothing rather than
+/// reopening a fact a second decision ended.
+const UNEXPIRE_SQL: &str = r#"
+    UPDATE memory
+       SET occurred_until = NULL
+     WHERE tenant_id = $1 AND id = $2
+       AND superseded_by IS NULL AND occurred_until = $3
+    RETURNING id
 "#;
 
 /// Everything one tenant holds, live and retired, ordered by id so the keyset cursor is total.
@@ -1502,8 +1598,10 @@ impl MemoryRepository for PgMemoryRepository {
         Ok(inserted)
     }
 
-    /// Live rows only. Collapsing a new write into a row that was already retired would revive the
-    /// fact that retirement was correcting.
+    /// Live rows only, on both clocks. Collapsing a new write into a row that was already retired
+    /// would revive the fact that retirement was correcting, and collapsing it into an expired row
+    /// is worse: the owner restates a fact the store closed, the write is counted as a duplicate,
+    /// and the fact stays absent from every live read.
     async fn find_exact(
         &self,
         tenant: &str,
@@ -1511,11 +1609,15 @@ impl MemoryRepository for PgMemoryRepository {
         content: &str,
     ) -> Result<Option<Memory>> {
         let row = sqlx::query(select_memory!(
-            "",
-            "FROM memory
-              WHERE tenant_id = $1 AND namespace = $2 AND content = $3
-                AND superseded_by IS NULL
-              ORDER BY created_at DESC LIMIT 1"
+            "m.",
+            concat!(
+                "FROM memory m
+              WHERE m.tenant_id = $1 AND m.namespace = $2 AND m.content = $3
+                AND ",
+                live!(),
+                "
+              ORDER BY m.created_at DESC LIMIT 1"
+            )
         ))
         .bind(tenant)
         .bind(namespace)
@@ -1723,7 +1825,8 @@ impl MemoryRepository for PgMemoryRepository {
                 // restrictive, and the query already filtered on `sensitivity_rank`.
                 sensitivity: Sensitivity::parse(r.get::<&str, _>("sensitivity"))
                     .unwrap_or(Sensitivity::Sealed),
-                superseded_at: r.get("superseded_at"),
+                retired_at: r.get("retired_at"),
+                expired: r.get("expired"),
                 occurred_at: r.get("occurred_at"),
                 occurred_until: r.get("occurred_until"),
                 end_open: r.get("end_open"),
@@ -1839,7 +1942,9 @@ impl MemoryRepository for PgMemoryRepository {
               WHERE tenant_id = $1
                 AND namespace = $2
                 AND sensitivity_rank(sensitivity) <= sensitivity_rank($4)
+                -- `live!()` under this statement's own spelling: the table carries no alias here.
                 AND superseded_by IS NULL
+                AND (occurred_until IS NULL OR occurred_until > now())
                 AND embedding IS NOT NULL
                 AND 1 - (embedding <=> $3) >= $5
               ORDER BY embedding <=> $3
@@ -2118,6 +2223,21 @@ impl MemoryRepository for PgMemoryRepository {
         Ok(done == 1)
     }
 
+    async fn expire(&self, tenant: &str, id: uuid::Uuid) -> Result<Option<DateTime<Utc>>> {
+        let row = sqlx::query(EXPIRE_SQL).bind(tenant).bind(id).fetch_optional(&self.pool).await?;
+        Ok(row.map(|r| r.get("occurred_until")))
+    }
+
+    async fn unexpire(&self, tenant: &str, id: uuid::Uuid, until: DateTime<Utc>) -> Result<bool> {
+        let row = sqlx::query(UNEXPIRE_SQL)
+            .bind(tenant)
+            .bind(id)
+            .bind(until)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
     /// The last row on the chain from `id`. Depth-capped like every other walk, so a table that
     /// already contains a cycle answers with a bounded row rather than hanging.
     async fn supersession_head(&self, tenant: &str, id: uuid::Uuid) -> Result<Option<Memory>> {
@@ -2345,9 +2465,11 @@ impl MemoryRepository for PgMemoryRepository {
 
         let mut edits = ChainEdits::default();
         if !plan.revive.is_empty() {
-            // `occurred_until` goes back to NULL with the rest of the retirement. It is written in
-            // exactly one place, `RETIRE_PREDECESSOR_SQL`, and the insert never carries it, so the
-            // only value here is the one that supersession wrote and reviving is undoing. Leaving it
+            // `occurred_until` goes back to NULL with the rest of the retirement. Two statements
+            // write that column, `RETIRE_PREDECESSOR_SQL` and `EXPIRE_SQL`, and only the first can
+            // have written it on a row that has a successor: `write::validate_supersedes_target`
+            // refuses a target whose period is already closed, so an expired row never gains one.
+            // The value cleared here is therefore the one that supersession wrote. Leaving it
             // set stranded the row: live search filters on `superseded_by IS NULL` and returned it,
             // every as-of read filters on `occurred_until` and did not, and the COALESCE in the
             // retire statement meant a later supersession kept the stale end rather than correcting
@@ -2418,21 +2540,25 @@ impl MemoryRepository for PgMemoryRepository {
     ) -> Result<Vec<Memory>> {
         let (g_prefix, g_exact, g_max) = crate::adapters::postgres::cleanup::grant_arrays(reader);
         let rows = sqlx::query(select_memory!(
-            "",
-            "FROM memory
-              WHERE tenant_id = $1
-                AND superseded_by IS NULL
-                AND last_accessed_at IS NULL
-                AND created_at < now() - ($2 || ' days')::interval
+            "m.",
+            concat!(
+                "FROM memory m
+              WHERE m.tenant_id = $1
+                AND ",
+                live!(),
+                "
+                AND m.last_accessed_at IS NULL
+                AND m.created_at < now() - ($2 || ' days')::interval
                 AND EXISTS (
                       SELECT 1
                         FROM unnest($4::text[], $5::bool[], $6::text[]) AS g(prefix, exact, max)
-                       WHERE CASE WHEN g.exact THEN memory.namespace = g.prefix
-                                  ELSE left(memory.namespace, length(g.prefix)) = g.prefix END
-                         AND sensitivity_rank(g.max) >= sensitivity_rank(memory.sensitivity)
+                       WHERE CASE WHEN g.exact THEN m.namespace = g.prefix
+                                  ELSE left(m.namespace, length(g.prefix)) = g.prefix END
+                         AND sensitivity_rank(g.max) >= sensitivity_rank(m.sensitivity)
                     )
-              ORDER BY created_at ASC
+              ORDER BY m.created_at ASC
               LIMIT $3"
+            )
         ))
         .bind(tenant)
         .bind(older_than_days.to_string())
@@ -2449,19 +2575,28 @@ impl MemoryRepository for PgMemoryRepository {
     /// the facts being retrieved are, not how recently someone looked at them.
     async fn staleness(&self, tenant: &str) -> Result<Staleness> {
         let row = sqlx::query(
+            // `live` is `live!()` under this statement's own spelling, computed once and read by
+            // four counters. `superseded_rows` reads the other axis and stays as it was, so a row
+            // whose period closed with no successor counts in neither. That is the honest answer:
+            // it is not live and nothing replaced it.
             "SELECT
-               count(*) FILTER (WHERE superseded_by IS NULL) AS live_rows,
-               count(*) FILTER (WHERE superseded_by IS NULL AND last_accessed_at IS NULL)
+               count(*) FILTER (WHERE live) AS live_rows,
+               count(*) FILTER (WHERE live AND last_accessed_at IS NULL)
                  AS never_retrieved,
                count(*) FILTER (WHERE superseded_by IS NOT NULL) AS superseded_rows,
                percentile_cont(0.5) WITHIN GROUP (
                  ORDER BY (extract(epoch FROM now() - created_at) / 86400.0)::float8)
-                 FILTER (WHERE superseded_by IS NULL AND last_accessed_at IS NOT NULL)
+                 FILTER (WHERE live AND last_accessed_at IS NOT NULL)
                  AS median_age_days_retrieved,
                max((extract(epoch FROM now() - created_at) / 86400.0)::float8)
-                 FILTER (WHERE superseded_by IS NULL AND last_accessed_at IS NULL)
+                 FILTER (WHERE live AND last_accessed_at IS NULL)
                  AS oldest_never_retrieved_days
-             FROM memory WHERE tenant_id = $1",
+             FROM (
+               SELECT superseded_by, last_accessed_at, created_at,
+                      superseded_by IS NULL
+                        AND (occurred_until IS NULL OR occurred_until > now()) AS live
+                 FROM memory WHERE tenant_id = $1
+             ) m",
         )
         .bind(tenant)
         .fetch_one(&self.pool)
@@ -2512,7 +2647,12 @@ impl MemoryRepository for PgMemoryRepository {
                 -- transaction is still reported exactly once.
                 AND (a.created_at, a.id) < (b.created_at, b.id)
               WHERE a.tenant_id = $1
-                AND a.superseded_by IS NULL AND b.superseded_by IS NULL
+                -- `live!()` on both sides, under this statement's own aliases. A pair is a finding
+                -- only while both facts still hold.
+                AND a.superseded_by IS NULL
+                AND (a.occurred_until IS NULL OR a.occurred_until > now())
+                AND b.superseded_by IS NULL
+                AND (b.occurred_until IS NULL OR b.occurred_until > now())
                 AND a.embedding IS NOT NULL AND b.embedding IS NOT NULL
                 AND 1 - (a.embedding <=> b.embedding) >= $2
               ORDER BY similarity DESC
@@ -2562,13 +2702,17 @@ impl MemoryRepository for PgMemoryRepository {
         offset: i64,
     ) -> Result<Vec<Memory>> {
         let rows = sqlx::query(select_memory!(
-            "",
-            "FROM memory
-              WHERE tenant_id = $1
-                AND sensitivity_rank(sensitivity) <= sensitivity_rank($2)
-                AND superseded_by IS NULL
-              ORDER BY created_at ASC, id ASC
+            "m.",
+            concat!(
+                "FROM memory m
+              WHERE m.tenant_id = $1
+                AND sensitivity_rank(m.sensitivity) <= sensitivity_rank($2)
+                AND ",
+                live!(),
+                "
+              ORDER BY m.created_at ASC, m.id ASC
               LIMIT $3 OFFSET $4"
+            )
         ))
         .bind(tenant)
         .bind(max_sensitivity.as_str())
@@ -3303,19 +3447,123 @@ mod tests {
         assert!(SQL.contains("occurred_until "));
     }
 
-    /// A search that asks about now is the search this server has always run, down to the text.
+    /// Every statement in the adapter that reads or writes the supersession link, classified.
     ///
-    /// Valid time reaches its result by riding the final select list and nothing else: no period
-    /// predicate, no extra bind, no change to what either arm filters. The vector arm's plan is
-    /// what pgvector's iterative scan depends on, and a range filter ahead of its LIMIT is the
-    /// shape of the failure migration 003 exists to prevent, so these four keep the shape they had
-    /// when the columns landed. The as-of statements carry the predicate and are asserted apart.
+    /// The live readers splice `live!()` and carry the period test beside the link test. The
+    /// statements below read or write history on purpose, each with the reason, and the test after
+    /// this refuses any occurrence that is neither. A reader added to either file has to be
+    /// classified before the suite goes green, which is the whole point: the first version of
+    /// decision 0017 left five statements behind and nothing said so.
+    const HISTORY_OWNERS: [(&str, &str); 9] = [
+        ("occurred_at_compliance", "counts dating discipline, which an expiry does not change"),
+        (
+            "namespace_counts",
+            "discovery: a namespace does not stop existing when a fact in it expires, and this \
+             count never reaches a response",
+        ),
+        ("SEED_ALIAS_SQL", "structural edges, rebuilt hourly and severed by the reader's grant"),
+        ("SEED_TAG_SQL", "structural edges, rebuilt hourly and severed by the reader's grant"),
+        ("SAMPLE_CONTENT_SQL", "the recall monitor samples what search could reach at all"),
+        ("RETIRED_SQL", "the list of what left the live reads, both kinds, by definition"),
+        ("RETIRE_PREDECESSOR_SQL", "a writer, and its guard reads the state it refuses"),
+        ("EXPIRE_SQL", "a writer, and its guard reads both columns already"),
+        ("UNEXPIRE_SQL", "a writer, and its guard reads both columns already"),
+    ];
+
+    /// A new reader cannot reach Postgres without somebody deciding which clock it answers.
+    ///
+    /// Both adapter files read their own source, because the thing being guarded is the text of
+    /// statements written in five shapes: a macro call, a `concat!`, a raw string, an inline
+    /// literal inside a method, and a fragment spliced into another statement. A test over a list
+    /// of constants misses every statement somebody writes inline, and those are the ones that got
+    /// missed.
+    ///
+    /// Matching is exact text, not parsing. A line counts as live when the three lines starting at
+    /// it contain the literal `occurred_until IS NULL OR`, which is the opening of the period test
+    /// in `live!()` and in the three statements that spell it under their own aliases. Any other
+    /// mention of `occurred_until` nearby proves nothing: `EXPIRE_SQL` carries one in a guard that
+    /// is not a period test at all.
     #[test]
-    fn valid_time_reaches_a_search_result_without_touching_the_search() {
+    fn every_link_test_in_the_adapter_is_classified_live_or_history() {
+        // Up to the test module in each file, so the assertions below are not their own evidence.
+        const SOURCES: [(&str, &str); 2] =
+            [("memory.rs", include_str!("memory.rs")), ("cleanup.rs", include_str!("cleanup.rs"))];
+
+        let mut unclassified: Vec<String> = vec![];
+        for (file, source) in SOURCES {
+            let head = source.split("#[cfg(test)]").next().unwrap();
+            let lines: Vec<&str> = head.lines().collect();
+            let mut owner = "the top of the file";
+            for (i, line) in lines.iter().enumerate() {
+                if let Some(name) = declared_name(line) {
+                    owner = name;
+                }
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || !trimmed.contains("superseded_by IS NULL") {
+                    continue;
+                }
+                if HISTORY_OWNERS.iter().any(|(name, _)| *name == owner) {
+                    continue;
+                }
+                let window = lines[i..(i + 3).min(lines.len())].join(" ");
+                if window.contains("occurred_until IS NULL OR") {
+                    continue;
+                }
+                unclassified.push(format!("{file}: {owner}, line {}", i + 1));
+            }
+        }
+
+        assert!(
+            unclassified.is_empty(),
+            "these read the supersession link and answer neither clock question. Splice `live!()` \
+             or name them in HISTORY_OWNERS with a reason: {unclassified:?}"
+        );
+    }
+
+    /// The constant or function a line declares, for the scan above.
+    ///
+    /// Indentation is stripped first. A `const` nested inside a function is its own owner, and
+    /// reading it as part of the function around it would file its statement under a name the
+    /// allow list might already carry.
+    fn declared_name(line: &str) -> Option<&str> {
+        let trimmed = line.trim_start();
+        let after = |kw: &str| -> Option<&str> {
+            let rest = trimmed.split_once(kw)?.1.trim_start();
+            let end = rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
+            Some(&rest[..end]).filter(|n| !n.is_empty())
+        };
+        for kw in ["const ", "static "] {
+            if trimmed.starts_with(kw) || trimmed.starts_with(&format!("pub {kw}")) {
+                return after(kw);
+            }
+        }
+        for kw in ["fn ", "async fn ", "pub fn ", "pub async fn ", "pub(super) async fn "] {
+            if trimmed.starts_with(kw) {
+                return after("fn ");
+            }
+        }
+        None
+    }
+
+    /// A live search answers both clocks, and it binds what it always bound.
+    ///
+    /// Valid time reached a result through the select list alone until decision 0017, which put the
+    /// period test into the live predicate as a conjunct. The two live statements carry it, the two
+    /// history statements carry neither clock, and none of the four gained a parameter. The vector
+    /// arm's plan is what pgvector's iterative scan depends on, so the shape that stays fixed is
+    /// the one that matters: no range filter, no new bind, one more boolean term.
+    #[test]
+    fn a_live_search_answers_both_clocks_and_binds_what_it_always_did() {
         for sql in NO_AS_OF_SQL {
             assert!(sql.contains("m.occurred_at, m.occurred_until,"));
-            assert!(!sql.contains("occurred_until IS NULL"), "no period predicate on a live read");
             assert!(!sql.contains("occurred_at <="), "no range filter on a live read");
+        }
+        for sql in [SEARCH_LIVE, SEARCH_RRF_LIVE] {
+            assert_eq!(sql.matches(live!()).count(), 2, "the vector arm and the lexical arm");
+        }
+        for sql in [SEARCH_ALL, SEARCH_RRF_ALL] {
+            assert!(!sql.contains("superseded_by IS NULL"));
+            assert!(!sql.contains("occurred_until IS NULL"), "history asks about neither clock");
         }
         for sql in [SEARCH_LIVE, SEARCH_ALL] {
             assert!(sql.contains("$13"), "the shipped statement still binds thirteen parameters");
@@ -3325,14 +3573,39 @@ mod tests {
             assert!(sql.contains("$14"), "rank fusion still binds k as the fourteenth");
             assert!(!sql.contains("$15"));
         }
-        assert_eq!(SEARCH_LIVE.matches("m.superseded_by IS NULL").count(), 2);
-        assert_eq!(SEARCH_RRF_LIVE.matches("m.superseded_by IS NULL").count(), 2);
-        assert!(!SEARCH_ALL.contains("superseded_by IS NULL"));
-        assert!(!SEARCH_RRF_ALL.contains("superseded_by IS NULL"));
         // The as-of pair reads the same two columns into its result and adds the predicate.
         for sql in AS_OF_SQL {
             assert!(sql.contains("m.occurred_at, m.occurred_until,"));
             assert!(sql.contains("m.occurred_until IS NULL OR m.occurred_until >"));
+        }
+    }
+
+    /// The statements that answer "what does the store hold now", in one list.
+    ///
+    /// A reader added to this file is live or it is history, and the test below is where a new one
+    /// gets classified. The statements the adapter builds inline (`neighbours`, `conflicts`,
+    /// `staleness`) carry the same two clauses under their own prefixes and cannot join a list of
+    /// constants.
+    const LIVE_SQL: [&str; 6] =
+        [SEARCH_LIVE, SEARCH_RRF_LIVE, RECENT_LIVE, DIGEST_SQL, GRAPH_NEIGHBOURS_SQL, UNDATED_SQL];
+
+    /// A live read answers both clocks: no successor replaced the row, and its period is open.
+    ///
+    /// Decision 0017 reversed the ruling that a live read carries no period predicate. The history
+    /// readers keep what they had, because a closed period is exactly what they are asked about.
+    #[test]
+    fn every_live_statement_carries_the_period_conjunct() {
+        for sql in LIVE_SQL {
+            assert!(sql.contains("m.superseded_by IS NULL"));
+            assert!(sql.contains("m.occurred_until IS NULL OR m.occurred_until > now()"));
+        }
+        // The history readers keep what they had.
+        for sql in [SEARCH_ALL, SEARCH_RRF_ALL] {
+            assert!(!sql.contains("occurred_until > now()"));
+        }
+        assert!(!RETIRED_SQL.contains("occurred_until > now()"));
+        for sql in AS_OF_SQL {
+            assert!(!sql.contains("occurred_until > now()"), "as-of reads an instant, not now");
         }
     }
 
