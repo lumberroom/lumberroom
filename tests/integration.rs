@@ -3258,6 +3258,96 @@ async fn a_retirement_whose_successor_is_missing_reads_as_retired_rather_than_ex
     );
 }
 
+/// A fact whose period ends next week still holds this week, and both doors say so.
+///
+/// An archive restore binds `occurred_until`, `superseded_by` and `superseded_at` one by one, so a
+/// live row with a future end reaches the store without an expiry ever running. The service check
+/// let it through and the statement guard did not, which left the caller holding a supersession the
+/// database never wrote.
+#[tokio::test]
+async fn a_future_end_takes_a_successor_at_both_doors() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let old = write::run(&ctx, "the loan runs at four percent", "global", None, None, None, None)
+        .await
+        .unwrap();
+    let ends = chrono::Utc::now() + chrono::Duration::days(7);
+    sqlx::query("UPDATE memory SET occurred_until = $2 WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&old.id).unwrap())
+        .bind(ends)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let new = write::run(&ctx, "the loan runs at five percent", "global", None, None, None, None)
+        .await
+        .unwrap();
+    review::supersede(&ctx, &old.id, &new.id).await.unwrap();
+
+    assert_eq!(
+        memory_links(&pool, &old.id).await.1,
+        Some(new.id.clone()),
+        "the retirement landed rather than matching no row"
+    );
+    assert_eq!(
+        memory_links(&pool, &new.id).await.0,
+        Some(old.id.clone()),
+        "and the mirror names the row it replaced"
+    );
+    // COALESCE keeps the end somebody stated. A supersession moves the link, never the date.
+    assert_eq!(occurred_until(&pool, &old.id).await.map(|u| u.timestamp()), Some(ends.timestamp()));
+
+    // The write path takes a target through the same check, so neither door is laxer.
+    let third =
+        write::run(&ctx, "the loan runs at six percent", "global", None, Some(&new.id), None, None)
+            .await
+            .unwrap();
+    assert_eq!(memory_links(&pool, &new.id).await.1, Some(third.id));
+}
+
+/// A retire that moves no row leaves nothing behind, least of all a mirror claiming it happened.
+///
+/// The service refuses an expired target first, and the repository refuses it again inside the
+/// transaction. The second refusal is the one under test: a caller reaching the port directly must
+/// not end up with `supersedes` written on the new row while the old row stays live, which is two
+/// rows where one claims to have replaced the other.
+#[tokio::test]
+async fn a_retire_that_moves_no_row_never_leaves_the_mirror_written() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let old =
+        write::run(&ctx, "the depot opens at six", "global", None, None, None, None).await.unwrap();
+    let new = write::run(&ctx, "the depot opens at seven", "global", None, None, None, None)
+        .await
+        .unwrap();
+    // Expired: an end that has arrived, and no supersession stamp. Written by hand because an
+    // archive restore writes it this way and `expire` is not the only path to the column.
+    sqlx::query(
+        "UPDATE memory SET occurred_until = now() - interval '1 day', superseded_at = NULL
+          WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&old.id).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let refused = review::supersede(&ctx, &old.id, &new.id).await.unwrap_err();
+    assert!(refused.client_message().contains("expired"), "{}", refused.client_message());
+
+    let from_the_port = ctx
+        .repos
+        .memories
+        .supersede(
+            ctx.tenant(),
+            uuid::Uuid::parse_str(&old.id).unwrap(),
+            uuid::Uuid::parse_str(&new.id).unwrap(),
+        )
+        .await
+        .expect_err("the statement matched no row, so the transaction has nothing to commit");
+    assert_eq!(from_the_port.kind.http_status(), 409);
+
+    assert_eq!(memory_links(&pool, &new.id).await.0, None, "no mirror on the new row");
+    assert_eq!(memory_links(&pool, &old.id).await.1, None, "and the old row keeps its own life");
+}
+
 // ---- decision 0014 part 4: the graph ----
 
 /// The severing claim, which is the production-tier one. An edge whose far end the caller may not

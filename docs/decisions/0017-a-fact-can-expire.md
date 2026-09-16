@@ -158,6 +158,13 @@ a supersession retired does not hold now and is retired rather than expired.
 `RETIRE_PREDECESSOR_SQL` carries the same refusal inside the statement as defence in depth, spelled
 as the state test rather than as `occurred_until IS NULL`, so the orphan above is still replaceable.
 
+**A guard inside a statement costs a `rows_affected` check at every caller.** Both supersession
+paths read it and roll back on zero: the write path did from the start, and `supersede` gained it
+after the statement's guard first shipped without the clock term. A row with a future end passed the
+service door, matched no row inside the UPDATE, and left `supersedes` written on the live row with
+the predecessor unretired, which is two live rows where one claims to have replaced the other. The
+state is spelled once now, in `domain::types::expired`, and the statement transcribes it.
+
 **A recorded ruling is reversed.** `valid_time_reaches_a_search_result_without_touching_the_search`
 asserted that no live statement carries a period predicate. The test is split: the live half now
 asserts the conjunct and the as-of half keeps every assertion it had.

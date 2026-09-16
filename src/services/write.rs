@@ -612,12 +612,10 @@ async fn validate_supersedes_target(ctx: &Ctx, raw: &str) -> Result<(uuid::Uuid,
     // A closed period has no successor to write. Decision 0017 made `occurred_until` reachable
     // without a supersession, and a supersession over an expired row would end a period that has
     // already ended and hand `forget`'s revive an end it did not write.
-    // Expired, spelled the way every other surface spells it: an end, and no supersession stamp.
-    // A row whose `superseded_at` is set was retired by a supersession, so a restore that lost the
-    // link leaves a replaceable row rather than an expired one. A future end still holds.
-    if target.superseded_at.is_none()
-        && target.occurred_until.is_some_and(|until| until <= Utc::now())
-    {
+    // `domain::types::expired` holds the definition, and `RETIRE_PREDECESSOR_SQL` transcribes the
+    // same test into the UPDATE. A guard here that the statement does not share lets a row pass one
+    // door and stall at the other, which is how a supersession got reported that never landed.
+    if target.is_expired() {
         return Err(DomainError::conflict(format!(
             "memory {raw} expired, so its period is already closed and it takes no successor. \
              Write the new fact on its own, or bring the old one back first."

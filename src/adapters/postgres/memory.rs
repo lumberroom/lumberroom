@@ -61,6 +61,19 @@ impl PgMemoryRepository {
         self
     }
 
+    /// The refusal both supersession paths return when `RETIRE_PREDECESSOR_SQL` moves no row.
+    ///
+    /// One sentence for both paths, because by this point neither can tell the cases apart and the
+    /// caller's next move is the same either way: retry against the row the store holds now. The
+    /// head walk runs after the rollback, so no row lock is held while it waits for a connection.
+    async fn retire_moved_nothing(&self, tenant: &str, old: uuid::Uuid) -> Result<DomainError> {
+        let head = self.supersession_head(tenant, old).await?;
+        let head_id = head.map(|h| h.id).unwrap_or_else(|| old.to_string());
+        Ok(DomainError::conflict(format!(
+            "memory {old} was already superseded; the live row is {head_id}"
+        )))
+    }
+
     /// How much of this tenant's valid time is a copy of its transaction time.
     ///
     /// The detector for the one failure a tool description cannot prevent. `occurred_at` is set by
@@ -1045,10 +1058,12 @@ const RETIRE_PREDECESSOR_SQL: &str = r#"
            occurred_until = COALESCE(occurred_until, $4::timestamptz)
      WHERE tenant_id = $1 AND id = $2 AND superseded_by IS NULL
        -- An expired row takes no successor. `write::validate_supersedes_target` refuses it first
-       -- and this is the same test inside the statement, spelled the way the state is defined
-       -- everywhere else: a row carrying `superseded_at` was retired by a supersession and is
-       -- still replaceable, a row carrying an end and no stamp expired and is not.
-       AND (superseded_at IS NOT NULL OR occurred_until IS NULL)
+       -- and this is the same test inside the statement, spelled the way `domain::types::expired`
+       -- spells it: a row carrying `superseded_at` was retired by a supersession and is still
+       -- replaceable, and an end still ahead of now has not arrived, so that fact holds and takes
+       -- a successor. Dropping the clock term made this stricter than the service door, and a row
+       -- with a future end then passed one and matched nothing here.
+       AND (superseded_at IS NOT NULL OR occurred_until IS NULL OR occurred_until > now())
 "#;
 
 /// Close a row's validity with no successor.
@@ -1583,14 +1598,9 @@ impl MemoryRepository for PgMemoryRepository {
             if retired == 0 {
                 // The insert already proved the target exists, so the only way to update nothing is
                 // that something else retired it first. Roll back rather than store a correction
-                // pointing at a row that is no longer the current one, and name the live head so the
-                // caller can retry against it.
+                // pointing at a row that is no longer the current one.
                 tx.rollback().await?;
-                let head = self.supersession_head(&m.tenant_id, old).await?;
-                let head_id = head.map(|h| h.id).unwrap_or_else(|| old.to_string());
-                return Err(DomainError::conflict(format!(
-                    "memory {old} was already superseded; the live row is {head_id}"
-                )));
+                return Err(self.retire_moved_nothing(&m.tenant_id, old).await?);
             }
         }
 
@@ -2074,13 +2084,24 @@ impl MemoryRepository for PgMemoryRepository {
         )?;
         warn_on_open_validity(old, new, predecessor_occurred_at, until);
 
-        sqlx::query(RETIRE_PREDECESSOR_SQL)
+        let retired = sqlx::query(RETIRE_PREDECESSOR_SQL)
             .bind(tenant)
             .bind(old)
             .bind(new)
             .bind(until)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected();
+
+        if retired == 0 {
+            // The lock above read the row and found no successor, so a zero-row update means the
+            // guard inside the statement refused it: the period closed under this call, or another
+            // writer got there first. The mirror below must not run either way. A `supersedes`
+            // beside a predecessor nothing retired leaves two live rows, one of them claiming to
+            // have replaced the other, and the service reports a supersession that never happened.
+            tx.rollback().await?;
+            return Err(self.retire_moved_nothing(tenant, old).await?);
+        }
 
         // The mirror, and only when it is empty. `superseded_by` on the retired row is the
         // authoritative link and the one every read filters on; `supersedes` on the live row is the
@@ -3627,6 +3648,41 @@ mod tests {
         assert!(RETIRE_PREDECESSOR_SQL.contains("AND superseded_by IS NULL"));
         // The start is never rewritten. A change ends a period; moving its start is a correction.
         assert!(!RETIRE_PREDECESSOR_SQL.contains("occurred_at ="));
+    }
+
+    /// Both supersession doors refuse the same state, or a row walks through one and stalls at the
+    /// other.
+    ///
+    /// The statement guard was stricter than the service check for one release: it refused any end
+    /// with no stamp, while `write::validate_supersedes_target` refuses only an end that has
+    /// arrived. An archive restore binds `occurred_until` on its own, so a row with a future end
+    /// passed the service, matched no row here, and left the caller holding a supersession that
+    /// never happened.
+    ///
+    /// The table below is the SQL clause read as boolean logic, checked against
+    /// `domain::types::expired`, which is the one the service calls.
+    #[test]
+    fn the_retire_guard_and_the_service_guard_spell_one_expired_state() {
+        assert!(RETIRE_PREDECESSOR_SQL.contains(
+            "(superseded_at IS NOT NULL OR occurred_until IS NULL OR occurred_until > now())"
+        ));
+
+        let now = Utc::now();
+        let hour = chrono::Duration::hours(1);
+        // (superseded_at, occurred_until, refused)
+        let states = [
+            (None, None, false),
+            (None, Some(now - hour), true),
+            (None, Some(now + hour), false),
+            (Some(now - hour), Some(now - hour), false),
+            (Some(now - hour), None, false),
+        ];
+        for (stamp, until, refused) in states {
+            let service = crate::domain::types::expired(stamp, until, now);
+            let statement = !(stamp.is_some() || until.is_none() || until.is_some_and(|u| u > now));
+            assert_eq!(service, refused, "the service guard on {stamp:?} {until:?}");
+            assert_eq!(statement, refused, "the statement guard on {stamp:?} {until:?}");
+        }
     }
 
     fn at(rfc3339: &str) -> DateTime<Utc> {
