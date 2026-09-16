@@ -104,6 +104,29 @@ impl Memory {
     pub fn is_live(&self) -> bool {
         self.superseded_by.is_none() && self.occurred_until.is_none_or(|until| until > Utc::now())
     }
+
+    /// Did this fact's period end with nothing replacing it? Decision 0017's state, read off a row.
+    pub fn is_expired(&self) -> bool {
+        expired(self.superseded_at, self.occurred_until, Utc::now())
+    }
+}
+
+/// Decision 0017's definition of expired, in one place and with the clock passed in.
+///
+/// Both halves matter. A row carrying `superseded_at` was retired by a supersession, even where a
+/// restore lost the link, so it keeps its replace form. An end still ahead of now has not arrived,
+/// so the fact holds and takes a successor like any other row does.
+///
+/// The service door reads this and `RETIRE_PREDECESSOR_SQL` spells the same test inside the
+/// statement. The two disagreed for one release and a row with a future end fell through the gap:
+/// the service accepted it, the UPDATE matched nothing, and the caller was told a supersession had
+/// happened.
+pub fn expired(
+    superseded_at: Option<DateTime<Utc>>,
+    occurred_until: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    superseded_at.is_none() && occurred_until.is_some_and(|until| until <= now)
 }
 
 #[derive(Debug, Clone, Serialize)]
