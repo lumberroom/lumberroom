@@ -96,6 +96,16 @@ pub struct Resolved {
     pub end_left_open: bool,
 }
 
+/// A fact whose period the owner closed, and the instant that closed it.
+///
+/// The instant is what `unexpire` is guarded on, so a caller who wants the action back has to
+/// carry it. Returning it is the whole of the undo contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct Expired {
+    pub id: String,
+    pub until: DateTime<Utc>,
+}
+
 pub async fn queue(ctx: &Ctx, limit: Option<i64>) -> Result<ReviewQueue> {
     let limit = limit.unwrap_or(20).clamp(1, 200);
 
@@ -184,7 +194,8 @@ pub async fn supersede(ctx: &Ctx, old: &str, new: &str) -> Result<Resolved> {
     }
     if !new_row.is_live() {
         return Err(DomainError::conflict(format!(
-            "memory {new} is itself superseded and cannot be the replacement"
+            "memory {new} does not hold now, because something superseded it or its period closed, \
+             so it cannot be the replacement"
         )));
     }
 
@@ -267,6 +278,57 @@ pub async fn date_candidates(ctx: &Ctx, limit: Option<i64>) -> Result<Vec<DateCa
         }
     }
     Ok(out)
+}
+
+/// "This fact described a situation, and the situation has passed."
+///
+/// The third thing the queue can do to a row, beside confirming it and superseding it, and the
+/// first that retires one with nothing to retire it into. `CleanupKind::Stale` deletes for exactly
+/// this reason; this is the answer that keeps the text, the history and every as-of read.
+///
+/// The write grant at the row's own level and no capability flag. `may_delete` guards loss nothing
+/// brings back, and `unexpire` is one statement away.
+pub async fn expire(ctx: &Ctx, id: &str) -> Result<Expired> {
+    let (uuid, row) = writable_row(ctx, id).await?;
+    // The period first. `is_live` answers both clocks, so a row this path already closed would
+    // otherwise be reported as superseded by something that does not exist.
+    //
+    // Two ways a period is already closed, and the refusal says which. A stamp means a supersession
+    // ended it, even where the successor went missing in a restore; no stamp means this path did.
+    if let Some(until) = row.occurred_until {
+        return Err(DomainError::validation(match row.superseded_at {
+            None => format!("memory {id} already expired at {}", until.to_rfc3339()),
+            Some(_) => format!(
+                "memory {id} was retired by a supersession that ended its period at {}",
+                until.to_rfc3339()
+            ),
+        }));
+    }
+    if !row.is_live() {
+        return Err(DomainError::conflict(format!(
+            "memory {id} is already superseded, so its end is the supersession's to write"
+        )));
+    }
+    // Everything the row said is checked above, so a statement that moves nothing here means the
+    // row changed between the read and the write rather than that it was already closed.
+    let Some(until) = ctx.repos.memories.expire(ctx.tenant(), uuid).await? else {
+        return Err(DomainError::conflict(format!("memory {id} changed while this ran")));
+    };
+    super::bootstrap::clear_cache();
+    Ok(Expired { id: uuid.to_string(), until })
+}
+
+/// Reopen a fact this instant closed, and say whether the statement moved anything.
+///
+/// A false return is a row somebody else has since changed, which the caller reports rather than
+/// overrides.
+pub async fn unexpire(ctx: &Ctx, id: &str, until: DateTime<Utc>) -> Result<bool> {
+    let (uuid, _) = writable_row(ctx, id).await?;
+    let done = ctx.repos.memories.unexpire(ctx.tenant(), uuid, until).await?;
+    if done {
+        super::bootstrap::clear_cache();
+    }
+    Ok(done)
 }
 
 /// Fill a start date on a row that never carried one.

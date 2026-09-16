@@ -2926,6 +2926,338 @@ async fn filling_a_date_takes_only_one_the_fact_itself_names_and_never_moves_an_
     );
 }
 
+// ---- decision 0017: a fact can stop being true without being replaced ----
+
+/// Does a live search for `label` return the row `id`?
+///
+/// The label is a nonce, so a hit is the row and a miss is the row being absent rather than the
+/// query having drifted.
+async fn live_search_finds(ctx: &Ctx, label: &str, id: &str) -> bool {
+    search::run(ctx, label, None, Some(20), None, None, None)
+        .await
+        .unwrap()
+        .hits
+        .iter()
+        .any(|h| h.id == id)
+}
+
+#[tokio::test]
+async fn an_expired_row_leaves_search_and_the_digest_and_comes_back() {
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let label = nonce("expire");
+    let row = write::run(
+        &ctx,
+        &format!("the sprint board {label} is where this week's work sits"),
+        "global",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(live_search_finds(&ctx, &label, &row.id).await, "a fresh fact answers a live search");
+    bootstrap::clear_cache();
+    let before = bootstrap::run(&ctx, None).await.unwrap();
+    assert!(digest_json(&before).contains(&label), "a live fact reaches the digest");
+
+    let expired = review::expire(&ctx, &row.id).await.unwrap();
+    assert_eq!(expired.id, row.id);
+
+    assert!(
+        !live_search_finds(&ctx, &label, &row.id).await,
+        "a fact whose period has closed answers no live search"
+    );
+    let after = bootstrap::run(&ctx, None).await.unwrap();
+    assert!(!digest_json(&after).contains(&label), "and it is out of the digest too");
+
+    assert!(review::unexpire(&ctx, &row.id, expired.until).await.unwrap());
+    assert!(
+        live_search_finds(&ctx, &label, &row.id).await,
+        "unexpire puts the fact back where it was"
+    );
+}
+
+/// The whole reason this closes a period rather than deleting: the text, the history and every
+/// as-of read survive the retirement.
+#[tokio::test]
+async fn an_expired_row_still_answers_as_of_a_time_inside_its_period() {
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let label = nonce("asof");
+    let a_year_ago = chrono::Utc::now() - chrono::Duration::days(365);
+    let row = write::run(
+        &ctx,
+        &format!("the {label} rate card held through the year"),
+        "global",
+        None,
+        None,
+        None,
+        Some(a_year_ago),
+    )
+    .await
+    .unwrap();
+
+    review::expire(&ctx, &row.id).await.unwrap();
+
+    let six_months_ago = chrono::Utc::now() - chrono::Duration::days(180);
+    let then =
+        search::run(&ctx, &label, None, Some(20), None, None, Some(six_months_ago)).await.unwrap();
+    assert!(
+        then.hits.iter().any(|h| h.id == row.id),
+        "an instant inside the period still gets the fact"
+    );
+    assert!(!live_search_finds(&ctx, &label, &row.id).await, "and now does not");
+}
+
+#[tokio::test]
+async fn expire_refuses_a_row_a_successor_already_retired() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let old = write::run(&ctx, "the port is 8080", "global", None, None, None, None).await.unwrap();
+    let new = write::run(&ctx, "the port is 8787", "global", None, None, None, None).await.unwrap();
+    review::supersede(&ctx, &old.id, &new.id).await.unwrap();
+
+    let ended_by_the_supersession = occurred_until(&pool, &old.id).await;
+    let err = review::expire(&ctx, &old.id).await.unwrap_err();
+    // The refusal names the supersession rather than calling the row expired, because a stamped
+    // row with a closed period was replaced and this path did not close it.
+    assert!(err.client_message().contains("retired by a supersession"), "{}", err.client_message());
+    assert_eq!(
+        occurred_until(&pool, &old.id).await,
+        ended_by_the_supersession,
+        "the end the supersession wrote is not this path's to move"
+    );
+}
+
+#[tokio::test]
+async fn unexpire_refuses_an_instant_it_did_not_write() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let label = nonce("guard");
+    let row = write::run(
+        &ctx,
+        &format!("the {label} standup runs at nine"),
+        "global",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let expired = review::expire(&ctx, &row.id).await.unwrap();
+    assert!(
+        !review::unexpire(&ctx, &row.id, chrono::Utc::now()).await.unwrap(),
+        "an instant nobody wrote reopens nothing"
+    );
+    assert_eq!(occurred_until(&pool, &row.id).await, Some(expired.until));
+
+    assert!(review::unexpire(&ctx, &row.id, expired.until).await.unwrap());
+    assert_eq!(occurred_until(&pool, &row.id).await, None);
+}
+
+#[tokio::test]
+async fn expire_needs_the_write_grant_at_the_rows_own_level() {
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let row =
+        write::run(&ctx, "a fact anyone may read", "global", None, None, None, None).await.unwrap();
+
+    let reader = restricted(&ctx, &["global"], &[]);
+    let err = review::expire(&reader, &row.id).await.unwrap_err();
+    assert_eq!(err.kind.http_status(), 404);
+    assert!(err.client_message().contains("not yours to change"), "{}", err.client_message());
+}
+
+/// The failure that made `find_exact` the first item on the review: the owner restates a fact the
+/// store closed, the write collapses into the closed row, and the fact stays absent from every
+/// live answer with nothing reporting it.
+#[tokio::test]
+async fn restating_an_expired_fact_writes_a_new_live_row_rather_than_collapsing_into_it() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let label = nonce("restate");
+    let text = format!("the {label} standing order runs monthly");
+
+    let first = write::run(&ctx, &text, "global", None, None, None, None).await.unwrap();
+    let expired = review::expire(&ctx, &first.id).await.unwrap();
+
+    let second = write::run(&ctx, &text, "global", None, None, None, None).await.unwrap();
+    assert!(!second.deduplicated, "a closed fact restated is a fact again, not a duplicate");
+    assert_ne!(second.id, first.id);
+    assert_eq!(
+        occurred_until(&pool, &first.id).await,
+        Some(expired.until),
+        "the old row stays closed"
+    );
+    assert_eq!(occurred_until(&pool, &second.id).await, None);
+    assert!(live_search_finds(&ctx, &label, &second.id).await, "the restated fact answers now");
+    assert!(!live_search_finds(&ctx, &label, &first.id).await);
+}
+
+/// A closed period takes no successor, which is what keeps `forget`'s revive honest: the revive
+/// clears `occurred_until` on every row it brings back, and only a supersession may have written
+/// one there.
+#[tokio::test]
+async fn an_expired_row_takes_no_successor_so_a_revive_cannot_wipe_its_end() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let old =
+        write::run(&ctx, "the office is on the third floor", "global", None, None, None, None)
+            .await
+            .unwrap();
+    let expired = review::expire(&ctx, &old.id).await.unwrap();
+    let new =
+        write::run(&ctx, "the office is on the ninth floor", "global", None, None, None, None)
+            .await
+            .unwrap();
+
+    let refused = review::supersede(&ctx, &old.id, &new.id).await.unwrap_err();
+    assert!(refused.client_message().contains("expired"), "{}", refused.client_message());
+
+    // The write path takes the same target through the same check, so neither door is laxer.
+    let refused_write = write::run(
+        &ctx,
+        "the office is on the tenth floor",
+        "global",
+        None,
+        Some(&old.id),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused_write.client_message().contains("expired"),
+        "{}",
+        refused_write.client_message()
+    );
+
+    assert_eq!(memory_links(&pool, &old.id).await.1, None, "nothing retired it");
+    assert_eq!(occurred_until(&pool, &old.id).await, Some(expired.until), "its end stands");
+}
+
+#[tokio::test]
+async fn expiring_a_row_twice_names_the_instant_rather_than_blaming_a_race() {
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let row =
+        write::run(&ctx, "the winter timetable is in force", "global", None, None, None, None)
+            .await
+            .unwrap();
+    let expired = review::expire(&ctx, &row.id).await.unwrap();
+
+    let again = review::expire(&ctx, &row.id).await.unwrap_err();
+    assert_eq!(again.kind.http_status(), 400);
+    assert!(again.client_message().contains("already expired at"), "{}", again.client_message());
+    assert!(
+        again.client_message().contains(&expired.until.to_rfc3339()),
+        "the refusal names the instant, which is what unexpire is guarded on: {}",
+        again.client_message()
+    );
+}
+
+/// The retired page is the one list that says what left the live reads, so an expiry belongs on it
+/// and has to be tellable from a supersession.
+#[tokio::test]
+async fn an_expired_row_reaches_the_retired_list_marked_as_expired() {
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let label = nonce("retiredlist");
+    let row = write::run(
+        &ctx,
+        &format!("the {label} car park closes at seven"),
+        "global",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    review::expire(&ctx, &row.id).await.unwrap();
+
+    let readable = vec![lumberroom_server::domain::policy::NamespaceCeiling {
+        namespace: "global".into(),
+        max: Sensitivity::Sealed,
+    }];
+    let since = chrono::Utc::now() - chrono::Duration::days(7);
+    let rows = ctx.repos.memories.retired_since(ctx.tenant(), &readable, since, 100).await.unwrap();
+
+    let found = rows
+        .iter()
+        .find(|r| r.id.to_string() == row.id)
+        .expect("the expired row is on the list of what left");
+    assert!(found.expired, "and it is marked as expired rather than as replaced");
+    assert!(found.successor_id.is_none());
+}
+
+/// A successor has to hold now. An expired row named as the replacement would retire a live fact
+/// into one that no live read returns, which is the fact disappearing with a correction's paperwork
+/// around it.
+#[tokio::test]
+async fn supersede_refuses_an_expired_row_as_the_replacement() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let old = write::run(&ctx, "the meeting is on Tuesday", "global", None, None, None, None)
+        .await
+        .unwrap();
+    let new = write::run(&ctx, "the meeting is on Thursday", "global", None, None, None, None)
+        .await
+        .unwrap();
+    review::expire(&ctx, &new.id).await.unwrap();
+
+    let refused = review::supersede(&ctx, &old.id, &new.id).await.unwrap_err();
+    assert!(refused.client_message().contains("does not hold now"), "{}", refused.client_message());
+    assert_eq!(memory_links(&pool, &old.id).await.1, None, "the live row keeps holding");
+}
+
+/// The shape a restore leaves when it cannot relink a successor: `superseded_at` and
+/// `occurred_until` set, the link NULL. It is a retirement whose successor is missing, and reading
+/// the link alone filed it as expired everywhere, took away its replace form and refused a
+/// supersession over it.
+#[tokio::test]
+async fn a_retirement_whose_successor_is_missing_reads_as_retired_rather_than_expired() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let orphan =
+        write::run(&ctx, "the invoice runs through Stripe", "global", None, None, None, None)
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE memory SET superseded_at = now(), occurred_until = now(), superseded_by = NULL
+          WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&orphan.id).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let readable = vec![lumberroom_server::domain::policy::NamespaceCeiling {
+        namespace: "global".into(),
+        max: Sensitivity::Sealed,
+    }];
+    let since = chrono::Utc::now() - chrono::Duration::days(7);
+    let rows = ctx.repos.memories.retired_since(ctx.tenant(), &readable, since, 100).await.unwrap();
+    let listed = rows
+        .iter()
+        .find(|r| r.id.to_string() == orphan.id)
+        .expect("a retirement belongs on the list of what left");
+    assert!(!listed.expired, "a stamped row with an end was superseded, not expired");
+    assert!(listed.successor_id.is_none(), "and its successor is the part that went missing");
+
+    // The replace path still works on it, which is the half that was lost.
+    let replacement = write::run(
+        &ctx,
+        "the invoice runs through GoCardless",
+        "global",
+        None,
+        Some(&orphan.id),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        memory_links(&pool, &orphan.id).await.1,
+        Some(replacement.id),
+        "the supersession landed and the link points at the new row"
+    );
+}
+
 // ---- decision 0014 part 4: the graph ----
 
 /// The severing claim, which is the production-tier one. An edge whose far end the caller may not

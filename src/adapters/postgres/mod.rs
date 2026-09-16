@@ -1,5 +1,25 @@
 //! The Postgres adapter. The only module in the service that contains SQL.
 
+/// What "the store holds this now" means, in one place, for every reader that asks it.
+///
+/// Two clauses, and the second is the one decision 0017 added. `superseded_by IS NULL` is
+/// transaction time: no later row replaced this one. The period test is valid time: nobody closed
+/// the fact's validity without a replacement, which is what `review::expire` writes.
+///
+/// A conjunct rather than a rewrite, which is what keeps the `memory_live` partial index from
+/// migration 005. The index predicate is the first clause and this predicate implies it, so the
+/// planner can still prove the index applies and the period test becomes a filter above the scan.
+/// The trap `memory.rs` records at `($n OR superseded_by IS NULL)` is the opposite shape: weaker
+/// than the index predicate, so unprovable.
+///
+/// Defined here so the readers in `memory` and in `cleanup` take the same text. A statement whose
+/// alias is not `m` spells the two clauses out and names this macro in a comment.
+macro_rules! live {
+    () => {
+        "m.superseded_by IS NULL AND (m.occurred_until IS NULL OR m.occurred_until > now())"
+    };
+}
+
 mod alias;
 mod cleanup;
 mod ingest;

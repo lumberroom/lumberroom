@@ -68,6 +68,8 @@ fn ns_bounds(namespace: Option<&str>) -> (String, bool) {
 /// It reads: this tenant, live, in scope, at or below the ceiling, admitted by the grant, and
 /// holding readable text. It is written four times because `sqlx::query` refuses a string built at
 /// runtime, and rightly: a predicate assembled with `format!` is one edit away from carrying data.
+/// The live half is the one part every candidate statement in this file splices from `live!()`
+/// rather than spells, so a row whose period closed is a candidate for no cleanup kind.
 /// `$1` tenant, `$2` ceiling, `$3` namespace pattern, `$4` whether that pattern is exact, `$5` to
 /// `$7` the grant as prefix, exactness and ceiling.
 ///
@@ -91,14 +93,17 @@ const GRANT_PREDICATE: &str = r#"AND EXISTS (
     )"#;
 
 /// Live rows whose normalised content is byte-identical, grouped, anchored on what changed.
-const EXACT_DUPLICATES_SQL: &str = r#"
+const EXACT_DUPLICATES_SQL: &str = concat!(
+    r#"
             WITH scoped AS (
               SELECT m.id, m.namespace, m.sensitivity, m.content, m.created_at, m.access_count,
                      m.namespace || '\x1f' ||
                      lower(regexp_replace(btrim(m.content), '\s+', ' ', 'g')) AS norm
                 FROM memory m
                WHERE     m.tenant_id = $1
-    AND m.superseded_by IS NULL
+    AND "#,
+    live!(),
+    r#"
     AND m.content IS NOT NULL
     AND (
       CASE $2::text
@@ -127,7 +132,8 @@ const EXACT_DUPLICATES_SQL: &str = r#"
                AND s.norm IN (SELECT norm FROM scoped GROUP BY norm HAVING count(*) > 1)
              ORDER BY s.norm, s.created_at
              LIMIT $9
-            "#;
+            "#
+);
 
 /// Live pairs within a cosine band, anchored on one side and open on the other.
 ///
@@ -136,13 +142,16 @@ const EXACT_DUPLICATES_SQL: &str = r#"
 /// duplicates were already grouped per namespace by the `norm` prefix; this brings the cosine band
 /// to the same rule. The cost is that a fact restated under a second namespace is not a finding,
 /// which `docs/cleanup-schedule.md` had been promising all along.
-const SIMILAR_PAIRS_SQL: &str = r#"
+const SIMILAR_PAIRS_SQL: &str = concat!(
+    r#"
             WITH scoped AS (
               SELECT m.id, m.namespace, m.sensitivity, m.content, m.created_at, m.access_count,
                      m.embedding
                 FROM memory m
                WHERE     m.tenant_id = $1
-    AND m.superseded_by IS NULL
+    AND "#,
+    live!(),
+    r#"
     AND m.content IS NOT NULL
     AND (
       CASE $2::text
@@ -172,14 +181,18 @@ const SIMILAR_PAIRS_SQL: &str = r#"
                AND 1 - (a.embedding <=> b.embedding) >= $9
              ORDER BY similarity DESC
              LIMIT $10
-            "#;
+            "#
+);
 
 /// The newest live row in scope. No window: the question is what the store now holds.
-const NEWEST_SQL: &str = r#"
+const NEWEST_SQL: &str = concat!(
+    r#"
             SELECT max(m.created_at) AS newest
               FROM memory m
              WHERE     m.tenant_id = $1
-    AND m.superseded_by IS NULL
+    AND "#,
+    live!(),
+    r#"
     AND m.content IS NOT NULL
     AND (
       CASE $2::text
@@ -195,14 +208,21 @@ const NEWEST_SQL: &str = r#"
                   ELSE left(m.namespace, length(g.prefix)) = g.prefix END
          AND sensitivity_rank(m.sensitivity) <= sensitivity_rank(g.max)
     )
-"#;
+"#
+);
 
 /// Live rows nothing has read, older than the interval.
-const UNREAD_SQL: &str = r#"
+///
+/// The live test is `live!()`, so a fact whose period closed with no successor is not a stale
+/// candidate. Decision 0017 carries the reasoning.
+const UNREAD_SQL: &str = concat!(
+    r#"
             SELECT m.id, m.namespace, m.sensitivity, m.content, m.created_at, m.access_count
               FROM memory m
              WHERE     m.tenant_id = $1
-    AND m.superseded_by IS NULL
+    AND "#,
+    live!(),
+    r#"
     AND m.content IS NOT NULL
     AND (
       CASE $2::text
@@ -223,7 +243,8 @@ const UNREAD_SQL: &str = r#"
                AND m.created_at < now() - make_interval(days => $8::int)
              ORDER BY m.created_at
              LIMIT $9
-            "#;
+            "#
+);
 
 /// A proposal this caller may read: its own namespace matched by some grant entry, and every
 /// member row readable at the level it is stored at. `$3` to `$5` are the grant arrays.
@@ -347,7 +368,8 @@ pub(crate) fn grant_arrays(grants: &[NamespaceGrant]) -> (Vec<String>, Vec<bool>
 ///
 /// Both grant axes, the same shape every other candidate query uses. The pass runs as the whole
 /// tenant and an HTTP caller runs as itself; neither spelling skips the check.
-const TAGGED_DATED_SQL: &str = r#"
+const TAGGED_DATED_SQL: &str = concat!(
+    r#"
     WITH granted AS (
         SELECT prefix, exact, sensitivity_rank(max) AS max_rank
           FROM unnest($2::text[], $3::bool[], $4::text[]) AS g(prefix, exact, max)
@@ -356,7 +378,9 @@ const TAGGED_DATED_SQL: &str = r#"
            m.occurred_at
       FROM memory m
      WHERE m.tenant_id = $1
-       AND m.superseded_by IS NULL
+       AND "#,
+    live!(),
+    r#"
        AND m.occurred_at IS NOT NULL
        AND $5 = ANY(m.tags)
        AND sensitivity_rank(m.sensitivity) <= sensitivity_rank($6)
@@ -370,7 +394,8 @@ const TAGGED_DATED_SQL: &str = r#"
            )
      ORDER BY m.occurred_at DESC, m.id DESC
      LIMIT $7
-"#;
+"#
+);
 
 fn candidate_from(row: &sqlx::postgres::PgRow, prefix: &str) -> Result<Candidate> {
     let id: Uuid = row.try_get(format!("{prefix}id").as_str()).map_err(map_err)?;
@@ -1031,7 +1056,10 @@ mod tests {
                 "{name} lost the grant predicate, which is what keeps a caller's run inside its \
                  own namespaces"
             );
-            assert!(sql.contains("m.superseded_by IS NULL"), "{name} would read retired rows");
+            assert!(
+                sql.contains(live!()),
+                "{name} lost the live test, so it would read retired or expired rows"
+            );
             assert!(sql.contains("m.content IS NOT NULL"), "{name} would read sealed rows");
             assert!(
                 sql.contains("WHEN 'open' THEN m.sensitivity = 'open'"),
@@ -1090,6 +1118,14 @@ mod tests {
             SIMILAR_PAIRS_SQL.contains("a.created_at >= $8 OR b.created_at >= $8"),
             "the window has to admit a pair where only one side is new"
         );
+    }
+
+    /// The cleanup pass reads live rows, so it answers both clocks the way every other live
+    /// reader does. Decision 0017 carries the reasoning.
+    #[test]
+    fn the_unread_scan_skips_a_row_whose_period_has_closed() {
+        assert!(UNREAD_SQL.contains("m.superseded_by IS NULL"));
+        assert!(UNREAD_SQL.contains("m.occurred_until IS NULL OR m.occurred_until > now()"));
     }
 
     #[test]

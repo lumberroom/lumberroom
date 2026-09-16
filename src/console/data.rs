@@ -63,6 +63,13 @@ pub struct Entry {
     pub occurred_until: Option<DateTime<Utc>>,
     /// A later write replaced this one. Printed struck through, in place.
     pub retired: bool,
+    /// The period closed and no supersession closed it, so no live read returns it and nothing
+    /// replaced it. A third state beside live and retired, and the page names it.
+    ///
+    /// Read off `superseded_at` rather than the link. A restore that could not relink a successor
+    /// leaves a row stamped by a supersession with a NULL link, and that row is retired with its
+    /// successor missing rather than expired.
+    pub expired: bool,
     /// The owner restated it, so the store counted it as confirmed.
     pub confirmed: bool,
     /// True for a sealed row. The page says why the content is absent rather than drawing a box
@@ -87,6 +94,8 @@ impl Entry {
             occurred_at: m.occurred_at,
             occurred_until: m.occurred_until,
             retired: m.superseded_by.is_some(),
+            expired: m.superseded_at.is_none()
+                && m.occurred_until.is_some_and(|until| until <= Utc::now()),
             confirmed: m.last_confirmed_at.is_some(),
             withheld,
         }
@@ -192,6 +201,11 @@ pub struct Revision {
     pub occurred_at: Option<DateTime<Utc>>,
     pub occurred_until: Option<DateTime<Utc>>,
     pub retired_at: Option<DateTime<Utc>>,
+    /// When this version's period closed with no supersession closing it.
+    ///
+    /// Never set together with `retired_at`, and the reason is the predicate rather than the
+    /// column: this is set only when `superseded_at` is absent, and `retired_at` is that column.
+    pub expired_at: Option<DateTime<Utc>>,
     pub current: bool,
     pub withheld: bool,
 }
@@ -362,6 +376,11 @@ pub async fn leaf(ctx: &Ctx, id: &str) -> Result<Option<Leaf>> {
             // Dropping it would sever the chain and report a short history as a complete one, which
             // is the failure the repository's own comment warns about.
             let withheld = m.sensitivity == Sensitivity::Sealed || unopened.contains(&m.id);
+            // An expired version is not current, and it carries no `superseded_at` to date it by.
+            let expired_at = match m.superseded_at.is_none() {
+                true => m.occurred_until.filter(|until| *until <= Utc::now()),
+                false => None,
+            };
             Revision {
                 id: m.id.clone(),
                 content: if withheld { String::new() } else { m.content.clone() },
@@ -370,7 +389,8 @@ pub async fn leaf(ctx: &Ctx, id: &str) -> Result<Option<Leaf>> {
                 occurred_at: m.occurred_at,
                 occurred_until: m.occurred_until,
                 retired_at: m.superseded_at,
-                current: m.superseded_by.is_none(),
+                expired_at,
+                current: m.superseded_by.is_none() && expired_at.is_none(),
                 withheld,
             }
         })
@@ -488,6 +508,11 @@ pub async fn answer(
                 .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
                 .map(|d| d.with_timezone(&Utc)),
             retired: hit.superseded_by.is_some(),
+            // A search answer never carries an expired row: `search::run` reads live rows and
+            // this console asks it for live rows. The wire shape carries no `superseded_at`, so
+            // the state cannot be computed here anyway, and inventing it from the link alone is
+            // the mistake this predicate exists to avoid.
+            expired: false,
             confirmed: false,
             withheld: hit.sensitivity == Sensitivity::Sealed,
         };

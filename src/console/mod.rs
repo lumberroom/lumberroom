@@ -816,12 +816,13 @@ async fn composed(
 /// The form filled from the entry a replacement would retire, or nothing for an entry that cannot
 /// be replaced from here.
 ///
-/// A retired row already has a successor and `write::run` refuses a second one. A sealed row is
-/// bytes this server cannot read, so the box would come up empty and the submit would overwrite a
-/// secret with a blank.
+/// A retired row already has a successor and `write::run` refuses a second one. An expired row has
+/// a closed period and `write::validate_supersedes_target` refuses that too. A sealed row is bytes
+/// this server cannot read, so the box would come up empty and the submit would overwrite a secret
+/// with a blank.
 fn prefill(leaf: &data::Leaf) -> Option<pages::Draft> {
     let e = &leaf.entry;
-    if e.retired || e.withheld {
+    if e.retired || e.expired || e.withheld {
         return None;
     }
     // The same prefill the control inside an entry uses, plus the old wording, because this page
@@ -850,9 +851,9 @@ fn unreplaceable(app: &Console) -> Response {
         StatusCode::CONFLICT,
         pages::notice(
             "that entry cannot be replaced from here",
-            "A row that has already been replaced takes no second successor, and a sealed row is \
-             encrypted on the machine that wrote it. Open the entry itself to see which of the two \
-             it is.",
+            "A row that has already been replaced takes no second successor, a row whose period \
+             expired takes none either, and a sealed row is encrypted on the machine that wrote \
+             it. Open the entry itself to see which of the three it is.",
             None,
             Some(&app.health()),
         ),

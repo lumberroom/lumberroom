@@ -95,8 +95,14 @@ pub struct Memory {
 }
 
 impl Memory {
+    /// Does this fact hold now? Both clocks, since decision 0017.
+    ///
+    /// The period half is what stops an expired row being named as the successor in a supersession,
+    /// which would retire a live fact into one no live read returns. Distinct from the `expired`
+    /// state the console prints: a row a supersession retired does not hold now either, and it is
+    /// retired rather than expired.
     pub fn is_live(&self) -> bool {
-        self.superseded_by.is_none()
+        self.superseded_by.is_none() && self.occurred_until.is_none_or(|until| until > Utc::now())
     }
 }
 

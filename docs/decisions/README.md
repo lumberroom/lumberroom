@@ -27,6 +27,7 @@ carries a marker pointing here.
 | [0014](0014-nothing-finds-the-pair-a-supersession-needs.md) | The store can record a supersession and nothing finds the pair; four parts, three of them held | 25 Aug 2026 | draft; all four parts implemented and tested, the gating rerun passed, part 4's own result argues for the extractor it was built to avoid |
 | [0015](0015-sealed-enumeration.md) | `SealedRepository` gains an enumeration method, reachable only after a caller already passed the whole-store gate | 30 Aug 2026 | accepted, design |
 | [0016](0016-audience-is-checked-where-a-token-becomes-a-principal.md) | The audience on an access token is checked where the token becomes a principal, and a token with no audience is admitted until the population drains | 8 Sep 2026 | accepted, implemented |
+| [0017](0017-a-fact-can-expire.md) | A live read answers both clocks, so a fact can be retired with no successor and brought back | 15 Sep 2026 | accepted, implemented |
 
 **On "verified".** All four gates ran against a live server on 20 August 2026 and passed. An OAuth
 flow completed end to end, a private row was encrypted and read back, and a replayed refresh token

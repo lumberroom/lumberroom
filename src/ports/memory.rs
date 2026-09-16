@@ -152,14 +152,19 @@ pub struct WalkBounds {
     pub include_retired: bool,
 }
 
-/// One retired row, with what retired it.
+/// One row that left the live reads, with what took it out.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Retired {
     pub id: uuid::Uuid,
     pub namespace: String,
     pub content: String,
     pub sensitivity: crate::domain::types::Sensitivity,
-    pub superseded_at: chrono::DateTime<chrono::Utc>,
+    /// When the row left. A supersession's `superseded_at`, or the instant an expiry closed the
+    /// period. The two never both apply, because an expiry writes no successor.
+    pub retired_at: chrono::DateTime<chrono::Utc>,
+    /// The period closed with nothing replacing the fact. The row is neither live nor retired, and
+    /// `review::unexpire` brings it back.
+    pub expired: bool,
     pub occurred_at: Option<chrono::DateTime<chrono::Utc>>,
     pub occurred_until: Option<chrono::DateTime<chrono::Utc>>,
     /// The row was retired and its period never closed, so as-of reads still report it as holding.
@@ -604,6 +609,31 @@ pub trait MemoryRepository: Send + Sync {
         tenant: &str,
         id: uuid::Uuid,
         when: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool>;
+
+    /// Close a live row's validity with no successor, and report the instant written.
+    ///
+    /// The third thing that can happen to a row, beside a confirmation and a supersession, and the
+    /// first that retires one with nothing to retire it into. `None` says the statement moved
+    /// nothing: the row is already retired, already closed, or gone.
+    ///
+    /// Must refuse a row a successor already retired. That row's end belongs to the supersession
+    /// that wrote it.
+    async fn expire(
+        &self,
+        tenant: &str,
+        id: uuid::Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
+
+    /// Reopen a row this instant closed.
+    ///
+    /// Guarded on the instant, so a close somebody else wrote is not this caller's to undo. A
+    /// `false` return means the statement moved nothing and the row stands as it was.
+    async fn unexpire(
+        &self,
+        tenant: &str,
+        id: uuid::Uuid,
+        until: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool>;
 
     /// Walk the chain to the row that is live now, so a rejection can name the current head.
