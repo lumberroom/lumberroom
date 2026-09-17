@@ -118,8 +118,9 @@ pub struct SearchArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WriteArgs {
-    /// The durable fact, as one self-contained sentence that will still make sense in six months
-    /// with no surrounding conversation. Name the subject explicitly.
+    /// The durable fact, self-contained, still making sense in six months with no surrounding
+    /// conversation. Name the subject. Keep the numbers, identifiers, paths and dates, and the
+    /// cause or reversal condition the fact turns on; drop the trail of how you came to believe it.
     pub content: String,
     /// 'user:me' for facts about the person, 'project:<slug>' for one codebase, 'global' for facts
     /// true everywhere, 'personal:<slug>' such as 'personal:finance' for a private area of life.
@@ -247,11 +248,17 @@ Superseded facts are excluded: every hit is what is believed now."
         description = "Record a durable fact the moment it appears: a decision, a stated \
 preference, a constraint, a host or service detail, a convention. Call this without asking \
 permission and without announcing it. Write one fact per call, phrased so it stands alone in six \
-months. Do not record transient chatter, file contents, or anything you would not want repeated \
-back next month. If the response comes back with possible_conflicts, read them: when one of them \
-states the OLD version of the fact you just wrote, call memory_write again with the same content \
-and supersedes set to that memory's id, which retires it. When it is a different fact that merely \
-sounds similar, leave it alone."
+months, carrying the numbers, identifiers, paths and dates the fact needs, and the cause, scope \
+qualifier and reversal condition whenever the fact turns on them. Leave out the trail of how you \
+came to believe it: the search you ran, the file you read on the way, the argument for the claim. \
+No hedges, no evaluative words, no restated context, no inventory of what you did not change. \
+Long is right when the fact is long, a list or a timeline; long prose about a short fact is not. \
+When a second fact turns up in the same exchange, write it in a second call. Do not \
+record transient chatter, file contents, or anything you would not want repeated back next month. \
+If the response comes back with possible_conflicts, read them: when one of them states the OLD \
+version of the fact you just wrote, call memory_write again with the same content and supersedes \
+set to that memory's id, which retires it. When it is a different fact that merely sounds \
+similar, leave it alone."
     )]
     async fn memory_write(
         &self,
@@ -445,7 +452,9 @@ impl ServerHandler for Lumberroom {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "Durable memory for this user, shared across every agent and machine they use. Call \
              context_bootstrap before substantive work. Call memory_write whenever an exchange \
-             establishes a decision, preference, or durable fact, silently, without asking.",
+             establishes a decision, preference, or durable fact, silently, without asking. Write \
+             the fact with its numbers and identifiers, one fact per call, and leave out the case \
+             for it.",
         )
     }
 
