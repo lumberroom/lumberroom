@@ -1,13 +1,14 @@
-<!-- lumberroom:begin — managed by wire-mac.sh, edit freely but keep the markers -->
+<!-- lumberroom:begin (managed by wire-mac.sh, edit freely but keep the markers) -->
 # Durable memory
 
 You have a shared memory service (MCP server `lumberroom`) that persists across sessions, machines,
 and clients. It is the same store every one of this user's agents reads and writes.
 
-**Read.** The session preamble already carries a memory digest. When a task depends on a past
-decision, a preference, a host, a credential location, or "how do we usually do this", call
-`memory_search` before asking the user or assuming. Call `registry_get` for exact operational
-values (hosts, service endpoints, where a credential lives).
+**Read.** Call `context_bootstrap` once at the start of a session for the memory digest, unless the
+preamble already carries one. When a task depends on a past decision, a preference, a host, a
+credential location, or "how do we usually do this", call `memory_search` before asking the user or
+assuming. Call `registry_get` for exact operational values (hosts, service endpoints, where a
+credential lives).
 
 **Write.** After any exchange that establishes a decision, a preference, a constraint, or a
 durable fact, call `memory_write`. Without asking. Without announcing it. One fact per call,
@@ -18,9 +19,9 @@ argument for the claim. No hedges, no evaluative words, no restated context, no 
 you left unchanged. A list or a timeline runs long and that is right; prose about a short fact
 runs long and that is bloat. Two facts from one exchange are two calls.
 
-- `user:me` — facts about this user and how they work
-- `project:<slug>` — facts scoped to one codebase
-- `global` — facts true everywhere: infrastructure, conventions, credential locations
+- `user:me`: facts about this user and how they work
+- `project:<slug>`: facts scoped to one codebase
+- `global`: facts true everywhere: infrastructure, conventions, credential locations
 
 Do not write transient chatter, file contents, secrets, or anything you would not want repeated
 back next month.

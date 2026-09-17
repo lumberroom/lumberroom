@@ -162,8 +162,11 @@ when the digest is still empty.
 
 Read `client/CLAUDE.md.snippet` before you install it. It tells the model to call `memory_write`
 after any exchange that settles a decision, preference, constraint or durable fact, without asking
-and without announcing it, one fact per call, phrased to stand alone in six months. It names the
-three namespaces (`user:me`, `project:<slug>`, `global`) and lists what to leave out: transient
+and without announcing it, one fact per call, phrased to stand alone in six months, carrying the
+numbers, identifiers, paths and dates the fact needs, and the cause, scope qualifier and reversal
+condition whenever the fact turns on them. It tells the model to cut the trail of how it came to
+believe the fact, the hedges and the list of what it left unchanged, and that a list or a timeline
+runs long and that is right. It names the three namespaces (`user:me`, `project:<slug>`, `global`) and lists what to leave out: transient
 chatter, file contents, secrets. Step 4 of wire-mac.sh appends it to `~/.claude/CLAUDE.md` between
 managed markers and refreshes the block in place on later runs, so your own edits to the rest of
 that file survive and edits inside the markers do not.
