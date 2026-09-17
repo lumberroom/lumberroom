@@ -68,6 +68,34 @@ surfaces the Phase 2 measurement in §5 is watching: if its unprompted read and 
 near zero, the fallback ladder there (sharper tool descriptions, then per-account instructions,
 then a browser-extension-equivalent if one exists for Hermes) applies to it the same as ChatGPT.
 
+## Tell it how to remember
+
+A token gets Hermes to the store. Nothing in a token tells it to write. Hermes reads `AGENTS.md`,
+the rules file every non-Anthropic agent framework has settled on, so the write rule lives in
+[`AGENTS.md.snippet`](AGENTS.md.snippet) rather than in the Claude Code snippet next to it. Copy
+that file into the `AGENTS.md` Hermes reads for the project, keeping the `lumberroom:begin` and
+`lumberroom:end` markers so `wire-mac.sh` can refresh the block later. `wire-mac.sh` step 5 already
+installs it into `$CODEX_HOME/AGENTS.md` (default `~/.codex/AGENTS.md`), which reaches Codex and
+anything else reading a global `AGENTS.md`, and not Hermes.
+
+The paragraph that does the work, verbatim from the snippet:
+
+```
+**Write.** After any exchange that establishes a decision, a preference, a constraint, or a
+durable fact, call `memory_write`. Without asking. Without announcing it. One fact per call,
+phrased so it stands alone in six months, carrying the numbers, identifiers, paths and dates the
+fact needs, and the cause, scope qualifier and reversal condition whenever the fact turns on them.
+Cut the trail of how you came to believe it: the search you ran, the file you read on the way, the
+argument for the claim. No hedges, no evaluative words, no restated context, no inventory of what
+you left unchanged. A list or a timeline runs long and that is right; prose about a short fact
+runs long and that is bloat. Two facts from one exchange are two calls.
+```
+
+The Read paragraph above it covers the other half: `memory_search` before assuming, `registry_get`
+for a host or an endpoint, `context_bootstrap` once at the start of a session. Hermes has no
+lifecycle hook to force the bootstrap call, so that sentence is the only thing asking for it. The
+unprompted-write number in step 2 of Acceptance is what tells you the snippet landed.
+
 ## Acceptance
 
 Run the per-surface harness from `docs/specs/phase-2-surfaces.md` §6 by hand, since Hermes has no
