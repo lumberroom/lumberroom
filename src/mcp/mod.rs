@@ -71,6 +71,9 @@ pub struct AppState {
     /// refused, which is why `/readyz` reports it: a server that silently refuses every private
     /// write looks healthy otherwise.
     pub kek_verified: bool,
+    /// Proposal producers wired for `review_queue`. The engine ships none; a downstream server
+    /// fills this to add a `proposal:` source.
+    pub proposals: Vec<Arc<dyn crate::services::review_queue::ProposalSource>>,
 }
 
 #[derive(Clone)]

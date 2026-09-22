@@ -28,6 +28,7 @@ carries a marker pointing here.
 | [0015](0015-sealed-enumeration.md) | `SealedRepository` gains an enumeration method, reachable only after a caller already passed the whole-store gate | 30 Aug 2026 | accepted, design |
 | [0016](0016-audience-is-checked-where-a-token-becomes-a-principal.md) | The audience on an access token is checked where the token becomes a principal, and a token with no audience is admitted until the population drains | 8 Sep 2026 | accepted, implemented |
 | [0017](0017-a-fact-can-expire.md) | A live read answers both clocks, so a fact can be retired with no successor and brought back | 15 Sep 2026 | accepted, implemented |
+| [0018](0018-one-review-queue.md) | One queue shape with a source field, one decide route, a ledger that remembers "both are fine", and a proposal seam the engine leaves empty | 22 Sep 2026 | accepted, not implemented |
 
 **On "verified".** All four gates ran against a live server on 20 August 2026 and passed. An OAuth
 flow completed end to end, a private row was encrypted and read back, and a replayed refresh token

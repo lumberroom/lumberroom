@@ -198,6 +198,7 @@ mod tests {
                 dedupe_threshold: 0.97,
                 conflict_threshold: 0.90,
                 conflict_limit: 3,
+                conflict_scan_max: 2_000,
                 stale_days: 365,
                 export_max_sensitivity: crate::domain::types::Sensitivity::Open,
                 archive_max_decompressed_bytes: 2 * 1024 * 1024 * 1024,

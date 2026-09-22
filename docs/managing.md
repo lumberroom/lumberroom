@@ -178,7 +178,7 @@ Some management still happens on the command line, and one thing needs psql.
 ```bash
 lumberroom clients                    # every OAuth client, how it registered, consent state
 lumberroom registry set|get|alias     # the registry writes; the console reads them
-lumberroom review [--stale] [--conflicts] [--registry]
+lumberroom review [--source conflict,stale,proposal] [--limit N] [--days N] [--min-similarity X] [--json]
 lumberroom stats [--hours 168] [--by-client]
 lumberroom forget <id> [--dry-run]    # needs mayDelete on the credential
 lumberroom seal <key> --namespace credentials:aws
@@ -188,6 +188,17 @@ lumberroom currency [--fixture f]     # does the store report the fact that held
 lumberroom arity preview|declare|forget|run|list
 lumberroom graph walk "<question>" | lumberroom graph rebuild
 ```
+
+`review` opens one queue over conflicts, stale rows and, on a server that fills them, proposals.
+`--stale` and `--conflicts` still work, as aliases for `--source stale` and `--source conflict`.
+Without `--json` it walks the queue one item at a time: full row text, then a key line drawn from
+what that item allows (`s` supersede keep newer, `o` keep older, `m` merge, `k` keep both, `d`
+delete, `c` confirm, `a` apply, `x` dismiss, `n` skip, `q` quit). `--json` prints the page as JSON
+and exits instead of walking it. The conflict source answers `namespace_too_large` and sits out of
+the page when a readable namespace holds more live rows than `CONFLICT_SCAN_MAX` (default 2000):
+the self-join that finds a namespace's conflicting pairs runs per namespace, so a namespace past
+that ceiling would cost tens of seconds rather than answer a page. The default came from a
+dev-container probe; recalibrate it against a timed run on the deployment's own hardware.
 
 `arity` and `graph` are the two worth reading about before use, because both decide what the store
 hides. Declaring a tag `single` lets the cleanup pass propose that one dated fact ended another, so

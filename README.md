@@ -193,7 +193,7 @@ lumberroom doctor                       # connectivity, auth, readiness, tool li
 lumberroom clients                      # registered OAuth clients, how each registered, consent state
 lumberroom search "how do we deploy"
 lumberroom write "..." --namespace user:me --tags preference
-lumberroom review [--stale] [--conflicts] [--registry]
+lumberroom review [--source conflict,stale,proposal] [--limit N] [--days N] [--min-similarity X] [--json]
 lumberroom registry get|set|alias ...
 lumberroom stats [--hours 168] [--by-client]
 lumberroom export --obsidian ~/vault

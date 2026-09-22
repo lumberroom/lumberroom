@@ -142,6 +142,7 @@ async fn run() -> Result<()> {
         degraded_embedder: degraded,
         keys,
         kek_verified,
+        proposals: Vec::new(),
     });
     let auth = adapters::auth::create(&cfg, Some(Arc::clone(&oauth)))?;
 

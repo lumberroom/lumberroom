@@ -4,6 +4,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **One review queue** joins conflicts, stale rows and, on a server that fills any, proposals
+  behind one route and one decide path. `GET /admin/review/queue` and `POST /admin/review/decide`
+  carry `supersede`, `merge`, `keep_both`, `delete`, `confirm`, `apply` and `dismiss` as the
+  verdicts a caller's grant allows. `lumberroom review` walks the queue interactively, one item at
+  a time, or answers `--json`, `--supersede`, `--merge`, `--keep-both`, `--confirm`, `--apply` and
+  `--dismiss` without a prompt; `--delete` asks for the id typed back unless `--yes` is given.
+- **A dismissed-pair ledger.** `keep_both` on a conflict writes a row to `memory_pair_dismissed`
+  naming who dismissed the pair and when, so a pair the owner has read and kept leaves the queue
+  rather than reappearing every page. `GET /admin/review/dismissed` lists it and
+  `DELETE /admin/review/dismissed/{a}/{b}` reverses one entry.
+- **A proposal seam.** `AppState.proposals` takes any number of `ProposalSource` implementations; a
+  server with none answers `[]` in `sources.proposal` and refuses `--source proposal`,
+  `--apply` and `--dismiss` with `source_not_filled`. This engine ships the trait and fills nothing.
+
+### Changed
+
+- **Confirming a stale row cleared it for a window.** `stale` gained a clause that also excludes a
+  row confirmed within `greatest(days, 1)` days, so a restated fact or a `confirm` verdict left the
+  list rather than reappearing on the next read; it returns for re-confirmation once the window
+  passes.
+- **The conflicts query took the caller's read grant and an offset.** `conflicts` ran over the
+  whole tenant and filtered each pair after the fact; the grant runs inside the query, as `stale`
+  already does, and paging is by `offset` rather than a client-side skip.
+- **A namespace past `CONFLICT_SCAN_MAX` refuses the conflict source rather than running the
+  self-join against it.** The setting defaults to 2000 live rows per namespace, validated at boot
+  like every other setting, and a refusal carries `namespace_too_large` instead of a slow answer.
+- **`GET /admin/review/stale` publishes a narrower row.** Both old review routes read through the
+  one queue now, so a stale row carries `opened`, `access_count`, `last_accessed_at` and
+  `last_confirmed_at`, and no longer carries `tags`, `source_client`, `embedding_model`,
+  `supersedes`, `occurred_until`, `superseded_by` or `superseded_at`. The envelopes, the page
+  default of 25 and the conflict pair's five fields are unchanged. A client that read a dropped
+  field should read the row by id, or move to `GET /admin/review/queue`.
+- **`GET /admin/review/stale` caps a page at 200 rather than 500**, the cap the queue applies to
+  every source.
+- **`crates/lumberroom` moved from 0.4.0 to 0.5.0** for the review loop's new flags and wire types.
+
 ## [0.4.0] - 2026-09-07
 
 Three changes since 0.3.1, all in the client. A renewal that crashes or races another one leaves a

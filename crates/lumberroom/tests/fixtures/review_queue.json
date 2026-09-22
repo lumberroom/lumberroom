@@ -1,0 +1,87 @@
+{
+  "items": [
+    {
+      "key": "conflict:1111aaaa-0000-4a1b-8c3d-112233445566:2222bbbb-0000-4a1b-8c3d-112233445566",
+      "source": "conflict",
+      "namespace": "user:me",
+      "rows": [
+        {
+          "id": "1111aaaa-0000-4a1b-8c3d-112233445566",
+          "namespace": "user:me",
+          "sensitivity": "open",
+          "content": "Aditya prefers Opus for reviews and Sonnet for implementation.",
+          "opened": true,
+          "created_at": "2026-08-19T00:00:00Z",
+          "access_count": 4,
+          "last_accessed_at": "2026-09-01T00:00:00Z"
+        },
+        {
+          "id": "2222bbbb-0000-4a1b-8c3d-112233445566",
+          "namespace": "user:me",
+          "sensitivity": "open",
+          "content": "Reviewer and planner run on Opus; implementer, content writer and frontend run on Sonnet.",
+          "opened": true,
+          "created_at": "2026-09-04T00:00:00Z",
+          "access_count": 0
+        }
+      ],
+      "similarity": 0.931,
+      "verdicts": ["supersede", "merge", "keep_both"]
+    },
+    {
+      "key": "stale:3333cccc-0000-4a1b-8c3d-112233445566",
+      "source": "stale",
+      "namespace": "global",
+      "rows": [
+        {
+          "id": "3333cccc-0000-4a1b-8c3d-112233445566",
+          "namespace": "global",
+          "sensitivity": "open",
+          "content": "Deploys go out on Tuesdays.",
+          "opened": true,
+          "created_at": "2026-01-04T09:00:00Z",
+          "access_count": 0
+        }
+      ],
+      "age_days": 400,
+      "verdicts": ["confirm", "merge", "delete"]
+    },
+    {
+      "key": "proposal:jev:claim-loss-1",
+      "source": "proposal",
+      "namespace": "user:me",
+      "rows": [
+        {
+          "id": "4444dddd-0000-4a1b-8c3d-112233445566",
+          "namespace": "user:me",
+          "sensitivity": "open",
+          "content": "The owner runs the eval nightly.",
+          "opened": true,
+          "created_at": "2026-09-10T00:00:00Z",
+          "access_count": 1
+        }
+      ],
+      "proposal": {
+        "id": "claim-loss-1",
+        "origin": "jev",
+        "kind": "claim_loss",
+        "proposed_content": "The owner runs the eval nightly against the longmemeval fixture.",
+        "fields": [
+          { "label": "why", "value": "a second model reads this fact as narrower than the source" },
+          { "label": "confidence", "value": "0.72" }
+        ],
+        "created_at": "2026-09-15T00:00:00Z",
+        "verdicts": ["apply", "dismiss"]
+      },
+      "verdicts": ["apply", "dismiss"]
+    }
+  ],
+  "sources": { "conflict": true, "stale": true, "proposal": ["jev"] },
+  "refused": { "conflict": "namespace_too_large" },
+  "dismissed": 12,
+  "stale_days": 365,
+  "min_similarity": 0.9,
+  "limit": 50,
+  "offset": 0,
+  "has_more": false
+}
