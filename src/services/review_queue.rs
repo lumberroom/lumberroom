@@ -28,6 +28,7 @@ pub mod codes {
     pub const UNKNOWN_SOURCE: &str = "unknown_source";
     pub const NAMESPACE_TOO_LARGE: &str = "namespace_too_large";
     pub const PAGE_TOO_DEEP: &str = "page_too_deep";
+    pub const ROW_NOT_OPENED: &str = "row_not_opened";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +215,9 @@ pub trait ProposalSource: Send + Sync {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<(ProposalItem, Vec<Memory>)>>;
+    /// The source, not the engine, owns the grant here: apply the equivalent of `writable_row` to
+    /// every row this act writes. `decide_proposal` checks the verdict shape and the origin only;
+    /// nothing downstream of this call re-checks the caller's grant on the source's behalf.
     async fn decide(&self, ctx: &Ctx, id: &str, verdict: Verdict) -> Result<ProposalDecided>;
 }
 
@@ -231,7 +235,8 @@ pub struct DismissedListing {
     pub hi_id: String,
     pub dismissed_by: String,
     pub dismissed_token: String,
-    pub dismissed_at: DateTime<Utc>,
+    /// `to_rfc3339`, like every other timestamp these routes answer, so a client parses one shape.
+    pub dismissed_at: String,
     pub rows: Vec<QueueRow>,
 }
 
@@ -314,6 +319,11 @@ fn verdict_shaped_for(source: Source, verdict: Verdict) -> bool {
 /// `MAX_OFFSET` is a refusal, not a clamp: silently returning page zero for a deep offset would
 /// tell a caller stepping through the queue that the list ended when it did not.
 fn checked_offset(offset: i64) -> Result<i64> {
+    // Negative reaches Postgres otherwise, which raises "OFFSET must not be negative" and surfaces
+    // as an uncoded 500 instead of a validation refusal.
+    if offset < 0 {
+        return Err(DomainError::validation(format!("offset {offset} is negative")));
+    }
     if offset > MAX_OFFSET {
         return Err(DomainError::validation(format!("offset {offset} is past the last page"))
             .with_code(codes::PAGE_TOO_DEEP));
@@ -507,6 +517,9 @@ pub async fn queue(
     let mut has_more = false;
     let mut attempted = 0u32;
     let mut failed = 0u32;
+    // Kept whole, not just its code: a single-source request that refuses has to answer with the
+    // refusal's own `Kind` (e.g. `namespace_too_large` is a 400, not a 500) end to end.
+    let mut first_error: Option<DomainError> = None;
 
     if wants(Source::Conflict) {
         attempted += 1;
@@ -518,6 +531,7 @@ pub async fn queue(
             Err(e) => {
                 failed += 1;
                 refused.insert("conflict".to_string(), e.code().unwrap_or("review_queue_failed"));
+                first_error.get_or_insert(e);
             }
         }
     }
@@ -532,6 +546,7 @@ pub async fn queue(
             Err(e) => {
                 failed += 1;
                 refused.insert("stale".to_string(), e.code().unwrap_or("review_queue_failed"));
+                first_error.get_or_insert(e);
             }
         }
     }
@@ -550,15 +565,18 @@ pub async fn queue(
                         source.origin().to_string(),
                         e.code().unwrap_or("review_queue_failed"),
                     );
+                    first_error.get_or_insert(e);
                 }
             }
         }
     }
 
     // One source refusing leaves the others in the envelope; every requested source refusing
-    // means the caller asked for something and got nothing, which is a failure and not a page.
+    // means the caller asked for something and got nothing. Answer with the first refusal's own
+    // `Kind` and code rather than flattening it to an internal 500: a single-source
+    // `namespace_too_large` (spec, docs/managing.md) has to reach the caller as the 400 it is.
     if attempted > 0 && failed == attempted {
-        return Err(DomainError::internal("every requested source refused"));
+        return Err(first_error.expect("failed == attempted > 0 means at least one error was recorded"));
     }
 
     let dismissed = ctx.repos.memories.dismissed_count(ctx.tenant(), &ctx.principal.read).await?;
@@ -682,9 +700,20 @@ async fn merge_rows(
     })
 }
 
+/// A row whose key this caller cannot open is one the queue offered no verdict for, so the decide
+/// path refuses it too. Without this a caller acts on text they never read.
+async fn refuse_unopened(ctx: &Ctx, rows: Vec<&mut Memory>) -> Result<()> {
+    if super::decrypt(ctx, rows).await.is_empty() {
+        return Ok(());
+    }
+    Err(DomainError::new(Kind::Forbidden, "a row in this item did not open for this caller")
+        .with_code(codes::ROW_NOT_OPENED))
+}
+
 async fn decide_conflict(ctx: &Ctx, d: &Decision, a: Uuid, b: Uuid) -> Result<Decided> {
-    let (a_id, a_row) = super::review::writable_row(ctx, &a.to_string()).await?;
-    let (b_id, b_row) = super::review::writable_row(ctx, &b.to_string()).await?;
+    let (a_id, mut a_row) = super::review::writable_row(ctx, &a.to_string()).await?;
+    let (b_id, mut b_row) = super::review::writable_row(ctx, &b.to_string()).await?;
+    refuse_unopened(ctx, vec![&mut a_row, &mut b_row]).await?;
     // The key's own order never decides which row is older: (created_at, id) is the tiebreak the
     // conflicts SQL itself sorts on.
     let (older_id, older_row, newer_id, newer_row) =
@@ -787,7 +816,8 @@ async fn decide_conflict(ctx: &Ctx, d: &Decision, a: Uuid, b: Uuid) -> Result<De
 }
 
 async fn decide_stale(ctx: &Ctx, d: &Decision, id: Uuid) -> Result<Decided> {
-    let (uid, row) = super::review::writable_row(ctx, &id.to_string()).await?;
+    let (uid, mut row) = super::review::writable_row(ctx, &id.to_string()).await?;
+    refuse_unopened(ctx, vec![&mut row]).await?;
     if !verdict_shaped_for(Source::Stale, d.verdict) {
         let verdicts = verdicts_for(Source::Stale, true, ctx.principal.may_delete);
         return Err(verdict_not_for_source(Source::Stale, d.verdict, &verdicts));
@@ -896,7 +926,7 @@ pub async fn dismissed(ctx: &Ctx, limit: Option<i64>) -> Result<Vec<DismissedLis
             hi_id: p.hi_id.to_string(),
             dismissed_by: p.dismissed_by,
             dismissed_token: p.dismissed_token,
-            dismissed_at: p.dismissed_at,
+            dismissed_at: p.dismissed_at.to_rfc3339(),
             rows: vec![queue_row(&lo, lo_opened), queue_row(&hi, hi_opened)],
         });
     }
@@ -1057,5 +1087,10 @@ mod tests {
         assert_eq!(checked_offset(MAX_OFFSET).unwrap(), MAX_OFFSET);
         let err = checked_offset(MAX_OFFSET + 1).unwrap_err();
         assert_eq!(err.code(), Some(codes::PAGE_TOO_DEEP));
+    }
+
+    #[test]
+    fn a_negative_offset_is_refused_before_it_reaches_postgres() {
+        checked_offset(-1).unwrap_err();
     }
 }

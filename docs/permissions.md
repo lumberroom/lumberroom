@@ -175,6 +175,8 @@ retrieval is a leak waiting on the one code path that forgets to filter.
 | `registry_history` | MayReadHistory | `mayReadHistory` |
 | `registry_set` | RegistryWrite | `registryWrite` |
 | `alias_set` | RegistryWrite | `registryWrite` |
+| `review_queue` | Open | none (verdicts filtered per row inside the call) |
+| `review_decide` | Open | none (writable_row and, on `delete`, `mayDelete`) |
 
 Open still means every authenticated client, not every request: the namespace and sensitivity
 ceilings apply inside the call regardless of which capability gated the tool's visibility.
@@ -183,6 +185,34 @@ the same class as a registry key; nobody gains alias-write who did not already h
 higher-trust flag, and no client gains any capability it was not granted by name. This table is
 `TOOL_CAPABILITIES` in `src/mcp/capability.rs`, held against the router's own tool list by a test
 there so a tool added without an entry fails the build instead of shipping ungated.
+
+### The two review tools
+
+`review_queue` and `review_decide` sit at Open, same as `memory_search`, and the grant does its
+work inside the call rather than at the tool list.
+
+A caller holding read alone, no matching write grant, sees every item its read ceiling admits, but
+each item's `verdicts` list comes back empty: the decide path needs read and write on every row in
+an item (`writable_row`), so a caller who cannot write a row is never offered a key for it. Calling
+`review_decide` on such an item anyway fails the same check `review_queue` used to build the empty
+list, and the refusal names the row rather than the tool. A read-plus-write caller gets every
+verdict an item lists except `delete`, which needs `mayDelete` on top, the same flag
+`memory_forget` reads: deleting a row through the review queue is still deleting a row.
+
+`keep_both` writes the dismissed-pair ledger, which hides the pair from every reader of the
+tenant, and it takes read and write on both rows, the same authority a supersede of the pair
+takes. The ledger records the client and the token fingerprint, and `dismissed` in the envelope
+counts what it hides.
+
+`apply` and `dismiss` belong to whichever `ProposalSource` owns the item's origin, and the source
+keeps its own gate; this engine ships the trait and wires no source, so `sources.proposal` answers
+`[]`. `source=proposal` on `review_queue` answers `source_not_filled` for every caller regardless of
+grant, because the queue read refuses an empty source list outright. `review_decide` on a
+`proposal:<origin>:<id>` key never reaches that check: it looks up `origin` in the source list,
+finds none, and answers `unknown_origin` instead, again for every caller regardless of grant. A
+deployment that wires a source inherits that source's own
+permission rules for `apply` and `dismiss`, on top of the read grant `review_queue` already checked
+to show the item at all.
 
 ## Setting AUTH_TOKENS without breaking the JSON
 

@@ -1,12 +1,11 @@
 # 0018. One review queue, one decide path
 
-22 September 2026. Accepted, not implemented.
+22 September 2026. Accepted, implemented.
 
-What was run, and where: nothing. This record files the shape before the code exists. The migration,
-the port signatures, the two statement constants, the config bound and the service types landed in
-one commit whose gate is `./scripts/cargo.sh check --all-targets`; every function body in
-`src/services/review_queue.rs` returns `not built` and the five new adapter methods do the same. No
-store has been migrated by a binary carrying this, and no queue has answered a request.
+What was run, and where: on 22 September 2026, `./scripts/cargo.sh check --all-targets` ran clean,
+then the library suite, the `review_queue` acceptance suite and the full suite. `test -j 1` reported
+1045 passed, 0 failed; the library suite reported 796 passed; `review_queue` reported 27 passed;
+`review_queue_mcp` reported 8 passed.
 
 The measurements the design rests on come from the maintainer's own store on 22 September 2026: 39
 conflict pairs at the 0.90 threshold over about 1,390 live rows, the conflicts read taking 4.2

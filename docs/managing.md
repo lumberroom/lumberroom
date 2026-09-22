@@ -183,6 +183,9 @@ lumberroom stats [--hours 168] [--by-client]
 lumberroom forget <id> [--dry-run]    # needs mayDelete on the credential
 lumberroom seal <key> --namespace credentials:aws
 lumberroom review --dates             # undated facts whose own text names a day
+lumberroom review --registry          # registry entries due for review, non-canonical keys
+lumberroom review --dismissed         # lists the dismissed-pair ledger
+lumberroom review --undismiss <a>,<b> # removes one pair from the ledger
 lumberroom fill-date <id> <date>      # fill that day in; it never moves a date already there
 lumberroom currency [--fixture f]     # does the store report the fact that held
 lumberroom arity preview|declare|forget|run|list

@@ -1117,7 +1117,9 @@ const CONFLICTS_SQL: &str = "SELECT a.id AS older_id, a.namespace AS older_names
                          AND d.lo_id = least(a.id, b.id)
                          AND d.hi_id = greatest(a.id, b.id)
                     )
-              -- Total order: round4 makes ties common and an unstable sort breaks paging.
+              -- Total order: the raw float similarity ties whenever two pairs share an embedding
+              -- distance, and an unstable sort breaks paging across a tie. round4 runs in Rust on
+              -- the fetched rows, after this statement has already ordered them.
               ORDER BY similarity DESC, a.created_at, a.id, b.id
               LIMIT $3 OFFSET $4";
 
@@ -1168,7 +1170,9 @@ const DISMISSED_COUNT_SQL: &str = "SELECT count(*)
 
 /// Live embedded rows per readable namespace, highest first. The conflicts self-join runs per
 /// namespace, so this is what bounds it: the largest namespace's count against
-/// `QUALITY.conflict_scan_max`, answered from `memory_live` rather than the join itself.
+/// `QUALITY.conflict_scan_max`. The statement reads `FROM memory` with the `live!()` predicate and
+/// an embedding-not-null test, the same shape the conflicts join itself filters on, not a lookup
+/// against the `memory_live` partial index.
 const LIVE_EMBEDDED_COUNTS_SQL: &str = concat!(
     "SELECT m.namespace, count(*) AS n
        FROM memory m
@@ -3715,6 +3719,12 @@ mod tests {
     #[test]
     fn the_dismissed_listing_applies_the_grant_to_both_halves() {
         assert_eq!(DISMISSED_PAIRS_SQL.matches("unnest($").count(), 2);
+    }
+
+    #[test]
+    fn the_conflicts_statement_applies_the_grant_to_both_halves_and_the_ledger() {
+        assert_eq!(CONFLICTS_SQL.matches("unnest($").count(), 2);
+        assert!(CONFLICTS_SQL.contains("NOT EXISTS"));
     }
 
     #[test]

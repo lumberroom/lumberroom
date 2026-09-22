@@ -340,7 +340,7 @@ fn an_apply_report_parses_with_only_the_required_field() {
 fn a_review_queue_parses_and_keeps_the_proposal_origins() {
     let q: ReviewQueue = serde_json::from_value(fixture("review_queue.json")).unwrap();
     assert_eq!(q.items.len(), 3);
-    assert_eq!(q.sources.proposal, vec!["jev".to_string()]);
+    assert_eq!(q.sources.proposal, vec!["canned".to_string()]);
     assert_eq!(q.refused.get("conflict").map(String::as_str), Some("namespace_too_large"));
     assert_eq!(q.dismissed, 12);
     assert!(!q.has_more);
@@ -375,7 +375,7 @@ fn a_proposal_item_keeps_its_fields_in_order_and_its_verdicts() {
     let item = &q.items[2];
     assert_eq!(item.source, Source::Proposal);
     let proposal = item.proposal.as_ref().expect("a proposal item carries a proposal");
-    assert_eq!(proposal.origin, "jev");
+    assert_eq!(proposal.origin, "canned");
     assert_eq!(proposal.fields[0].label, "why");
     assert_eq!(proposal.fields[1].label, "confidence");
     assert_eq!(proposal.verdicts, vec![Verdict::Apply, Verdict::Dismiss]);

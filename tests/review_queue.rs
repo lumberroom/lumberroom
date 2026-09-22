@@ -500,20 +500,62 @@ async fn a_kept_pair_leaves_the_queue_and_undismiss_brings_it_back() {
     );
 }
 
+/// A conflict pair where the two rows carry different sensitivities, so a grant can be built to
+/// straddle them: readable on both, writable on only one.
+async fn conflict_pair_at(
+    ctx: &Ctx,
+    pool: &PgPool,
+    namespace: &str,
+    tag: &str,
+    older_sensitivity: &str,
+    newer_sensitivity: &str,
+) -> (String, String) {
+    let older = write::run(
+        ctx,
+        &format!("the {tag} rota starts on Monday and runs through Friday {}", nonce(tag)),
+        namespace,
+        None,
+        None,
+        Some(older_sensitivity),
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
+    set_created_at(pool, &older, Utc::now() - Duration::hours(1)).await;
+    let newer = write::run(
+        ctx,
+        &format!("the {tag} rota starts on Tuesday and runs through Friday {}", nonce(tag)),
+        namespace,
+        None,
+        None,
+        Some(newer_sensitivity),
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
+    (older, newer)
+}
+
 #[tokio::test]
 async fn keep_both_needs_the_write_grant_on_both_rows() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
-    let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "keep2").await;
-    let key = format!("conflict:{older}:{newer}");
 
-    // Read on both, write on only one. `writable_row` needs both, on every row, for every verdict.
+    // Read covers both rows (open and private); write covers open alone, so exactly one row of
+    // each pair is writable. `writable_row` runs on both ids in the key's order, so the check has
+    // to fail whichever half lands first: try it with the writable row named first, then with it
+    // named second.
     let half_writable = restricted_at(
         &h.ctx,
+        &[("global", Sensitivity::Private)],
         &[("global", Sensitivity::Open)],
-        &[("nowhere", Sensitivity::Open)],
     );
+
+    let (open_first, private_first) =
+        conflict_pair_at(&h.ctx, &h.pool, "global", "keep2a", "open", "private").await;
     let err = review_queue::decide(&half_writable, &no_sources(), Decision {
-        key,
+        key: format!("conflict:{open_first}:{private_first}"),
         verdict: Verdict::KeepBoth,
         keep: None,
         id: None,
@@ -524,7 +566,31 @@ async fn keep_both_needs_the_write_grant_on_both_rows() {
     })
     .await
     .unwrap_err();
-    assert_eq!(err.kind, Kind::NotFound, "writable_row maps a missing write grant to not_found");
+    assert_eq!(
+        err.kind,
+        Kind::NotFound,
+        "the writable-first pair still has one unwritable row: refuse it"
+    );
+
+    let (private_second, open_second) =
+        conflict_pair_at(&h.ctx, &h.pool, "global", "keep2b", "private", "open").await;
+    let err = review_queue::decide(&half_writable, &no_sources(), Decision {
+        key: format!("conflict:{private_second}:{open_second}"),
+        verdict: Verdict::KeepBoth,
+        keep: None,
+        id: None,
+        content: None,
+        tags: None,
+        occurred_at: None,
+        reason: None,
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.kind,
+        Kind::NotFound,
+        "the writable-second pair still has one unwritable row: refuse it"
+    );
 }
 
 #[tokio::test]
@@ -564,6 +630,28 @@ async fn undismiss_answers_false_for_a_pair_the_caller_may_not_change() {
     let b = uuid::Uuid::new_v4().to_string();
     let answer = review_queue::undismiss(&h.ctx, &a, &b).await.unwrap();
     assert!(!answer, "nothing was ever dismissed for this pair");
+}
+
+#[tokio::test]
+async fn undismiss_answers_false_for_a_narrow_grant_that_cannot_read_the_pair() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let (older, newer) = conflict_pair(&h.ctx, &h.pool, "project:vault", "undismiss-narrow").await;
+    review_queue::decide(&h.ctx, &no_sources(), Decision {
+        key: format!("conflict:{older}:{newer}"),
+        verdict: Verdict::KeepBoth,
+        keep: None,
+        id: None,
+        content: None,
+        tags: None,
+        occurred_at: None,
+        reason: None,
+    })
+    .await
+    .unwrap();
+
+    let narrow = restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
+    let answer = review_queue::undismiss(&narrow, &older, &newer).await.unwrap();
+    assert!(!answer, "the pair is real and dismissed, but this grant cannot read either row");
 }
 
 #[tokio::test]
@@ -624,13 +712,68 @@ async fn a_narrow_grant_sees_a_full_page_of_its_own_pairs_and_no_count_of_the_re
     assert!(!q.has_more, "exactly 3 readable rows exist, so there is no further page");
 }
 
+/// The conflict twin of the stale test above. Three tied pairs sit in namespaces the narrow grant
+/// cannot read, written earlier than the one pair it can; identical wording ties every similarity
+/// so `ORDER BY similarity DESC, a.created_at, ...` puts the unreadable pairs first. That makes the
+/// grant filter load-bearing: drop both `EXISTS` blocks from `CONFLICTS_SQL` and the unreadable
+/// pairs fill the `limit + 1` window before the readable one is ever fetched, so this page comes
+/// back empty instead of holding its one pair.
+#[tokio::test]
+async fn a_narrow_grant_sees_a_full_page_of_its_own_conflict_pairs_and_none_of_the_rest() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+
+    for (i, ns) in ["project:secret0", "project:secret1", "project:secret2"].iter().enumerate() {
+        let older = write_at(&h.ctx, "the rota tie aa bb cc", ns).await;
+        set_created_at(&h.pool, &older, Utc::now() - Duration::hours(6 - i as i64)).await;
+        write_at(&h.ctx, "the rota tie aa bb dd", ns).await;
+    }
+    let older = write_at(&h.ctx, "the rota tie aa bb cc", "global").await;
+    set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
+    let newer = write_at(&h.ctx, "the rota tie aa bb dd", "global").await;
+    let key = format!("conflict:{older}:{newer}");
+
+    let narrow = restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
+    let q = review_queue::queue(&narrow, &no_sources(), QueueQuery {
+        sources: Some(vec![Source::Conflict]),
+        limit: Some(1),
+        offset: None,
+        days: None,
+        min_similarity: Some(0.0),
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        q.items.iter().map(|i| i.key.clone()).collect::<Vec<_>>(),
+        vec![key],
+        "the one pair this grant can read, and nothing from the three it cannot"
+    );
+    assert!(!q.has_more, "exactly one readable pair exists, so there is no further page");
+}
+
 #[tokio::test]
 async fn the_envelope_carries_no_tenant_wide_count() {
-    let h = ctx_or_skip!();
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
     let vault_id = write_at(&h.ctx, &format!("a fact the narrow grant cannot reach {}", nonce("t")), "project:vault").await;
     make_stale(&h.pool, &vault_id).await;
     let global_id = write_at(&h.ctx, &format!("a fact the narrow grant may read {}", nonce("t")), "global").await;
     make_stale(&h.pool, &global_id).await;
+
+    // A dismissed pair in the namespace the narrow grant cannot read: the owner sees it in the
+    // ledger count, the narrow grant must not, so `dismissed` has to be filtered by the same read
+    // grant as the listing rather than counted once over the whole tenant.
+    let (vault_older, vault_newer) = conflict_pair(&h.ctx, &h.pool, "project:vault", "envelope").await;
+    review_queue::decide(&h.ctx, &no_sources(), Decision {
+        key: format!("conflict:{vault_older}:{vault_newer}"),
+        verdict: Verdict::KeepBoth,
+        keep: None,
+        id: None,
+        content: None,
+        tags: None,
+        occurred_at: None,
+        reason: None,
+    })
+    .await
+    .unwrap();
 
     let narrow = restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
     let q = review_queue::queue(&narrow, &no_sources(), QueueQuery {
@@ -642,11 +785,22 @@ async fn the_envelope_carries_no_tenant_wide_count() {
     })
     .await
     .unwrap();
-    let published = serde_json::to_value(&q).unwrap().to_string();
-    assert!(
-        !published.contains("live_rows") && !published.contains("tenant"),
-        "the envelope must carry nothing about the tenant this grant cannot see: {published}"
+    assert_eq!(
+        q.dismissed, 0,
+        "the dismissed pair sits in a namespace this grant cannot read, so its count is 0, not 1"
     );
+
+    let owner_q = review_queue::queue(&h.ctx, &no_sources(), QueueQuery {
+        sources: Some(vec![Source::Stale]),
+        limit: Some(10),
+        offset: None,
+        days: Some(0),
+        min_similarity: None,
+    })
+    .await
+    .unwrap();
+    assert_eq!(owner_q.dismissed, 1, "the owner's own grant does cover that namespace");
+
     assert_eq!(q.items.len(), 1, "only the readable row appears");
 }
 
@@ -752,8 +906,9 @@ async fn a_row_whose_content_is_empty_still_takes_every_verdict() {
     let item = q.items.iter().find(|i| i.rows.iter().any(|r| r.id == id)).unwrap();
     let row = item.rows.iter().find(|r| r.id == id).unwrap();
     assert!(row.opened, "an open row is never in decrypt's failed list, whatever its text is");
-    assert!(
-        !item.verdicts.is_empty(),
+    assert_eq!(
+        item.verdicts,
+        vec![Verdict::Confirm, Verdict::Merge, Verdict::Delete],
         "an owner-writable stale row with empty content still takes confirm, merge and delete"
     );
 }

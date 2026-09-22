@@ -19,6 +19,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **A proposal seam.** `AppState.proposals` takes any number of `ProposalSource` implementations; a
   server with none answers `[]` in `sources.proposal` and refuses `--source proposal`,
   `--apply` and `--dismiss` with `source_not_filled`. This engine ships the trait and fills nothing.
+- **The MCP surface gained `review_queue` and `review_decide`,** the same two operations as the
+  HTTP routes above. Both sit at `Capability::Open`, so a read grant alone can list the queue; the
+  decide path still needs write on every row it acts on, and `delete` still needs `mayDelete`, the
+  same flag `memory_forget` reads. See `docs/permissions.md`, "The two review tools".
 
 ### Changed
 
@@ -40,6 +44,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   field should read the row by id, or move to `GET /admin/review/queue`.
 - **`GET /admin/review/stale` caps a page at 200 rather than 500**, the cap the queue applies to
   every source.
+- **`GET /admin/review/conflicts` floors `min_similarity` at `CONFLICT_THRESHOLD` rather than
+  clamping it to `[0, 1]`.** The route now reads through `review_queue::queue`, which never answers
+  a conflict below the configured threshold; a request for 0.5 with the threshold at 0.9 gets 0.9
+  back, not 0.5.
 - **`crates/lumberroom` moved from 0.4.0 to 0.5.0** for the review loop's new flags and wire types.
 
 ## [0.4.0] - 2026-09-07

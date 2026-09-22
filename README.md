@@ -194,6 +194,10 @@ lumberroom clients                      # registered OAuth clients, how each reg
 lumberroom search "how do we deploy"
 lumberroom write "..." --namespace user:me --tags preference
 lumberroom review [--source conflict,stale,proposal] [--limit N] [--days N] [--min-similarity X] [--json]
+lumberroom review --dates                # undated facts whose own text names a day
+lumberroom review --registry             # registry entries due for review, non-canonical keys
+lumberroom review --dismissed            # lists the dismissed-pair ledger
+lumberroom review --undismiss <a>,<b>    # removes one pair from the ledger
 lumberroom registry get|set|alias ...
 lumberroom stats [--hours 168] [--by-client]
 lumberroom export --obsidian ~/vault

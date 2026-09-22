@@ -53,7 +53,10 @@ fn parse_sources(raw: &str) -> Result<Option<Vec<Source>>, Response> {
             other => {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": "unknown_source", "detail": other })),
+                    Json(serde_json::json!({
+                        "error": review_queue::codes::UNKNOWN_SOURCE,
+                        "detail": other,
+                    })),
                 )
                     .into_response())
             }

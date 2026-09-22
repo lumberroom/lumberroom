@@ -60,7 +60,12 @@ async fn run_loop(
     let mut running = Tally::default();
 
     'paging: loop {
-        let queue = fetch_queue(c, args, offset, limit).await?;
+        // A run of skips can carry `offset` past the server's `page_too_deep` ceiling; that
+        // refusal means the queue is over, not that the call failed, so print the tally in hand
+        // rather than raise past this point.
+        let Some(queue) = fetch_queue_for_loop(c, args, offset, limit).await? else {
+            break 'paging;
+        };
         running.dismissed_in_ledger = queue.dismissed;
 
         if queue.items.iter().all(|it| skipped.contains(&it.key)) {
@@ -747,16 +752,26 @@ fn refusal_text(status: u16, body: &Value) -> String {
     }
 }
 
-async fn fetch_queue(c: &Client, args: &Args, offset: i64, limit: i64) -> Result<wire::ReviewQueue> {
+/// `fetch_queue` for the interactive loop only: `Ok(None)` means the server answered
+/// `page_too_deep`, the one refusal that ends the loop rather than failing it.
+async fn fetch_queue_for_loop(
+    c: &Client,
+    args: &Args,
+    offset: i64,
+    limit: i64,
+) -> Result<Option<wire::ReviewQueue>> {
     let path = queue_path(args, offset, limit);
     let (status, body) = c.http_get(&path).await?;
     if status == 404 {
         return Err(err("this server has no review queue route; upgrade it"));
     }
     if status != 200 {
+        if body.get("error").and_then(Value::as_str) == Some("page_too_deep") {
+            return Ok(None);
+        }
         return Err(err(format!("review queue failed {}", refusal_text(status, &body))));
     }
-    typed(&body, "review queue")
+    Ok(Some(typed(&body, "review queue")?))
 }
 
 async fn run_json(c: &Client, args: &Args) -> Result<()> {
@@ -1240,6 +1255,137 @@ mod tests {
             assert_eq!(st.decides[0]["verdict"], "merge");
             assert_eq!(st.decides[0]["content"], "first line second line");
             assert_eq!(st.decides[0]["key"], "conflict:a:b");
+        }
+
+        /// Mirrors `services::review_queue::MAX_OFFSET`. The queue route refuses any offset past
+        /// this with `page_too_deep`; this probe is what drives the loop there.
+        const PROBE_MAX_OFFSET: i64 = 2_000;
+
+        fn offset_of(path: &str) -> i64 {
+            path.split("offset=")
+                .nth(1)
+                .and_then(|rest| rest.split('&').next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        }
+
+        /// Answers every `/admin/review/queue` GET with the same one-item stale page and
+        /// `has_more: true`, until `offset` is past `PROBE_MAX_OFFSET`, when it answers the
+        /// server's own refusal shape for `page_too_deep` instead.
+        async fn serve_paging_probe(socket: &mut tokio::net::TcpStream, seen: &Mutex<Vec<i64>>) {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let n = socket.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(at) = find_header_end(&buf) {
+                    break at;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let request_line = headers.lines().next().unwrap_or_default().to_string();
+            let path = request_line.split(' ').nth(1).unwrap_or("").to_string();
+            let offset = offset_of(&path);
+            seen.lock().unwrap().push(offset);
+
+            let (status_line, body) = if offset > PROBE_MAX_OFFSET {
+                (
+                    "HTTP/1.1 400 Bad Request",
+                    serde_json::json!({
+                        "error": "page_too_deep",
+                        "detail": format!("offset {offset} is past the last page"),
+                    })
+                    .to_string(),
+                )
+            } else {
+                (
+                    "HTTP/1.1 200 OK",
+                    serde_json::json!({
+                        "items": [{
+                            "key": "stale:c",
+                            "source": "stale",
+                            "namespace": "user:me",
+                            "rows": [
+                                { "id": "cccccccc-0000", "namespace": "user:me",
+                                  "sensitivity": "open", "content": "stale text", "opened": true,
+                                  "created_at": "2026-01-01T00:00:00Z", "access_count": 3 },
+                            ],
+                            "age_days": 400,
+                            "verdicts": ["confirm"],
+                        }],
+                        "sources": { "conflict": false, "stale": true, "proposal": [] },
+                        "refused": {},
+                        "dismissed": 0,
+                        "stale_days": 180,
+                        "min_similarity": 0.85,
+                        "limit": 200,
+                        "offset": offset,
+                        "has_more": true,
+                    })
+                    .to_string(),
+                )
+            };
+            let response = format!(
+                "{status_line}\r\ncontent-type: application/json\r\ncontent-length: \
+                 {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        }
+
+        /// A page-only run: the item is skipped once, its key lands in the loop's own `skipped`
+        /// set, and every later page repeats that key, so the loop climbs `offset` on its own with
+        /// no further input until the server's `page_too_deep` ends it. Before this fix that
+        /// refusal came back as an `Err` from `fetch_queue` and `run` returned it, so the tally
+        /// this test is really checking for was never printed.
+        #[tokio::test]
+        async fn a_run_of_skips_past_page_too_deep_ends_the_loop_instead_of_erroring() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let server_seen = seen.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else { break };
+                    serve_paging_probe(&mut socket, &server_seen).await;
+                    if server_seen.lock().unwrap().last().copied().unwrap_or(0) > PROBE_MAX_OFFSET {
+                        break;
+                    }
+                }
+            });
+
+            let env: HashMap<String, String> = HashMap::from([
+                ("LUMBERROOM_URL".to_string(), format!("http://127.0.0.1:{port}")),
+                ("LUMBERROOM_TOKEN".to_string(), "t".to_string()),
+            ]);
+            let file = crate::config::FileConfig::empty(std::env::temp_dir().join(format!(
+                "lumberroom-review-page-too-deep-{}-{}.json",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+            let resolved = crate::config::resolve(&env, &file, None, None, None, false, None);
+            let client = Client::new(resolved, file).unwrap();
+            let args =
+                Args::parse(["review", "--limit", "200"].into_iter().map(str::to_string));
+
+            let mut lines = vec!["n\n"].into_iter();
+            let mut read = move || Ok(lines.next().unwrap_or("").to_string());
+
+            run(&client, &args, &mut read).await.unwrap();
+            drop(server.await);
+
+            let requests = seen.lock().unwrap();
+            assert!(
+                requests.iter().any(|&o| o > PROBE_MAX_OFFSET),
+                "the loop must reach the refusal, not stop or hang earlier: {requests:?}"
+            );
         }
     }
 }

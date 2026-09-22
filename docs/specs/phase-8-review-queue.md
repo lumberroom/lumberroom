@@ -414,6 +414,10 @@ deletion of either row (cascade); the retirement of either row, after which the 
 test in the conflicts query and the ledger row is dead weight the next delete clears. A successor
 is a new id and gets a fresh comparison.
 
+An archive restore does not carry the ledger either: the archive enumerates no
+`memory_pair_dismissed` table, so a pair dismissed before an export reappears in the conflict source
+of the restored store, live and unread.
+
 ### 3.3 The join
 
 `conflicts` gains one clause beside its live and grant tests:

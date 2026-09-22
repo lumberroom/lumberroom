@@ -313,9 +313,16 @@ mean three different things, and `.env.example` carries the rule above `AUTH_TOK
 
 ### memory_forget is absent unless the grant carries mayDelete
 
-The MCP surface has ten tools (`src/mcp/capability.rs` is the exhaustive list). A bare grant like
-the one above sees five: `context_bootstrap`, `memory_search`, `memory_write`, `registry_get`,
-`alias_list`. `memory_forget` is missing because the grant sets no `mayDelete`, and `tools/list`
+The MCP surface has twelve tools (`src/mcp/capability.rs` is the exhaustive list). A bare grant
+like the one above sees seven: `context_bootstrap`, `memory_search`, `memory_write`,
+`registry_get`, `alias_list`, `review_queue`, `review_decide`. `review_queue` lists what the read
+grant already admits; because this grant also carries `"write":["*"]`, `review_decide` may
+supersede, merge, confirm or keep_both any row it can see, at `open`, since `writable_row` passes
+wherever read and write both hold at the row's stored level. `delete` is the one verdict this
+grant is refused, because it also needs `mayDelete`, the same flag `memory_forget` reads below. A
+read-only grant refuses every row instead; `docs/permissions.md` ("The two review tools") covers
+that empty-verdicts case.
+`memory_forget` is missing because the grant sets no `mayDelete`, and `tools/list`
 filters it out per credential (`src/mcp/mod.rs`). Keeping it out of the list keeps the idea away
 from the model in the first place; the service refuses the call again if one arrives anyway.
 `.env.example` argues this is a decision rather than an omission: a model that can delete memories

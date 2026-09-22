@@ -47,7 +47,7 @@
       "verdicts": ["confirm", "merge", "delete"]
     },
     {
-      "key": "proposal:jev:claim-loss-1",
+      "key": "proposal:canned:example-1",
       "source": "proposal",
       "namespace": "user:me",
       "rows": [
@@ -55,17 +55,17 @@
           "id": "4444dddd-0000-4a1b-8c3d-112233445566",
           "namespace": "user:me",
           "sensitivity": "open",
-          "content": "The owner runs the eval nightly.",
+          "content": "The owner runs the batch job nightly.",
           "opened": true,
           "created_at": "2026-09-10T00:00:00Z",
           "access_count": 1
         }
       ],
       "proposal": {
-        "id": "claim-loss-1",
-        "origin": "jev",
-        "kind": "claim_loss",
-        "proposed_content": "The owner runs the eval nightly against the longmemeval fixture.",
+        "id": "example-1",
+        "origin": "canned",
+        "kind": "example",
+        "proposed_content": "The owner runs the batch job nightly against the corpus fixture.",
         "fields": [
           { "label": "why", "value": "a second model reads this fact as narrower than the source" },
           { "label": "confidence", "value": "0.72" }
@@ -76,7 +76,7 @@
       "verdicts": ["apply", "dismiss"]
     }
   ],
-  "sources": { "conflict": true, "stale": true, "proposal": ["jev"] },
+  "sources": { "conflict": true, "stale": true, "proposal": ["canned"] },
   "refused": { "conflict": "namespace_too_large" },
   "dismissed": 12,
   "stale_days": 365,
