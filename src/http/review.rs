@@ -92,7 +92,11 @@ async fn queue(
     }
 }
 
-async fn decide(State(http): State<Http>, headers: HeaderMap, Json(body): Json<Decision>) -> Response {
+async fn decide(
+    State(http): State<Http>,
+    headers: HeaderMap,
+    Json(body): Json<Decision>,
+) -> Response {
     let ctx = match authed(&http, &headers).await {
         Ok(c) => c,
         Err(r) => return r,
@@ -160,7 +164,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_coded_refusal_publishes_its_own_code_and_an_uncoded_one_the_fallback() {
-        let coded = DomainError::validation("bad key").with_code(review_queue::codes::NOT_A_QUEUE_KEY);
+        let coded =
+            DomainError::validation("bad key").with_code(review_queue::codes::NOT_A_QUEUE_KEY);
         let body = error_body(refusal(&coded, "review_decide_failed")).await;
         assert_eq!(body["error"], review_queue::codes::NOT_A_QUEUE_KEY);
 

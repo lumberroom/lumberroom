@@ -227,11 +227,7 @@ fn owner_like(client: &str) -> Principal {
 /// A second client with an explicit ceiling per namespace, the way `integration.rs`'s
 /// `restricted_at` is built. Namespace alone is not a grant under the two-axis model, so most
 /// grant tests here need to set the second axis.
-fn restricted_at(
-    ctx: &Ctx,
-    read: &[(&str, Sensitivity)],
-    write: &[(&str, Sensitivity)],
-) -> Ctx {
+fn restricted_at(ctx: &Ctx, read: &[(&str, Sensitivity)], write: &[(&str, Sensitivity)]) -> Ctx {
     let grants = |spec: &[(&str, Sensitivity)]| -> Vec<NamespaceGrant> {
         spec.iter().map(|(ns, max)| NamespaceGrant::new((*ns).to_string(), *max)).collect()
     };
@@ -366,13 +362,12 @@ async fn put_empty_open(ctx: &Ctx, pool: &PgPool, namespace: &str) -> String {
 }
 
 async fn live(pool: &PgPool, id: &str) -> (Option<String>, bool) {
-    let row: (Option<uuid::Uuid>, Option<DateTime<Utc>>) = sqlx::query_as(
-        "SELECT superseded_by, occurred_until FROM memory WHERE id = $1",
-    )
-    .bind(uuid::Uuid::parse_str(id).unwrap())
-    .fetch_one(pool)
-    .await
-    .unwrap();
+    let row: (Option<uuid::Uuid>, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT superseded_by, occurred_until FROM memory WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(id).unwrap())
+            .fetch_one(pool)
+            .await
+            .unwrap();
     let is_live = row.0.is_none() && row.1.is_none_or(|u| u > Utc::now());
     (row.0.map(|u| u.to_string()), is_live)
 }
@@ -438,13 +433,17 @@ async fn a_kept_pair_leaves_the_queue_and_undismiss_brings_it_back() {
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "keep1").await;
     let key = format!("conflict:{older}:{newer}");
 
-    let before = review_queue::queue(&h.ctx, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Conflict]),
-        limit: None,
-        offset: None,
-        days: None,
-        min_similarity: Some(0.0),
-    })
+    let before = review_queue::queue(
+        &h.ctx,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Conflict]),
+            limit: None,
+            offset: None,
+            days: None,
+            min_similarity: Some(0.0),
+        },
+    )
     .await
     .unwrap();
     assert!(
@@ -452,8 +451,10 @@ async fn a_kept_pair_leaves_the_queue_and_undismiss_brings_it_back() {
         "the seeded pair has to show up before it is dismissed"
     );
 
-    let decided =
-        review_queue::decide(&h.ctx, &no_sources(), Decision {
+    let decided = review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
             key: key.clone(),
             verdict: Verdict::KeepBoth,
             keep: None,
@@ -462,18 +463,23 @@ async fn a_kept_pair_leaves_the_queue_and_undismiss_brings_it_back() {
             tags: None,
             occurred_at: None,
             reason: None,
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(decided.verdict, Verdict::KeepBoth);
 
-    let after = review_queue::queue(&h.ctx, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Conflict]),
-        limit: None,
-        offset: None,
-        days: None,
-        min_similarity: Some(0.0),
-    })
+    let after = review_queue::queue(
+        &h.ctx,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Conflict]),
+            limit: None,
+            offset: None,
+            days: None,
+            min_similarity: Some(0.0),
+        },
+    )
     .await
     .unwrap();
     assert!(
@@ -485,13 +491,17 @@ async fn a_kept_pair_leaves_the_queue_and_undismiss_brings_it_back() {
     let brought_back = review_queue::undismiss(&h.ctx, &older, &newer).await.unwrap();
     assert!(brought_back, "undismiss on a pair that is in the ledger answers true");
 
-    let restored = review_queue::queue(&h.ctx, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Conflict]),
-        limit: None,
-        offset: None,
-        days: None,
-        min_similarity: Some(0.0),
-    })
+    let restored = review_queue::queue(
+        &h.ctx,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Conflict]),
+            limit: None,
+            offset: None,
+            days: None,
+            min_similarity: Some(0.0),
+        },
+    )
     .await
     .unwrap();
     assert!(
@@ -554,16 +564,20 @@ async fn keep_both_needs_the_write_grant_on_both_rows() {
 
     let (open_first, private_first) =
         conflict_pair_at(&h.ctx, &h.pool, "global", "keep2a", "open", "private").await;
-    let err = review_queue::decide(&half_writable, &no_sources(), Decision {
-        key: format!("conflict:{open_first}:{private_first}"),
-        verdict: Verdict::KeepBoth,
-        keep: None,
-        id: None,
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    let err = review_queue::decide(
+        &half_writable,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{open_first}:{private_first}"),
+            verdict: Verdict::KeepBoth,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap_err();
     assert_eq!(
@@ -574,16 +588,20 @@ async fn keep_both_needs_the_write_grant_on_both_rows() {
 
     let (private_second, open_second) =
         conflict_pair_at(&h.ctx, &h.pool, "global", "keep2b", "private", "open").await;
-    let err = review_queue::decide(&half_writable, &no_sources(), Decision {
-        key: format!("conflict:{private_second}:{open_second}"),
-        verdict: Verdict::KeepBoth,
-        keep: None,
-        id: None,
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    let err = review_queue::decide(
+        &half_writable,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{private_second}:{open_second}"),
+            verdict: Verdict::KeepBoth,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap_err();
     assert_eq!(
@@ -598,16 +616,20 @@ async fn keep_both_records_the_client_and_the_token_fingerprint() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "keep3").await;
 
-    review_queue::decide(&h.ctx, &no_sources(), Decision {
-        key: format!("conflict:{older}:{newer}"),
-        verdict: Verdict::KeepBoth,
-        keep: None,
-        id: None,
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{older}:{newer}"),
+            verdict: Verdict::KeepBoth,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap();
 
@@ -636,20 +658,25 @@ async fn undismiss_answers_false_for_a_pair_the_caller_may_not_change() {
 async fn undismiss_answers_false_for_a_narrow_grant_that_cannot_read_the_pair() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "project:vault", "undismiss-narrow").await;
-    review_queue::decide(&h.ctx, &no_sources(), Decision {
-        key: format!("conflict:{older}:{newer}"),
-        verdict: Verdict::KeepBoth,
-        keep: None,
-        id: None,
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{older}:{newer}"),
+            verdict: Verdict::KeepBoth,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap();
 
-    let narrow = restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
+    let narrow =
+        restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
     let answer = review_queue::undismiss(&narrow, &older, &newer).await.unwrap();
     assert!(!answer, "the pair is real and dismissed, but this grant cannot read either row");
 }
@@ -658,16 +685,20 @@ async fn undismiss_answers_false_for_a_narrow_grant_that_cannot_read_the_pair() 
 async fn a_deleted_row_takes_its_dismissals_with_it() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "keep4").await;
-    review_queue::decide(&h.ctx, &no_sources(), Decision {
-        key: format!("conflict:{older}:{newer}"),
-        verdict: Verdict::KeepBoth,
-        keep: None,
-        id: None,
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{older}:{newer}"),
+            verdict: Verdict::KeepBoth,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap();
 
@@ -690,19 +721,23 @@ async fn a_narrow_grant_sees_a_full_page_of_its_own_pairs_and_no_count_of_the_re
         make_stale(&h.pool, &id).await;
     }
     for i in 0..3 {
-        let id =
-            write_at(&h.ctx, &format!("global fact {i} {}", nonce("narrow")), "global").await;
+        let id = write_at(&h.ctx, &format!("global fact {i} {}", nonce("narrow")), "global").await;
         make_stale(&h.pool, &id).await;
     }
 
-    let narrow = restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
-    let q = review_queue::queue(&narrow, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Stale]),
-        limit: Some(3),
-        offset: None,
-        days: Some(0),
-        min_similarity: None,
-    })
+    let narrow =
+        restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
+    let q = review_queue::queue(
+        &narrow,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Stale]),
+            limit: Some(3),
+            offset: None,
+            days: Some(0),
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
     assert_eq!(q.items.len(), 3, "3 asked for and 3 readable rows exist");
@@ -732,14 +767,19 @@ async fn a_narrow_grant_sees_a_full_page_of_its_own_conflict_pairs_and_none_of_t
     let newer = write_at(&h.ctx, "the rota tie aa bb dd", "global").await;
     let key = format!("conflict:{older}:{newer}");
 
-    let narrow = restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
-    let q = review_queue::queue(&narrow, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Conflict]),
-        limit: Some(1),
-        offset: None,
-        days: None,
-        min_similarity: Some(0.0),
-    })
+    let narrow =
+        restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
+    let q = review_queue::queue(
+        &narrow,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Conflict]),
+            limit: Some(1),
+            offset: None,
+            days: None,
+            min_similarity: Some(0.0),
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -753,36 +793,53 @@ async fn a_narrow_grant_sees_a_full_page_of_its_own_conflict_pairs_and_none_of_t
 #[tokio::test]
 async fn the_envelope_carries_no_tenant_wide_count() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
-    let vault_id = write_at(&h.ctx, &format!("a fact the narrow grant cannot reach {}", nonce("t")), "project:vault").await;
+    let vault_id = write_at(
+        &h.ctx,
+        &format!("a fact the narrow grant cannot reach {}", nonce("t")),
+        "project:vault",
+    )
+    .await;
     make_stale(&h.pool, &vault_id).await;
-    let global_id = write_at(&h.ctx, &format!("a fact the narrow grant may read {}", nonce("t")), "global").await;
+    let global_id =
+        write_at(&h.ctx, &format!("a fact the narrow grant may read {}", nonce("t")), "global")
+            .await;
     make_stale(&h.pool, &global_id).await;
 
     // A dismissed pair in the namespace the narrow grant cannot read: the owner sees it in the
     // ledger count, the narrow grant must not, so `dismissed` has to be filtered by the same read
     // grant as the listing rather than counted once over the whole tenant.
-    let (vault_older, vault_newer) = conflict_pair(&h.ctx, &h.pool, "project:vault", "envelope").await;
-    review_queue::decide(&h.ctx, &no_sources(), Decision {
-        key: format!("conflict:{vault_older}:{vault_newer}"),
-        verdict: Verdict::KeepBoth,
-        keep: None,
-        id: None,
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    let (vault_older, vault_newer) =
+        conflict_pair(&h.ctx, &h.pool, "project:vault", "envelope").await;
+    review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{vault_older}:{vault_newer}"),
+            verdict: Verdict::KeepBoth,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap();
 
-    let narrow = restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
-    let q = review_queue::queue(&narrow, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Stale]),
-        limit: Some(10),
-        offset: None,
-        days: Some(0),
-        min_similarity: None,
-    })
+    let narrow =
+        restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
+    let q = review_queue::queue(
+        &narrow,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Stale]),
+            limit: Some(10),
+            offset: None,
+            days: Some(0),
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -790,13 +847,17 @@ async fn the_envelope_carries_no_tenant_wide_count() {
         "the dismissed pair sits in a namespace this grant cannot read, so its count is 0, not 1"
     );
 
-    let owner_q = review_queue::queue(&h.ctx, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Stale]),
-        limit: Some(10),
-        offset: None,
-        days: Some(0),
-        min_similarity: None,
-    })
+    let owner_q = review_queue::queue(
+        &h.ctx,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Stale]),
+            limit: Some(10),
+            offset: None,
+            days: Some(0),
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
     assert_eq!(owner_q.dismissed, 1, "the owner's own grant does cover that namespace");
@@ -837,20 +898,28 @@ async fn two_pairs_at_one_similarity_page_once_each() {
         })
         .map(|i| i.key.clone())
         .collect();
-    assert_eq!(seen.len(), 2, "two tied pairs, one per offset page, no repeat and no gap: {seen:?}");
+    assert_eq!(
+        seen.len(),
+        2,
+        "two tied pairs, one per offset page, no repeat and no gap: {seen:?}"
+    );
     assert_ne!(seen[0], seen[1], "the same key must not appear on both pages");
 }
 
 #[tokio::test]
 async fn an_offset_past_the_ceiling_is_refused_rather_than_clamped() {
     let h = ctx_or_skip!();
-    let err = review_queue::queue(&h.ctx, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Stale]),
-        limit: None,
-        offset: Some(review_queue::MAX_OFFSET + 1),
-        days: None,
-        min_similarity: None,
-    })
+    let err = review_queue::queue(
+        &h.ctx,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Stale]),
+            limit: None,
+            offset: Some(review_queue::MAX_OFFSET + 1),
+            days: None,
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap_err();
     assert_eq!(err.code(), Some(review_queue::codes::PAGE_TOO_DEEP));
@@ -867,13 +936,17 @@ async fn a_namespace_over_the_scan_ceiling_refuses_conflicts_and_still_answers_s
         write_at(&h.ctx, &format!("filler row {i} {}", nonce("ceiling")), "global").await;
     }
 
-    let q = review_queue::queue(&h.ctx, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Conflict, Source::Stale]),
-        limit: None,
-        offset: None,
-        days: Some(0),
-        min_similarity: None,
-    })
+    let q = review_queue::queue(
+        &h.ctx,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Conflict, Source::Stale]),
+            limit: None,
+            offset: None,
+            days: Some(0),
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -894,13 +967,17 @@ async fn a_row_whose_content_is_empty_still_takes_every_verdict() {
     let id = put_empty_open(&h.ctx, &h.pool, "global").await;
     make_stale(&h.pool, &id).await;
 
-    let q = review_queue::queue(&h.ctx, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Stale]),
-        limit: None,
-        offset: None,
-        days: Some(0),
-        min_similarity: None,
-    })
+    let q = review_queue::queue(
+        &h.ctx,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Stale]),
+            limit: None,
+            offset: None,
+            days: Some(0),
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
     let item = q.items.iter().find(|i| i.rows.iter().any(|r| r.id == id)).unwrap();
@@ -922,16 +999,20 @@ async fn a_merge_writes_once_and_retires_both_sources_into_it() {
     set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
     let newer = write_dated(&h.ctx, "the pair merges new", "global", new_date).await;
 
-    let decided = review_queue::decide(&h.ctx, &no_sources(), Decision {
-        key: format!("conflict:{older}:{newer}"),
-        verdict: Verdict::Merge,
-        keep: None,
-        id: None,
-        content: Some("the merged fact, in the caller's own words".into()),
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    let decided = review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{older}:{newer}"),
+            verdict: Verdict::Merge,
+            keep: None,
+            id: None,
+            content: Some("the merged fact, in the caller's own words".into()),
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap();
 
@@ -967,16 +1048,20 @@ async fn a_merge_of_two_same_day_rows_writes_without_an_occurred_at() {
     let newer = write_at(&h.ctx, "same day merge new", "global").await;
     set_occurred_at(&h.pool, &newer, now).await;
 
-    let decided = review_queue::decide(&h.ctx, &no_sources(), Decision {
-        key: format!("conflict:{older}:{newer}"),
-        verdict: Verdict::Merge,
-        keep: None,
-        id: None,
-        content: Some("merged, no occurred_at should stick".into()),
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    let decided = review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{older}:{newer}"),
+            verdict: Verdict::Merge,
+            keep: None,
+            id: None,
+            content: Some("merged, no occurred_at should stick".into()),
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap();
     let written = decided.written.unwrap();
@@ -1005,16 +1090,20 @@ async fn a_merge_whose_second_retirement_fails_reports_the_leftover_in_unfinishe
     // supersede target whose period has already closed, which is what leaves it unfinished.
     review::expire(&h.ctx, &older).await.unwrap();
 
-    let decided = review_queue::decide(&h.ctx, &no_sources(), Decision {
-        key: format!("conflict:{older}:{newer}"),
-        verdict: Verdict::Merge,
-        keep: None,
-        id: None,
-        content: Some("the write lands even though one retirement will not".into()),
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    let decided = review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{older}:{newer}"),
+            verdict: Verdict::Merge,
+            keep: None,
+            id: None,
+            content: Some("the write lands even though one retirement will not".into()),
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap();
     assert!(decided.written.is_some(), "the write itself still lands");
@@ -1030,16 +1119,20 @@ async fn a_verdict_the_source_does_not_take_is_refused_before_any_row_changes() 
     let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "badverdict").await;
 
-    let err = review_queue::decide(&h.ctx, &no_sources(), Decision {
-        key: format!("conflict:{older}:{newer}"),
-        verdict: Verdict::Confirm,
-        keep: None,
-        id: None,
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    let err = review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{older}:{newer}"),
+            verdict: Verdict::Confirm,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap_err();
     assert_eq!(err.code(), Some(review_queue::codes::VERDICT_NOT_FOR_SOURCE));
@@ -1052,22 +1145,27 @@ async fn a_verdict_the_source_does_not_take_is_refused_before_any_row_changes() 
 #[tokio::test]
 async fn delete_through_the_queue_still_needs_may_delete() {
     let h = ctx_or_skip!();
-    let id = write_at(&h.ctx, &format!("delete through the queue {}", nonce("del")), "global").await;
+    let id =
+        write_at(&h.ctx, &format!("delete through the queue {}", nonce("del")), "global").await;
     make_stale(&h.pool, &id).await;
 
     let mut no_delete = h.ctx.clone();
     no_delete.principal.may_delete = false;
 
-    let err = review_queue::decide(&no_delete, &no_sources(), Decision {
-        key: format!("stale:{id}"),
-        verdict: Verdict::Delete,
-        keep: None,
-        id: Some(id.clone()),
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    let err = review_queue::decide(
+        &no_delete,
+        &no_sources(),
+        Decision {
+            key: format!("stale:{id}"),
+            verdict: Verdict::Delete,
+            keep: None,
+            id: Some(id.clone()),
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap_err();
     assert_eq!(err.kind.http_status(), 403);
@@ -1082,16 +1180,20 @@ async fn a_supersede_default_keeps_the_newer_row_whatever_order_the_key_spelled(
 
     // Spelled with the newer id first: `parse_key`'s job is to reorder from the stored rows, not
     // from how the caller wrote the key.
-    review_queue::decide(&h.ctx, &no_sources(), Decision {
-        key: format!("conflict:{newer}:{older}"),
-        verdict: Verdict::Supersede,
-        keep: None,
-        id: None,
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{newer}:{older}"),
+            verdict: Verdict::Supersede,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap();
 
@@ -1115,7 +1217,9 @@ async fn the_queue_route_answers_the_envelope_with_sources_and_defaults_from_con
     assert_eq!(v["sources"]["stale"], true);
     assert_eq!(v["sources"]["proposal"], serde_json::json!([]));
     assert_eq!(v["stale_days"], h.ctx.cfg.quality.stale_days);
-    assert!((v["min_similarity"].as_f64().unwrap() - h.ctx.cfg.quality.conflict_threshold).abs() < 1e-9);
+    assert!(
+        (v["min_similarity"].as_f64().unwrap() - h.ctx.cfg.quality.conflict_threshold).abs() < 1e-9
+    );
     assert_eq!(v["limit"], review_queue::DEFAULT_LIMIT);
     assert_eq!(v["offset"], 0);
 }
@@ -1130,7 +1234,10 @@ async fn the_old_conflicts_and_stale_routes_answer_the_same_json_they_did_before
     let (status, body) = h.get("/admin/review/stale?days=0").await;
     assert_eq!(status, 200, "{body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(v.get("days").is_some() && v.get("rows").is_some(), "stale route keeps its own shape: {v}");
+    assert!(
+        v.get("days").is_some() && v.get("rows").is_some(),
+        "stale route keeps its own shape: {v}"
+    );
     let row = v["rows"].as_array().unwrap().first().expect("a stale row").clone();
     for key in ["id", "namespace", "sensitivity", "content", "created_at"] {
         assert!(row.get(key).is_some(), "stale row keeps {key}: {row}");
@@ -1167,8 +1274,8 @@ async fn the_old_routes_keep_their_own_page_default() {
     // one row and the page count would read as a paging bug.
     let words = [
         "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
-        "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
-        "sierra", "tango", "uniform", "victor", "whiskey", "xray", "yankee", "zulu",
+        "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra",
+        "tango", "uniform", "victor", "whiskey", "xray", "yankee", "zulu",
     ];
     for w in words {
         let id = write_at(&h.ctx, &format!("{w} is a stale fixture {}", nonce(w)), "global").await;
@@ -1222,13 +1329,17 @@ async fn a_canned_proposal_appears_with_its_members_fields_and_verdicts() {
     };
     let sources = one_source(CannedProposals::new(vec![(item, vec![member])]));
 
-    let q = review_queue::queue(&h.ctx, &sources, QueueQuery {
-        sources: Some(vec![Source::Proposal]),
-        limit: None,
-        offset: None,
-        days: None,
-        min_similarity: None,
-    })
+    let q = review_queue::queue(
+        &h.ctx,
+        &sources,
+        QueueQuery {
+            sources: Some(vec![Source::Proposal]),
+            limit: None,
+            offset: None,
+            days: None,
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
     let found = q.items.iter().find(|i| i.source == Source::Proposal).expect("the canned item");
@@ -1243,7 +1354,8 @@ async fn a_full_page_of_canned_proposals_reports_has_more() {
     let h = ctx_or_skip!();
     let mut member_rows = Vec::new();
     for i in 0..3 {
-        let id = write_at(&h.ctx, &format!("proposal member {i} {}", nonce("page")), "global").await;
+        let id =
+            write_at(&h.ctx, &format!("proposal member {i} {}", nonce("page")), "global").await;
         member_rows.push(
             h.ctx
                 .repos
@@ -1274,13 +1386,17 @@ async fn a_full_page_of_canned_proposals_reports_has_more() {
         .collect();
     let sources = one_source(CannedProposals::new(items));
 
-    let q = review_queue::queue(&h.ctx, &sources, QueueQuery {
-        sources: Some(vec![Source::Proposal]),
-        limit: Some(2),
-        offset: None,
-        days: None,
-        min_similarity: None,
-    })
+    let q = review_queue::queue(
+        &h.ctx,
+        &sources,
+        QueueQuery {
+            sources: Some(vec![Source::Proposal]),
+            limit: Some(2),
+            offset: None,
+            days: None,
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
     assert_eq!(q.items.iter().filter(|i| i.source == Source::Proposal).count(), 2);
@@ -1290,8 +1406,12 @@ async fn a_full_page_of_canned_proposals_reports_has_more() {
 #[tokio::test]
 async fn a_canned_proposal_with_a_member_outside_the_grant_drops_whole() {
     let h = ctx_or_skip!();
-    let unreadable_id =
-        write_at(&h.ctx, &format!("outside the narrow grant {}", nonce("outside")), "project:vault").await;
+    let unreadable_id = write_at(
+        &h.ctx,
+        &format!("outside the narrow grant {}", nonce("outside")),
+        "project:vault",
+    )
+    .await;
     let member = h
         .ctx
         .repos
@@ -1311,14 +1431,19 @@ async fn a_canned_proposal_with_a_member_outside_the_grant_drops_whole() {
     };
     let sources = one_source(CannedProposals::new(vec![(item, vec![member])]));
 
-    let narrow = restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
-    let q = review_queue::queue(&narrow, &sources, QueueQuery {
-        sources: Some(vec![Source::Proposal]),
-        limit: None,
-        offset: None,
-        days: None,
-        min_similarity: None,
-    })
+    let narrow =
+        restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
+    let q = review_queue::queue(
+        &narrow,
+        &sources,
+        QueueQuery {
+            sources: Some(vec![Source::Proposal]),
+            limit: None,
+            offset: None,
+            days: None,
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
     assert!(
@@ -1330,10 +1455,18 @@ async fn a_canned_proposal_with_a_member_outside_the_grant_drops_whole() {
 #[tokio::test]
 async fn a_canned_proposal_with_a_member_that_will_not_open_takes_no_verdict() {
     let h = ctx_or_skip!();
-    let id = write::run(&h.ctx, "a private member that will be corrupted", "global", None, None, Some("private"), None)
-        .await
-        .unwrap()
-        .id;
+    let id = write::run(
+        &h.ctx,
+        "a private member that will be corrupted",
+        "global",
+        None,
+        None,
+        Some("private"),
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
     break_ciphertext(&h.pool, &id).await;
     let member = h
         .ctx
@@ -1354,16 +1487,21 @@ async fn a_canned_proposal_with_a_member_that_will_not_open_takes_no_verdict() {
     };
     let sources = one_source(CannedProposals::new(vec![(item, vec![member])]));
 
-    let q = review_queue::queue(&h.ctx, &sources, QueueQuery {
-        sources: Some(vec![Source::Proposal]),
-        limit: None,
-        offset: None,
-        days: None,
-        min_similarity: None,
-    })
+    let q = review_queue::queue(
+        &h.ctx,
+        &sources,
+        QueueQuery {
+            sources: Some(vec![Source::Proposal]),
+            limit: None,
+            offset: None,
+            days: None,
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
-    let found = q.items.iter().find(|i| i.source == Source::Proposal).expect("the item still appears");
+    let found =
+        q.items.iter().find(|i| i.source == Source::Proposal).expect("the item still appears");
     assert!(
         found.verdicts.is_empty(),
         "a member that will not decrypt empties the verdicts, it does not remove the item"
@@ -1372,9 +1510,11 @@ async fn a_canned_proposal_with_a_member_that_will_not_open_takes_no_verdict() {
 }
 
 #[tokio::test]
-async fn a_proposal_decision_reaches_the_source_named_by_the_key_and_an_unknown_origin_is_refused() {
+async fn a_proposal_decision_reaches_the_source_named_by_the_key_and_an_unknown_origin_is_refused()
+{
     let h = ctx_or_skip!();
-    let member_id = write_at(&h.ctx, &format!("canned decide member {}", nonce("decide")), "global").await;
+    let member_id =
+        write_at(&h.ctx, &format!("canned decide member {}", nonce("decide")), "global").await;
     let member = h
         .ctx
         .repos
@@ -1395,16 +1535,20 @@ async fn a_proposal_decision_reaches_the_source_named_by_the_key_and_an_unknown_
     let canned = Arc::new(CannedProposals::new(vec![(item, vec![member])]));
     let sources: Vec<Arc<dyn ProposalSource>> = vec![canned.clone()];
 
-    review_queue::decide(&h.ctx, &sources, Decision {
-        key: "proposal:canned:p-decide".into(),
-        verdict: Verdict::Apply,
-        keep: None,
-        id: None,
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    review_queue::decide(
+        &h.ctx,
+        &sources,
+        Decision {
+            key: "proposal:canned:p-decide".into(),
+            verdict: Verdict::Apply,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -1413,16 +1557,20 @@ async fn a_proposal_decision_reaches_the_source_named_by_the_key_and_an_unknown_
         "the decision reached the source the key named"
     );
 
-    let err = review_queue::decide(&h.ctx, &sources, Decision {
-        key: "proposal:notcanned:whatever".into(),
-        verdict: Verdict::Apply,
-        keep: None,
-        id: None,
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    let err = review_queue::decide(
+        &h.ctx,
+        &sources,
+        Decision {
+            key: "proposal:notcanned:whatever".into(),
+            verdict: Verdict::Apply,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap_err();
     assert_eq!(err.code(), Some(review_queue::codes::UNKNOWN_ORIGIN));
@@ -1435,40 +1583,54 @@ async fn a_proposal_decision_reaches_the_source_named_by_the_key_and_an_unknown_
 #[tokio::test]
 async fn a_confirmed_stale_row_leaves_the_list_for_one_window() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
-    let id = write_at(&h.ctx, &format!("confirm and it leaves the list {}", nonce("confirm")), "global").await;
+    let id =
+        write_at(&h.ctx, &format!("confirm and it leaves the list {}", nonce("confirm")), "global")
+            .await;
     make_stale(&h.pool, &id).await;
 
-    let before = review_queue::queue(&h.ctx, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Stale]),
-        limit: None,
-        offset: None,
-        days: Some(30),
-        min_similarity: None,
-    })
+    let before = review_queue::queue(
+        &h.ctx,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Stale]),
+            limit: None,
+            offset: None,
+            days: Some(30),
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
     assert!(before.items.iter().any(|i| i.rows.iter().any(|r| r.id == id)));
 
-    review_queue::decide(&h.ctx, &no_sources(), Decision {
-        key: format!("stale:{id}"),
-        verdict: Verdict::Confirm,
-        keep: None,
-        id: None,
-        content: None,
-        tags: None,
-        occurred_at: None,
-        reason: None,
-    })
+    review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("stale:{id}"),
+            verdict: Verdict::Confirm,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+        },
+    )
     .await
     .unwrap();
 
-    let just_after = review_queue::queue(&h.ctx, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Stale]),
-        limit: None,
-        offset: None,
-        days: Some(30),
-        min_similarity: None,
-    })
+    let just_after = review_queue::queue(
+        &h.ctx,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Stale]),
+            limit: None,
+            offset: None,
+            days: Some(30),
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
     assert!(
@@ -1478,13 +1640,17 @@ async fn a_confirmed_stale_row_leaves_the_list_for_one_window() {
 
     // Backdate the confirmation past the window (floored at one day, so `--days 0` still matters).
     set_last_confirmed_at(&h.pool, &id, Utc::now() - Duration::days(31)).await;
-    let after_window = review_queue::queue(&h.ctx, &no_sources(), QueueQuery {
-        sources: Some(vec![Source::Stale]),
-        limit: None,
-        offset: None,
-        days: Some(30),
-        min_similarity: None,
-    })
+    let after_window = review_queue::queue(
+        &h.ctx,
+        &no_sources(),
+        QueueQuery {
+            sources: Some(vec![Source::Stale]),
+            limit: None,
+            offset: None,
+            days: Some(30),
+            min_similarity: None,
+        },
+    )
     .await
     .unwrap();
     assert!(

@@ -422,8 +422,11 @@ async fn stale_items(
     limit: i64,
     offset: i64,
 ) -> Result<(Vec<QueueItem>, bool)> {
-    let mut rows =
-        ctx.repos.memories.stale(ctx.tenant(), days, limit + 1, offset, &ctx.principal.read).await?;
+    let mut rows = ctx
+        .repos
+        .memories
+        .stale(ctx.tenant(), days, limit + 1, offset, &ctx.principal.read)
+        .await?;
     let has_more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
 
@@ -506,7 +509,8 @@ pub async fn queue(
 
     // Asking for everything (no `source` param) reads as "review what this server has"; only an
     // explicit `source=proposal` on an engine that fills none is refused.
-    let asked_for_proposal = q.sources.as_ref().is_some_and(|list| list.contains(&Source::Proposal));
+    let asked_for_proposal =
+        q.sources.as_ref().is_some_and(|list| list.contains(&Source::Proposal));
     if asked_for_proposal && sources.is_empty() {
         return Err(DomainError::validation("this server fills no proposal source")
             .with_code(codes::SOURCE_NOT_FILLED));
@@ -576,7 +580,9 @@ pub async fn queue(
     // `Kind` and code rather than flattening it to an internal 500: a single-source
     // `namespace_too_large` (spec, docs/managing.md) has to reach the caller as the 400 it is.
     if attempted > 0 && failed == attempted {
-        return Err(first_error.expect("failed == attempted > 0 means at least one error was recorded"));
+        return Err(
+            first_error.expect("failed == attempted > 0 means at least one error was recorded")
+        );
     }
 
     let dismissed = ctx.repos.memories.dismissed_count(ctx.tenant(), &ctx.principal.read).await?;
@@ -996,15 +1002,15 @@ mod tests {
     #[test]
     fn a_proposal_key_carries_its_origin() {
         let key = parse_key("proposal:cleanup:abc-123").unwrap();
-        assert_eq!(
-            key,
-            Key::Proposal { origin: "cleanup".to_string(), id: "abc-123".to_string() }
-        );
+        assert_eq!(key, Key::Proposal { origin: "cleanup".to_string(), id: "abc-123".to_string() });
     }
 
     #[test]
     fn a_stale_item_takes_confirm_and_merge_and_delete_only_with_the_flag() {
-        assert_eq!(verdicts_for(Source::Stale, true, false), vec![Verdict::Confirm, Verdict::Merge]);
+        assert_eq!(
+            verdicts_for(Source::Stale, true, false),
+            vec![Verdict::Confirm, Verdict::Merge]
+        );
         assert_eq!(
             verdicts_for(Source::Stale, true, true),
             vec![Verdict::Confirm, Verdict::Merge, Verdict::Delete]

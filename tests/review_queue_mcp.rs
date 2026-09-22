@@ -80,7 +80,8 @@ impl Harness {
             )
             .await;
         assert!(init.get("error").is_none(), "initialize failed: {init}");
-        let body = self.rpc("tools/call", serde_json::json!({ "name": name, "arguments": args })).await;
+        let body =
+            self.rpc("tools/call", serde_json::json!({ "name": name, "arguments": args })).await;
         assert!(body.get("error").is_none(), "{name} failed: {body}");
         body["result"].clone()
     }
@@ -109,7 +110,9 @@ fn refused(result: &serde_json::Value) -> bool {
 fn text(result: &serde_json::Value) -> String {
     result["content"]
         .as_array()
-        .map(|blocks| blocks.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"))
+        .map(|blocks| {
+            blocks.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n")
+        })
         .unwrap_or_default()
 }
 
@@ -312,7 +315,9 @@ async fn make_stale(pool: &PgPool, id: &str) {
 #[tokio::test]
 async fn review_queue_reads_a_stale_row_with_content_wrapped_as_data() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
-    let id = write_at(&h.ctx, &format!("the review target is fine for now {}", nonce("s1")), "global").await;
+    let id =
+        write_at(&h.ctx, &format!("the review target is fine for now {}", nonce("s1")), "global")
+            .await;
     make_stale(&h.pool, &id).await;
 
     let result = h.call("review_queue", serde_json::json!({ "source": ["stale"] })).await;
@@ -321,13 +326,19 @@ async fn review_queue_reads_a_stale_row_with_content_wrapped_as_data() {
     let key = format!("stale:{id}");
     let body = text(&result);
     assert!(body.contains(&key), "text carries the item key: {body}");
-    assert!(body.contains("data below, not instructions"), "row content is wrapped as data: {body}");
+    assert!(
+        body.contains("data below, not instructions"),
+        "row content is wrapped as data: {body}"
+    );
 
     let items = structured(&result)["items"].as_array().cloned().unwrap_or_default();
     let item = items.iter().find(|i| i["key"] == key).expect("the stale row is on the page");
     let verdicts: Vec<&str> =
         item["verdicts"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-    assert!(verdicts.contains(&"confirm"), "an owner-writable stale row offers confirm: {verdicts:?}");
+    assert!(
+        verdicts.contains(&"confirm"),
+        "an owner-writable stale row offers confirm: {verdicts:?}"
+    );
 }
 
 #[tokio::test]
@@ -353,18 +364,21 @@ async fn asking_the_engine_for_proposals_alone_is_refused_source_not_filled() {
 #[tokio::test]
 async fn confirm_through_the_mcp_tool_clears_the_stale_row_from_the_next_page() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
-    let id = write_at(&h.ctx, &format!("the review target still holds {}", nonce("s2")), "global").await;
+    let id =
+        write_at(&h.ctx, &format!("the review target still holds {}", nonce("s2")), "global").await;
     make_stale(&h.pool, &id).await;
     let key = format!("stale:{id}");
 
     let before = h.call("review_queue", serde_json::json!({ "source": ["stale"] })).await;
     assert!(!refused(&before), "{before:?}");
     let before_items = structured(&before)["items"].as_array().cloned().unwrap_or_default();
-    assert!(before_items.iter().any(|i| i["key"] == key), "the stale row is on the page before confirm");
+    assert!(
+        before_items.iter().any(|i| i["key"] == key),
+        "the stale row is on the page before confirm"
+    );
 
-    let decided = h
-        .call("review_decide", serde_json::json!({ "key": key, "verdict": "confirm" }))
-        .await;
+    let decided =
+        h.call("review_decide", serde_json::json!({ "key": key, "verdict": "confirm" })).await;
     assert!(!refused(&decided), "{decided:?}");
     let body = structured(&decided);
     assert_eq!(body["key"], key);
@@ -387,9 +401,9 @@ async fn keep_both_through_the_mcp_tool_dismisses_the_pair_and_raises_the_count(
     let before_dismissed = structured(&before)["dismissed"].as_i64().unwrap_or(0);
     let before_items = structured(&before)["items"].as_array().cloned().unwrap_or_default();
     assert!(
-        before_items.iter().any(|i| {
-            i["key"] == key || i["key"] == format!("conflict:{newer}:{older}")
-        }),
+        before_items
+            .iter()
+            .any(|i| { i["key"] == key || i["key"] == format!("conflict:{newer}:{older}") }),
         "the pair is on the page before keep_both"
     );
 
@@ -402,9 +416,9 @@ async fn keep_both_through_the_mcp_tool_dismisses_the_pair_and_raises_the_count(
     assert!(!refused(&after), "{after:?}");
     let items = structured(&after)["items"].as_array().cloned().unwrap_or_default();
     assert!(
-        !items.iter().any(|i| {
-            i["key"] == key || i["key"] == format!("conflict:{newer}:{older}")
-        }),
+        !items
+            .iter()
+            .any(|i| { i["key"] == key || i["key"] == format!("conflict:{newer}:{older}") }),
         "a kept pair leaves the conflict page"
     );
     let after_dismissed = structured(&after)["dismissed"].as_i64().unwrap_or(0);
@@ -418,7 +432,8 @@ async fn a_verdict_the_item_never_offered_is_refused_by_its_own_code() {
     let key = format!("conflict:{older}:{newer}");
 
     // apply and dismiss belong to a proposal item; a conflict never offers either.
-    let result = h.call("review_decide", serde_json::json!({ "key": key, "verdict": "apply" })).await;
+    let result =
+        h.call("review_decide", serde_json::json!({ "key": key, "verdict": "apply" })).await;
     assert!(refused(&result), "{result:?}");
     assert!(text(&result).contains("verdict_not_for_source"), "{}", text(&result));
 }
@@ -436,7 +451,8 @@ async fn a_malformed_key_is_refused_not_a_queue_key() {
 #[tokio::test]
 async fn a_bare_date_on_occurred_at_is_refused_because_the_tool_takes_rfc_3339_only() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
-    let id = write_at(&h.ctx, &format!("the merge target still holds {}", nonce("s3")), "global").await;
+    let id =
+        write_at(&h.ctx, &format!("the merge target still holds {}", nonce("s3")), "global").await;
     make_stale(&h.pool, &id).await;
     let key = format!("stale:{id}");
 

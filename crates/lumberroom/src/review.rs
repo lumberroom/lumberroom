@@ -87,8 +87,7 @@ async fn run_loop(
             'answer: loop {
                 out(&key_line(&item.verdicts, item.rows.len() > 1));
                 crate::prompt("> ");
-                let line =
-                    read_line().map_err(|e| err(format!("cannot read the answer: {e}")))?;
+                let line = read_line().map_err(|e| err(format!("cannot read the answer: {e}")))?;
                 if line.is_empty() {
                     out(&tally(&running));
                     return Ok(());
@@ -143,8 +142,8 @@ async fn run_loop(
                     Answer::NeedsDelete => {
                         let which = if item.rows.len() > 1 {
                             crate::prompt("delete which? (o/n): ");
-                            let which =
-                                read_line().map_err(|e| err(format!("cannot read the answer: {e}")))?;
+                            let which = read_line()
+                                .map_err(|e| err(format!("cannot read the answer: {e}")))?;
                             if which.is_empty() {
                                 out(&tally(&running));
                                 return Ok(());
@@ -265,8 +264,11 @@ fn print_rows(item: &wire::ReviewItem) {
         let reads =
             if row.opened { format!("read {}x", row.access_count) } else { "unopened".to_string() };
         out(&format!("  {label:<6} {}  {day}  {reads}", short_id(&row.id)));
-        let content =
-            if row.opened { row.content.clone() } else { "(not opened for this caller)".to_string() };
+        let content = if row.opened {
+            row.content.clone()
+        } else {
+            "(not opened for this caller)".to_string()
+        };
         out(&format!("         {content}"));
     }
     if let Some(p) = &item.proposal {
@@ -334,7 +336,9 @@ pub fn answer_to_decision(item: &wire::ReviewItem, answer: &str) -> Answer {
         'c' if has(wire::Verdict::Confirm) => {
             Answer::Act { verdict: wire::Verdict::Confirm, keep: None }
         }
-        'a' if has(wire::Verdict::Apply) => Answer::Act { verdict: wire::Verdict::Apply, keep: None },
+        'a' if has(wire::Verdict::Apply) => {
+            Answer::Act { verdict: wire::Verdict::Apply, keep: None }
+        }
         'x' if has(wire::Verdict::Dismiss) => {
             Answer::Act { verdict: wire::Verdict::Dismiss, keep: None }
         }
@@ -501,10 +505,14 @@ pub fn one_line(d: &wire::Decided) -> String {
                 "kept both".to_string()
             }
         }
-        wire::Verdict::Delete => format!("deleted {}", d.deleted.first().cloned().unwrap_or_default()),
+        wire::Verdict::Delete => {
+            format!("deleted {}", d.deleted.first().cloned().unwrap_or_default())
+        }
         wire::Verdict::Confirm => "confirmed".to_string(),
         wire::Verdict::Apply => d.proposal_state.clone().unwrap_or_else(|| "applied".to_string()),
-        wire::Verdict::Dismiss => d.proposal_state.clone().unwrap_or_else(|| "dismissed".to_string()),
+        wire::Verdict::Dismiss => {
+            d.proposal_state.clone().unwrap_or_else(|| "dismissed".to_string())
+        }
     }
 }
 
@@ -537,10 +545,7 @@ pub fn flag_decision(args: &Args) -> Result<Option<FlagAction>> {
         ["supersede", "merge", "keep-both", "confirm", "delete", "apply", "dismiss"];
     let present: Vec<&str> = ACTION_FLAGS.into_iter().filter(|f| args.present(f)).collect();
     if present.len() > 1 {
-        return Err(err(format!(
-            "one action flag per call; got --{}",
-            present.join(" and --")
-        )));
+        return Err(err(format!("one action flag per call; got --{}", present.join(" and --"))));
     }
     let Some(flag) = present.first().copied() else {
         return Ok(None);
@@ -548,7 +553,8 @@ pub fn flag_decision(args: &Args) -> Result<Option<FlagAction>> {
 
     let action = match flag {
         "supersede" => {
-            let raw = args.value("supersede").ok_or_else(|| err("--supersede needs <old>,<new>"))?;
+            let raw =
+                args.value("supersede").ok_or_else(|| err("--supersede needs <old>,<new>"))?;
             let (old, new) = split_pair(raw, "--supersede")?;
             FlagAction {
                 key: format!("conflict:{old}:{new}"),
@@ -832,7 +838,10 @@ async fn run_dismissed(c: &Client, args: &Args) -> Result<()> {
     let rows: Vec<wire::DismissedPair> = typed(list_value, "dismissed listing")?;
     out(&format!("dismissed pairs: {}", rows.len()));
     for p in &rows {
-        out(&format!("  {}  {}  dismissed by {} ({})", p.lo_id, p.hi_id, p.dismissed_by, p.dismissed_at));
+        out(&format!(
+            "  {}  {}  dismissed by {} ({})",
+            p.lo_id, p.hi_id, p.dismissed_by, p.dismissed_at
+        ));
         for r in &p.rows {
             out(&format!(
                 "    {}  [{}]  {}",
@@ -1216,7 +1225,8 @@ mod tests {
         async fn a_two_line_paste_merges_once_and_leaves_the_second_item_undecided() {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let port = listener.local_addr().unwrap().port();
-            let state = Arc::new(Mutex::new(Recorded { decides: Vec::new(), merged_already: false }));
+            let state =
+                Arc::new(Mutex::new(Recorded { decides: Vec::new(), merged_already: false }));
             let server_state = state.clone();
             let server = tokio::spawn(async move {
                 // One queue read, one decide, one queue re-read after the decision, one more
@@ -1243,8 +1253,7 @@ mod tests {
             let client = Client::new(resolved, file).unwrap();
             let args = Args::parse(["review"].into_iter().map(str::to_string));
 
-            let mut lines =
-                vec!["m\n", "first line\n", "second line\n", "\n", "q\n"].into_iter();
+            let mut lines = vec!["m\n", "first line\n", "second line\n", "\n", "q\n"].into_iter();
             let mut read = move || Ok(lines.next().unwrap_or("").to_string());
 
             run(&client, &args, &mut read).await.unwrap();
@@ -1372,8 +1381,7 @@ mod tests {
             )));
             let resolved = crate::config::resolve(&env, &file, None, None, None, false, None);
             let client = Client::new(resolved, file).unwrap();
-            let args =
-                Args::parse(["review", "--limit", "200"].into_iter().map(str::to_string));
+            let args = Args::parse(["review", "--limit", "200"].into_iter().map(str::to_string));
 
             let mut lines = vec!["n\n"].into_iter();
             let mut read = move || Ok(lines.next().unwrap_or("").to_string());

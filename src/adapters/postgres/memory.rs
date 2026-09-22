@@ -1124,7 +1124,8 @@ const CONFLICTS_SQL: &str = "SELECT a.id AS older_id, a.namespace AS older_names
               LIMIT $3 OFFSET $4";
 
 /// The dismissed-pair ledger, newest first, both halves checked against the caller's grant.
-const DISMISSED_PAIRS_SQL: &str = "SELECT d.lo_id, d.hi_id, d.dismissed_by, d.dismissed_token, d.dismissed_at
+const DISMISSED_PAIRS_SQL: &str =
+    "SELECT d.lo_id, d.hi_id, d.dismissed_by, d.dismissed_token, d.dismissed_at
        FROM memory_pair_dismissed d
        JOIN memory lo ON lo.id = d.lo_id
        JOIN memory hi ON hi.id = d.hi_id

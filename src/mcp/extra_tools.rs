@@ -349,8 +349,8 @@ them being reported as a conflict again."
         // namespace is recorded here either.
         self.run("review_decide", None, &rc, |ctx| async move {
             let verdict = parse_verdict(&args.verdict).map_err(lead_with_code)?;
-            let occurred_at =
-                parse_rfc3339("occurred_at", args.occurred_at.as_deref()).map_err(lead_with_code)?;
+            let occurred_at = parse_rfc3339("occurred_at", args.occurred_at.as_deref())
+                .map_err(lead_with_code)?;
             let decision = Decision {
                 key: args.key,
                 verdict,

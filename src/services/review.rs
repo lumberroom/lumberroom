@@ -280,4 +280,3 @@ pub(super) async fn writable_row(ctx: &Ctx, id: &str) -> Result<(uuid::Uuid, Mem
         ))),
     }
 }
-
