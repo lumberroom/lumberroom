@@ -67,6 +67,12 @@ pub const TOOL_CAPABILITIES: &[(&str, Capability)] = &[
     // Reading the alias group is ordinary read. The namespaces it may name are filtered inside the
     // call: a list of names is a disclosure a content filter cannot see.
     ("alias_list", Capability::Open),
+    // supersede and merge are memory_write with supersedes, confirm is a restated fact, delete
+    // still reads may_delete through forget::by_id, apply and dismiss are a proposal source's own
+    // gate. keep_both is the one mutation new to this surface, and it needs read and write on both
+    // rows, the same authority a supersede of that pair already needs.
+    ("review_queue", Capability::Open),
+    ("review_decide", Capability::Open),
 ];
 
 pub fn required(tool: &str) -> Capability {
@@ -118,7 +124,9 @@ mod tests {
                 "memory_search",
                 "memory_write",
                 "registry_get",
-                "alias_list"
+                "alias_list",
+                "review_queue",
+                "review_decide"
             ]
         );
     }

@@ -426,6 +426,10 @@ pub struct QualityConfig {
     pub conflict_threshold: f64,
     /// How many conflict candidates a write returns.
     pub conflict_limit: i64,
+    /// Largest readable namespace, in live embedded rows, that the conflicts self-join will scan.
+    /// The join is O(n squared) per namespace: a dev-container probe timed 2.48s at 1,400 rows,
+    /// 13.33s at 3,000 and 34.96s at 5,000, so past this the queue refuses instead of hanging.
+    pub conflict_scan_max: i64,
     /// A live row never retrieved and older than this appears in `lumberroom review --stale`.
     pub stale_days: i32,
     /// Highest sensitivity the Obsidian export may include. Private content in a vault synced to a
@@ -912,6 +916,7 @@ pub fn load() -> Result<Config> {
             dedupe_threshold: env_num("DEDUPE_THRESHOLD", 0.97f64)?,
             conflict_threshold: env_num("CONFLICT_THRESHOLD", 0.90f64)?,
             conflict_limit: env_num("CONFLICT_LIMIT", 3i64)?,
+            conflict_scan_max: env_num("CONFLICT_SCAN_MAX", 2_000i64)?,
             stale_days: env_num("STALE_DAYS", 365i32)?,
             export_max_sensitivity: env_sensitivity("EXPORT_MAX_SENSITIVITY", Sensitivity::Open)?,
             archive_max_decompressed_bytes: env_num(
@@ -1093,6 +1098,16 @@ fn validate(cfg: &Config) -> Result<()> {
             "CONFLICT_THRESHOLD must be at or below DEDUPE_THRESHOLD, otherwise the band that \
              produces conflict candidates is empty and corrections silently collapse into the row \
              they were correcting.",
+        ));
+    }
+
+    // Under a hundred rows a namespace the self-join answers in milliseconds, so a bound below
+    // that only refuses stores that were never at risk.
+    if cfg.quality.conflict_scan_max < 100 {
+        return Err(DomainError::validation(
+            "CONFLICT_SCAN_MAX must be at least 100. Below that the bound refuses namespaces the \
+             conflicts query answers in milliseconds, which removes the review queue's conflict \
+             source on a store that never needed protecting.",
         ));
     }
 

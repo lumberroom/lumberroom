@@ -315,6 +315,172 @@ pub struct AliasForgetResponse {
     pub forgotten: bool,
 }
 
+/// `services::review_queue::Source`, the `source` list on `GET /admin/review/queue` and the `key`
+/// prefix on `POST /admin/review/decide`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    Conflict,
+    Stale,
+    Proposal,
+}
+
+/// `services::review_queue::Verdict`, the key line's answers and `DecisionRequest::verdict`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Supersede,
+    Merge,
+    KeepBoth,
+    Delete,
+    Confirm,
+    Apply,
+    Dismiss,
+}
+
+/// `services::review_queue::QueueRow`. The loop prints a row in full, so every field it carries is
+/// read somewhere: `opened` decides whether content is safe to trust, `access_count` and the two
+/// timestamps are the "read Nx" line, `sensitivity` marks a private row in the header.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewRow {
+    pub id: String,
+    pub namespace: String,
+    pub sensitivity: String,
+    pub content: String,
+    pub opened: bool,
+    pub created_at: String,
+    #[serde(default)]
+    pub occurred_at: Option<String>,
+    pub access_count: i32,
+    #[serde(default)]
+    pub last_accessed_at: Option<String>,
+    #[serde(default)]
+    pub last_confirmed_at: Option<String>,
+}
+
+/// `services::review_queue::ProposalField`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewProposalField {
+    pub label: String,
+    pub value: String,
+}
+
+/// `services::review_queue::ProposalItem`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewProposal {
+    pub id: String,
+    pub origin: String,
+    pub kind: String,
+    #[serde(default)]
+    pub proposed_content: Option<String>,
+    #[serde(default)]
+    pub fields: Vec<ReviewProposalField>,
+    pub created_at: String,
+    pub verdicts: Vec<Verdict>,
+}
+
+/// `services::review_queue::QueueItem`. `key` is the address a decision names; the loop draws its
+/// key line from `verdicts` and nothing else, per the CLI's own rule.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewItem {
+    pub key: String,
+    pub source: Source,
+    pub namespace: String,
+    #[serde(default)]
+    pub rows: Vec<ReviewRow>,
+    #[serde(default)]
+    pub similarity: Option<f64>,
+    #[serde(default)]
+    pub age_days: Option<i64>,
+    #[serde(default)]
+    pub proposal: Option<ReviewProposal>,
+    #[serde(default)]
+    pub verdicts: Vec<Verdict>,
+}
+
+/// `services::review_queue::Sources`. `proposal` lists the origins a server fills; an engine
+/// answers `[]`, which is what makes `--source proposal` a `source_not_filled` refusal rather than
+/// an empty page.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReviewSources {
+    pub conflict: bool,
+    pub stale: bool,
+    #[serde(default)]
+    pub proposal: Vec<String>,
+}
+
+/// `GET /admin/review/queue`'s envelope, mirroring `services::review_queue::Queue`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReviewQueue {
+    #[serde(default)]
+    pub items: Vec<ReviewItem>,
+    pub sources: ReviewSources,
+    #[serde(default)]
+    pub refused: std::collections::BTreeMap<String, String>,
+    pub dismissed: i64,
+    pub stale_days: i32,
+    pub min_similarity: f64,
+    pub limit: i64,
+    pub offset: i64,
+    pub has_more: bool,
+}
+
+/// `POST /admin/review/decide`'s response, mirroring `services::review_queue::Decided`. The loop's
+/// one-line answer branches on every field here.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Decided {
+    pub key: String,
+    pub verdict: Verdict,
+    #[serde(default)]
+    pub written: Option<String>,
+    #[serde(default)]
+    pub superseded: Vec<String>,
+    #[serde(default)]
+    pub deleted: Vec<String>,
+    #[serde(default)]
+    pub end_left_open: bool,
+    #[serde(default)]
+    pub unfinished: Vec<String>,
+    #[serde(default)]
+    pub already_dismissed: bool,
+    #[serde(default)]
+    pub proposal_state: Option<String>,
+}
+
+/// `GET /admin/review/dismissed`'s per-pair listing, mirroring
+/// `services::review_queue::DismissedListing`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DismissedPair {
+    pub lo_id: String,
+    pub hi_id: String,
+    pub dismissed_by: String,
+    pub dismissed_token: String,
+    pub dismissed_at: String,
+    #[serde(default)]
+    pub rows: Vec<ReviewRow>,
+}
+
+/// `services::review_queue::Decision`, the request body of `POST /admin/review/decide`. Every key
+/// the server reads and no other; a paraphrased field there is a runtime failure, never a compile
+/// one, which is the whole reason `tests/wire.rs` pins the serialized key set.
+#[derive(Debug, Serialize)]
+pub struct DecisionRequest<'a> {
+    pub key: &'a str,
+    pub verdict: Verdict,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'a str>,
+}
+
 /// `POST /admin/archive/import`'s response, mirroring `services::archive::ApplyReport`.
 ///
 /// `id_map` is left out: a single CLI request has nothing to resume between runs, so nothing this

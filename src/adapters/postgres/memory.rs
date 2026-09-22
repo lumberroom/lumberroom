@@ -1041,6 +1041,158 @@ const SUBJECT_HISTORY_SQL: &str = select_memory!(
      ORDER BY w.depth, m.created_at, m.id"#
 );
 
+/// The review queue's stale source. A constant so a test can scan it, and so the grant block and
+/// the confirmation window live in one place rather than in the handler that reads them.
+const STALE_SQL: &str = select_memory!(
+    "m.",
+    concat!(
+        "FROM memory m
+      WHERE m.tenant_id = $1
+        AND ",
+        live!(),
+        "
+        AND m.last_accessed_at IS NULL
+        AND m.created_at < now() - make_interval(days => $2)
+        -- A confirmed row leaves the queue for one window. Without this the column `confirm`
+        -- writes changes nothing a reader can see, which is the bug this replaces. Floored at one
+        -- day: `--days 0` asks for every never-read row, and without the floor this clause reduces
+        -- to `last_confirmed_at < now()`, so a confirmation today would hide nothing.
+        AND (m.last_confirmed_at IS NULL
+             OR m.last_confirmed_at < now() - make_interval(days => greatest($2, 1)))
+        AND EXISTS (
+              SELECT 1
+                FROM unnest($5::text[], $6::bool[], $7::text[]) AS g(prefix, exact, max)
+               WHERE CASE WHEN g.exact THEN m.namespace = g.prefix
+                          ELSE left(m.namespace, length(g.prefix)) = g.prefix END
+                 AND sensitivity_rank(g.max) >= sensitivity_rank(m.sensitivity)
+            )
+      ORDER BY m.created_at ASC, m.id
+      LIMIT $3 OFFSET $4"
+    )
+);
+
+/// The review queue's conflict source: a self-join on vector distance, O(n squared) in the rows of
+/// one namespace with no index able to help. `live_embedded_counts` bounds the namespace before a
+/// caller reaches this, and `LIMIT`/`OFFSET` are bound so a deep page does not cost the whole scan.
+const CONFLICTS_SQL: &str = "SELECT a.id AS older_id, a.namespace AS older_namespace,
+                    COALESCE(a.content, '') AS older_content,
+                    b.id AS newer_id, b.namespace AS newer_namespace,
+                    COALESCE(b.content, '') AS newer_content,
+                    (1 - (a.embedding <=> b.embedding))::float8 AS similarity
+               FROM memory a
+               JOIN memory b
+                 ON b.tenant_id = a.tenant_id
+                AND b.namespace = a.namespace
+                -- Row comparison rather than created_at alone, so a pair written in the same
+                -- transaction is still reported exactly once.
+                AND (a.created_at, a.id) < (b.created_at, b.id)
+              WHERE a.tenant_id = $1
+                -- `live!()` on both sides, under this statement's own aliases. A pair is a finding
+                -- only while both facts still hold.
+                AND a.superseded_by IS NULL
+                AND (a.occurred_until IS NULL OR a.occurred_until > now())
+                AND b.superseded_by IS NULL
+                AND (b.occurred_until IS NULL OR b.occurred_until > now())
+                AND a.embedding IS NOT NULL AND b.embedding IS NOT NULL
+                AND 1 - (a.embedding <=> b.embedding) >= $2
+                -- Both halves inside the query: a grant pass over results returns short pages and
+                -- calls them full, and it reads rows this caller may not see on the way.
+                AND EXISTS (
+                      SELECT 1
+                        FROM unnest($5::text[], $6::bool[], $7::text[]) AS g(prefix, exact, max)
+                       WHERE CASE WHEN g.exact THEN a.namespace = g.prefix
+                                  ELSE left(a.namespace, length(g.prefix)) = g.prefix END
+                         AND sensitivity_rank(g.max) >= sensitivity_rank(a.sensitivity)
+                    )
+                AND EXISTS (
+                      SELECT 1
+                        FROM unnest($5::text[], $6::bool[], $7::text[]) AS g(prefix, exact, max)
+                       WHERE CASE WHEN g.exact THEN b.namespace = g.prefix
+                                  ELSE left(b.namespace, length(g.prefix)) = g.prefix END
+                         AND sensitivity_rank(g.max) >= sensitivity_rank(b.sensitivity)
+                    )
+                AND NOT EXISTS (
+                      SELECT 1 FROM memory_pair_dismissed d
+                       WHERE d.tenant_id = a.tenant_id
+                         AND d.lo_id = least(a.id, b.id)
+                         AND d.hi_id = greatest(a.id, b.id)
+                    )
+              -- Total order: the raw float similarity ties whenever two pairs share an embedding
+              -- distance, and an unstable sort breaks paging across a tie. round4 runs in Rust on
+              -- the fetched rows, after this statement has already ordered them.
+              ORDER BY similarity DESC, a.created_at, a.id, b.id
+              LIMIT $3 OFFSET $4";
+
+/// The dismissed-pair ledger, newest first, both halves checked against the caller's grant.
+const DISMISSED_PAIRS_SQL: &str =
+    "SELECT d.lo_id, d.hi_id, d.dismissed_by, d.dismissed_token, d.dismissed_at
+       FROM memory_pair_dismissed d
+       JOIN memory lo ON lo.id = d.lo_id
+       JOIN memory hi ON hi.id = d.hi_id
+      WHERE d.tenant_id = $1
+        AND EXISTS (
+              SELECT 1
+                FROM unnest($3::text[], $4::bool[], $5::text[]) AS g(prefix, exact, max)
+               WHERE CASE WHEN g.exact THEN lo.namespace = g.prefix
+                          ELSE left(lo.namespace, length(g.prefix)) = g.prefix END
+                 AND sensitivity_rank(g.max) >= sensitivity_rank(lo.sensitivity)
+            )
+        AND EXISTS (
+              SELECT 1
+                FROM unnest($3::text[], $4::bool[], $5::text[]) AS g(prefix, exact, max)
+               WHERE CASE WHEN g.exact THEN hi.namespace = g.prefix
+                          ELSE left(hi.namespace, length(g.prefix)) = g.prefix END
+                 AND sensitivity_rank(g.max) >= sensitivity_rank(hi.sensitivity)
+            )
+      ORDER BY d.dismissed_at DESC
+      LIMIT $2";
+
+/// The envelope's `dismissed` count. Same two grant halves as the listing, counted in the query so
+/// it never names an id past the caller's grant to say how many there are.
+const DISMISSED_COUNT_SQL: &str = "SELECT count(*)
+       FROM memory_pair_dismissed d
+       JOIN memory lo ON lo.id = d.lo_id
+       JOIN memory hi ON hi.id = d.hi_id
+      WHERE d.tenant_id = $1
+        AND EXISTS (
+              SELECT 1
+                FROM unnest($2::text[], $3::bool[], $4::text[]) AS g(prefix, exact, max)
+               WHERE CASE WHEN g.exact THEN lo.namespace = g.prefix
+                          ELSE left(lo.namespace, length(g.prefix)) = g.prefix END
+                 AND sensitivity_rank(g.max) >= sensitivity_rank(lo.sensitivity)
+            )
+        AND EXISTS (
+              SELECT 1
+                FROM unnest($2::text[], $3::bool[], $4::text[]) AS g(prefix, exact, max)
+               WHERE CASE WHEN g.exact THEN hi.namespace = g.prefix
+                          ELSE left(hi.namespace, length(g.prefix)) = g.prefix END
+                 AND sensitivity_rank(g.max) >= sensitivity_rank(hi.sensitivity)
+            )";
+
+/// Live embedded rows per readable namespace, highest first. The conflicts self-join runs per
+/// namespace, so this is what bounds it: the largest namespace's count against
+/// `QUALITY.conflict_scan_max`. The statement reads `FROM memory` with the `live!()` predicate and
+/// an embedding-not-null test, the same shape the conflicts join itself filters on, not a lookup
+/// against the `memory_live` partial index.
+const LIVE_EMBEDDED_COUNTS_SQL: &str = concat!(
+    "SELECT m.namespace, count(*) AS n
+       FROM memory m
+      WHERE m.tenant_id = $1
+        AND ",
+    live!(),
+    "
+        AND m.embedding IS NOT NULL
+        AND EXISTS (
+              SELECT 1
+                FROM unnest($2::text[], $3::bool[], $4::text[]) AS g(prefix, exact, max)
+               WHERE CASE WHEN g.exact THEN m.namespace = g.prefix
+                          ELSE left(m.namespace, length(g.prefix)) = g.prefix END
+                 AND sensitivity_rank(g.max) >= sensitivity_rank(m.sensitivity)
+            )
+      GROUP BY m.namespace
+      ORDER BY n DESC"
+);
+
 /// Retire one row in favour of another, and end its validity in the same statement.
 ///
 /// One constant for both supersession paths: the write that carries `supersedes` and the standalone
@@ -2557,39 +2709,129 @@ impl MemoryRepository for PgMemoryRepository {
         tenant: &str,
         older_than_days: i32,
         limit: i64,
+        offset: i64,
         reader: &[NamespaceGrant],
     ) -> Result<Vec<Memory>> {
-        let (g_prefix, g_exact, g_max) = crate::adapters::postgres::cleanup::grant_arrays(reader);
-        let rows = sqlx::query(select_memory!(
-            "m.",
-            concat!(
-                "FROM memory m
-              WHERE m.tenant_id = $1
-                AND ",
-                live!(),
-                "
-                AND m.last_accessed_at IS NULL
-                AND m.created_at < now() - ($2 || ' days')::interval
-                AND EXISTS (
-                      SELECT 1
-                        FROM unnest($4::text[], $5::bool[], $6::text[]) AS g(prefix, exact, max)
-                       WHERE CASE WHEN g.exact THEN m.namespace = g.prefix
-                                  ELSE left(m.namespace, length(g.prefix)) = g.prefix END
-                         AND sensitivity_rank(g.max) >= sensitivity_rank(m.sensitivity)
-                    )
-              ORDER BY m.created_at ASC
-              LIMIT $3"
-            )
-        ))
-        .bind(tenant)
-        .bind(older_than_days.to_string())
-        .bind(limit)
-        .bind(&g_prefix)
-        .bind(&g_exact)
-        .bind(&g_max)
-        .fetch_all(&self.pool)
-        .await?;
+        if reader.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (g_prefix, g_exact, g_max) = super::grant_arrays(reader);
+        let rows = sqlx::query(STALE_SQL)
+            .bind(tenant)
+            .bind(older_than_days)
+            .bind(limit)
+            .bind(offset)
+            .bind(&g_prefix)
+            .bind(&g_exact)
+            .bind(&g_max)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows.iter().map(memory_from_row).collect())
+    }
+
+    /// A "both are fine" verdict. `least`/`greatest` in the statement, not the caller, so the two
+    /// arrival orders of one pair collide on the same row.
+    async fn dismiss_pair(
+        &self,
+        tenant: &str,
+        a: uuid::Uuid,
+        b: uuid::Uuid,
+        by: &str,
+        token: &str,
+    ) -> Result<bool> {
+        if a == b {
+            return Err(DomainError::validation("a pair needs two different ids"));
+        }
+        let outcome = sqlx::query(
+            "INSERT INTO memory_pair_dismissed (tenant_id, lo_id, hi_id, dismissed_by, dismissed_token)
+             VALUES ($1, least($2, $3), greatest($2, $3), $4, $5)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(tenant)
+        .bind(a)
+        .bind(b)
+        .bind(by)
+        .bind(token)
+        .execute(&self.pool)
+        .await?;
+        Ok(outcome.rows_affected() == 1)
+    }
+
+    async fn undismiss_pair(&self, tenant: &str, a: uuid::Uuid, b: uuid::Uuid) -> Result<bool> {
+        let outcome = sqlx::query(
+            "DELETE FROM memory_pair_dismissed
+              WHERE tenant_id = $1 AND lo_id = least($2, $3) AND hi_id = greatest($2, $3)",
+        )
+        .bind(tenant)
+        .bind(a)
+        .bind(b)
+        .execute(&self.pool)
+        .await?;
+        Ok(outcome.rows_affected() == 1)
+    }
+
+    async fn dismissed_pairs(
+        &self,
+        tenant: &str,
+        limit: i64,
+        reader: &[NamespaceGrant],
+    ) -> Result<Vec<crate::ports::DismissedPair>> {
+        if reader.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (g_prefix, g_exact, g_max) = super::grant_arrays(reader);
+        let rows = sqlx::query(DISMISSED_PAIRS_SQL)
+            .bind(tenant)
+            .bind(limit)
+            .bind(&g_prefix)
+            .bind(&g_exact)
+            .bind(&g_max)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::ports::DismissedPair {
+                lo_id: r.get("lo_id"),
+                hi_id: r.get("hi_id"),
+                dismissed_by: r.get("dismissed_by"),
+                dismissed_token: r.get("dismissed_token"),
+                dismissed_at: r.get("dismissed_at"),
+            })
+            .collect())
+    }
+
+    async fn dismissed_count(&self, tenant: &str, reader: &[NamespaceGrant]) -> Result<i64> {
+        if reader.is_empty() {
+            return Ok(0);
+        }
+        let (g_prefix, g_exact, g_max) = super::grant_arrays(reader);
+        let row = sqlx::query(DISMISSED_COUNT_SQL)
+            .bind(tenant)
+            .bind(&g_prefix)
+            .bind(&g_exact)
+            .bind(&g_max)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get("count"))
+    }
+
+    async fn live_embedded_counts(
+        &self,
+        tenant: &str,
+        reader: &[NamespaceGrant],
+    ) -> Result<Vec<(String, i64)>> {
+        if reader.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (g_prefix, g_exact, g_max) = super::grant_arrays(reader);
+        let rows = sqlx::query(LIVE_EMBEDDED_COUNTS_SQL)
+            .bind(tenant)
+            .bind(&g_prefix)
+            .bind(&g_exact)
+            .bind(&g_max)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|r| (r.get("namespace"), r.get("n"))).collect())
     }
 
     /// One pass over the tenant's rows. Age is measured from `created_at`: the question is how old
@@ -2641,49 +2883,33 @@ impl MemoryRepository for PgMemoryRepository {
 
     /// Near-duplicate live pairs in one namespace, each reported once, older row first.
     ///
-    /// This is a self-join on vector distance, so it is O(n^2) in the rows of a namespace with no
-    /// index able to help: HNSW answers "near this vector", not "all pairs near each other". The
-    /// LIMIT is the only bound, and Postgres has to compute the distances before it can apply it.
-    /// At a few thousand rows per namespace that is seconds; somewhere around fifty thousand it
-    /// stops being a command you can run interactively and needs either a blocking pre-filter or a
-    /// per-row nearest-neighbour probe instead. It runs from `lumberroom review` by hand, never on a
-    /// request path, which is what makes the trade acceptable today.
+    /// This is a self-join on vector distance, so it is still O(n^2) in the rows of a namespace with
+    /// no index able to help: HNSW answers "near this vector", not "all pairs near each other".
+    /// `live_embedded_counts` and `QUALITY.conflict_scan_max` are what bound it on a request path
+    /// now; a namespace past the ceiling gets refused rather than run. The per-row nearest-neighbour
+    /// probe is still the way out past that ceiling.
     async fn conflicts(
         &self,
         tenant: &str,
         min_similarity: f64,
         limit: i64,
+        offset: i64,
+        reader: &[NamespaceGrant],
     ) -> Result<Vec<ConflictPair>> {
-        let rows = sqlx::query(
-            "SELECT a.id AS older_id, a.namespace AS older_namespace,
-                    COALESCE(a.content, '') AS older_content,
-                    b.id AS newer_id, b.namespace AS newer_namespace,
-                    COALESCE(b.content, '') AS newer_content,
-                    (1 - (a.embedding <=> b.embedding))::float8 AS similarity
-               FROM memory a
-               JOIN memory b
-                 ON b.tenant_id = a.tenant_id
-                AND b.namespace = a.namespace
-                -- Row comparison rather than created_at alone, so a pair written in the same
-                -- transaction is still reported exactly once.
-                AND (a.created_at, a.id) < (b.created_at, b.id)
-              WHERE a.tenant_id = $1
-                -- `live!()` on both sides, under this statement's own aliases. A pair is a finding
-                -- only while both facts still hold.
-                AND a.superseded_by IS NULL
-                AND (a.occurred_until IS NULL OR a.occurred_until > now())
-                AND b.superseded_by IS NULL
-                AND (b.occurred_until IS NULL OR b.occurred_until > now())
-                AND a.embedding IS NOT NULL AND b.embedding IS NOT NULL
-                AND 1 - (a.embedding <=> b.embedding) >= $2
-              ORDER BY similarity DESC
-              LIMIT $3",
-        )
-        .bind(tenant)
-        .bind(min_similarity)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        if reader.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (g_prefix, g_exact, g_max) = super::grant_arrays(reader);
+        let rows = sqlx::query(CONFLICTS_SQL)
+            .bind(tenant)
+            .bind(min_similarity)
+            .bind(limit)
+            .bind(offset)
+            .bind(&g_prefix)
+            .bind(&g_exact)
+            .bind(&g_max)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .iter()
@@ -3466,6 +3692,46 @@ mod tests {
         assert!(SQL.contains("content, "));
         assert!(SQL.contains("occurred_at, "));
         assert!(SQL.contains("occurred_until "));
+    }
+
+    #[test]
+    fn the_conflicts_statement_names_the_ledger_on_both_ids_in_uuid_order() {
+        assert!(CONFLICTS_SQL.contains("least(a.id, b.id)"));
+        assert!(CONFLICTS_SQL.contains("greatest(a.id, b.id)"));
+    }
+
+    #[test]
+    fn the_conflicts_statement_breaks_a_similarity_tie_on_created_at_and_both_ids() {
+        assert!(CONFLICTS_SQL.contains("ORDER BY similarity DESC, a.created_at, a.id, b.id"));
+    }
+
+    #[test]
+    fn both_review_statements_bind_an_offset_rather_than_skipping_rows_later() {
+        assert!(CONFLICTS_SQL.contains("OFFSET $4"));
+        assert!(STALE_SQL.contains("OFFSET $4"));
+    }
+
+    #[test]
+    fn the_stale_statement_names_the_confirmation_column_with_a_floored_window() {
+        assert!(STALE_SQL.contains("last_confirmed_at"));
+        assert!(STALE_SQL.contains("greatest($2, 1)"));
+    }
+
+    #[test]
+    fn the_dismissed_listing_applies_the_grant_to_both_halves() {
+        assert_eq!(DISMISSED_PAIRS_SQL.matches("unnest($").count(), 2);
+    }
+
+    #[test]
+    fn the_conflicts_statement_applies_the_grant_to_both_halves_and_the_ledger() {
+        assert_eq!(CONFLICTS_SQL.matches("unnest($").count(), 2);
+        assert!(CONFLICTS_SQL.contains("NOT EXISTS"));
+    }
+
+    #[test]
+    fn the_namespace_count_reads_live_embedded_rows_and_groups_by_namespace() {
+        assert!(LIVE_EMBEDDED_COUNTS_SQL.contains("embedding IS NOT NULL"));
+        assert!(LIVE_EMBEDDED_COUNTS_SQL.contains("GROUP BY m.namespace"));
     }
 
     /// Every statement in the adapter that reads or writes the supersession link, classified.

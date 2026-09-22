@@ -416,6 +416,17 @@ pub struct ConflictPair {
     pub similarity: f64,
 }
 
+/// One dismissed pair, as the ledger holds it. Both columns name the caller because one cannot: a
+/// deployment putting several people behind one client writes the same `dismissed_by` for all.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DismissedPair {
+    pub lo_id: uuid::Uuid,
+    pub hi_id: uuid::Uuid,
+    pub dismissed_by: String,
+    pub dismissed_token: String,
+    pub dismissed_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// The three numbers that say whether the store is decaying: a store read often and written rarely
 /// is decaying, and one never read at all is dead weight (system PRD §8).
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -727,6 +738,7 @@ pub trait MemoryRepository: Send + Sync {
         tenant: &str,
         older_than_days: i32,
         limit: i64,
+        offset: i64,
         reader: &[NamespaceGrant],
     ) -> Result<Vec<Memory>>;
 
@@ -735,12 +747,49 @@ pub trait MemoryRepository: Send + Sync {
     /// Near-duplicate live pairs, for `lumberroom review`. Computed on demand rather than recorded at
     /// write time: a stored queue drifts out of step with the store it describes, and this runs by
     /// hand rather than on the hot path.
+    ///
+    /// `offset` is bound into the statement. Reading a page and discarding its head in Rust makes
+    /// a deep page cost the whole scan, and this join has no index to lean on.
     async fn conflicts(
         &self,
         tenant: &str,
         min_similarity: f64,
         limit: i64,
+        offset: i64,
+        reader: &[NamespaceGrant],
     ) -> Result<Vec<ConflictPair>>;
+
+    /// One row in the dismissed-pair ledger. False when the pair was already there. Either id order.
+    async fn dismiss_pair(
+        &self,
+        tenant: &str,
+        a: uuid::Uuid,
+        b: uuid::Uuid,
+        by: &str,
+        token: &str,
+    ) -> Result<bool>;
+
+    /// False when there was nothing to remove. The service checks the grant on both rows first.
+    async fn undismiss_pair(&self, tenant: &str, a: uuid::Uuid, b: uuid::Uuid) -> Result<bool>;
+
+    /// Newest first. `reader` runs inside the query on both rows' namespaces, as `stale` does.
+    async fn dismissed_pairs(
+        &self,
+        tenant: &str,
+        limit: i64,
+        reader: &[NamespaceGrant],
+    ) -> Result<Vec<DismissedPair>>;
+
+    /// For the envelope's `dismissed`. Counted in the query, so it never names an id to say how many.
+    async fn dismissed_count(&self, tenant: &str, reader: &[NamespaceGrant]) -> Result<i64>;
+
+    /// Live embedded rows per readable namespace, highest first. The conflicts self-join runs per
+    /// namespace, so the largest one bounds the work and the whole-tenant total does not.
+    async fn live_embedded_counts(
+        &self,
+        tenant: &str,
+        reader: &[NamespaceGrant],
+    ) -> Result<Vec<(String, i64)>>;
 
     /// The ciphertext columns for rows the caller already holds, so the service can decrypt them.
     ///

@@ -19,6 +19,7 @@ pub mod ingest;
 pub mod recall;
 pub mod registry;
 pub mod review;
+pub mod review_queue;
 pub mod search;
 pub mod supersession;
 pub mod write;

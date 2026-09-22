@@ -30,6 +30,9 @@ mod sealed;
 mod tool_calls;
 
 pub use alias::PgAliasRepository;
+/// The one glob-to-SQL translation. Any statement that filters on a caller's grants binds these
+/// three arrays, so a second translation cannot drift from the first.
+pub(crate) use cleanup::grant_arrays;
 pub use cleanup::PgCleanupRepository;
 pub use ingest::PgIngestRepository;
 pub use memory::PgMemoryRepository;

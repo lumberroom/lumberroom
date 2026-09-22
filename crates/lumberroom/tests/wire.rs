@@ -330,3 +330,109 @@ fn an_apply_report_parses_with_only_the_required_field() {
     assert_eq!(r.skipped_already_applied, 0);
     assert!(r.refused.is_empty());
 }
+
+// ---- phase 8, the review queue ----
+
+/// `services::review_queue::Queue`, `GET /admin/review/queue`. `sources.proposal` names the
+/// origins this server fills; the fixture carries one so a client is never left assuming an
+/// engine's own answer of `[]`.
+#[test]
+fn a_review_queue_parses_and_keeps_the_proposal_origins() {
+    let q: ReviewQueue = serde_json::from_value(fixture("review_queue.json")).unwrap();
+    assert_eq!(q.items.len(), 3);
+    assert_eq!(q.sources.proposal, vec!["canned".to_string()]);
+    assert_eq!(q.refused.get("conflict").map(String::as_str), Some("namespace_too_large"));
+    assert_eq!(q.dismissed, 12);
+    assert!(!q.has_more);
+}
+
+/// A server that adds a field to the envelope or to an item must not break an installed client.
+#[test]
+fn a_review_queue_parses_when_the_server_adds_a_field_this_client_does_not_read() {
+    let mut raw = fixture("review_queue.json");
+    raw["some_future_field"] = serde_json::json!("added later");
+    raw["items"][0]["some_future_item_field"] = serde_json::json!(true);
+    let q: ReviewQueue = serde_json::from_value(raw).unwrap();
+    assert_eq!(q.items.len(), 3);
+}
+
+/// The fixture's second item is stale: no `similarity`, an `age_days`, one row.
+#[test]
+fn a_review_item_without_similarity_is_a_stale_item() {
+    let q: ReviewQueue = serde_json::from_value(fixture("review_queue.json")).unwrap();
+    let stale = &q.items[1];
+    assert_eq!(stale.source, Source::Stale);
+    assert!(stale.similarity.is_none());
+    assert_eq!(stale.age_days, Some(400));
+    assert_eq!(stale.rows.len(), 1);
+}
+
+/// `services::review_queue::ProposalItem`: fields keep the source's own order, and `verdicts`
+/// carries what the source, not the engine, says this proposal takes.
+#[test]
+fn a_proposal_item_keeps_its_fields_in_order_and_its_verdicts() {
+    let q: ReviewQueue = serde_json::from_value(fixture("review_queue.json")).unwrap();
+    let item = &q.items[2];
+    assert_eq!(item.source, Source::Proposal);
+    let proposal = item.proposal.as_ref().expect("a proposal item carries a proposal");
+    assert_eq!(proposal.origin, "canned");
+    assert_eq!(proposal.fields[0].label, "why");
+    assert_eq!(proposal.fields[1].label, "confidence");
+    assert_eq!(proposal.verdicts, vec![Verdict::Apply, Verdict::Dismiss]);
+}
+
+/// `services::review_queue::Decision`, the request body of `POST /admin/review/decide`. Every
+/// key the server reads and no other.
+#[test]
+fn a_decision_request_serialises_exactly_the_keys_the_server_reads() {
+    let v = serde_json::to_value(DecisionRequest {
+        key: "conflict:1111:2222",
+        verdict: Verdict::Supersede,
+        keep: Some("2222"),
+        id: None,
+        content: None,
+        tags: None,
+        occurred_at: None,
+        reason: None,
+    })
+    .unwrap();
+    assert_eq!(keys(&v), set(&["key", "verdict", "keep"]));
+
+    let v = serde_json::to_value(DecisionRequest {
+        key: "conflict:1111:2222",
+        verdict: Verdict::Merge,
+        keep: None,
+        id: None,
+        content: Some("the merged text"),
+        tags: Some(vec!["infra".into()]),
+        occurred_at: Some("2026-09-01T00:00:00Z".into()),
+        reason: None,
+    })
+    .unwrap();
+    assert_eq!(keys(&v), set(&["key", "verdict", "content", "tags", "occurred_at"]));
+}
+
+/// `services::review_queue::Decided`. Every optional field is skipped by the server when empty,
+/// so this must parse from just `key` and `verdict`.
+#[test]
+fn a_decided_body_parses_without_its_optional_fields() {
+    let raw = serde_json::json!({ "key": "stale:3333", "verdict": "confirm" });
+    let d: Decided = serde_json::from_value(raw).unwrap();
+    assert!(d.written.is_none());
+    assert!(d.superseded.is_empty());
+    assert!(!d.already_dismissed);
+
+    let d: Decided = serde_json::from_value(fixture("review_decide.json")).unwrap();
+    assert_eq!(d.verdict, Verdict::Merge);
+    assert_eq!(d.written.as_deref(), Some("2b7cabcd-0000-4a1b-8c3d-112233445566"));
+    assert_eq!(d.superseded.len(), 2);
+}
+
+/// `services::review_queue::DismissedListing`, one entry of `GET /admin/review/dismissed`.
+#[test]
+fn a_dismissed_pair_carries_both_rows() {
+    let p: DismissedPair = serde_json::from_value(fixture("review_dismissed.json")).unwrap();
+    assert_eq!(p.dismissed_by, "claude-code");
+    assert_eq!(p.rows.len(), 2);
+    assert_eq!(p.rows[0].namespace, "user:me");
+}

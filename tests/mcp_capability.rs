@@ -57,8 +57,15 @@ const HIDDEN_NS: &str = "personal:finance";
 
 /// What a client with no capability at all sees, spelled out rather than derived from the table.
 /// Deriving it would make this test agree with any table, including a wrong one.
-const OPEN_TOOLS: [&str; 5] =
-    ["alias_list", "context_bootstrap", "memory_search", "memory_write", "registry_get"];
+const OPEN_TOOLS: [&str; 7] = [
+    "alias_list",
+    "context_bootstrap",
+    "memory_search",
+    "memory_write",
+    "registry_get",
+    "review_decide",
+    "review_queue",
+];
 
 /// Every test here truncates the shared test database, so they serialise themselves rather than
 /// relying on `--test-threads=1` being remembered. Cargo runs one test binary at a time, so this
@@ -297,6 +304,7 @@ async fn setup() -> Option<Harness> {
         degraded_embedder: false,
         keys: ctx.keys.clone(),
         kek_verified: ctx.kek_verified,
+        proposals: Vec::new(),
     });
     let authenticator = auth::create(&ctx.cfg, Some(oauth)).ok()?;
     let app = lumberroom_server::http::router(state, authenticator);
