@@ -381,6 +381,36 @@ fn a_proposal_item_keeps_its_fields_in_order_and_its_verdicts() {
     assert_eq!(proposal.verdicts, vec![Verdict::Apply, Verdict::Dismiss]);
 }
 
+/// Phase 9 adds `repairable`, `held_by` and `version` to `ProposalItem`. This crate's wire types
+/// read no field of that name and carry no `deny_unknown_fields`, so the extra keys pass through
+/// unread and the page still parses.
+#[test]
+fn the_cli_wire_reads_a_page_carrying_repairable_held_by_and_version() {
+    let mut raw = fixture("review_queue.json");
+    raw["items"][2]["proposal"]["repairable"] = serde_json::json!(true);
+    raw["items"][2]["proposal"]["held_by"] = serde_json::json!("a_check");
+    raw["items"][2]["proposal"]["version"] = serde_json::json!("3fa1c0de9b27a4e1");
+    let q: ReviewQueue = serde_json::from_value(raw).unwrap();
+    let item = &q.items[2];
+    let proposal = item.proposal.as_ref().expect("a proposal item carries a proposal");
+    assert_eq!(proposal.origin, "canned");
+    assert_eq!(proposal.verdicts, vec![Verdict::Apply, Verdict::Dismiss]);
+    assert_eq!(item.verdicts, vec![Verdict::Apply, Verdict::Dismiss]);
+}
+
+/// Phase 9 adds `content_written` and `overrode` to `Decided`. This crate's `Decided` reads
+/// neither field and carries no `deny_unknown_fields`, so both pass through as unknown keys
+/// rather than landing on the type: the same forward-compat guarantee as the queue page above.
+#[test]
+fn the_cli_wire_reads_a_decided_carrying_content_written_and_overrode() {
+    let mut raw = fixture("review_decide.json");
+    raw["content_written"] = serde_json::json!(true);
+    raw["overrode"] = serde_json::json!("a_check");
+    let d: Decided = serde_json::from_value(raw).unwrap();
+    assert_eq!(d.verdict, Verdict::Merge);
+    assert_eq!(d.written.as_deref(), Some("2b7cabcd-0000-4a1b-8c3d-112233445566"));
+}
+
 /// `services::review_queue::Decision`, the request body of `POST /admin/review/decide`. Every
 /// key the server reads and no other.
 #[test]

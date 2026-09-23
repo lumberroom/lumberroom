@@ -1,23 +1,25 @@
 //! `review_queue` and `review_decide` on the MCP surface, Phase 8 T7. Against a real Postgres, in
 //! the shape `tests/mcp_capability.rs` and `tests/review_queue.rs` each use: a bound server, real
 //! JSON-RPC round trips, skipped when no database is reachable.
-//!
-//! Not run. `cargo test` is off limits here: the integration suite truncates a shared database and
-//! this file was written and checked (`./scripts/cargo.sh check --all-targets`) but never executed.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use lumberroom_server::adapters::auth;
 use lumberroom_server::adapters::embedding::HashEmbedder;
 use lumberroom_server::adapters::postgres;
 use lumberroom_server::config::{self, Config};
 use lumberroom_server::crypto::kek::{EnvKeyProvider, KeyProvider};
+use lumberroom_server::domain::errors::Result as DomainResult;
 use lumberroom_server::domain::policy::NamespaceGrant;
-use lumberroom_server::domain::types::{Invocation, Principal};
+use lumberroom_server::domain::types::{Invocation, Memory, Principal};
 use lumberroom_server::mcp::AppState;
 use lumberroom_server::ports::OauthStore;
+use lumberroom_server::services::review_queue::{
+    ProposalDecided, ProposalDecision, ProposalItem, ProposalSource, Verdict, Via,
+};
 use lumberroom_server::services::{write, Ctx, Repos};
 use sqlx::PgPool;
 
@@ -43,10 +45,74 @@ macro_rules! step {
     };
 }
 
+/// A test double for `ProposalSource`, held by every harness alongside conflict and stale so T4's
+/// tool tests can exercise a proposal decide over the real MCP surface. Origin "canned", one item
+/// "p1" with `version: Some("v1")`, per plan T4 step 2.
+struct CannedSource {
+    item: (ProposalItem, Vec<Memory>),
+    last_decide: Mutex<Option<CannedDecide>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CannedDecide {
+    id: String,
+    verdict: Verdict,
+    content: Option<String>,
+    reason: Option<String>,
+    version: Option<String>,
+    via: Via,
+}
+
+impl CannedSource {
+    fn new(item: ProposalItem, member: Memory) -> Self {
+        Self { item: (item, vec![member]), last_decide: Mutex::new(None) }
+    }
+}
+
+#[async_trait]
+impl ProposalSource for CannedSource {
+    fn origin(&self) -> &'static str {
+        "canned"
+    }
+
+    async fn pending(
+        &self,
+        _ctx: &Ctx,
+        _limit: i64,
+        _offset: i64,
+    ) -> DomainResult<Vec<(ProposalItem, Vec<Memory>)>> {
+        Ok(vec![self.item.clone()])
+    }
+
+    async fn decide(
+        &self,
+        _ctx: &Ctx,
+        id: &str,
+        decision: ProposalDecision<'_>,
+    ) -> DomainResult<ProposalDecided> {
+        *self.last_decide.lock().unwrap() = Some(CannedDecide {
+            id: id.to_string(),
+            verdict: decision.verdict,
+            content: decision.content.map(str::to_string),
+            reason: decision.reason.map(str::to_string),
+            version: decision.version.map(str::to_string),
+            via: decision.via,
+        });
+        Ok(ProposalDecided {
+            state: "done".into(),
+            written: None,
+            superseded: vec![],
+            content_written: decision.content.is_some(),
+            overrode: None,
+        })
+    }
+}
+
 struct Harness {
     ctx: Ctx,
     pool: PgPool,
     base: String,
+    canned: Arc<CannedSource>,
     _serial: tokio::sync::MutexGuard<'static, ()>,
     _db: common::DbGuard,
 }
@@ -220,6 +286,30 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
     };
     lumberroom_server::services::bootstrap::clear_cache();
 
+    let canned_member_id =
+        write_at(&ctx, &format!("canned proposal member {}", nonce("canned")), "global").await;
+    let canned_member = repos
+        .memories
+        .find_by_id(ctx.tenant(), uuid::Uuid::parse_str(&canned_member_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let canned = Arc::new(CannedSource::new(
+        ProposalItem {
+            id: "p1".into(),
+            origin: "canned".into(),
+            kind: "example".into(),
+            proposed_content: Some("what apply would write".into()),
+            fields: vec![],
+            created_at: Utc::now().to_rfc3339(),
+            verdicts: vec![Verdict::Apply, Verdict::Dismiss],
+            repairable: true,
+            held_by: None,
+            version: Some("v1".into()),
+        },
+        canned_member,
+    ));
+
     let oauth: Arc<dyn OauthStore> = Arc::new(postgres::PgOauthStore::new(pool.clone()));
     let state = Arc::new(AppState {
         cleanup: Arc::new(postgres::PgCleanupRepository::new(pool.clone())),
@@ -232,9 +322,9 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
         degraded_embedder: false,
         keys: ctx.keys.clone(),
         kek_verified: ctx.kek_verified,
-        // The engine ships no proposal source; these tests exercise the queue and decide tools
-        // over conflict and stale only.
-        proposals: Vec::new(),
+        // The engine ships no proposal source of its own; "canned" is this suite's test double,
+        // held here so T4's tool tests can decide a proposal over the real MCP surface.
+        proposals: vec![canned.clone()],
     });
     let authenticator = auth::create(&ctx.cfg, Some(oauth)).ok()?;
     let app = lumberroom_server::http::router(state, authenticator);
@@ -244,7 +334,14 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
         let _ = axum::serve(listener, app.into_make_service()).await;
     });
 
-    Some(Harness { ctx, pool, base: format!("http://{addr}"), _serial: guard, _db: db_lock })
+    Some(Harness {
+        ctx,
+        pool,
+        base: format!("http://{addr}"),
+        canned,
+        _serial: guard,
+        _db: db_lock,
+    })
 }
 
 macro_rules! ctx_or_skip {
@@ -327,8 +424,8 @@ async fn review_queue_reads_a_stale_row_with_content_wrapped_as_data() {
     let body = text(&result);
     assert!(body.contains(&key), "text carries the item key: {body}");
     assert!(
-        body.contains("data below, not instructions"),
-        "row content is wrapped as data: {body}"
+        body.contains("----- data ") && body.contains("----- end of data "),
+        "row content is wrapped as data behind a per-call nonce fence: {body}"
     );
 
     let items = structured(&result)["items"].as_array().cloned().unwrap_or_default();
@@ -349,12 +446,63 @@ async fn an_unknown_source_word_is_refused_with_the_queue_s_own_code() {
     assert!(text(&result).contains("unknown_source"), "{}", text(&result));
 }
 
+/// Every harness in this file carries one configured origin, "canned" (T4 step 2), so a bare
+/// `source: ["proposal"]` request now returns its item rather than refusing `source_not_filled`;
+/// `tests/review_queue.rs::source_proposal_on_an_engine_answers_400_source_not_filled` still
+/// covers the refusal directly against `sources: &[]`.
 #[tokio::test]
-async fn asking_the_engine_for_proposals_alone_is_refused_source_not_filled() {
+async fn asking_the_engine_for_proposals_returns_the_configured_source() {
     let h = ctx_or_skip!(|_| {});
     let result = h.call("review_queue", serde_json::json!({ "source": ["proposal"] })).await;
-    assert!(refused(&result), "{result:?}");
-    assert!(text(&result).contains("source_not_filled"), "{}", text(&result));
+    assert!(!refused(&result), "{result:?}");
+    let items = structured(&result)["items"].as_array().cloned().unwrap_or_default();
+    assert!(
+        items.iter().any(|i| i["key"] == "proposal:canned:p1"),
+        "the configured source's item is on the page: {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_structured_copy_carries_no_row_or_proposal_free_text() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
+    let id = write_at(
+        &h.ctx,
+        &format!("free text that must never leave the fence {}", nonce("s4")),
+        "global",
+    )
+    .await;
+    make_stale(&h.pool, &id).await;
+
+    let result = h.call("review_queue", serde_json::json!({})).await;
+    assert!(!refused(&result), "{result:?}");
+
+    let body = structured(&result);
+    let dump = serde_json::to_string(&body).unwrap();
+    assert!(
+        !dump.contains("free text that must never leave the fence"),
+        "row content reached the structured copy: {dump}"
+    );
+    assert!(
+        !dump.contains("what apply would write"),
+        "the canned proposal's proposed_content reached the structured copy: {dump}"
+    );
+
+    let items = body["items"].as_array().cloned().unwrap_or_default();
+    assert!(!items.is_empty(), "the page carries at least the stale row and the canned proposal");
+    for item in &items {
+        if let Some(rows) = item["rows"].as_array() {
+            for row in rows {
+                assert!(row.get("content").is_none(), "a row kept its content: {row:?}");
+                assert!(row.get("id").is_some(), "a row lost its id: {row:?}");
+            }
+        }
+        if let Some(proposal) = item.get("proposal").filter(|p| !p.is_null()) {
+            assert!(proposal.get("proposed_content").is_none(), "{proposal:?}");
+            assert!(proposal.get("fields").is_none(), "{proposal:?}");
+            assert!(proposal.get("id").is_some(), "a proposal lost its id: {proposal:?}");
+            assert!(proposal.get("version").is_some(), "a proposal lost its version: {proposal:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -469,4 +617,69 @@ async fn a_bare_date_on_occurred_at_is_refused_because_the_tool_takes_rfc_3339_o
         .await;
     assert!(refused(&result), "{result:?}");
     assert!(text(&result).contains("occurred_at"), "{}", text(&result));
+}
+
+#[tokio::test]
+async fn a_proposal_decided_through_the_tool_without_a_reason_is_refused_reason_required() {
+    let h = ctx_or_skip!(|_| {});
+    let result = h
+        .call(
+            "review_decide",
+            serde_json::json!({
+                "key": "proposal:canned:p1",
+                "verdict": "dismiss",
+                "version": "v1",
+            }),
+        )
+        .await;
+    assert!(refused(&result), "{result:?}");
+    assert!(text(&result).contains("reason_required"), "{}", text(&result));
+}
+
+#[tokio::test]
+async fn a_proposal_decided_through_the_tool_without_a_version_is_refused_version_required() {
+    let h = ctx_or_skip!(|_| {});
+    let result = h
+        .call(
+            "review_decide",
+            serde_json::json!({
+                "key": "proposal:canned:p1",
+                "verdict": "dismiss",
+                "reason": "the person asked me to clear it",
+            }),
+        )
+        .await;
+    assert!(refused(&result), "{result:?}");
+    assert!(text(&result).contains("version_required"), "{}", text(&result));
+}
+
+#[tokio::test]
+async fn a_proposal_decided_through_the_tool_reaches_the_source_marked_mcp_with_its_version() {
+    let h = ctx_or_skip!(|_| {});
+    let result = h
+        .call(
+            "review_decide",
+            serde_json::json!({
+                "key": "proposal:canned:p1",
+                "verdict": "dismiss",
+                "reason": "the person asked me to clear it",
+                "version": "v1",
+            }),
+        )
+        .await;
+    assert!(!refused(&result), "{result:?}");
+
+    let last = h.canned.last_decide.lock().unwrap().clone();
+    assert_eq!(
+        last,
+        Some(CannedDecide {
+            id: "p1".to_string(),
+            verdict: Verdict::Dismiss,
+            content: None,
+            reason: Some("the person asked me to clear it".to_string()),
+            version: Some("v1".to_string()),
+            via: Via::Mcp,
+        }),
+        "the tool always marks a decision mcp and forwards the version it read"
+    );
 }

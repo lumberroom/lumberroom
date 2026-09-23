@@ -4,9 +4,6 @@
 //! Every test seeds through `write::run` and calls `review_queue::{queue, decide}` directly,
 //! except the three that name the HTTP route: those go through a bound server the way
 //! `tests/cleanup.rs` does, because the capability gate and the route wiring live in the router.
-//!
-//! This file will not compile until the wiring pass (plan W1) lands the HTTP routes on top of the
-//! T0 lock. Implemented against that lock; not run.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -24,8 +21,8 @@ use lumberroom_server::domain::types::{Invocation, Memory, Principal, Sensitivit
 use lumberroom_server::mcp::AppState;
 use lumberroom_server::ports::OauthStore;
 use lumberroom_server::services::review_queue::{
-    self, Decision, ProposalDecided, ProposalField, ProposalItem, ProposalSource, QueueQuery,
-    Source, Verdict,
+    self, Decision, ProposalDecided, ProposalDecision, ProposalField, ProposalItem, ProposalSource,
+    QueueQuery, Source, Verdict, Via,
 };
 use lumberroom_server::services::{review, write, Ctx, Repos};
 use sqlx::PgPool;
@@ -377,7 +374,17 @@ async fn live(pool: &PgPool, id: &str) -> (Option<String>, bool) {
 /// none.
 struct CannedProposals {
     items: Mutex<Vec<(ProposalItem, Vec<Memory>)>>,
-    last_decide: Mutex<Option<(String, Verdict)>>,
+    last_decide: Mutex<Option<CannedCall>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CannedCall {
+    id: String,
+    verdict: Verdict,
+    content: Option<String>,
+    reason: Option<String>,
+    version: Option<String>,
+    via: Via,
 }
 
 impl CannedProposals {
@@ -408,10 +415,23 @@ impl ProposalSource for CannedProposals {
         &self,
         _ctx: &Ctx,
         id: &str,
-        verdict: Verdict,
+        decision: ProposalDecision<'_>,
     ) -> DomainResult<ProposalDecided> {
-        *self.last_decide.lock().unwrap() = Some((id.to_string(), verdict));
-        Ok(ProposalDecided { state: "done".into(), written: None, superseded: vec![] })
+        *self.last_decide.lock().unwrap() = Some(CannedCall {
+            id: id.to_string(),
+            verdict: decision.verdict,
+            content: decision.content.map(str::to_string),
+            reason: decision.reason.map(str::to_string),
+            version: decision.version.map(str::to_string),
+            via: decision.via,
+        });
+        Ok(ProposalDecided {
+            state: "done".into(),
+            written: None,
+            superseded: vec![],
+            content_written: decision.content.is_some(),
+            overrode: None,
+        })
     }
 }
 
@@ -463,6 +483,8 @@ async fn a_kept_pair_leaves_the_queue_and_undismiss_brings_it_back() {
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -576,6 +598,8 @@ async fn keep_both_needs_the_write_grant_on_both_rows() {
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -600,6 +624,8 @@ async fn keep_both_needs_the_write_grant_on_both_rows() {
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -628,6 +654,8 @@ async fn keep_both_records_the_client_and_the_token_fingerprint() {
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -670,6 +698,8 @@ async fn undismiss_answers_false_for_a_narrow_grant_that_cannot_read_the_pair() 
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -697,6 +727,8 @@ async fn a_deleted_row_takes_its_dismissals_with_it() {
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -822,6 +854,8 @@ async fn the_envelope_carries_no_tenant_wide_count() {
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -1011,6 +1045,8 @@ async fn a_merge_writes_once_and_retires_both_sources_into_it() {
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -1060,6 +1096,8 @@ async fn a_merge_of_two_same_day_rows_writes_without_an_occurred_at() {
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -1102,6 +1140,8 @@ async fn a_merge_whose_second_retirement_fails_reports_the_leftover_in_unfinishe
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -1131,6 +1171,8 @@ async fn a_verdict_the_source_does_not_take_is_refused_before_any_row_changes() 
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -1164,6 +1206,8 @@ async fn delete_through_the_queue_still_needs_may_delete() {
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -1192,6 +1236,8 @@ async fn a_supersede_default_keeps_the_newer_row_whatever_order_the_key_spelled(
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
@@ -1326,6 +1372,9 @@ async fn a_canned_proposal_appears_with_its_members_fields_and_verdicts() {
         fields: vec![field("why", "a test fixture offered it")],
         created_at: Utc::now().to_rfc3339(),
         verdicts: vec![Verdict::Apply, Verdict::Dismiss],
+        repairable: false,
+        held_by: None,
+        version: None,
     };
     let sources = one_source(CannedProposals::new(vec![(item, vec![member])]));
 
@@ -1379,6 +1428,9 @@ async fn a_full_page_of_canned_proposals_reports_has_more() {
                     fields: vec![],
                     created_at: Utc::now().to_rfc3339(),
                     verdicts: vec![Verdict::Dismiss],
+                    repairable: false,
+                    held_by: None,
+                    version: None,
                 },
                 vec![m],
             )
@@ -1428,6 +1480,9 @@ async fn a_canned_proposal_with_a_member_outside_the_grant_drops_whole() {
         fields: vec![],
         created_at: Utc::now().to_rfc3339(),
         verdicts: vec![Verdict::Apply],
+        repairable: false,
+        held_by: None,
+        version: None,
     };
     let sources = one_source(CannedProposals::new(vec![(item, vec![member])]));
 
@@ -1484,6 +1539,9 @@ async fn a_canned_proposal_with_a_member_that_will_not_open_takes_no_verdict() {
         fields: vec![],
         created_at: Utc::now().to_rfc3339(),
         verdicts: vec![Verdict::Apply],
+        repairable: false,
+        held_by: None,
+        version: None,
     };
     let sources = one_source(CannedProposals::new(vec![(item, vec![member])]));
 
@@ -1531,6 +1589,9 @@ async fn a_proposal_decision_reaches_the_source_named_by_the_key_and_an_unknown_
         fields: vec![],
         created_at: Utc::now().to_rfc3339(),
         verdicts: vec![Verdict::Apply],
+        repairable: false,
+        held_by: None,
+        version: None,
     };
     let canned = Arc::new(CannedProposals::new(vec![(item, vec![member])]));
     let sources: Vec<Arc<dyn ProposalSource>> = vec![canned.clone()];
@@ -1547,13 +1608,22 @@ async fn a_proposal_decision_reaches_the_source_named_by_the_key_and_an_unknown_
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
     .unwrap();
     assert_eq!(
         *canned.last_decide.lock().unwrap(),
-        Some(("p-decide".to_string(), Verdict::Apply)),
+        Some(CannedCall {
+            id: "p-decide".to_string(),
+            verdict: Verdict::Apply,
+            content: None,
+            reason: None,
+            version: None,
+            via: Via::Http,
+        }),
         "the decision reached the source the key named"
     );
 
@@ -1569,11 +1639,467 @@ async fn a_proposal_decision_reaches_the_source_named_by_the_key_and_an_unknown_
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
     .unwrap_err();
     assert_eq!(err.code(), Some(review_queue::codes::UNKNOWN_ORIGIN));
+}
+
+#[tokio::test]
+async fn a_repair_reaches_the_source_with_its_text_reason_version_and_surface() {
+    let h = ctx_or_skip!();
+    let member_id =
+        write_at(&h.ctx, &format!("canned repair member {}", nonce("repair")), "global").await;
+    let member = h
+        .ctx
+        .repos
+        .memories
+        .find_by_id(h.ctx.tenant(), uuid::Uuid::parse_str(&member_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let item = ProposalItem {
+        id: "p-repair".into(),
+        origin: "canned".into(),
+        kind: "example".into(),
+        proposed_content: Some("what the source would write".into()),
+        fields: vec![],
+        created_at: Utc::now().to_rfc3339(),
+        verdicts: vec![Verdict::Apply, Verdict::Dismiss],
+        repairable: true,
+        held_by: None,
+        version: Some("v1".into()),
+    };
+    let canned = Arc::new(CannedProposals::new(vec![(item, vec![member])]));
+    let sources: Vec<Arc<dyn ProposalSource>> = vec![canned.clone()];
+
+    let decided = review_queue::decide(
+        &h.ctx,
+        &sources,
+        Decision {
+            key: "proposal:canned:p-repair".into(),
+            verdict: Verdict::Apply,
+            keep: None,
+            id: None,
+            content: Some("fixed".into()),
+            tags: None,
+            occurred_at: None,
+            reason: Some("why".into()),
+            version: Some("v1".into()),
+            via: Via::Http,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *canned.last_decide.lock().unwrap(),
+        Some(CannedCall {
+            id: "p-repair".to_string(),
+            verdict: Verdict::Apply,
+            content: Some("fixed".to_string()),
+            reason: Some("why".to_string()),
+            version: Some("v1".to_string()),
+            via: Via::Http,
+        }),
+        "the repair's text, reason, version and surface all reached the source"
+    );
+    assert_eq!(decided.content_written, Some(true));
+}
+
+#[tokio::test]
+async fn a_proposal_decision_over_http_without_a_reason_or_version_reaches_the_source() {
+    let h = ctx_or_skip!();
+    let member_id =
+        write_at(&h.ctx, &format!("canned dismiss member {}", nonce("nobits")), "global").await;
+    let member = h
+        .ctx
+        .repos
+        .memories
+        .find_by_id(h.ctx.tenant(), uuid::Uuid::parse_str(&member_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let item = ProposalItem {
+        id: "p-nobits".into(),
+        origin: "canned".into(),
+        kind: "example".into(),
+        proposed_content: None,
+        fields: vec![],
+        created_at: Utc::now().to_rfc3339(),
+        verdicts: vec![Verdict::Dismiss],
+        repairable: false,
+        held_by: None,
+        version: None,
+    };
+    let canned = Arc::new(CannedProposals::new(vec![(item, vec![member])]));
+    let sources: Vec<Arc<dyn ProposalSource>> = vec![canned.clone()];
+
+    review_queue::decide(
+        &h.ctx,
+        &sources,
+        Decision {
+            key: "proposal:canned:p-nobits".into(),
+            verdict: Verdict::Dismiss,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+            version: None,
+            via: Via::Http,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *canned.last_decide.lock().unwrap(),
+        Some(CannedCall {
+            id: "p-nobits".to_string(),
+            verdict: Verdict::Dismiss,
+            content: None,
+            reason: None,
+            version: None,
+            via: Via::Http,
+        }),
+        "HTTP takes a dismissal with neither a reason nor a version"
+    );
+}
+
+#[tokio::test]
+async fn an_all_whitespace_reason_reaches_the_source_as_none() {
+    let h = ctx_or_skip!();
+    let member_id =
+        write_at(&h.ctx, &format!("canned blank-reason member {}", nonce("blankreason")), "global")
+            .await;
+    let member = h
+        .ctx
+        .repos
+        .memories
+        .find_by_id(h.ctx.tenant(), uuid::Uuid::parse_str(&member_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let item = ProposalItem {
+        id: "p-blankreason".into(),
+        origin: "canned".into(),
+        kind: "example".into(),
+        proposed_content: None,
+        fields: vec![],
+        created_at: Utc::now().to_rfc3339(),
+        verdicts: vec![Verdict::Dismiss],
+        repairable: false,
+        held_by: None,
+        version: None,
+    };
+    let canned = Arc::new(CannedProposals::new(vec![(item, vec![member])]));
+    let sources: Vec<Arc<dyn ProposalSource>> = vec![canned.clone()];
+
+    review_queue::decide(
+        &h.ctx,
+        &sources,
+        Decision {
+            key: "proposal:canned:p-blankreason".into(),
+            verdict: Verdict::Dismiss,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: Some("   ".into()),
+            version: None,
+            via: Via::Http,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        canned.last_decide.lock().unwrap().as_ref().and_then(|c| c.reason.clone()),
+        None,
+        "an all-whitespace reason carries nothing to record, so the source sees no reason at all"
+    );
+}
+
+#[tokio::test]
+async fn repairable_is_cleared_on_an_item_the_caller_cannot_apply() {
+    let h = ctx_or_skip!();
+    let member_id =
+        write_at(&h.ctx, &format!("canned dismiss-only member {}", nonce("dismonly")), "global")
+            .await;
+    let member = h
+        .ctx
+        .repos
+        .memories
+        .find_by_id(h.ctx.tenant(), uuid::Uuid::parse_str(&member_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let item = ProposalItem {
+        id: "p-dismonly".into(),
+        origin: "canned".into(),
+        kind: "example".into(),
+        proposed_content: Some("would-be text".into()),
+        fields: vec![],
+        created_at: Utc::now().to_rfc3339(),
+        verdicts: vec![Verdict::Dismiss],
+        repairable: true,
+        held_by: None,
+        version: Some("v1".into()),
+    };
+    let sources = one_source(CannedProposals::new(vec![(item, vec![member.clone()])]));
+
+    let q = review_queue::queue(
+        &h.ctx,
+        &sources,
+        QueueQuery {
+            sources: Some(vec![Source::Proposal]),
+            limit: None,
+            offset: None,
+            days: None,
+            min_similarity: None,
+        },
+    )
+    .await
+    .unwrap();
+    let found = q.items.iter().find(|i| i.source == Source::Proposal).expect("the canned item");
+    assert!(
+        !found.proposal.as_ref().unwrap().repairable,
+        "a caller who cannot apply never sees repairable, even when the source set it"
+    );
+
+    let read_only_member_id =
+        write_at(&h.ctx, &format!("canned read-only member {}", nonce("readonly")), "global").await;
+    let read_only_member = h
+        .ctx
+        .repos
+        .memories
+        .find_by_id(h.ctx.tenant(), uuid::Uuid::parse_str(&read_only_member_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let read_only_item = ProposalItem {
+        id: "p-readonly".into(),
+        origin: "canned".into(),
+        kind: "example".into(),
+        proposed_content: Some("would-be text".into()),
+        fields: vec![],
+        created_at: Utc::now().to_rfc3339(),
+        verdicts: vec![Verdict::Apply, Verdict::Dismiss],
+        repairable: true,
+        held_by: None,
+        version: Some("v1".into()),
+    };
+    let sources = one_source(CannedProposals::new(vec![(read_only_item, vec![read_only_member])]));
+    let narrow = restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[]);
+    let q = review_queue::queue(
+        &narrow,
+        &sources,
+        QueueQuery {
+            sources: Some(vec![Source::Proposal]),
+            limit: None,
+            offset: None,
+            days: None,
+            min_similarity: None,
+        },
+    )
+    .await
+    .unwrap();
+    let found = q.items.iter().find(|i| i.source == Source::Proposal).expect("the canned item");
+    assert!(
+        !found.proposal.as_ref().unwrap().repairable,
+        "a read-only principal never sees repairable either"
+    );
+}
+
+#[tokio::test]
+async fn decided_carries_content_written_and_overrode_from_the_source() {
+    struct Overriding;
+
+    #[async_trait]
+    impl ProposalSource for Overriding {
+        fn origin(&self) -> &'static str {
+            "overriding"
+        }
+
+        async fn pending(
+            &self,
+            _ctx: &Ctx,
+            _limit: i64,
+            _offset: i64,
+        ) -> DomainResult<Vec<(ProposalItem, Vec<Memory>)>> {
+            Ok(vec![])
+        }
+
+        async fn decide(
+            &self,
+            _ctx: &Ctx,
+            _id: &str,
+            _decision: ProposalDecision<'_>,
+        ) -> DomainResult<ProposalDecided> {
+            Ok(ProposalDecided {
+                state: "done".into(),
+                written: None,
+                superseded: vec![],
+                content_written: false,
+                overrode: Some("a_check".into()),
+            })
+        }
+    }
+
+    let h = ctx_or_skip!();
+    let sources: Vec<Arc<dyn ProposalSource>> = vec![Arc::new(Overriding)];
+
+    let decided = review_queue::decide(
+        &h.ctx,
+        &sources,
+        Decision {
+            key: "proposal:overriding:p1".into(),
+            verdict: Verdict::Apply,
+            keep: None,
+            id: None,
+            content: Some("corrected text".into()),
+            tags: None,
+            occurred_at: None,
+            reason: None,
+            version: None,
+            via: Via::Http,
+        },
+    )
+    .await
+    .unwrap();
+
+    let v = serde_json::to_value(&decided).unwrap();
+    assert_eq!(v["overrode"], "a_check");
+    assert_eq!(v["content_written"], false);
+}
+
+#[tokio::test]
+async fn a_source_that_ignores_content_answers_content_written_false() {
+    struct IgnoresContent;
+
+    #[async_trait]
+    impl ProposalSource for IgnoresContent {
+        fn origin(&self) -> &'static str {
+            "ignores"
+        }
+
+        async fn pending(
+            &self,
+            _ctx: &Ctx,
+            _limit: i64,
+            _offset: i64,
+        ) -> DomainResult<Vec<(ProposalItem, Vec<Memory>)>> {
+            Ok(vec![])
+        }
+
+        async fn decide(
+            &self,
+            _ctx: &Ctx,
+            _id: &str,
+            _decision: ProposalDecision<'_>,
+        ) -> DomainResult<ProposalDecided> {
+            Ok(ProposalDecided {
+                state: "done".into(),
+                written: None,
+                superseded: vec![],
+                content_written: false,
+                overrode: None,
+            })
+        }
+    }
+
+    let h = ctx_or_skip!();
+    let sources: Vec<Arc<dyn ProposalSource>> = vec![Arc::new(IgnoresContent)];
+
+    let decided = review_queue::decide(
+        &h.ctx,
+        &sources,
+        Decision {
+            key: "proposal:ignores:p1".into(),
+            verdict: Verdict::Apply,
+            keep: None,
+            id: None,
+            content: Some("caller's text".into()),
+            tags: None,
+            occurred_at: None,
+            reason: None,
+            version: None,
+            via: Via::Http,
+        },
+    )
+    .await
+    .unwrap();
+
+    let v = serde_json::to_value(&decided).unwrap();
+    assert_eq!(v["content_written"], false);
+}
+
+#[tokio::test]
+async fn a_decide_without_content_carries_no_content_written_key() {
+    let h = ctx_or_skip!();
+    let member_id =
+        write_at(&h.ctx, &format!("canned no-content member {}", nonce("nocontent")), "global")
+            .await;
+    let member = h
+        .ctx
+        .repos
+        .memories
+        .find_by_id(h.ctx.tenant(), uuid::Uuid::parse_str(&member_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let item = ProposalItem {
+        id: "p-nocontent".into(),
+        origin: "canned".into(),
+        kind: "example".into(),
+        proposed_content: None,
+        fields: vec![],
+        created_at: Utc::now().to_rfc3339(),
+        verdicts: vec![Verdict::Apply],
+        repairable: false,
+        held_by: None,
+        version: None,
+    };
+    let sources = one_source(CannedProposals::new(vec![(item, vec![member])]));
+
+    let decided = review_queue::decide(
+        &h.ctx,
+        &sources,
+        Decision {
+            key: "proposal:canned:p-nocontent".into(),
+            verdict: Verdict::Apply,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: None,
+            version: None,
+            via: Via::Http,
+        },
+    )
+    .await
+    .unwrap();
+
+    let v = serde_json::to_value(&decided).unwrap();
+    assert!(
+        v.as_object().unwrap().get("content_written").is_none(),
+        "a decide that sent no content never claims a written state either way"
+    );
+}
+
+#[test]
+fn a_body_that_names_via_cannot_claim_mcp() {
+    let d: Decision =
+        serde_json::from_str(r#"{"key":"proposal:canned:p1","verdict":"dismiss","via":"mcp"}"#)
+            .unwrap();
+    assert_eq!(d.via, Via::Http);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1615,6 +2141,8 @@ async fn a_confirmed_stale_row_leaves_the_list_for_one_window() {
             tags: None,
             occurred_at: None,
             reason: None,
+            version: None,
+            via: Via::Http,
         },
     )
     .await
