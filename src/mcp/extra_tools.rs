@@ -20,6 +20,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use super::tools;
+use super::views;
 use super::Lumberroom;
 use crate::domain::errors::DomainError;
 use crate::domain::namespaces;
@@ -147,7 +148,8 @@ retired included. Call it when the user asks what was believed before, or when a
 and you need to see what it replaced. It takes a memory id from memory_search or memory_write and \
 never a phrase. Versions your credential may not read are counted in withheld rather than shown, \
 so a chain with a withheld count is a partial answer: say so rather than reading it as the whole \
-story. One indexed walk, bounded by a depth cap it reports as depth_capped."
+story. One indexed walk, bounded by a depth cap it reports as depth_capped. Each version's source \
+is the name of the app that wrote it."
     )]
     async fn memory_history(
         &self,
@@ -163,7 +165,7 @@ story. One indexed walk, bounded by a depth cap it reports as depth_capped."
             if let Some(ns) = args.namespace.as_deref() {
                 namespaces::normalize(ns)?;
             }
-            let timeline = history::of(&ctx, id).await?;
+            let timeline = views::timeline(&ctx, history::of(&ctx, id).await?).await;
             let json = serde_json::to_value(&timeline).unwrap_or_default();
             Ok((serde_json::to_string_pretty(&json).unwrap_or_default(), json))
         })
@@ -177,7 +179,7 @@ not in the answer: registry_get is one call away for that, and this is what the 
 holding. Call it when an operational value changed and the old one still matters, as in \"where did \
 the backups live before we moved them\". A key reached through a redirect answers here too, and \
 resolved_from names the key the versions came from. Bounded to 20 versions unless you ask for \
-more, 200 at most."
+more, 200 at most. Each entry's source is the name of the app that wrote it."
     )]
     async fn registry_history(
         &self,
@@ -197,7 +199,8 @@ more, 200 at most."
                 args.limit,
             )
             .await?;
-            let json = serde_json::to_value(&result).unwrap_or_default();
+            let view = views::registry_history(&ctx, result).await;
+            let json = serde_json::to_value(&view).unwrap_or_default();
             Ok((serde_json::to_string_pretty(&json).unwrap_or_default(), json))
         })
         .await
@@ -607,6 +610,14 @@ mod tests {
         assert!(d.contains("content_written: true"));
         assert!(d.contains("held_by"));
         assert!(d.contains("never unprompted"));
+    }
+
+    #[test]
+    fn every_description_whose_answer_names_a_writer_says_what_source_is() {
+        for name in ["memory_search", "memory_history", "registry_get", "registry_history"] {
+            let d = description_of(name);
+            assert!(d.contains("source is the name of the app that wrote"), "{name}: {d}");
+        }
     }
 
     #[test]

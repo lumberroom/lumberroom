@@ -271,6 +271,7 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
         tool_calls: Arc::new(postgres::PgToolCallRepository::new(pool.clone())),
         sealed: Some(Arc::new(postgres::PgSealedRepository::new(pool.clone()))),
         ciphertext: Some(memories),
+        oauth: None,
         aliases: Arc::new(postgres::PgAliasRepository::new(pool.clone())),
     };
     let cfg = Arc::new(cfg);

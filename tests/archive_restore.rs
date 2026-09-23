@@ -205,6 +205,7 @@ async fn setup(key: Key) -> Option<Harness> {
             tool_calls: Arc::new(postgres::PgToolCallRepository::new(pool.clone())),
             sealed: Some(Arc::new(postgres::PgSealedRepository::new(pool.clone()))),
             ciphertext: Some(memories),
+            oauth: None,
         },
         embedder: Arc::new(HashEmbedder::new(768)),
         keys,

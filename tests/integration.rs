@@ -147,6 +147,7 @@ async fn setup_with(
             tool_calls: Arc::new(postgres::PgToolCallRepository::new(pool.clone())),
             sealed: Some(Arc::new(postgres::PgSealedRepository::new(pool.clone()))),
             ciphertext: Some(memories),
+            oauth: None,
         },
         embedder: Arc::new(HashEmbedder::new(768)),
         keys: Some(keys),
@@ -756,7 +757,8 @@ async fn published_payloads_keep_their_field_names() {
     keys.sort();
     assert_eq!(keys, vec!["deduplicated", "id", "namespace", "sensitivity"]);
 
-    // memory_search. `superseded_by` is skipped unless the caller asked for history.
+    // memory_search. `superseded_by` is skipped unless the caller asked for history. `source`
+    // replaced `source_client` in decision 0020: the stored id stays off the wire.
     let hits = search::run(&ctx, "what has something to sample", None, None, None, None, None)
         .await
         .unwrap();
@@ -775,7 +777,7 @@ async fn published_payloads_keep_their_field_names() {
             "score",
             "sensitivity",
             "similarity",
-            "source_client",
+            "source",
             "tags",
         ]
     );

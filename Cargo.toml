@@ -60,6 +60,9 @@ hmac = "0.13"
 base64 = "0.22"
 # Redirect URIs are compared exactly, but they are validated structurally before registration.
 url = "2"
+# NFKC for comparing OAuth client names, so "Codex" and a full-width copy of it read as one name
+# (decision 0020). Already in the tree through `stringprep`, which sqlx uses for SCRAM.
+unicode-normalization = "0.1"
 
 # The archive format. Its own crate because the CLI and the server both read it, and neither should
 # carry the other's dependency tree to do so.

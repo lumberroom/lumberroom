@@ -33,6 +33,7 @@ use crate::services::{bootstrap, forget, registry, search, write, Ctx, Repos};
 
 pub mod capability;
 pub mod extra_tools;
+pub mod views;
 
 pub const SERVER_NAME: &str = "lumberroom";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -208,7 +209,8 @@ re-ask questions that were answered weeks ago."
         description = "Search durable memory for what is already known before answering from \
 assumption or asking the user. Use it whenever a task depends on a past decision, a preference, a \
 host, a credential location, or \"how do we usually do this\". Semantic, so ask in full sentences. \
-Superseded facts are excluded: every hit is what is believed now."
+Superseded facts are excluded: every hit is what is believed now. Each hit's source is the name \
+of the app that wrote it."
     )]
     async fn memory_search(
         &self,
@@ -297,7 +299,7 @@ similar, leave it alone."
         description = "Exact lookup of a known operational value: a host, a service endpoint, \
 where a credential lives, a model route, a dataset. Use this instead of guessing an address or \
 asking the user to repeat it. Returns found:false when nothing is recorded, so then ask and write \
-the answer with memory_write."
+the answer with memory_write. source is the name of the app that wrote the value."
     )]
     async fn registry_get(
         &self,
@@ -314,7 +316,8 @@ the answer with memory_write."
                 args.project.as_deref(),
             )
             .await?;
-            let json = serde_json::to_value(&result).unwrap_or_default();
+            let view = views::registry_get(&ctx, result).await;
+            let json = serde_json::to_value(&view).unwrap_or_default();
             Ok((serde_json::to_string_pretty(&json).unwrap_or_default(), json))
         })
         .await
@@ -337,8 +340,9 @@ wanted. Call it with dry_run true first unless the user named this exact memory.
             let result =
                 forget::by_id(&ctx, &args.id, Some(&args.reason), args.dry_run.unwrap_or(false))
                     .await?;
-            let text = result.text.clone();
-            Ok((text, serde_json::to_value(&result).unwrap_or_default()))
+            let view = views::forget(&ctx, result).await;
+            let text = view.text.clone();
+            Ok((text, serde_json::to_value(&view).unwrap_or_default()))
         })
         .await
     }
