@@ -2152,8 +2152,10 @@ impl MemoryRepository for PgMemoryRepository {
         }
         let mut tx = self.pool.begin().await?;
 
-        // Locked in id order so two concurrent supersessions cannot deadlock, and locked at all so
-        // the cycle check below cannot be invalidated between the check and the write.
+        // Locked in id order so two concurrent supersessions cannot deadlock with each other, and
+        // locked at all so the cycle check below cannot be invalidated between the check and the
+        // write. Id order does not cover writers that lock in another order; the access bump stays
+        // out of the cycle by skipping held rows instead of waiting on them.
         let (first, second) = if old < new { (old, new) } else { (new, old) };
         // The two valid-time columns ride along on the lock query. The dates have to be read under
         // the same lock as the cycle check, and reading them here costs nothing a second statement
@@ -2470,6 +2472,13 @@ impl MemoryRepository for PgMemoryRepository {
     /// per row: a ten-row search that wrote ten times would turn every read into a write storm.
     /// A collector coalescing across requests would be the next step and is not worth it at
     /// single-user query rates.
+    ///
+    /// The statement never waits on a row lock. A plain UPDATE locks rows in scan order and holds
+    /// each until it ends, and `supersede`, `delete` and a revive lock the same rows in their own
+    /// orders, so a search that returned both rows of a pending supersession could deadlock the
+    /// write it raced, and the write could be the side Postgres aborts. SKIP LOCKED leaves a held
+    /// row alone, and FOR NO KEY UPDATE rather than FOR UPDATE keeps a foreign-key check on this
+    /// row from queueing behind the bump.
     fn touch_accessed(&self, tenant: &str, ids: Vec<uuid::Uuid>) {
         if ids.is_empty() {
             return;
@@ -2477,10 +2486,13 @@ impl MemoryRepository for PgMemoryRepository {
         let pool = self.pool.clone();
         let tenant = tenant.to_string();
         tokio::spawn(async move {
+            // A row that is mid-write loses this one bump, which a usage counter can afford.
             let result = sqlx::query(
                 "UPDATE memory
                     SET access_count = access_count + 1, last_accessed_at = now()
-                  WHERE tenant_id = $1 AND id = ANY($2)",
+                  WHERE id IN (SELECT id FROM memory
+                                WHERE tenant_id = $1 AND id = ANY($2)
+                                  FOR NO KEY UPDATE SKIP LOCKED)",
             )
             .bind(&tenant)
             .bind(&ids)

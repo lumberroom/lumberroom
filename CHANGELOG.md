@@ -83,6 +83,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   corrected text, a reason, the version the caller read and the surface the call arrived on. Every
   implementation of the trait changes its signature to match.
 
+### Fixed
+
+- **A search no longer deadlocks a write on the rows it returned.** The access bump after every
+  search locked its rows in scan order and held them until the statement ended, while a
+  supersession locks its two rows in id order, so a search that returned both could hold one while
+  the write held the other. Postgres aborted one side and the write could be the victim, reported
+  as "internal error". The bump now skips any row another transaction holds, so a row mid-write
+  loses one access count. Gate: `./scripts/cargo.sh test -j 1 --test integration
+  an_access_bump_skips_a_row_another_write_holds`.
+
 ## [0.4.0] - 2026-09-07
 
 Three changes since 0.3.1, all in the client. A renewal that crashes or races another one leaves a
