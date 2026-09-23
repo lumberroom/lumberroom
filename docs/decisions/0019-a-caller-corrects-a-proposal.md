@@ -1,6 +1,12 @@
 # 19. A caller corrects a proposal
 
-**Date:** 23 September 2026 · **Status:** accepted, not built · **Decided by:** the owner
+**Date:** 23 September 2026 · **Status:** accepted, implemented · **Decided by:** the owner
+
+What was run, and where: on 23 September 2026, `./scripts/cargo.sh check --all-targets` ran clean,
+`./scripts/cargo.sh fmt --all` left no diff, and `./scripts/cargo.sh test -j 1` reported 1075
+passed, 0 failed. This repository ships no `ProposalSource`, so the repair path in §2's contract
+and the override path in §4.2 ran only against the test double in `tests/review_queue.rs`; neither
+has run against a source that writes real proposal text.
 
 ## Decision
 
@@ -9,8 +15,11 @@ optional reason, the version of the proposal the caller read, and the surface th
 A repair is `apply` with `content`, not a new verdict. A proposal decision over MCP requires a
 `reason` and a `version`; over HTTP both stay optional. The data fence `render` draws around row
 content and proposal text takes a nonce drawn fresh per call, so a row cannot pre-forge its closing
-line. Once the person has asked an agent to work the queue, that agent may decide proposal items on
-its own, one `review_decide` call per item, without reading each one back first.
+line. Row content, `proposed_content` and every proposal field's value are stripped from the MCP
+tool's structured copy entirely; they reach the agent only inside that fenced text block, never as
+a JSON value a client could render as data. Once the person has asked an agent to work the queue,
+that agent may decide proposal items on its own, one `review_decide` call per item, without reading
+each one back first.
 
 ## Context
 

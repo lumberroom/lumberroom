@@ -398,9 +398,9 @@ fn the_cli_wire_reads_a_page_carrying_repairable_held_by_and_version() {
     assert_eq!(item.verdicts, vec![Verdict::Apply, Verdict::Dismiss]);
 }
 
-/// Phase 9 adds `content_written` and `overrode` to `Decided`. Both are absent unless the caller
-/// sent `content`, so the existing fixture, built from a request with none, still parses once the
-/// two keys land on the type: the same forward-compat guarantee as the queue page above.
+/// Phase 9 adds `content_written` and `overrode` to `Decided`. This crate's `Decided` reads
+/// neither field and carries no `deny_unknown_fields`, so both pass through as unknown keys
+/// rather than landing on the type: the same forward-compat guarantee as the queue page above.
 #[test]
 fn the_cli_wire_reads_a_decided_carrying_content_written_and_overrode() {
     let mut raw = fixture("review_decide.json");

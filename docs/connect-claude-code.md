@@ -322,8 +322,9 @@ wherever read and write both hold at the row's stored level. `delete` is the one
 grant is refused, because it also needs `mayDelete`, the same flag `memory_forget` reads below. A
 read-only grant refuses every row instead; `docs/permissions.md` ("The two review tools") covers
 that empty-verdicts case. Once the person has asked it to work the queue, the model may decide a
-proposal item itself, one `review_decide` call per item, and it reports back what it applied over
-a check the item had already failed.
+proposal item itself, one `review_decide` call per item; the tool's own text tells it to report
+back what it applied over a check the item had already failed, an instruction the model can ignore
+like any other.
 `memory_forget` is missing because the grant sets no `mayDelete`, and `tools/list`
 filters it out per credential (`src/mcp/mod.rs`). Keeping it out of the list keeps the idea away
 from the model in the first place; the service refuses the call again if one arrives anyway.

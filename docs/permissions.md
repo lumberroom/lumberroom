@@ -217,7 +217,10 @@ to show the item at all.
 A source may take corrected text on `apply`: the item carries `repairable`, and the caller passes
 that text as `content` on the decide call. The source checks the text before it writes it and
 answers `content_written`. An `apply` without `content` on an item carrying `held_by` goes past
-that check instead, and the answer names the check in `overrode`, so nothing is gone past silently.
+that check instead, and the HTTP and MCP answers name the check in `overrode`, so nothing is gone
+past silently there. CLI 0.5.0's `Decided` (`crates/lumberroom/src/wire.rs:431-448`) reads no
+`overrode` field and prints `proposal_state` alone; an override through the CLI is recorded on the
+source's side but shows nowhere in its output until a release that reads the field ships.
 Over MCP, a proposal decision needs a `reason` and the item's `version`, both required; an HTTP
 caller may leave either out. `repairable` shows only on an item this caller could also `apply`
 outright, so a grant that hides `apply` hides the repair as well, with no second check to fall

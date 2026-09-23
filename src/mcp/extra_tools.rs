@@ -332,7 +332,8 @@ fills. A source that refuses to answer appears in refused with its own reason."
             let envelope =
                 review_queue::queue(&ctx, &proposals, query).await.map_err(lead_with_code)?;
             let text = review_queue::render(&envelope);
-            let json = serde_json::to_value(&envelope).unwrap_or_default();
+            let mut json = serde_json::to_value(&envelope).unwrap_or_default();
+            strip_free_text(&mut json);
             Ok((text, json))
         })
         .await
@@ -342,16 +343,18 @@ fills. A source that refuses to answer appears in refused with its own reason."
         name = "review_decide",
         description = "Act on exactly one review_queue item with exactly one verdict from that \
 item's own list. Call it only after the person has asked you to work the queue, never unprompted. \
-On a proposal item, reason is required: one plain sentence saying why, recorded with your client \
-name for the person to read. version is required too, copied from the item; the source answers \
+On a proposal item, reason is required: one plain sentence saying why, passed to the proposal \
+source with your client name. version is required too, copied from the item; the source answers \
 proposal_moved when the proposal changed since you read it, and you read the queue again. On an \
 item marked repairable, apply with content submits corrected text; the source checks it and \
 answers repair_refused with the check's name rather than writing anything, and you may correct it \
 again or dismiss. A repair landed only when the answer carries content_written: true. apply \
 without content on an item with held_by goes past that check: do it only when reason can say why \
 the check is wrong for this item, and otherwise repair or dismiss. merge on a conflict or stale \
-item takes the exact text the person gave you. keep_both records that two rows are both fine. When \
-you finish, tell the person what you decided, and name every apply that went past a check."
+item takes the exact text the person gave you. keep_both records that two rows are both fine. \
+Conflict and stale items need the person every time; only a proposal is yours to decide once \
+asked. When you finish, tell the person what you decided, and name every apply that went past a \
+check."
     )]
     async fn review_decide(
         &self,
@@ -466,6 +469,27 @@ fn parse_rfc3339(
                 value.chars().take(60).collect::<String>()
             ))
         })
+}
+
+/// Strips every field a source or a caller wrote as free text from `review_queue`'s structured
+/// copy: `rows[].content`, `proposal.proposed_content` and `proposal.fields[].value`. An agent
+/// needs the structured copy's keys, versions and verdicts exact, but that text is untrusted and
+/// belongs only inside the fenced text block, never in a shape a client may render as data.
+fn strip_free_text(json: &mut serde_json::Value) {
+    let Some(items) = json.get_mut("items").and_then(|v| v.as_array_mut()) else { return };
+    for item in items {
+        if let Some(rows) = item.get_mut("rows").and_then(|v| v.as_array_mut()) {
+            for row in rows {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.remove("content");
+                }
+            }
+        }
+        if let Some(obj) = item.get_mut("proposal").and_then(|v| v.as_object_mut()) {
+            obj.remove("proposed_content");
+            obj.remove("fields");
+        }
+    }
 }
 
 /// Puts the service's own code in front of the message a model reads, so a refusal like

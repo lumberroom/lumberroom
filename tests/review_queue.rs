@@ -1772,6 +1772,61 @@ async fn a_proposal_decision_over_http_without_a_reason_or_version_reaches_the_s
 }
 
 #[tokio::test]
+async fn an_all_whitespace_reason_reaches_the_source_as_none() {
+    let h = ctx_or_skip!();
+    let member_id =
+        write_at(&h.ctx, &format!("canned blank-reason member {}", nonce("blankreason")), "global")
+            .await;
+    let member = h
+        .ctx
+        .repos
+        .memories
+        .find_by_id(h.ctx.tenant(), uuid::Uuid::parse_str(&member_id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let item = ProposalItem {
+        id: "p-blankreason".into(),
+        origin: "canned".into(),
+        kind: "example".into(),
+        proposed_content: None,
+        fields: vec![],
+        created_at: Utc::now().to_rfc3339(),
+        verdicts: vec![Verdict::Dismiss],
+        repairable: false,
+        held_by: None,
+        version: None,
+    };
+    let canned = Arc::new(CannedProposals::new(vec![(item, vec![member])]));
+    let sources: Vec<Arc<dyn ProposalSource>> = vec![canned.clone()];
+
+    review_queue::decide(
+        &h.ctx,
+        &sources,
+        Decision {
+            key: "proposal:canned:p-blankreason".into(),
+            verdict: Verdict::Dismiss,
+            keep: None,
+            id: None,
+            content: None,
+            tags: None,
+            occurred_at: None,
+            reason: Some("   ".into()),
+            version: None,
+            via: Via::Http,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        canned.last_decide.lock().unwrap().as_ref().and_then(|c| c.reason.clone()),
+        None,
+        "an all-whitespace reason carries nothing to record, so the source sees no reason at all"
+    );
+}
+
+#[tokio::test]
 async fn repairable_is_cleared_on_an_item_the_caller_cannot_apply() {
     let h = ctx_or_skip!();
     let member_id =
@@ -1908,7 +1963,7 @@ async fn decided_carries_content_written_and_overrode_from_the_source() {
             verdict: Verdict::Apply,
             keep: None,
             id: None,
-            content: None,
+            content: Some("corrected text".into()),
             tags: None,
             occurred_at: None,
             reason: None,
@@ -1921,6 +1976,7 @@ async fn decided_carries_content_written_and_overrode_from_the_source() {
 
     let v = serde_json::to_value(&decided).unwrap();
     assert_eq!(v["overrode"], "a_check");
+    assert_eq!(v["content_written"], false);
 }
 
 #[tokio::test]

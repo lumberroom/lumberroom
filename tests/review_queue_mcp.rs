@@ -462,6 +462,49 @@ async fn asking_the_engine_for_proposals_returns_the_configured_source() {
     );
 }
 
+#[tokio::test]
+async fn the_structured_copy_carries_no_row_or_proposal_free_text() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
+    let id = write_at(
+        &h.ctx,
+        &format!("free text that must never leave the fence {}", nonce("s4")),
+        "global",
+    )
+    .await;
+    make_stale(&h.pool, &id).await;
+
+    let result = h.call("review_queue", serde_json::json!({})).await;
+    assert!(!refused(&result), "{result:?}");
+
+    let body = structured(&result);
+    let dump = serde_json::to_string(&body).unwrap();
+    assert!(
+        !dump.contains("free text that must never leave the fence"),
+        "row content reached the structured copy: {dump}"
+    );
+    assert!(
+        !dump.contains("what apply would write"),
+        "the canned proposal's proposed_content reached the structured copy: {dump}"
+    );
+
+    let items = body["items"].as_array().cloned().unwrap_or_default();
+    assert!(!items.is_empty(), "the page carries at least the stale row and the canned proposal");
+    for item in &items {
+        if let Some(rows) = item["rows"].as_array() {
+            for row in rows {
+                assert!(row.get("content").is_none(), "a row kept its content: {row:?}");
+                assert!(row.get("id").is_some(), "a row lost its id: {row:?}");
+            }
+        }
+        if let Some(proposal) = item.get("proposal").filter(|p| !p.is_null()) {
+            assert!(proposal.get("proposed_content").is_none(), "{proposal:?}");
+            assert!(proposal.get("fields").is_none(), "{proposal:?}");
+            assert!(proposal.get("id").is_some(), "a proposal lost its id: {proposal:?}");
+            assert!(proposal.get("version").is_some(), "a proposal lost its version: {proposal:?}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // review_decide
 // ---------------------------------------------------------------------------------------------

@@ -31,6 +31,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   over HTTP both stay optional. Eight codes: `reason_required`, `reason_too_long`,
   `content_not_for_verdict`, `content_empty`, `version_required`, `repair_not_offered`,
   `repair_refused`, `proposal_moved`. See `docs/decisions/0019-a-caller-corrects-a-proposal.md`.
+  `ProposalItem` and `ProposalDecided` derive `Default`; a source should build both with
+  `..Default::default()` so a field added later still compiles against every existing
+  implementation. A source must set `version` on every item it offers `apply` or `dismiss` on; both
+  `version` and `held_by` must match `[a-z0-9_]+`, or `render` prints them as `unrenderable` rather
+  than passing free text outside the data fence. CLI 0.5.0 reads no `overrode` field and shows no
+  override on any proposal decision; that lands in the CLI's next release.
 
 ### Changed
 

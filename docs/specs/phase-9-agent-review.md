@@ -4,8 +4,10 @@ Written 23 September 2026. Design for letting a caller send corrected text and a
 proposal source through the one decide path, and for the MCP tool text that lets an agent work
 proposal items on its own once the person has asked it to.
 
-Nothing below is built. Every claim about current behaviour names the file it was read from; every
-claim about new behaviour is a design target until the gates in §11 report.
+Everything below is built. Every claim about current behaviour names the file it was read from. The
+gates in §11 ran: `check --all-targets` clean, `fmt` clean, `test -j 1` 1075 passed, 0 failed; no
+source in this repository fills `ProposalSource`, so the repair and override paths ran only against
+the test double in `tests/review_queue.rs`.
 
 ## 0. Ground truth
 
@@ -348,8 +350,11 @@ things bound what that text can make it do.
 1. **The fence cannot be closed from inside.** `render` draws a nonce per call, the first 12 hex
    characters of a v4 uuid, and writes `----- data <nonce> -----` and `----- end of data <nonce>
    -----`. A row cannot know the nonce of a call that has not happened, so text that imitates a
-   closing line stays inside the block. The structured content carries the same strings as JSON
-   values, which a client renders as data.
+   closing line stays inside the block. The MCP tool's structured copy strips the same text out
+   entirely: `strip_free_text` (`src/mcp/extra_tools.rs`) removes `rows[].content`,
+   `proposal.proposed_content` and `proposal.fields[].value` before the envelope is handed back as
+   JSON, so a client reading the structured copy for keys, verdicts and versions never receives the
+   free text at all. It exists only inside the fenced text block.
 2. **The verdict comes from the item.** `decide` refuses a verdict the item did not list, as
    today. Text can steer the choice between listed verdicts and nothing beyond.
 3. **Corrected text passes the source's checks first.** The engine forwards `content` and
