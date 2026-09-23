@@ -21,6 +21,7 @@ pub mod registry;
 pub mod review;
 pub mod review_queue;
 pub mod search;
+pub mod sources;
 pub mod supersession;
 pub mod write;
 
@@ -78,6 +79,9 @@ pub struct Repos {
     /// because search consults it on every query, which is what `Repos` is for. The alias service
     /// still takes the repository as an argument, so nothing else has to reach through this.
     pub aliases: Arc<dyn crate::ports::AliasRepository>,
+    /// The OAuth client table, read only to name a row's writer. `None` outside `AUTH_MODE=oauth`,
+    /// and then every `source_client` prints as stored: see `sources::label_store`.
+    pub oauth: Option<Arc<dyn crate::ports::OauthStore>>,
 }
 
 /// Everything a tool handler needs. Cloned per request; the expensive parts are behind Arc.

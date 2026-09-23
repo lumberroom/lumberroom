@@ -57,6 +57,11 @@ pub struct Hit {
     pub namespace: String,
     pub content: String,
     pub tags: Vec<String>,
+    /// The app that wrote the row, by name (decision 0020).
+    pub source: String,
+    /// The stored id, for the console, which prints it until it moves to `source` too. Never
+    /// serialised: this struct is `memory_search`'s wire shape, and an MCP answer carries the name.
+    #[serde(skip_serializing)]
     pub source_client: String,
     pub sensitivity: Sensitivity,
     pub created_at: String,
@@ -257,6 +262,7 @@ pub async fn run(
             namespace: hit.memory.namespace,
             content: hit.memory.content,
             tags: hit.memory.tags,
+            source: hit.memory.source_client.clone(),
             source_client: hit.memory.source_client,
             sensitivity: hit.memory.sensitivity,
             created_at: hit.memory.created_at.to_rfc3339(),
@@ -286,6 +292,14 @@ pub async fn run(
         ctx.session_id.clone(),
         emissions,
     );
+
+    let writers: Vec<String> = out.iter().map(|h| h.source_client.clone()).collect();
+    let labels = super::sources::labels(ctx, &writers).await;
+    for hit in &mut out {
+        if let Some(name) = labels.get(&hit.source_client) {
+            hit.source = name.clone();
+        }
+    }
 
     answered.sort();
     Ok(SearchResult { namespaces: names(&primary), also_searched: answered, hits: out })

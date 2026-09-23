@@ -129,6 +129,7 @@ async fn run() -> Result<()> {
         tool_calls: Arc::new(pg::PgToolCallRepository::new(pool.clone())),
         sealed: Some(Arc::new(pg::PgSealedRepository::new(pool.clone()))),
         ciphertext: Some(memories),
+        oauth: services::sources::label_store(cfg.auth.mode, &oauth),
     };
 
     let state = Arc::new(AppState {

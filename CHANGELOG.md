@@ -40,6 +40,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **MCP answers name the app that wrote a row.** `context_bootstrap`, `memory_search`,
+  `memory_history`, `registry_get`, `registry_history` and `memory_forget` carry `source` in place
+  of `source_client`, and the digest trailer reads `via Codex` rather than `via <client_id>`. For a
+  built-in OAuth client `source` is the name it registered with, revoked clients included; any other
+  stored value prints as it is. Two approved clients sharing a name carry the date each was added,
+  `Codex (added 1 Sep)`, with the time on a same-day tie. The lookup runs only under
+  `AUTH_MODE=oauth`, and a failed read of the client table prints every value as stored. Storage,
+  export, the archive, the admin routes and the console keep `source_client`. A client that read
+  `source_client` from `memory_search`'s structured content reads `source` now. See
+  `docs/decisions/0020-mcp-names-the-source.md`.
 - **Confirming a stale row cleared it for a window.** `stale` gained a clause that also excludes a
   row confirmed within `greatest(days, 1)` days, so a restated fact or a `confirm` verdict left the
   list rather than reappearing on the next read; it returns for re-confirmation once the window
