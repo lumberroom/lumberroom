@@ -214,6 +214,15 @@ deployment that wires a source inherits that source's own
 permission rules for `apply` and `dismiss`, on top of the read grant `review_queue` already checked
 to show the item at all.
 
+A source may take corrected text on `apply`: the item carries `repairable`, and the caller passes
+that text as `content` on the decide call. The source checks the text before it writes it and
+answers `content_written`. An `apply` without `content` on an item carrying `held_by` goes past
+that check instead, and the answer names the check in `overrode`, so nothing is gone past silently.
+Over MCP, a proposal decision needs a `reason` and the item's `version`, both required; an HTTP
+caller may leave either out. `repairable` shows only on an item this caller could also `apply`
+outright, so a grant that hides `apply` hides the repair as well, with no second check to fall
+through.
+
 ## Setting AUTH_TOKENS without breaking the JSON
 
 `.env` is parsed by Docker Compose itself, so a single-quoted JSON array there is fine:

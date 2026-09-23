@@ -23,6 +23,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   HTTP routes above. Both sit at `Capability::Open`, so a read grant alone can list the queue; the
   decide path still needs write on every row it acts on, and `delete` still needs `mayDelete`, the
   same flag `memory_forget` reads. See `docs/permissions.md`, "The two review tools".
+- **A proposal decision can now carry corrected text, a reason and the version the caller read.**
+  `ProposalItem` gained `repairable`, `held_by` and `version`; `Decision` gained `version` and a
+  `via` the handler sets and a request body cannot claim; `Decided` and `ProposalDecided` gained
+  `content_written` and `overrode`. A repair is `apply` with `content`, checked and written by the
+  source, never a new verdict. Over MCP a proposal decision now needs a `reason` and a `version`;
+  over HTTP both stay optional. Eight codes: `reason_required`, `reason_too_long`,
+  `content_not_for_verdict`, `content_empty`, `version_required`, `repair_not_offered`,
+  `repair_refused`, `proposal_moved`. See `docs/decisions/0019-a-caller-corrects-a-proposal.md`.
 
 ### Changed
 
@@ -49,6 +57,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a conflict below the configured threshold; a request for 0.5 with the threshold at 0.9 gets 0.9
   back, not 0.5.
 - **`crates/lumberroom` moved from 0.4.0 to 0.5.0** for the review loop's new flags and wire types.
+- **`review_queue` and `review_decide`'s tool descriptions changed.** An agent asked to work the
+  queue may now decide proposal items itself, one `review_decide` call per item, rather than
+  reading each one back to the person first; the data fence around row content and proposal text
+  now draws a fresh nonce per call instead of a fixed closing marker.
+- **`ProposalSource::decide` takes a `ProposalDecision` in place of a bare `Verdict`.** The
+  signature moves from `decide(&self, ctx: &Ctx, id: &str, verdict: Verdict)` to
+  `decide(&self, ctx: &Ctx, id: &str, decision: ProposalDecision<'_>)`, carrying the verdict,
+  corrected text, a reason, the version the caller read and the surface the call arrived on. Every
+  implementation of the trait changes its signature to match.
 
 ## [0.4.0] - 2026-09-07
 
