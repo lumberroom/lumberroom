@@ -31,7 +31,7 @@ path = "src/main.rs"
 # MCP. Streamable HTTP server transport, mounted as an axum service.
 rmcp = { version = "3.1", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = "0.8"
-tower-http = { version = "0.6", features = ["limit"] }
+tower-http = { version = "0.7", features = ["limit"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tokio-util = "0.7"
 
