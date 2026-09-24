@@ -6,6 +6,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Tag filtering, inside the query.** `memory_search` over MCP takes `tags`, and a hit must carry
+  every one. The reading page (`RecentQuery.tags`) and search (`SearchQuery.tags`) filter with
+  `tags @> $n::text[]` in SQL, beside the cursor and in both search arms, so a filtered page comes
+  back full and the GIN index serves it. With no tags each statement's text stays byte-identical
+  to before. `MemoryRepository::tag_summary` counts live rows per tag across the namespaces and
+  ceilings a caller holds. Tags normalise through `domain::tags::normalise` on write and on filter.
+  `console::data::page` takes a new last argument, `tags`.
+
 - **One review queue** joins conflicts, stale rows and, on a server that fills any, proposals
   behind one route and one decide path. `GET /admin/review/queue` and `POST /admin/review/decide`
   carry `supersede`, `merge`, `keep_both`, `delete`, `confirm`, `apply` and `dismiss` as the

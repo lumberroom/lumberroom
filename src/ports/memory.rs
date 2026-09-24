@@ -229,6 +229,13 @@ pub struct SearchQuery {
     /// `Principal::may_read_history` before setting it. Nothing below this line can: a repository
     /// holds no principal.
     pub as_of: Option<chrono::DateTime<chrono::Utc>>,
+    /// A hit carries every one of these. Empty is no filter, and then the statement is the one this
+    /// server ran before the filter existed, down to the text.
+    ///
+    /// Matched against the stored spelling as it stands, so a caller runs what it was handed
+    /// through `domain::tags::normalise` first. The test runs inside both arms, ahead of each
+    /// LIMIT, for the reason the policy filters do.
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -348,6 +355,12 @@ pub struct RecentQuery {
     /// Retired rows come back alongside the live ones, so a correction reads as a revision in
     /// place rather than as a row that vanished.
     pub include_superseded: bool,
+    /// A row carries every one of these. Empty is no filter.
+    ///
+    /// Inside the query beside the cursor, so a page under the filter is full and the cursor walks
+    /// the filtered rows. Matched against the stored spelling, so a caller normalises first with
+    /// `domain::tags::normalise`.
+    pub tags: Vec<String>,
 }
 
 /// What one namespace holds, filtered on both axes.
@@ -359,6 +372,13 @@ pub struct NamespaceSummary {
     /// Live rows above `open`. The size of a namespace and its exposure are different questions.
     pub above_open: i64,
     pub last_write: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One tag and the live rows carrying it, filtered on both axes.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TagCount {
+    pub tag: String,
+    pub live: i64,
 }
 
 /// Rows keyed to one namespace in one table.
@@ -527,6 +547,18 @@ pub trait MemoryRepository: Send + Sync {
         tenant: &str,
         readable: &[NamespaceCeiling],
     ) -> Result<Vec<NamespaceSummary>>;
+
+    /// Every tag on a live row the caller may read, with how many such rows carry it. Most rows
+    /// first, then by name.
+    ///
+    /// Both axes, for the reason `namespace_summary` gives: a tag carried only by rows above the
+    /// ceiling or outside the grant is absent rather than listed at zero. Live rows only, so a
+    /// tag that survives on retired rows alone drops out with them.
+    async fn tag_summary(
+        &self,
+        tenant: &str,
+        readable: &[NamespaceCeiling],
+    ) -> Result<Vec<TagCount>>;
 
     /// Random sample of stored content the caller may read, for the recall monitor.
     ///

@@ -466,6 +466,7 @@ async fn reading(
         q.before.as_deref().and_then(Cursor::parse),
         data::page_size(q.limit),
         false,
+        &[],
     )
     .await
     {
@@ -520,6 +521,7 @@ async fn namespace(
         q.before.as_deref().and_then(Cursor::parse),
         data::page_size(q.limit),
         true,
+        &[],
     )
     .await
     {

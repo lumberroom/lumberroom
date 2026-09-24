@@ -234,6 +234,7 @@ pub async fn by_query(
                 usage: 0.0,
             },
             include_superseded: true,
+            tags: vec![],
         })
         .await?;
 

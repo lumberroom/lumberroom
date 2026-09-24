@@ -259,6 +259,28 @@ mod tests {
         }
     }
 
+    /// A model reads the schema, so the schema is where `tags` has to say it is a list and that
+    /// every tag must match. A description that read as "any of" would send a model filtering for
+    /// two tags and reading an empty answer as absence.
+    #[test]
+    fn search_schema_takes_tags_as_a_list_every_hit_must_carry() {
+        let schema = serde_json::to_value(schemars::schema_for!(crate::mcp::SearchArgs))
+            .expect("the derived schema serialises");
+        let property = schema
+            .get("properties")
+            .and_then(|p| p.get("tags"))
+            .unwrap_or_else(|| panic!("memory_search has no tags argument: {schema}"));
+        assert!(property.to_string().contains("\"array\""), "tags is not a list: {property}");
+        assert!(property.to_string().contains("\"string\""), "a tag is not a string: {property}");
+        let described = property
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or_else(|| panic!("tags carries no description: {property}"));
+        assert!(squash(described).contains("every"), "the all-of rule is missing: {described}");
+        let required = schema.get("required").map(|r| r.to_string()).unwrap_or_default();
+        assert!(!required.contains("tags"), "tags must stay optional: {required}");
+    }
+
     #[test]
     fn as_of_takes_the_two_forms_and_refuses_a_bare_month() {
         assert_eq!(parse_as_of("2026-03-01").unwrap().to_rfc3339(), "2026-03-01T00:00:00+00:00");
