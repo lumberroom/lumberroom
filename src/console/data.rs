@@ -20,11 +20,12 @@ use crate::adapters::auth::{can_read, filter_readable};
 use crate::domain::errors::Result;
 use crate::domain::namespaces;
 use crate::domain::policy::NamespaceCeiling;
+use crate::domain::tags;
 use crate::domain::types::{Memory, RegistryEntry, Sensitivity};
 use crate::ports::ingest::{IngestRepository, Proposal, ProposalFilter};
 use crate::ports::memory::Retired;
-use crate::ports::RecentQuery;
 use crate::ports::Timeline;
+use crate::ports::{RecentQuery, TagCount};
 use crate::services::{search, Ctx};
 
 /// How many entries one page holds by default, and the ceiling on what a query string may ask for.
@@ -288,6 +289,14 @@ pub async fn contents(ctx: &Ctx, readable: &[NamespaceCeiling]) -> Result<Conten
     Ok(out)
 }
 
+/// Every tag on a live row this reader may see, most used first.
+///
+/// Beside `contents` because it answers the same kind of question from the same filter: the
+/// ceilings go into the query, so a tag carried only by rows past them never reaches this process.
+pub async fn tag_counts(ctx: &Ctx, readable: &[NamespaceCeiling]) -> Result<Vec<TagCount>> {
+    ctx.repos.memories.tag_summary(ctx.tenant(), readable).await
+}
+
 /// Sealed counts, for the namespaces where this reader's ceiling reaches sealed.
 ///
 /// A count is the whole answer. The bytes are encrypted by the client that stored them and the key
@@ -323,6 +332,10 @@ async fn sealed_counts(ctx: &Ctx, readable: &[NamespaceCeiling]) -> Vec<(String,
 ///
 /// `namespace` narrows to one section of the document; absent reads every namespace this reader
 /// may reach. The ceilings go into the query, so a row above them never enters this process.
+///
+/// `tags` keeps rows carrying every one of them, in the query beside the cursor, so a filtered page
+/// is full and the next one starts where it ended. Raw spellings are fine: they go through the
+/// write path's normaliser first. Empty is no filter.
 pub async fn page(
     ctx: &Ctx,
     readable: &[NamespaceCeiling],
@@ -330,6 +343,7 @@ pub async fn page(
     before: Option<Cursor>,
     limit: i64,
     include_superseded: bool,
+    tags: &[String],
 ) -> Result<Page> {
     // One more than the page, so the presence of a next page is an observation rather than a guess
     // that shows an empty page at the end.
@@ -343,6 +357,7 @@ pub async fn page(
             before: before.map(|c| (c.at, c.id)),
             limit: limit + 1,
             include_superseded,
+            tags: tags::normalise(tags),
         })
         .await?;
 

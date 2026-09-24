@@ -118,6 +118,11 @@ pub struct SearchArgs {
     /// which is what almost every question wants.
     #[serde(default)]
     pub as_of: Option<String>,
+    /// Keep only facts carrying every one of these tags. Omit it unless the person asked for a tag
+    /// or you know the tag the fact was filed under: a fact filed without the tag is dropped, and
+    /// the search then reports nothing known about something the store holds.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -210,7 +215,7 @@ re-ask questions that were answered weeks ago."
 assumption or asking the user. Use it whenever a task depends on a past decision, a preference, a \
 host, a credential location, or \"how do we usually do this\". Semantic, so ask in full sentences. \
 Superseded facts are excluded: every hit is what is believed now. Each hit's source is the name \
-of the app that wrote it."
+of the app that wrote it. Pass tags to keep only facts carrying all of them."
     )]
     async fn memory_search(
         &self,
@@ -222,7 +227,7 @@ of the app that wrote it."
                 Some(raw) => Some(tools::parse_as_of(raw)?),
                 None => None,
             };
-            let result = search::run(
+            let result = search::run_tagged(
                 &ctx,
                 &args.query,
                 args.namespaces,
@@ -236,6 +241,9 @@ of the app that wrote it."
                 // and the wording is the only thing holding the line. `services::search` gates it on
                 // `may_read_history` before the statement runs, as it always did.
                 as_of,
+                // All of them, normalised the way a write stores them. Absent and empty both mean
+                // no filter, which is the search this tool ran before the argument existed.
+                &args.tags.unwrap_or_default(),
             )
             .await?;
             let json = serde_json::to_value(&result).unwrap_or_default();

@@ -33,7 +33,7 @@ use crate::ports::memory::{
 use crate::ports::{
     ConflictPair, DigestData, DigestQuery, Emission, MemoryRepository, NamespaceRows,
     NamespaceSummary, NeighbourQuery, NewMemory, RecentQuery, RegistrySummary, SearchQuery,
-    Staleness,
+    Staleness, TagCount,
 };
 
 pub struct PgMemoryRepository {
@@ -415,6 +415,58 @@ const SEARCH_RRF_AS_OF: &str = rrf_search_sql!(
                    AND (m.occurred_until IS NULL OR m.occurred_until >  $15))"#
 );
 
+/// The six statements again, each with a tag test beside its period predicate.
+///
+/// Siblings rather than a bound array tested for emptiness. `(cardinality($n) = 0 OR m.tags @> $n)`
+/// would change the text of every search this server runs, and under a generic plan the planner
+/// cannot use the GIN index on `tags` through the OR. The predicate rides in the `$live` slot, so it
+/// lands inside both arms ahead of each LIMIT, where the policy filters sit and for their reason.
+///
+/// The tag array binds last, on the first parameter number its sibling leaves spare: `$14` for the
+/// linear pair, `$15` where rank fusion holds `k` or the linear as-of statement holds the instant,
+/// and `$16` for rank fusion as of an instant. `search` binds in that order.
+const SEARCH_LIVE_TAGGED: &str = linear_search_sql!(concat!(live!(), " AND m.tags @> $14::text[]"));
+const SEARCH_ALL_TAGGED: &str = linear_search_sql!("m.tags @> $14::text[]");
+const SEARCH_RRF_LIVE_TAGGED: &str =
+    rrf_search_sql!(concat!(live!(), " AND m.tags @> $15::text[]"));
+const SEARCH_RRF_ALL_TAGGED: &str = rrf_search_sql!("m.tags @> $15::text[]");
+const SEARCH_AS_OF_TAGGED: &str = linear_search_sql!(
+    r#"(COALESCE(m.occurred_at, m.created_at) <= $14
+                   AND (m.occurred_until IS NULL OR m.occurred_until >  $14))
+                   AND m.tags @> $15::text[]"#
+);
+const SEARCH_RRF_AS_OF_TAGGED: &str = rrf_search_sql!(
+    r#"(COALESCE(m.occurred_at, m.created_at) <= $15
+                   AND (m.occurred_until IS NULL OR m.occurred_until >  $15))
+                   AND m.tags @> $16::text[]"#
+);
+
+/// Which of the twelve search statements answers this question.
+///
+/// `as_of` decides before `include_superseded`: the period predicate already reaches retired rows,
+/// which is the whole reason to ask, so the flag says nothing under it.
+fn search_statement(
+    fusion: Fusion,
+    as_of: bool,
+    include_superseded: bool,
+    tagged: bool,
+) -> &'static str {
+    match (fusion, as_of, include_superseded, tagged) {
+        (Fusion::Linear, true, _, false) => SEARCH_AS_OF,
+        (Fusion::Rrf, true, _, false) => SEARCH_RRF_AS_OF,
+        (Fusion::Linear, false, false, false) => SEARCH_LIVE,
+        (Fusion::Linear, false, true, false) => SEARCH_ALL,
+        (Fusion::Rrf, false, false, false) => SEARCH_RRF_LIVE,
+        (Fusion::Rrf, false, true, false) => SEARCH_RRF_ALL,
+        (Fusion::Linear, true, _, true) => SEARCH_AS_OF_TAGGED,
+        (Fusion::Rrf, true, _, true) => SEARCH_RRF_AS_OF_TAGGED,
+        (Fusion::Linear, false, false, true) => SEARCH_LIVE_TAGGED,
+        (Fusion::Linear, false, true, true) => SEARCH_ALL_TAGGED,
+        (Fusion::Rrf, false, false, true) => SEARCH_RRF_LIVE_TAGGED,
+        (Fusion::Rrf, false, true, true) => SEARCH_RRF_ALL_TAGGED,
+    }
+}
+
 /// One page of facts, newest first, in two compile-time variants.
 ///
 /// The live-rows predicate is a literal rather than a bound boolean, for the reason `search_sql!`
@@ -458,6 +510,20 @@ macro_rules! recent_sql {
 const RECENT_LIVE: &str = recent_sql!(live!());
 /// History alongside the live rows, so a correction reads as a revision in place.
 const RECENT_ALL: &str = recent_sql!("true");
+/// The pair again with a tag test on `$8`, siblings for the reason the tagged search statements
+/// are: the untagged text stays as it was, and the GIN index on `tags` stays reachable under a
+/// generic plan.
+const RECENT_LIVE_TAGGED: &str = recent_sql!(concat!(live!(), " AND m.tags @> $8::text[]"));
+const RECENT_ALL_TAGGED: &str = recent_sql!("m.tags @> $8::text[]");
+
+fn recent_statement(include_superseded: bool, tagged: bool) -> &'static str {
+    match (include_superseded, tagged) {
+        (false, false) => RECENT_LIVE,
+        (true, false) => RECENT_ALL,
+        (false, true) => RECENT_LIVE_TAGGED,
+        (true, true) => RECENT_ALL_TAGGED,
+    }
+}
 
 /// Rows that left the live reads inside a window, newest first, with whatever retired them.
 ///
@@ -750,6 +816,32 @@ const NAMESPACE_SUMMARY_SQL: &str = concat!(
        AND sensitivity_rank(m.sensitivity) <= rg.max_rank
      GROUP BY m.namespace
      ORDER BY m.namespace
+"#
+);
+
+/// Live rows per tag, on both axes.
+///
+/// The `reachable` join for the reason `NAMESPACE_SUMMARY_SQL` carries it: a tag name and a count
+/// say a fact exists. `count(DISTINCT m.id)` because a restored row keeps its archive's tags as they
+/// stand, and an archive can repeat one; the write path never does.
+const TAG_SUMMARY_SQL: &str = concat!(
+    r#"
+    WITH reachable AS (
+        SELECT namespace, min(sensitivity_rank(max)) AS max_rank
+          FROM unnest($2::text[], $3::text[]) AS g(namespace, max)
+         GROUP BY namespace
+    )
+    SELECT t.tag, count(DISTINCT m.id) AS live
+      FROM memory m
+      JOIN reachable rg ON rg.namespace = m.namespace
+     CROSS JOIN LATERAL unnest(m.tags) AS t(tag)
+     WHERE m.tenant_id = $1
+       AND sensitivity_rank(m.sensitivity) <= rg.max_rank
+       AND "#,
+    live!(),
+    r#"
+     GROUP BY t.tag
+     ORDER BY live DESC, t.tag ASC
 "#
 );
 
@@ -1565,16 +1657,8 @@ impl MemoryRepository for PgMemoryRepository {
         // Over-fetch each arm so the blend, the penalty and the use boost have something to rerank.
         let candidates = (q.limit * 4).max(20);
 
-        // `as_of` decides first and `include_superseded` says nothing under it: the period
-        // predicate already reaches retired rows, which is the whole reason to ask.
-        let sql = match (self.fusion, q.as_of.is_some(), q.include_superseded) {
-            (Fusion::Linear, true, _) => SEARCH_AS_OF,
-            (Fusion::Rrf, true, _) => SEARCH_RRF_AS_OF,
-            (Fusion::Linear, false, false) => SEARCH_LIVE,
-            (Fusion::Linear, false, true) => SEARCH_ALL,
-            (Fusion::Rrf, false, false) => SEARCH_RRF_LIVE,
-            (Fusion::Rrf, false, true) => SEARCH_RRF_ALL,
-        };
+        let tagged = !q.tags.is_empty();
+        let sql = search_statement(self.fusion, q.as_of.is_some(), q.include_superseded, tagged);
         let mut stmt = sqlx::query(sql)
             .bind(&q.tenant_id)
             .bind(&primary_ns)
@@ -1602,6 +1686,10 @@ impl MemoryRepository for PgMemoryRepository {
         }
         if let Some(as_of) = q.as_of {
             stmt = stmt.bind(as_of);
+        }
+        // Last, because the tag array takes the first number every statement above leaves spare.
+        if tagged {
+            stmt = stmt.bind(&q.tags);
         }
         let rows = stmt.fetch_all(&self.pool).await?;
 
@@ -1943,17 +2031,21 @@ impl MemoryRepository for PgMemoryRepository {
             Some((at, id)) => (Some(at), Some(id)),
             None => (None, None),
         };
-        let sql = if q.include_superseded { RECENT_ALL } else { RECENT_LIVE };
-        let rows = sqlx::query(sql)
+        let tagged = !q.tags.is_empty();
+        let mut stmt = sqlx::query(recent_statement(q.include_superseded, tagged))
             .bind(&q.tenant_id)
             .bind(&readable_ns)
             .bind(&readable_max)
             .bind(&q.namespace)
             .bind(before_at)
             .bind(before_id)
-            .bind(q.limit)
-            .fetch_all(&self.pool)
-            .await?;
+            .bind(q.limit);
+        // Postgres refuses a bind count that disagrees with the statement, so `$8` goes on only
+        // for the text that mentions it.
+        if tagged {
+            stmt = stmt.bind(&q.tags);
+        }
+        let rows = stmt.fetch_all(&self.pool).await?;
         Ok(rows.iter().map(memory_from_row).collect())
     }
 
@@ -2024,6 +2116,25 @@ impl MemoryRepository for PgMemoryRepository {
                 last_write: r.get("last_write"),
             })
             .collect())
+    }
+
+    /// Live rows per tag, on both axes.
+    async fn tag_summary(
+        &self,
+        tenant: &str,
+        readable: &[NamespaceCeiling],
+    ) -> Result<Vec<TagCount>> {
+        if readable.is_empty() {
+            return Ok(vec![]);
+        }
+        let (readable_ns, readable_max) = split_ceilings(readable);
+        let rows = sqlx::query(TAG_SUMMARY_SQL)
+            .bind(tenant)
+            .bind(&readable_ns)
+            .bind(&readable_max)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|r| TagCount { tag: r.get("tag"), live: r.get("live") }).collect())
     }
 
     /// Plaintext rows only. The recall monitor embeds what it samples, and the repository cannot
@@ -3406,6 +3517,124 @@ mod tests {
             assert!(!sql.contains("1.0) * $13"), "the additive form belongs to the linear blend");
             assert!(sql.contains("THEN 1.0::float8 ELSE $11::float8 END))::float8"));
         }
+    }
+
+    // -- the tag filter ---------------------------------------------------------------------------
+
+    /// Each tagged search statement with the parameter its tag array binds to. The number is the
+    /// first one its untagged sibling leaves spare, so the bind order stays the order the
+    /// parameters are numbered in.
+    const TAGGED_SEARCH_SQL: [(&str, &str); 6] = [
+        (SEARCH_LIVE_TAGGED, "$14"),
+        (SEARCH_ALL_TAGGED, "$14"),
+        (SEARCH_RRF_LIVE_TAGGED, "$15"),
+        (SEARCH_RRF_ALL_TAGGED, "$15"),
+        (SEARCH_AS_OF_TAGGED, "$15"),
+        (SEARCH_RRF_AS_OF_TAGGED, "$16"),
+    ];
+
+    /// A search with no tag filter runs the statement it ran before the filter existed, down to
+    /// the text. The filter is a sibling statement, never a bound `NULL` the planner has to reason
+    /// its way around.
+    #[test]
+    fn an_untagged_statement_carries_no_tag_predicate() {
+        for sql in EVERY_SEARCH_SQL.iter().chain([RECENT_LIVE, RECENT_ALL].iter()) {
+            assert!(!sql.contains("m.tags @>"), "an untagged statement gained a tag filter");
+        }
+    }
+
+    /// Inside both arms, ahead of each LIMIT. A filter after the LIMIT is the HNSW truncation trap
+    /// again: the vector arm returns its quota, the filter empties it, and a tagged fact the
+    /// lexical arm missed never reaches the blend.
+    #[test]
+    fn a_tagged_search_filters_inside_both_arms_on_its_own_parameter() {
+        for (sql, n) in TAGGED_SEARCH_SQL {
+            let predicate = format!("m.tags @> {n}::text[]");
+            assert_eq!(sql.matches(&predicate).count(), 2, "the vector arm and the lexical arm");
+            let next = format!("${}", n[1..].parse::<u32>().unwrap() + 1);
+            assert!(!sql.contains(&next), "{n} is the last parameter a tagged statement binds");
+        }
+    }
+
+    /// A tag is a reason to narrow a search, and never a reason to widen it past the grant.
+    #[test]
+    fn a_tagged_search_keeps_every_policy_and_period_filter_its_sibling_has() {
+        for (sql, _) in TAGGED_SEARCH_SQL {
+            assert_eq!(sql.matches("<= rg.max_rank").count(), 2);
+            assert_eq!(sql.matches("m.namespace = ANY($2 || $4)").count(), 2);
+            assert!(sql.contains("m.sensitivity = 'open'"));
+        }
+        for sql in [SEARCH_LIVE_TAGGED, SEARCH_RRF_LIVE_TAGGED] {
+            assert_eq!(sql.matches("m.superseded_by IS NULL").count(), 2);
+        }
+        for sql in [SEARCH_ALL_TAGGED, SEARCH_RRF_ALL_TAGGED, SEARCH_AS_OF_TAGGED] {
+            assert!(!sql.contains("superseded_by IS NULL"));
+        }
+        assert!(!SEARCH_RRF_AS_OF_TAGGED.contains("superseded_by IS NULL"));
+        assert_eq!(SEARCH_AS_OF_TAGGED.matches("<= $14").count(), 2);
+        assert_eq!(SEARCH_RRF_AS_OF_TAGGED.matches("<= $15").count(), 2);
+    }
+
+    #[test]
+    fn the_search_statement_follows_the_blend_the_period_the_history_and_the_tags() {
+        use Fusion::{Linear, Rrf};
+        let cases = [
+            ((Linear, false, false, false), SEARCH_LIVE),
+            ((Linear, false, true, false), SEARCH_ALL),
+            ((Linear, true, false, false), SEARCH_AS_OF),
+            ((Linear, true, true, false), SEARCH_AS_OF),
+            ((Rrf, false, false, false), SEARCH_RRF_LIVE),
+            ((Rrf, false, true, false), SEARCH_RRF_ALL),
+            ((Rrf, true, false, false), SEARCH_RRF_AS_OF),
+            ((Linear, false, false, true), SEARCH_LIVE_TAGGED),
+            ((Linear, false, true, true), SEARCH_ALL_TAGGED),
+            ((Linear, true, true, true), SEARCH_AS_OF_TAGGED),
+            ((Rrf, false, false, true), SEARCH_RRF_LIVE_TAGGED),
+            ((Rrf, false, true, true), SEARCH_RRF_ALL_TAGGED),
+            ((Rrf, true, false, true), SEARCH_RRF_AS_OF_TAGGED),
+        ];
+        for ((fusion, as_of, superseded, tagged), want) in cases {
+            assert_eq!(
+                search_statement(fusion, as_of, superseded, tagged),
+                want,
+                "{fusion:?} as_of={as_of} include_superseded={superseded} tagged={tagged}"
+            );
+        }
+    }
+
+    /// The keyset comparison and the tag test sit in one WHERE clause, so the cursor pages through
+    /// the filtered rows. A tag test applied to a fetched page would return short pages and a
+    /// cursor that skips the rows the filter would have reached next.
+    #[test]
+    fn a_tagged_reading_page_filters_inside_the_query_beside_the_cursor() {
+        for sql in [RECENT_LIVE_TAGGED, RECENT_ALL_TAGGED] {
+            assert_eq!(sql.matches("m.tags @> $8::text[]").count(), 1);
+            assert!(!sql.contains("$9"), "the tag array is the eighth and last parameter");
+            assert!(sql.contains("(m.created_at, m.id) < ($5, $6::uuid)"));
+            assert_eq!(sql.matches("JOIN reachable rg").count(), 1);
+            assert_eq!(sql.matches("<= rg.max_rank").count(), 1);
+        }
+        assert_eq!(RECENT_LIVE_TAGGED.matches("m.superseded_by IS NULL").count(), 1);
+        assert!(!RECENT_ALL_TAGGED.contains("superseded_by IS NULL"));
+    }
+
+    #[test]
+    fn the_reading_page_statement_follows_the_history_and_the_tags() {
+        assert_eq!(recent_statement(false, false), RECENT_LIVE);
+        assert_eq!(recent_statement(true, false), RECENT_ALL);
+        assert_eq!(recent_statement(false, true), RECENT_LIVE_TAGGED);
+        assert_eq!(recent_statement(true, true), RECENT_ALL_TAGGED);
+    }
+
+    /// A tag name and a count is enough to say a fact exists. Both axes join in, and only live
+    /// rows count, so a tag carried only by rows the caller may not see is absent rather than
+    /// present at zero.
+    #[test]
+    fn the_tag_summary_counts_live_rows_the_caller_may_see() {
+        assert_eq!(TAG_SUMMARY_SQL.matches("JOIN reachable rg").count(), 1);
+        assert_eq!(TAG_SUMMARY_SQL.matches("<= rg.max_rank").count(), 1);
+        assert_eq!(TAG_SUMMARY_SQL.matches("m.superseded_by IS NULL").count(), 1);
+        assert!(TAG_SUMMARY_SQL.contains("ORDER BY live DESC, t.tag ASC"));
     }
 
     /// The score expression in Rust, so the arithmetic can be asserted without a database.

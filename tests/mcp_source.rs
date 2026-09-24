@@ -510,3 +510,53 @@ async fn in_token_mode_a_stored_client_id_prints_as_stored() {
     let (source, _) = h.searched_source(&content, &id).await;
     assert_eq!(source, codex.id);
 }
+
+/// `tags` on `memory_search` reaches the query and means all of them. A second row answers the
+/// same text without the tag and has to stay out. The filter arrives in a spelling the write
+/// would have cleaned, which is what a model copying a tag from a user's sentence sends.
+#[tokio::test]
+async fn memory_search_keeps_only_hits_carrying_every_tag_it_was_given() {
+    let h = harness_or_skip!(AuthMode::Token);
+    let stem = nonce("tags");
+    let write = |content: String, tags: Value| {
+        let h = &h;
+        async move {
+            let written = h
+                .call(
+                    "memory_write",
+                    json!({ "content": content, "namespace": "global", "tags": tags }),
+                )
+                .await;
+            structured(&written)["id"].as_str().unwrap().to_string()
+        }
+    };
+    let both =
+        write(format!("the {stem} release train leaves on thursdays"), json!(["infra", "release"]))
+            .await;
+    let one = write(format!("the {stem} release notes live in the wiki"), json!(["release"])).await;
+
+    let search = |tags: Value| {
+        let h = &h;
+        let stem = stem.clone();
+        async move {
+            let result = h
+                .call(
+                    "memory_search",
+                    json!({ "query": format!("{stem} release"), "limit": 20, "tags": tags }),
+                )
+                .await;
+            structured(&result)["hits"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|hit| hit["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let release = search(json!(["Release "])).await;
+    assert!(release.contains(&both) && release.contains(&one), "{release:?}");
+    assert_eq!(search(json!(["release", "INFRA"])).await, vec![both.clone()]);
+    assert!(search(json!(["release", "nowhere"])).await.is_empty(), "all of, never any of");
+}

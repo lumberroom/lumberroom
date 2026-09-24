@@ -4168,3 +4168,216 @@ async fn an_access_bump_skips_a_row_another_write_holds() {
     assert_eq!(free_count, 1, "the bump waited on a row another write holds");
     assert_eq!(held_count, 0, "the bump reached a row another write holds");
 }
+
+// -- the tag filter and the tag count ---------------------------------------------------------------
+
+fn tag_list(tags: &[&str]) -> Option<Vec<String>> {
+    Some(tags.iter().map(|t| (*t).to_string()).collect())
+}
+
+fn page_ids(page: &lumberroom_server::console::data::Page) -> Vec<String> {
+    page.entries.iter().map(|e| e.id.clone()).collect()
+}
+
+/// The tag test sits in the reading page's WHERE clause beside the keyset comparison, so the
+/// cursor walks the filtered rows. Filtering a fetched page would return a short page and a cursor
+/// past rows the filter would have reached next.
+#[tokio::test]
+async fn the_reading_page_keeps_rows_carrying_every_listed_tag_and_pages_under_the_filter() {
+    use lumberroom_server::console::data;
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let ns = "project:tagfilter";
+    let w = |content: &'static str, tags: Option<Vec<String>>| {
+        let ctx = ctx.clone();
+        async move { write::run(&ctx, content, ns, tags, None, None, None).await.unwrap().id }
+    };
+    let alpha = w("The staging cluster runs in Frankfurt", tag_list(&["alpha"])).await;
+    let both_old = w("Backups rotate every Sunday at four", tag_list(&["alpha", "beta"])).await;
+    let _beta = w("The design system uses an eight point grid", tag_list(&["beta"])).await;
+    let _bare = w("Nobody tagged this note about the lunch order", None).await;
+    let both_new =
+        w("Invoices go out on the first working day", tag_list(&["beta", "alpha"])).await;
+
+    let readable = data::readable(&ctx).await.unwrap();
+    let page = |tags: Vec<String>, before: Option<data::Cursor>, limit: i64| {
+        let (ctx, readable) = (ctx.clone(), readable.clone());
+        async move { data::page(&ctx, &readable, Some(ns), before, limit, false, &tags).await.unwrap() }
+    };
+
+    let unfiltered = page(vec![], None, 10).await;
+    assert_eq!(unfiltered.entries.len(), 5, "no tags is no filter");
+
+    let one = page(vec!["alpha".into()], None, 10).await;
+    assert_eq!(page_ids(&one), vec![both_new.clone(), both_old.clone(), alpha.clone()]);
+
+    let two = page(vec!["beta".into(), "alpha".into()], None, 10).await;
+    assert_eq!(page_ids(&two), vec![both_new.clone(), both_old.clone()], "all of, never any of");
+
+    // The raw spelling a dashboard would send, one row a page.
+    let first = page(vec![" ALPHA ".into(), "Beta".into()], None, 1).await;
+    assert_eq!(page_ids(&first), vec![both_new.clone()]);
+    let cursor = first.older.expect("a second row carries both tags");
+    let second = page(vec![" ALPHA ".into(), "Beta".into()], Some(cursor), 1).await;
+    assert_eq!(page_ids(&second), vec![both_old.clone()]);
+    // `alpha` sits behind `both_old` unfiltered, so a cursor here would mean the filter ran after
+    // the page was cut.
+    assert!(second.older.is_none(), "no third row carries both tags");
+}
+
+/// A row that matches the text and lacks the tag never reaches the caller, on every statement the
+/// repository can choose: both blends, now and as of an instant.
+#[tokio::test]
+async fn a_tagged_search_drops_a_text_match_that_lacks_the_tag() {
+    use lumberroom_server::domain::policy::NamespaceCeiling;
+    use lumberroom_server::ports::{MemoryRepository, SearchQuery, Weights};
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let tagged = write::run(
+        &ctx,
+        "The deploy host for kestrel is fern.internal",
+        "global",
+        tag_list(&["Infra"]),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
+    let untagged = write::run(
+        &ctx,
+        "The deploy host for kestrel moved to oak.internal",
+        "project:kestrel",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
+    let asked = || Some(vec!["global".to_string(), "project:kestrel".to_string()]);
+    let q = "deploy host for kestrel";
+    let ids = |r: &search::SearchResult| r.hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+
+    let all = search::run(&ctx, q, asked(), Some(10), None, None, None).await.unwrap();
+    assert!(ids(&all).contains(&tagged), "the tagged row answers the text: {:?}", ids(&all));
+    assert!(ids(&all).contains(&untagged), "so does the untagged one: {:?}", ids(&all));
+
+    let filtered =
+        search::run_tagged(&ctx, q, asked(), Some(10), None, None, None, &[" INFRA".into()])
+            .await
+            .unwrap();
+    assert_eq!(ids(&filtered), vec![tagged.clone()]);
+
+    let later = chrono::Utc::now() + chrono::Duration::minutes(1);
+    let as_of =
+        search::run_tagged(&ctx, q, asked(), Some(10), None, None, Some(later), &["infra".into()])
+            .await
+            .unwrap();
+    assert_eq!(ids(&as_of), vec![tagged.clone()]);
+
+    // The service runs whichever blend the config names, so rank fusion is reached at the port.
+    let mut rrf_cfg = ctx.cfg.search.clone();
+    rrf_cfg.fusion = config::Fusion::Rrf;
+    let repos = [
+        postgres::PgMemoryRepository::new(pool.clone()),
+        postgres::PgMemoryRepository::new(pool.clone()).with_search(&rrf_cfg),
+    ];
+    let embedding = ctx.embedder.embed_query(q).await.unwrap();
+    let readable = |ns: &str| NamespaceCeiling { namespace: ns.into(), max: Sensitivity::Sealed };
+    for (i, repo) in repos.iter().enumerate() {
+        for (as_of, include_superseded) in [(None, false), (None, true), (Some(later), false)] {
+            let hits = repo
+                .search(SearchQuery {
+                    tenant_id: ctx.cfg.tenant_id.clone(),
+                    primary: vec![readable("global"), readable("project:kestrel")],
+                    secondary: vec![],
+                    embedding: embedding.clone(),
+                    text: q.into(),
+                    limit: 10,
+                    weights: Weights {
+                        vector: 1.0,
+                        lexical: 0.35,
+                        secondary_penalty: 0.8,
+                        usage: 0.05,
+                    },
+                    include_superseded,
+                    as_of,
+                    tags: vec!["infra".into()],
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("repo {i} as_of={as_of:?} history={include_superseded}: {e:?}")
+                });
+            let got: Vec<String> = hits.iter().map(|h| h.memory.id.clone()).collect();
+            assert_eq!(
+                got,
+                vec![tagged.clone()],
+                "repo {i} as_of={as_of:?} history={include_superseded}"
+            );
+        }
+    }
+}
+
+/// A tag name and a count say a fact exists. A row outside the namespace grant, a row above the
+/// ceiling and a retired row all stay out of both, so a tag only they carry is absent rather than
+/// listed at zero.
+#[tokio::test]
+async fn the_tag_count_counts_only_live_rows_the_caller_may_see() {
+    use lumberroom_server::console::data;
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let w = |content: &'static str,
+             ns: &'static str,
+             tags: Option<Vec<String>>,
+             sens: Option<&'static str>| {
+        let ctx = ctx.clone();
+        async move { write::run(&ctx, content, ns, tags, None, sens, None).await.unwrap().id }
+    };
+    w("The shared runbook lives in the ops wiki", "global", tag_list(&["shared", "ops"]), None)
+        .await;
+    w("The ops pager rotation starts on Mondays", "project:ops", tag_list(&["ops"]), None).await;
+    w(
+        "The payroll run closes on the twentieth",
+        "project:ops",
+        tag_list(&["shared", "payroll"]),
+        Some("private"),
+    )
+    .await;
+    w(
+        "The hidden project ships on Fridays",
+        "project:hidden",
+        tag_list(&["shared", "hidden"]),
+        None,
+    )
+    .await;
+    let old = w("The build box is called anvil", "global", tag_list(&["retired"]), None).await;
+    write::run(&ctx, "The build box is called forge now", "global", None, Some(&old), None, None)
+        .await
+        .unwrap();
+
+    let pairs = |counts: Vec<lumberroom_server::ports::TagCount>| {
+        counts.into_iter().map(|c| (c.tag, c.live)).collect::<Vec<_>>()
+    };
+
+    let reader = restricted_at(
+        &ctx,
+        &at(&[("global", Sensitivity::Open), ("project:ops", Sensitivity::Open)]),
+        &[],
+    );
+    let readable = data::readable(&reader).await.unwrap();
+    let seen = pairs(data::tag_counts(&reader, &readable).await.unwrap());
+    assert_eq!(seen, vec![("ops".to_string(), 2), ("shared".to_string(), 1)]);
+
+    // The owner's view, to show the refused rows are in the store and ordered by count then name.
+    let readable = data::readable(&ctx).await.unwrap();
+    let all = pairs(data::tag_counts(&ctx, &readable).await.unwrap());
+    assert_eq!(
+        all,
+        vec![
+            ("shared".to_string(), 3),
+            ("ops".to_string(), 2),
+            ("hidden".to_string(), 1),
+            ("payroll".to_string(), 1),
+        ]
+    );
+}

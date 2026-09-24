@@ -435,14 +435,9 @@ fn parse_sensitivity(raw: Option<&str>) -> Result<Option<Sensitivity>> {
     })
 }
 
+/// The one spelling a tag filter also runs through, so a filter matches what this stored.
 fn clean_tags(tags: Option<Vec<String>>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    tags.unwrap_or_default()
-        .into_iter()
-        .map(|t| t.trim().to_ascii_lowercase())
-        .filter(|t| !t.is_empty())
-        .filter(|t| seen.insert(t.clone()))
-        .collect()
+    crate::domain::tags::normalise(tags.unwrap_or_default())
 }
 
 /// Live rows in this namespace close enough to be worth a decision, bounded by what the caller may

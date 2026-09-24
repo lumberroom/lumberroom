@@ -7,5 +7,6 @@ pub mod oauth;
 pub mod policy;
 pub mod presets;
 pub mod routing;
+pub mod tags;
 pub mod tripwire;
 pub mod types;
