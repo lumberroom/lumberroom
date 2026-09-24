@@ -931,7 +931,8 @@ impl PgCleanupRepository {
         let rows = sqlx::query(
             r#"
             SELECT cm.memory_id, cm.disposition, cm.seen_content,
-                   m.content AS current_content, m.superseded_by, m.namespace, m.sensitivity
+                   m.content AS current_content, m.superseded_by, m.namespace, m.sensitivity,
+                   m.created_at, m.occurred_at, m.access_count, m.source_client
               FROM cleanup_proposal_member cm
               LEFT JOIN memory m ON m.id = cm.memory_id
              WHERE cm.proposal_id = $1
@@ -959,6 +960,10 @@ impl PgCleanupRepository {
                 superseded_by: superseded_by.map(|u| u.to_string()),
                 namespace: row.try_get("namespace").map_err(map_err)?,
                 sensitivity: sensitivity.as_deref().map(parse_sensitivity).transpose()?,
+                created_at: row.try_get("created_at").map_err(map_err)?,
+                occurred_at: row.try_get("occurred_at").map_err(map_err)?,
+                access_count: row.try_get("access_count").map_err(map_err)?,
+                source_client: row.try_get("source_client").map_err(map_err)?,
             });
         }
         Ok(out)

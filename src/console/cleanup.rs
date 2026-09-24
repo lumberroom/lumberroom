@@ -714,6 +714,10 @@ mod tests {
             superseded_by: None,
             namespace: Some("user:me".into()),
             sensitivity: Some(Sensitivity::Open),
+            created_at: Some(Utc::now()),
+            occurred_at: None,
+            access_count: Some(0),
+            source_client: Some("test".into()),
         }
     }
 
