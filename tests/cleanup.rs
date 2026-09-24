@@ -1021,3 +1021,116 @@ async fn facts_sharing_a_day_are_reported_and_never_proposed() {
     assert_eq!(report.queued, 0, "an empty interval is not an ending");
     assert_eq!(report.same_day_skipped, 1, "and the owner is told it was skipped");
 }
+
+/// A sentence a person reads: a capital first, a full stop last, and no score in between. The
+/// similarity already travels as its own field, and a cosine printed into prose reads as a
+/// confidence the owner has no scale for. A count stays: "these 2 rows" is a fact, and a score is
+/// the only number here with a decimal point.
+fn reads_as_a_sentence(s: &str) -> bool {
+    let b = s.as_bytes();
+    let has_decimal =
+        b.windows(3).any(|w| w[0].is_ascii_digit() && w[1] == b'.' && w[2].is_ascii_digit());
+    s.chars().next().is_some_and(char::is_uppercase)
+        && s.trim_end().ends_with('.')
+        && !has_decimal
+        && !s.contains("cosine")
+}
+
+/// Every member of an exact cluster has the same text, so the facts about each row are all an
+/// owner has to judge the survivor by: when it was written, when it held, how often it was read,
+/// and who wrote it.
+#[tokio::test]
+async fn a_member_carries_when_it_was_written_its_reads_and_its_source() {
+    let h = harness_or_skip!();
+    let first = put_raw(&h, "user:me", "the staging bucket is called lr-staging-assets").await;
+    let second = put_raw(&h, "user:me", "The staging bucket is called lr-staging-assets").await;
+    set_occurred(&h, &first, "2026-03-04T00:00:00Z").await;
+    sqlx::query("UPDATE memory SET access_count = 7, source_client = 'cursor' WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&first).unwrap())
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+    let rows = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
+    let p = rows.iter().find(|p| p.members.iter().any(|m| m.memory_id == first)).unwrap();
+    let keep = p.members.iter().find(|m| m.memory_id == first).unwrap();
+    let other = p.members.iter().find(|m| m.memory_id == second).unwrap();
+
+    let written: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT created_at FROM memory WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&first).unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(keep.created_at, Some(written));
+    assert_eq!(keep.occurred_at, Some("2026-03-04T00:00:00Z".parse().unwrap()));
+    assert_eq!(keep.access_count, Some(7));
+    assert_eq!(keep.source_client.as_deref(), Some("cursor"));
+
+    assert!(other.created_at.is_some());
+    assert_eq!(other.occurred_at, None, "a row with no valid time says so");
+    assert_eq!(other.access_count, Some(0));
+    assert_eq!(other.source_client.as_deref(), Some("test"));
+
+    // The REST list serialises `Proposal` whole, so the wire carries whatever the struct does.
+    let wire = serde_json::to_value(keep).unwrap();
+    for field in ["created_at", "occurred_at", "access_count", "source_client"] {
+        assert!(wire.get(field).is_some_and(|v| !v.is_null()), "{field} missing: {wire}");
+    }
+    assert!(reads_as_a_sentence(&p.rationale), "{:?}", p.rationale);
+}
+
+/// A member whose row has gone carries no facts about it, the way it carries no current content.
+///
+/// The member table cascades on delete, so the fixture turns off trigger enforcement for its own
+/// session to leave the member behind. That needs a role allowed to set
+/// `session_replication_role`, which the local compose database grants.
+#[tokio::test]
+async fn a_gone_member_carries_none_of_the_row_facts() {
+    let h = harness_or_skip!();
+    let first = put_raw(&h, "user:me", "the nightly export lands in s3://lr-exports").await;
+    let second = put_raw(&h, "user:me", "The nightly export lands in s3://lr-exports").await;
+    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+
+    let mut conn = h.pool.acquire().await.unwrap();
+    sqlx::query("SET session_replication_role = replica").execute(&mut *conn).await.unwrap();
+    sqlx::query("DELETE FROM memory WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&second).unwrap())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("SET session_replication_role = origin").execute(&mut *conn).await.unwrap();
+    drop(conn);
+
+    let rows = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
+    let p = rows.iter().find(|p| p.members.iter().any(|m| m.memory_id == first)).unwrap();
+    let gone = p.members.iter().find(|m| m.memory_id == second).expect("the member stayed");
+    assert_eq!(gone.current_content, None, "the fixture did not remove the row");
+    assert_eq!(gone.created_at, None);
+    assert_eq!(gone.occurred_at, None);
+    assert_eq!(gone.access_count, None);
+    assert_eq!(gone.source_client, None);
+}
+
+/// A punctuation difference survives the exact query's normalisation but not the hash embedder's
+/// tokeniser, so the pair lands at a cosine of 1.0 as a paraphrase.
+#[tokio::test]
+async fn a_near_duplicate_rationale_is_a_sentence_with_no_score() {
+    let h = harness_or_skip!();
+    let older = put_raw(&h, "user:me", "the archive mailer relays through port 2525").await;
+    let newer = put_raw(&h, "user:me", "the archive mailer relays through port 2525.").await;
+
+    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+    let rows = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
+    let p = rows
+        .iter()
+        .find(|p| {
+            p.kind == lumberroom_server::domain::cleanup::CleanupKind::Paraphrase
+                && p.members.iter().any(|m| m.memory_id == older)
+                && p.members.iter().any(|m| m.memory_id == newer)
+        })
+        .expect("the pair was not proposed as a paraphrase");
+    assert!(reads_as_a_sentence(&p.rationale), "{:?}", p.rationale);
+    assert!(p.similarity.is_some(), "the score still travels, as its own field");
+}

@@ -165,6 +165,15 @@ pub struct Member {
     /// service check that claim a second time at the boundary.
     pub namespace: Option<String>,
     pub sensitivity: Option<Sensitivity>,
+    /// The row's own facts, read when the proposal is, so an owner can tell apart the members of
+    /// a cluster whose text is identical. All `None` when the row is gone, like `current_content`.
+    /// `occurred_at` is also `None` on a live row that never said when it held; `current_content`
+    /// tells the two apart.
+    pub created_at: Option<DateTime<Utc>>,
+    pub occurred_at: Option<DateTime<Utc>>,
+    pub access_count: Option<i32>,
+    /// The client that wrote the row, as stored.
+    pub source_client: Option<String>,
 }
 
 /// What `queue` did with a cluster it was handed.

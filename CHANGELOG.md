@@ -46,8 +46,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   than passing free text outside the data fence. CLI 0.5.0 reads no `overrode` field and shows no
   override on any proposal decision; that lands in the CLI's next release.
 
+- **A cleanup proposal's members carry the row's own facts.** Each `Member` in
+  `GET /admin/cleanup/proposals` and `GET /admin/cleanup/proposals/{id}` gained `created_at`,
+  `occurred_at`, `access_count` and `source_client`, read from the memory row when the proposal is
+  read, so the members of an exact cluster no longer look identical. `source_client` is the stored
+  value; no MCP tool serves a cleanup member. All four are `null` when the row is
+  gone, as `current_content` already was; `occurred_at` is also `null` on a live row with no valid
+  time. The fields are additive; code that builds a `ports::cleanup::Member` by hand has to set
+  them.
+
 ### Changed
 
+- **The cleanup pass writes its rationales as sentences.** A near-duplicate reads "These two say
+  the same thing." in place of "these two say the same thing at a cosine of 0.971."; the score
+  stays in the proposal's `similarity` field. The exact and stale rationales now start with a
+  capital. Proposals already stored keep their text.
 - **MCP answers name the app that wrote a row.** `context_bootstrap`, `memory_search`,
   `memory_history`, `registry_get`, `registry_history` and `memory_forget` carry `source` in place
   of `source_client`, and the digest trailer reads `via Codex` rather than `via <client_id>`. For a
