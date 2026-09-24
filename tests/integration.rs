@@ -4100,3 +4100,71 @@ async fn the_stranded_namespace_query_sees_what_namespace_counts_misses() {
         "user:me is reported and the caller is what skips it: {found:?}"
     );
 }
+
+/// The access bump rides along with every search, so it must never wait on a row lock.
+///
+/// It used to be one UPDATE that locked the returned rows in scan order and held each lock until
+/// the statement ended. A supersession locks its two rows in id order, so a search that returned
+/// both rows of a pending supersession could hold one while the write held the other. Postgres
+/// then aborts one of the two, and nothing retries a deadlock, so the victim could be the user's
+/// write. The bump now skips a row somebody else holds, which leaves nothing for a cycle to form
+/// around.
+///
+/// Before the fix the bump queues behind the held row and B's count stays at zero for the whole
+/// window: the statement has not ended, so even a row it already bumped is invisible here.
+#[tokio::test]
+async fn an_access_bump_skips_a_row_another_write_holds() {
+    let Some((ctx, pool, _guard, _db)) = setup().await else { return };
+
+    let held = uuid::Uuid::new_v4();
+    let free = uuid::Uuid::new_v4();
+    for (id, content) in [(held, "the row a write holds"), (free, "the row nobody holds")] {
+        sqlx::query(
+            "INSERT INTO memory (id, tenant_id, namespace, content, source_client)
+             VALUES ($1, $2, 'user:me', $3, 'test')",
+        )
+        .bind(id)
+        .bind(ctx.tenant())
+        .bind(content)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM memory WHERE id = $1 FOR UPDATE")
+        .bind(held)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+
+    ctx.repos.memories.touch_accessed(ctx.tenant(), vec![held, free]);
+
+    let count = |id: uuid::Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i32>("SELECT access_count FROM memory WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    // The bump runs on a spawned task, so the test polls for its effect. Three seconds is far
+    // past what one UPDATE over two rows takes and short enough that a blocked bump fails fast.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut free_count = count(free).await;
+    while free_count == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        free_count = count(free).await;
+    }
+    // One statement bumps both rows, so once B shows its bump the statement has ended and A's
+    // value is final.
+    let held_count = count(held).await;
+
+    // Released before asserting, so a failure here cannot leave a lock behind for the next test.
+    writer.rollback().await.unwrap();
+
+    assert_eq!(free_count, 1, "the bump waited on a row another write holds");
+    assert_eq!(held_count, 0, "the bump reached a row another write holds");
+}
