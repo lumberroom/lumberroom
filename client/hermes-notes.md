@@ -7,12 +7,13 @@ as every other surface.
 
 ## The one thing that matters before anything else
 
-**Hermes is documented to identify itself as `"Claude Code"` in its MCP `clientInfo.name` in some
-configurations.** That is not a typo and not a Hermes bug worth reporting: it is `clientInfo`,
-which is free text the client sends about itself, self-declared, unverified, and never used for
-policy in lumberroom (`docs/specs/phase-2-surfaces.md` §3). If you grant by `clientInfo` or by anything
-Hermes says about itself, you will hand a Nous Research agent the grant meant for your own Claude
-Code install, silently, and the log line will look correct while being wrong.
+**Never grant on what Hermes says about itself.** An earlier version of this note said Hermes
+sends `"Claude Code"` as its client name in some configurations. Hermes source at `fdec926e`
+(25 September 2026) says otherwise: its OAuth registration defaults `client_name` to
+`"Hermes Agent"` and switches to `"Claude Code"` only for Figma's remote MCP server, whose
+registration allowlist demands it (`tools/mcp_oauth.py:1089-1131`). The rule stands anyway.
+`clientInfo` and `client_name` are free text a client sends about itself, unverified, and lumberroom
+never uses them for policy (`docs/specs/phase-2-surfaces.md` §3).
 
 **Identity comes from the credential and only the credential.** Issue Hermes its own token in
 `AUTH_TOKENS`, distinct from every other client's, and let the server key the grant off that. This
@@ -59,14 +60,21 @@ egress IP) is logged for the per-client rate numbers in §5 and never checked fo
    LUMBERROOM_URL=https://<your-domain> LUMBERROOM_TOKEN=<hermes token> lumberroom doctor
    ```
 
-## No SessionStart hook
+## Recall with a plain MCP mount, and the hook that forces it
 
-Hermes has no documented lifecycle hook equivalent to Claude Code's `SessionStart`
-(`docs/specs/phase-2-surfaces.md` §1, "Auto-recall: none"). Recall depends entirely on Hermes
-choosing to call `context_bootstrap` or `memory_search` on its own. That makes Hermes one of the
-surfaces the Phase 2 measurement in §5 is watching: if its unprompted read and write rates stay
-near zero, the fallback ladder there (sharper tool descriptions, then per-account instructions,
-then a browser-extension-equivalent if one exists for Hermes) applies to it the same as ChatGPT.
+Hermes has a per-turn recall hook, and an MCP mount does not reach it. A memory-provider plugin
+selected with `memory.provider` gets `prefetch` before every non-trivial turn, and Hermes appends
+what it returns to the user message inside a `<memory-context>` block with an 8.0s bound
+(`agent/memory_provider.py:84-206`, `agent/memory_manager.py:32,317-333,457-501` at `fdec926e`).
+MCP tools have no link to that manager, so with the setup on this page recall depends on Hermes
+choosing to call `context_bootstrap` or `memory_search` on its own, and the Phase 2 measurement in
+§5 applies to it as it does to ChatGPT.
+
+The lumberroom provider plugin at
+[`github.com/lumberroom/lumberroom-hermes`](https://github.com/lumberroom/lumberroom-hermes) uses that
+hook, and it is the setup to reach for: recall on every turn, the engine's own tools for writes, and
+Hermes's built-in store switched off. This page stays as the no-code fallback, an MCP mount plus the
+write rule, for a Hermes install that cannot take the plugin.
 
 ## Tell it how to remember
 
@@ -92,8 +100,8 @@ runs long and that is bloat. Two facts from one exchange are two calls.
 ```
 
 The Read paragraph above it covers the other half: `memory_search` before assuming, `registry_get`
-for a host or an endpoint, `context_bootstrap` once at the start of a session. Hermes has no
-lifecycle hook to force the bootstrap call, so that sentence is the only thing asking for it. The
+for a host or an endpoint, `context_bootstrap` once at the start of a session. With a plain MCP
+mount nothing forces the bootstrap call, so that sentence is the only thing asking for it. The
 unprompted-write number in step 2 of Acceptance is what tells you the snippet landed.
 
 ## Acceptance
