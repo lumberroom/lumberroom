@@ -85,8 +85,9 @@ block.
 `tool_calls` row takes its client from the token that made the call, so two clients sharing one
 token collapse into a single line in `lumberroom stats --by-client`, and narrowing one narrows
 both. `clientInfo.name` is free text the client sends about itself and lumberroom never reads it
-for policy, which matters most with Hermes: it identifies itself as `"Claude Code"` in some
-configurations ([`../client/hermes-notes.md`](../client/hermes-notes.md)).
+for policy. Hermes registers as `"Hermes Agent"` and uses `"Claude Code"` only for Figma's MCP
+server (`tools/mcp_oauth.py:1089-1131` in hermes-agent at `fdec926e`), but a name any client can
+choose is still no boundary ([`../client/hermes-notes.md`](../client/hermes-notes.md)).
 
 Mint one and add an entry. Single-quote the whole value, since several scripts source `.env` with
 `sh`:

@@ -112,6 +112,10 @@ rule in one pass:
 ./client/wire-mac.sh --url http://127.0.0.1:8787 --token <token>
 ```
 
+For Hermes Agent, [`lumberroom-hermes`](https://github.com/lumberroom/lumberroom-hermes) is a memory
+provider: recall on every turn and the engine's own tools for writes. It uses lumberroom.cloud unless
+`base_url` names your own engine, which runs the same code.
+
 Then prove the loop, which states a fact in one session and recovers it in a fresh one:
 
 ```bash

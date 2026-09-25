@@ -6,6 +6,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A memory provider for Hermes Agent, in its own repository.**
+  [`lumberroom/lumberroom-hermes`](https://github.com/lumberroom/lumberroom-hermes) makes lumberroom
+  Hermes's memory through the existing `/mcp` endpoint and needed no engine change. Decision 0021
+  records why plugins talk MCP and ship from their own repositories; `client/hermes-notes.md` keeps
+  the no-code fallback. The research behind both plugins is in
+  `docs/research/hermes-openclaw-memory-plugins.md`.
 - **Tag filtering, inside the query.** `memory_search` over MCP takes `tags`, and a hit must carry
   every one. The reading page (`RecentQuery.tags`) and search (`SearchQuery.tags`) filter with
   `tags @> $n::text[]` in SQL, beside the cursor and in both search arms, so a filtered page comes

@@ -30,7 +30,7 @@ a Microsoft Copilot Cowork, built on Anthropic's execution technology and shippe
 | **ChatGPT web** | Yes, via Developer Mode. Plus and above; Free excluded | Reported, **not primary-confirmed** | Treat as required until tested | [unverified] | [unverified] | **low to medium** |
 | **ChatGPT mobile** | [unverified] whether custom connectors exist there at all | [unverified] | [unverified] | [unverified] | [unverified] | low |
 | **OpenWebUI** | Yes, **native** MCP client since v0.6.31, Streamable HTTP. Self-hosted, no gating | **Yes, native, no gating** | No | Weak, sends the generic SDK default `clientInfo` and no distinguishing User-Agent | **The only real one anywhere.** A Filter `inlet` runs on every incoming message, outside model tool choice | high |
-| **Hermes** (Nous Research) | Yes, open-source CLI, `mcp_servers:` config, no gating | **Yes, native, today** | No | Weak, and actively misleading, documented to sometimes set `client_name` to `"Claude Code"` for compatibility | None | high |
+| **Hermes** (Nous Research) | Yes, open-source CLI, `mcp_servers:` config, no gating | **Yes, native, today** | No | Weak. Registers as `"Hermes Agent"`; uses `"Claude Code"` only for Figma's MCP server (hermes-agent `tools/mcp_oauth.py:1089-1131` at `fdec926e`, corrected 25 Sep 2026; the earlier cell said it sometimes claims to be Claude Code) | None for an MCP mount. A memory-provider plugin gets `prefetch` per turn (`agent/memory_provider.py`) | high |
 
 ---
 
@@ -70,8 +70,9 @@ Ranked by how much weight the answer can bear:
 2. **A distinct static bearer token per surface**, wherever bearer auth is available. We mint it, so
    we own the mapping completely.
 3. **Not usable for policy: `clientInfo` from the initialize handshake.** Free text, self-declared,
-   no registry. Three different values have been reported for Claude.ai alone, and Hermes is
-   documented to identify itself as `"Claude Code"` in some cases. Log it, never authorize on it.
+   no registry. Three different values have been reported for Claude.ai alone, and Hermes sends
+   `"Claude Code"` to Figma's MCP server to pass its registration allowlist. Log it, never
+   authorize on it.
 4. **Weak: User-Agent and egress IP.** Anthropic's tool-call traffic comes from `Claude-User` on a
    fixed CIDR, which confirms "this is Anthropic's cloud" but not which product. OpenWebUI sends
    nothing distinguishing.

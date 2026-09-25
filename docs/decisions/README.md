@@ -31,6 +31,7 @@ carries a marker pointing here.
 | [0018](0018-one-review-queue.md) | One queue shape with a source field, one decide route, a ledger that remembers "both are fine", and a proposal seam the engine leaves empty | 22 Sep 2026 | accepted, implemented |
 | [0019](0019-a-caller-corrects-a-proposal.md) | A proposal source takes the caller's corrected text, reason, read version and surface; a repair is `apply` with `content`; an agent may decide proposal items once asked to work the queue | 23 Sep 2026 | accepted, implemented |
 | [0020](0020-mcp-names-the-source.md) | MCP answers carry `source`, the name of the app that wrote a row, in place of the stored `source_client`; storage, export and the archive keep the id | 23 Sep 2026 | accepted, implemented; suite not run |
+| [0021](0021-harness-plugins-talk-mcp.md) | Harness memory plugins talk to the existing `/mcp` endpoint through the MCP SDK, with no REST surface for plugins and no Rust change in v1, and each ships from its own repository | 25 Sep 2026 | accepted |
 
 **On "verified".** All four gates ran against a live server on 20 August 2026 and passed. An OAuth
 flow completed end to end, a private row was encrypted and read back, and a replayed refresh token
