@@ -113,6 +113,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   as "internal error". The bump now skips any row another transaction holds, so a row mid-write
   loses one access count. Gate: `./scripts/cargo.sh test -j 1 --test integration
   an_access_bump_skips_a_row_another_write_holds`.
+- **`lumberroom login` prints the reason a sign-in failed.** When the authorization server
+  redirects an error to the loopback callback, the CLI prints `authorization server returned
+  error=<e>: <error_description>` and exits 1. It replaces control characters in both values with
+  spaces, so a crafted callback URL cannot send an escape sequence to the terminal. Without a
+  description the line reads as before. Gate: `./scripts/cargo.sh test -j 1 -p lumberroom --lib
+  oauth::`.
 
 ## [0.4.0] - 2026-09-07
 

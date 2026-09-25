@@ -272,11 +272,13 @@ async fn wait_for_callback(
         let mut code = None;
         let mut state = None;
         let mut error = None;
+        let mut description = None;
         for (k, v) in url.query_pairs() {
             match k.as_ref() {
                 "code" => code = Some(v.into_owned()),
                 "state" => state = Some(v.into_owned()),
                 "error" => error = Some(v.into_owned()),
+                "error_description" => description = Some(v.into_owned()),
                 _ => {}
             }
         }
@@ -284,7 +286,7 @@ async fn wait_for_callback(
         let (page, outcome) = if let Some(e) = error {
             (
                 "lumberroom: sign-in was cancelled or failed. You can close this window.",
-                Callback::Failed(format!("authorization server returned error={e}")),
+                Callback::Failed(callback_error(&e, description.as_deref())),
             )
         } else if state.as_deref() != Some(expected_state) {
             (
@@ -308,6 +310,18 @@ async fn wait_for_callback(
             Callback::Code(c) => return Ok(c),
             Callback::Failed(message) => return Err(err(message)),
         }
+    }
+}
+
+/// The terminal line for an error redirect. Anyone who can make the browser load a loopback URL
+/// chooses these bytes, so control characters become spaces before an escape sequence can reach
+/// the terminal.
+fn callback_error(error: &str, description: Option<&str>) -> String {
+    let clean =
+        |s: &str| -> String { s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect() };
+    match description {
+        Some(d) => format!("authorization server returned error={}: {}", clean(error), clean(d)),
+        None => format!("authorization server returned error={}", clean(error)),
     }
 }
 
@@ -721,5 +735,43 @@ mod tests {
                 .await;
         let e = handle.await.unwrap().unwrap_err();
         assert!(e.message.contains("error=access_denied"), "{}", e.message);
+    }
+
+    /// Drive one callback carrying `query` through a real listener and return the failure text.
+    async fn callback_failure(query: &str) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle =
+            tokio::spawn(async move { wait_for_callback(listener, "/callback", "st8").await });
+        let _ = reqwest::get(format!("http://127.0.0.1:{port}/callback?{query}")).await;
+        handle.await.unwrap().unwrap_err().message
+    }
+
+    #[tokio::test]
+    async fn an_error_description_prints_beside_the_error() {
+        let message = callback_failure(
+            "error=access_denied&error_description=this+account+is+not+enrolled&state=st8",
+        )
+        .await;
+        assert_eq!(
+            message,
+            "authorization server returned error=access_denied: this account is not enrolled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_description_carrying_terminal_escapes_prints_without_them() {
+        // ESC [ 2 J clears the screen; BEL and a newline would forge a second line of output.
+        let message =
+            callback_failure("error=access_denied&error_description=a%1B%5B2Jb%07c%0Ad&state=st8")
+                .await;
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+        assert_eq!(message, "authorization server returned error=access_denied: a [2Jb c d");
+    }
+
+    #[tokio::test]
+    async fn no_description_prints_the_error_alone() {
+        let message = callback_failure("error=access_denied&state=st8").await;
+        assert_eq!(message, "authorization server returned error=access_denied");
     }
 }
