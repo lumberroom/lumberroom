@@ -211,7 +211,7 @@ run mkdir -p "$BIN_DIR" "$CLAUDE_DIR/hooks"
 if ! install_lumberroom_binary; then
   say ""
   say "  no lumberroom binary is available on this machine. Get one, then run this again:"
-  say "    brew install the-cybersapien/lumberroom/lumberroom"
+  say "    brew install lumberroom/lumberroom/lumberroom"
   say "    cargo install lumberroom"
   say "    or download it from ${RELEASE_REPO}/releases"
   exit 1

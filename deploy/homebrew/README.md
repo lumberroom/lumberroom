@@ -1,11 +1,11 @@
 # Publishing this formula
 
-The tap is `the-cybersapien/homebrew-lumberroom`, and `Formula/lumberroom.rb` there is what brew
+The tap is `lumberroom/homebrew-lumberroom`, and `Formula/lumberroom.rb` there is what brew
 installs. `lumberroom.rb` here is the staging copy, so a version can be reviewed alongside the
 release it targets before it goes live.
 
 ```bash
-brew tap the-cybersapien/lumberroom
+brew tap lumberroom/lumberroom
 brew install lumberroom
 ```
 
@@ -19,10 +19,10 @@ brew install lumberroom
 3. Copy the file into the tap at `Formula/lumberroom.rb`, commit, push.
 4. Confirm it, rather than assuming it:
    ```
-   brew update-reset "$(brew --repo the-cybersapien/lumberroom)"
-   brew audit --strict --online the-cybersapien/lumberroom/lumberroom
-   brew install the-cybersapien/lumberroom/lumberroom
-   brew test the-cybersapien/lumberroom/lumberroom
+   brew update-reset "$(brew --repo lumberroom/lumberroom)"
+   brew audit --strict --online lumberroom/lumberroom/lumberroom
+   brew install lumberroom/lumberroom/lumberroom
+   brew test lumberroom/lumberroom/lumberroom
    ```
 
 `brew bump-formula-pr` handles steps 2 and 3 against the tap once you have a tag and the hashes.

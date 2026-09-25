@@ -1,5 +1,5 @@
 # The published copy of this file lives at Formula/lumberroom.rb in the tap
-# the-cybersapien/homebrew-lumberroom, and that copy is what brew installs. This one is the staging
+# lumberroom/homebrew-lumberroom, and that copy is what brew installs. This one is the staging
 # copy: prepare a version here alongside the release it targets, then copy it across. brew resolves
 # formula lookups by path inside a tap, not by where the source happens to live before that.
 class Lumberroom < Formula

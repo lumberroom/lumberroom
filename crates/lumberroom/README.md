@@ -14,7 +14,7 @@ lumberroom doctor
 Homebrew works too, and carries a prebuilt binary rather than compiling one:
 
 ```bash
-brew install the-cybersapien/lumberroom/lumberroom
+brew install lumberroom/lumberroom/lumberroom
 ```
 
 The [releases page](https://github.com/lumberroom/lumberroom/releases) also carries plain

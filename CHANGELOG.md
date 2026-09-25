@@ -107,7 +107,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `github.com/the-cybersapien/lumberroom`, redirects there. Container images now publish to
   `ghcr.io/lumberroom/lumberroom` and `ghcr.io/lumberroom/lumberroom-server`; the old
   `ghcr.io/the-cybersapien/lumberroom` and `ghcr.io/the-cybersapien/lumberroom-server` images stay
-  public, frozen at 0.4.0, and take no new versions. The Homebrew tap command does not change.
+  public, frozen at 0.4.0, and take no new versions. The Homebrew tap moved with it, to
+  `lumberroom/homebrew-lumberroom`: install with `brew install lumberroom/lumberroom/lumberroom`. An
+  existing `the-cybersapien/lumberroom` tap follows the redirect on the next `brew update`, and brew
+  renames it. Homebrew drops trust from a tap whose owner changed, so run
+  `brew trust lumberroom/lumberroom` once after that update; until you do, `brew upgrade` refuses the
+  formula. The installed binary keeps working either way.
 
 ### Fixed
 

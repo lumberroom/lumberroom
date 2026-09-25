@@ -62,8 +62,12 @@ The client runs on the machine holding your transcripts and your credentials, an
 you host. Four ways in, in the order most people want them.
 
 ```bash
-brew install the-cybersapien/lumberroom/lumberroom
+brew install lumberroom/lumberroom/lumberroom
 ```
+
+Installed from the old `the-cybersapien/lumberroom` tap? The next `brew update` follows the move and
+renames the tap. Homebrew stops trusting a tap whose owner changed, so run
+`brew trust lumberroom/lumberroom` once, or `brew upgrade` refuses the formula.
 
 ```bash
 cargo install lumberroom
