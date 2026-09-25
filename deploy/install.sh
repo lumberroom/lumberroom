@@ -376,7 +376,7 @@ if [ "$BUILD_LOCAL" = 1 ]; then
   info "--build-local: building the image from this checkout (bakes the embedding model in; a few minutes)"
   run "${COMPOSE[@]}" build server cleanup
 else
-  info "pulling ${LUMBERROOM_SERVER_IMAGE:-ghcr.io/the-cybersapien/lumberroom-server:0.4.0} (a few seconds to a minute)"
+  info "pulling ${LUMBERROOM_SERVER_IMAGE:-ghcr.io/lumberroom/lumberroom-server:0.4.0} (a few seconds to a minute)"
   if [ "$DRY_RUN" = 1 ]; then
     info "would run: docker compose pull server cleanup, and build from source on failure"
   elif "${COMPOSE[@]}" pull server cleanup; then

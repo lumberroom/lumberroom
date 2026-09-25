@@ -57,7 +57,7 @@ which you need before any `private` write can land.
 Clone the repo onto the VM over https:
 
 ```bash
-git clone https://github.com/the-cybersapien/lumberroom.git
+git clone https://github.com/lumberroom/lumberroom.git
 ```
 
 For a private fork, give the box read access with a deploy key instead, or clone over an
@@ -81,12 +81,16 @@ throwaways, and copying it skips the fresh secret generation the installer does.
 
 ## 3. Install
 
-`docker-compose.yml` pins `server` and `cleanup` to `ghcr.io/the-cybersapien/lumberroom-server:0.4.0`
-and `ghcr.io/the-cybersapien/lumberroom:0.4.0`, the images `.github/workflows/publish-docker.yml`
+`docker-compose.yml` pins `server` and `cleanup` to `ghcr.io/lumberroom/lumberroom-server:0.4.0`
+and `ghcr.io/lumberroom/lumberroom:0.4.0`, the images `.github/workflows/publish-docker.yml`
 pushes on every `v*` tag. `install.sh` pulls those by default, a few seconds to a minute, and falls
 back to building from this checkout when the pull fails: no network, `ghcr.io` unreachable, no
 manifest for this architecture, or a working tree ahead of the last tagged release. Either path,
 the script says out loud which one it took.
+
+Moved: these used to publish as `ghcr.io/the-cybersapien/lumberroom-server` and
+`ghcr.io/the-cybersapien/lumberroom`. Both stay public, frozen at 0.4.0, and take no new versions;
+the images above replace them.
 
 Force the build path yourself with `--build-local`, for a different `EMBED_PROVIDER` or
 `EMBED_MODEL` than the published image carries, or to run something ahead of the last release on
@@ -100,8 +104,8 @@ To move to a different version, set `LUMBERROOM_SERVER_IMAGE` and `LUMBERROOM_CL
 running the installer, or edit them in `.env`:
 
 ```bash
-LUMBERROOM_SERVER_IMAGE=ghcr.io/the-cybersapien/lumberroom-server:0.4.0 \
-LUMBERROOM_CLIENT_IMAGE=ghcr.io/the-cybersapien/lumberroom:0.4.0 \
+LUMBERROOM_SERVER_IMAGE=ghcr.io/lumberroom/lumberroom-server:0.4.0 \
+LUMBERROOM_CLIENT_IMAGE=ghcr.io/lumberroom/lumberroom:0.4.0 \
   sudo -E ./deploy/install.sh
 ```
 
@@ -449,8 +453,8 @@ start. The safe order is back up, then get the new image, then recreate:
 ```bash
 ./deploy/backup.sh
 git pull
-LUMBERROOM_SERVER_IMAGE=ghcr.io/the-cybersapien/lumberroom-server:0.4.0 \
-LUMBERROOM_CLIENT_IMAGE=ghcr.io/the-cybersapien/lumberroom:0.4.0 \
+LUMBERROOM_SERVER_IMAGE=ghcr.io/lumberroom/lumberroom-server:0.4.0 \
+LUMBERROOM_CLIENT_IMAGE=ghcr.io/lumberroom/lumberroom:0.4.0 \
   docker compose pull server cleanup
 docker compose up -d
 ```

@@ -500,7 +500,7 @@ async fn create(
     }
     if p.name == "openrouter" {
         req = req
-            .header("HTTP-Referer", "https://github.com/the-cybersapien/lumberroom")
+            .header("HTTP-Referer", "https://github.com/lumberroom/lumberroom")
             .header("X-Title", "lumberroom");
     }
     send(req, p, timeout_secs).await

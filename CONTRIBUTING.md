@@ -135,5 +135,5 @@ contradicts an old one, mark the old record superseded rather than editing it to
 ## Reporting a vulnerability
 
 Use GitHub private vulnerability reporting on
-[the repository](https://github.com/the-cybersapien/lumberroom): Settings, Security, "Report a
+[the repository](https://github.com/lumberroom/lumberroom): Settings, Security, "Report a
 vulnerability". Do not open a public issue. [`SECURITY.md`](SECURITY.md) has the detail.
