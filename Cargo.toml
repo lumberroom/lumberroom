@@ -54,7 +54,7 @@ subtle = "2"
 sha2 = "0.11"
 hex = "0.4"
 # Owner password verification. Argon2id, so a stolen .env hash is not a password.
-argon2 = "0.5"
+argon2 = "0.6"
 # Signed authorization-server cookies, and the sealed-item key derivation.
 hmac = "0.13"
 base64 = "0.22"
