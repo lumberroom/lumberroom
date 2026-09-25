@@ -103,7 +103,7 @@ jobs:
           touch "digests/${digest#sha256:}"
           echo "SLUG=$slug" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: digest-${{ env.SLUG }}
           path: digests/*

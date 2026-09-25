@@ -95,7 +95,7 @@ jobs:
           cargo deb --no-build --no-strip -p lumberroom -o dist/
           cargo generate-rpm -p crates/lumberroom -o dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target }}
           path: dist/lumberroom[-_]*
@@ -129,7 +129,7 @@ jobs:
               "target/${target}/release/lumberroom" "$target" "$version" dist
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-darwin
           path: dist/lumberroom[-_]*
