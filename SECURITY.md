@@ -8,7 +8,7 @@ could land on; upgrading past a vulnerable commit is the only supported remediat
 ## Reporting a vulnerability
 
 Use GitHub's private vulnerability reporting rather than a public issue:
-[github.com/the-cybersapien/lumberroom/security/advisories/new](https://github.com/the-cybersapien/lumberroom/security/advisories/new).
+[github.com/lumberroom/lumberroom/security/advisories/new](https://github.com/lumberroom/lumberroom/security/advisories/new).
 
 Include:
 

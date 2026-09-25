@@ -103,6 +103,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `decide(&self, ctx: &Ctx, id: &str, decision: ProposalDecision<'_>)`, carrying the verdict,
   corrected text, a reason, the version the caller read and the surface the call arrived on. Every
   implementation of the trait changes its signature to match.
+- **The repository moved to `github.com/lumberroom/lumberroom`.** The old path,
+  `github.com/the-cybersapien/lumberroom`, redirects there. Container images now publish to
+  `ghcr.io/lumberroom/lumberroom` and `ghcr.io/lumberroom/lumberroom-server`; the old
+  `ghcr.io/the-cybersapien/lumberroom` and `ghcr.io/the-cybersapien/lumberroom-server` images stay
+  public, frozen at 0.4.0, and take no new versions. The Homebrew tap command does not change.
 
 ### Fixed
 

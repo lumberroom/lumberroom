@@ -12,7 +12,7 @@ brew install lumberroom
 ## Cutting a new version
 
 1. Push the tag and let `cli-release.yml` publish the four archives and `SHA256SUMS` under
-   `https://github.com/the-cybersapien/lumberroom/releases/download/<tag>/`.
+   `https://github.com/lumberroom/lumberroom/releases/download/<tag>/`.
 2. Update the four URLs in `lumberroom.rb` and replace each `sha256` with the matching `.tar.gz`
    line from that release's `SHA256SUMS`. Carry no version string anywhere else: `brew audit
    --strict` rejects an explicit `version` when every URL already spells it out.

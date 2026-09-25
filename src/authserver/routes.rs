@@ -146,7 +146,7 @@ pub fn metadata_document(
         // revoking it, and a public client has no other credential to offer.
         "revocation_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": scopes_supported,
-        "service_documentation": "https://github.com/the-cybersapien/lumberroom",
+        "service_documentation": "https://github.com/lumberroom/lumberroom",
     });
 
     // Advertised only when it exists. A registration endpoint in the document that answers 403 is

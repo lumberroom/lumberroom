@@ -41,16 +41,20 @@ the decisions a person has to make.
 ## Install the server
 
 ```bash
-git clone https://github.com/the-cybersapien/lumberroom.git && cd lumberroom
+git clone https://github.com/lumberroom/lumberroom.git && cd lumberroom
 sudo ./deploy/install.sh
 ```
 
 That is token mode on loopback: the server binds `127.0.0.1:8787`, opens no public port, and prints
 the client token with the command to run on your Mac. Add `--domain` and `--auth-mode oauth` when a
 browser has to reach it. The installer pulls
-`ghcr.io/the-cybersapien/lumberroom-server:0.4.0` and falls back to building from this tree when the
+`ghcr.io/lumberroom/lumberroom-server:0.4.0` and falls back to building from this tree when the
 pull fails; `--build-local` skips the pull. It pins a version rather than tracking `latest`, because
 a memory store that upgrades itself while you sleep is not a feature.
+
+Moved: the engine used to publish as `ghcr.io/the-cybersapien/lumberroom-server`. That image stays
+public, frozen at 0.4.0, and takes no new versions; pull `ghcr.io/lumberroom/lumberroom-server`
+instead.
 
 ## Install the client
 
@@ -70,7 +74,7 @@ A binary, with no package manager. Four targets, macOS and Linux on arm64 and x8
 ```bash
 tag=v0.4.0; target=aarch64-apple-darwin      # or x86_64-apple-darwin,
                                              # aarch64-unknown-linux-musl, x86_64-unknown-linux-musl
-base=https://github.com/the-cybersapien/lumberroom/releases/download/$tag
+base=https://github.com/lumberroom/lumberroom/releases/download/$tag
 curl -fsSLO "$base/lumberroom-${tag#v}-$target.tar.gz"
 curl -fsSL "$base/SHA256SUMS" | grep "$target.tar.gz" | shasum -a 256 -c -
 tar -xzf "lumberroom-${tag#v}-$target.tar.gz" && install -m 755 lumberroom ~/.local/bin/

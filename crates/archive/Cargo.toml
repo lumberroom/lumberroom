@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.83"
 description = "The lumberroom archive format: records, framing, and the age container."
 license = "Apache-2.0"
-repository = "https://github.com/the-cybersapien/lumberroom"
+repository = "https://github.com/lumberroom/lumberroom"
 homepage = "https://lumberroom.cloud"
 # The format is consumed by the server and the CLI in this workspace. Publishing it would promise a
 # stable format to strangers before the first import has run against a store somebody cares about.

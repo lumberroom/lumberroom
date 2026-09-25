@@ -17,7 +17,7 @@ Homebrew works too, and carries a prebuilt binary rather than compiling one:
 brew install the-cybersapien/lumberroom/lumberroom
 ```
 
-The [releases page](https://github.com/the-cybersapien/lumberroom/releases) also carries plain
+The [releases page](https://github.com/lumberroom/lumberroom/releases) also carries plain
 binaries, `.tar.gz` archives, and a `.deb` and `.rpm` per architecture, each covered by one
 `SHA256SUMS`.
 
@@ -57,12 +57,12 @@ too, and takes precedence.
 This crate talks to a server; it is not one. Running your own takes a Linux box with Docker:
 
 ```bash
-git clone https://github.com/the-cybersapien/lumberroom.git && cd lumberroom
+git clone https://github.com/lumberroom/lumberroom.git && cd lumberroom
 sudo ./deploy/install.sh
 ```
 
 Full documentation, including how to grant a client access to one project and nothing else, lives in
-the [repository](https://github.com/the-cybersapien/lumberroom).
+the [repository](https://github.com/lumberroom/lumberroom).
 
 ## Licence
 
