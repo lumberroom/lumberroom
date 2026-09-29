@@ -31,9 +31,10 @@ use crate::authserver::session::{OwnerSession, Sessions};
 use crate::config::{Config, ResourceAudience};
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::oauth::{
-    canonical_resource, hash_token, hashes_match, random_token, resource_matches,
-    validate_redirect_uri, verify_pkce_s256, AuthorizeIntent, AuthorizeRequest, GrantProfile,
-    OauthError, RegistrationRequest, RegistrationResponse, TokenResponse,
+    canonical_resource, check_self_registered_redirect, client_name_display, hash_token,
+    hashes_match, random_token, resource_matches, validate_redirect_uri, verify_pkce_s256,
+    AuthorizeIntent, AuthorizeRequest, GrantProfile, OauthError, RegistrationRequest,
+    RegistrationResponse, TokenResponse,
 };
 use crate::ports::{
     ClientGrantUpdate, CodeOutcome, NewAccessToken, NewAuthCode, NewOauthClient, NewRefreshToken,
@@ -217,7 +218,11 @@ async fn register(
                 format!("a redirect URI is longer than {MAX_REDIRECT_URI} characters"),
             );
         }
-        if let Err(e) = validate_redirect_uri(uri) {
+        // The second check is for an anonymous registrant only. A client the owner issues by hand
+        // may still name an IP address, because the owner knows whose machine it is.
+        if let Err(e) = validate_redirect_uri(uri)
+            .and_then(|()| check_self_registered_redirect(uri, &app.cfg.public_url))
+        {
             return registration_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_redirect_uri",
@@ -264,7 +269,11 @@ async fn register(
         }
     }
 
-    let client_name = match req.client_name.as_deref().map(str::trim) {
+    // Cleaned before the cap, so the cap measures what gets stored. Cleaning drops bidi overrides
+    // and zero-width characters, which can make a name print as another name, and turns control
+    // characters into spaces, which keeps a newline out of the log line below. Look-alike letters
+    // from other scripts stay: the consent page judges the redirect host, not the name.
+    let client_name = match req.client_name.as_deref().map(client_name_display) {
         Some(name) if name.len() > MAX_CLIENT_NAME => {
             return registration_error(
                 StatusCode::BAD_REQUEST,
@@ -276,9 +285,13 @@ async fn register(
         _ => "unnamed client".to_string(),
     };
 
-    for (field, value) in
-        [("software_id", &req.software_id), ("software_version", &req.software_version)]
-    {
+    // The consent page prints software_id, so it gets the same cleaning as the name. One that
+    // cleans to nothing is stored as undeclared, which is what the page says for an absent one.
+    let clean =
+        |v: &Option<String>| v.as_deref().map(client_name_display).filter(|v| !v.is_empty());
+    let software_id = clean(&req.software_id);
+    let software_version = clean(&req.software_version);
+    for (field, value) in [("software_id", &software_id), ("software_version", &software_version)] {
         if value.as_deref().is_some_and(|v| v.len() > MAX_SOFTWARE_FIELD) {
             return registration_error(
                 StatusCode::BAD_REQUEST,
@@ -301,8 +314,8 @@ async fn register(
         client_name: client_name.clone(),
         redirect_uris: req.redirect_uris.clone(),
         grant_types: grant_types.clone(),
-        software_id: req.software_id.clone(),
-        software_version: req.software_version.clone(),
+        software_id,
+        software_version,
         registered_via: "dcr".to_string(),
     };
 
@@ -1351,7 +1364,21 @@ fn consent_page(
 fn page(status: StatusCode, body: String) -> Response {
     // no-store on every page: they carry a CSRF token bound to a session, and a cached consent screen
     // is a form that outlives the login it belongs to.
-    (status, [(header::CACHE_CONTROL, "no-store")], Html(body)).into_response()
+    //
+    // Never framed. A consent page inside someone else's frame can sit under a decoy that lines a
+    // click up with Allow. The Lax session cookie already stays home on a cross-site frame, but a
+    // same-site page that embeds this one would still carry it, and the header costs nothing.
+    // X-Frame-Options covers browsers that predate frame-ancestors.
+    (
+        status,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+        ],
+        Html(body),
+    )
+        .into_response()
 }
 
 fn page_internal(e: &DomainError) -> Response {
@@ -1570,6 +1597,15 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_page_refuses_to_render_inside_another_site_frame() {
+        let response = page(StatusCode::OK, String::new());
+        let headers = response.headers();
+        assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert_eq!(headers.get(header::CONTENT_SECURITY_POLICY).unwrap(), "frame-ancestors 'none'");
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    }
 
     #[test]
     fn a_family_id_is_stable_for_one_code_and_different_for_another() {

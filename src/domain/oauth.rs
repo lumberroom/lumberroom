@@ -533,6 +533,167 @@ fn is_loopback(url: &Url) -> bool {
     }
 }
 
+// ---- who a redirect URI hands the code to ----
+
+/// The redirect hosts of the MCP clients this server can name on the consent page. Compared whole
+/// against the parsed host: `claude.ai.attacker.example` ends with nothing and contains nothing
+/// that counts.
+const KNOWN_CLIENT_HOSTS: &[&str] = &["claude.ai", "claude.com", "chatgpt.com"];
+
+/// Words in a client name that claim one of those clients, with the spelling the consent page
+/// prints. Checked against [`comparable_client_name`], so case and invisible characters do not
+/// hide them.
+const KNOWN_CLIENT_NAMES: &[(&str, &str)] = &[
+    ("claude", "Claude"),
+    ("chatgpt", "ChatGPT"),
+    ("openai", "OpenAI"),
+    ("anthropic", "Anthropic"),
+];
+
+/// Where an authorization code goes once the owner presses Allow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedirectDestination {
+    /// An http or https URI. `host` comes from the parser, so it is lowercase, an international
+    /// name arrives as punycode, and an IPv6 address carries its brackets. Punycode is the point:
+    /// a Cyrillic look-alike of a known host prints as `xn--...` instead of as the host it mimics.
+    ///
+    /// `local` is true for loopback only: the code stays on the owner's machine. `recognised` also
+    /// covers the known hosts, which are shared by every user of that service.
+    Host { host: String, recognised: bool, local: bool },
+    /// A private-use scheme. The code goes to whichever app on the device claimed the scheme, and
+    /// any app can claim any scheme, so this server cannot say which one that is.
+    App { scheme: String },
+    /// Not a URI. Registration refuses these, so reaching one means a row from before that check.
+    Unreadable,
+}
+
+impl RedirectDestination {
+    pub fn recognised(&self) -> bool {
+        matches!(self, RedirectDestination::Host { recognised: true, .. })
+    }
+
+    /// True only when the code lands on the owner's own machine. A recognised public host is
+    /// multi-tenant, so it says which service gets the code and not whose account there.
+    pub fn is_local(&self) -> bool {
+        matches!(self, RedirectDestination::Host { local: true, .. })
+    }
+}
+
+/// Read a redirect URI as the place a code will land, and say whether that place belongs to a
+/// client this server can name.
+///
+/// Loopback counts as recognised: a code sent there stays on the owner's machine. A known host
+/// counts only over https, since plain http to a public host is a code anyone on the path can read.
+pub fn redirect_destination(uri: &str) -> RedirectDestination {
+    let Ok(parsed) = Url::parse(uri) else { return RedirectDestination::Unreadable };
+    match parsed.scheme() {
+        "https" | "http" => {
+            let Some(host) = parsed.host_str() else { return RedirectDestination::Unreadable };
+            let local = is_loopback(&parsed);
+            let recognised =
+                local || (parsed.scheme() == "https" && KNOWN_CLIENT_HOSTS.contains(&host));
+            RedirectDestination::Host { host: host.to_string(), recognised, local }
+        }
+        scheme => RedirectDestination::App { scheme: scheme.to_string() },
+    }
+}
+
+/// The known client a name claims to be, when it claims one.
+///
+/// A substring match on purpose. "Claude Desktop" and "my claude helper" both borrow the name, and
+/// the consent page only uses the answer to word a warning it shows anyway.
+pub fn claimed_known_client(name: &str) -> Option<&'static str> {
+    let folded = comparable_client_name(name);
+    KNOWN_CLIENT_NAMES.iter().find(|(word, _)| folded.contains(word)).map(|(_, shown)| *shown)
+}
+
+/// Characters that change nothing a reader sees: zero-width spaces and joiners, the soft hyphen,
+/// the byte-order mark, and the bidi embedding, override and isolate controls. A right-to-left
+/// override is the dangerous one, since it can make a name print as a different name.
+///
+/// The same list as `services::sources::invisible`, which predates this one and cannot be imported
+/// from here because domain does not import services.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// A client name as registration stores it: invisible characters removed, control characters
+/// turned into spaces, whitespace runs collapsed and trimmed. May come back empty; the caller picks
+/// the placeholder.
+///
+/// Cleaned once at registration rather than at every render, because the name also reaches the log,
+/// the clients listing and the digest, and a newline in a log field forges a log line.
+pub fn client_name_display(name: &str) -> String {
+    let flat: String = name
+        .chars()
+        .filter(|c| !invisible(*c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    flat.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The form a name is compared in: cleaned, NFKC, lowercased.
+///
+/// Look-alike letters from other scripts, a Cyrillic "а" for a Latin "a", survive this; NFKC does
+/// not map across scripts. The consent page does not lean on the name for that reason: the redirect
+/// host decides whether it warns, and the name only sharpens the wording.
+fn comparable_client_name(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    client_name_display(name).nfkc().collect::<String>().to_lowercase()
+}
+
+/// Redirect rules for a client that registered itself, on top of [`validate_redirect_uri`].
+///
+/// Two refusals, both about a destination the consent page cannot describe to the owner:
+///
+/// - An IP address in place of a host name, loopback aside. The owner cannot tell whose machine
+///   `203.0.113.7` is, and no MCP client this server knows of registers one. An owner who runs such
+///   a client issues it by hand, where this rule does not apply.
+/// - This server's own host. No client lives at the authorization server, and a code sent back here
+///   lands in its access log. On loopback the comparison is the whole origin, because the CLI
+///   listens on the same address as a local server, on another port.
+///
+/// A private-use scheme passes: it has no host to judge, and the consent page warns about it.
+pub fn check_self_registered_redirect(uri: &str, public_url: &str) -> Result<()> {
+    let Ok(parsed) = Url::parse(uri) else { return Ok(()) };
+    if parsed.scheme() != "https" && parsed.scheme() != "http" {
+        return Ok(());
+    }
+
+    let ip_host = matches!(parsed.host(), Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)));
+    if ip_host && !is_loopback(&parsed) {
+        return Err(DomainError::validation(
+            "a self-registered client must name its redirect host, not an IP address. Ask the \
+             owner to issue a client for this address.",
+        ));
+    }
+
+    if let Ok(public) = Url::parse(public_url) {
+        let same = if is_loopback(&parsed) {
+            parsed.origin() == public.origin()
+        } else {
+            parsed.host_str().is_some() && parsed.host_str() == public.host_str()
+        };
+        if same {
+            return Err(DomainError::validation(
+                "redirect_uri points at this authorization server, which is not a client",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,5 +1175,160 @@ mod tests {
     fn a_profile_serialises_as_the_same_lowercase_word_it_parses() {
         assert_eq!(serde_json::to_string(&GrantProfile::Narrow).unwrap(), r#""narrow""#);
         assert_eq!(serde_json::from_str::<GrantProfile>(r#""full""#).unwrap(), GrantProfile::Full);
+    }
+
+    // ---- who a redirect URI hands the code to ----
+
+    fn host(uri: &str) -> (String, bool) {
+        match redirect_destination(uri) {
+            RedirectDestination::Host { host, recognised, .. } => (host, recognised),
+            other => panic!("expected a host for {uri}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_redirect_hosts_of_known_mcp_clients_are_recognised() {
+        assert_eq!(
+            host("https://claude.ai/api/mcp/auth_callback"),
+            ("claude.ai".to_string(), true)
+        );
+        assert!(host("https://claude.com/api/mcp/auth_callback").1);
+        assert!(host("https://chatgpt.com/connector_platform_oauth_redirect").1);
+    }
+
+    #[test]
+    fn a_known_host_is_matched_whole_and_never_as_a_suffix_or_prefix() {
+        assert_eq!(
+            host("https://claude.ai.attacker.example/cb"),
+            ("claude.ai.attacker.example".to_string(), false)
+        );
+        assert!(!host("https://evilclaude.ai/cb").1);
+        assert!(!host("https://www.claude.ai/cb").1);
+        assert!(!host("https://chatgpt.com.attacker.example/cb").1);
+        // A trailing dot names the same zone in DNS and a different string here. Unrecognised is
+        // the side to fail on.
+        assert!(!host("https://claude.ai./cb").1);
+    }
+
+    #[test]
+    fn a_known_host_is_recognised_whatever_case_the_client_wrote_it_in() {
+        assert_eq!(host("https://CLAUDE.AI/cb"), ("claude.ai".to_string(), true));
+    }
+
+    #[test]
+    fn a_known_host_over_plain_http_is_not_recognised() {
+        assert!(!host("http://claude.ai/cb").1);
+    }
+
+    #[test]
+    fn an_ip_address_host_is_shown_as_the_address_and_not_recognised() {
+        assert_eq!(host("https://203.0.113.7/cb"), ("203.0.113.7".to_string(), false));
+    }
+
+    #[test]
+    fn a_loopback_redirect_is_recognised() {
+        assert_eq!(host("http://127.0.0.1:53682/callback"), ("127.0.0.1".to_string(), true));
+        assert!(host("http://localhost:9000/cb").1);
+        assert!(host("http://[::1]:9000/cb").1);
+        assert!(!host("http://localhost.attacker.example/cb").1);
+    }
+
+    #[test]
+    fn only_loopback_keeps_the_code_on_the_owners_machine() {
+        let local = |uri| match redirect_destination(uri) {
+            RedirectDestination::Host { local, .. } => local,
+            other => panic!("expected a host, got {other:?}"),
+        };
+        assert!(local("http://127.0.0.1:53682/callback"));
+        assert!(local("http://localhost:9000/cb"));
+        assert!(local("http://[::1]:9000/cb"));
+        assert!(!local("https://claude.ai/api/mcp/auth_callback"));
+        assert!(!local("http://localhost.attacker.example/cb"));
+    }
+
+    #[test]
+    fn an_international_host_is_shown_in_its_ascii_form() {
+        // Punycode is what stops a look-alike host from reading as the real one.
+        assert!(host("https://cl\u{0430}ude.ai/cb").0.starts_with("xn--"));
+        assert!(!host("https://cl\u{0430}ude.ai/cb").1);
+    }
+
+    #[test]
+    fn a_private_use_scheme_names_the_app_and_is_not_recognised() {
+        assert_eq!(
+            redirect_destination("com.example.app:/oauth2redirect"),
+            RedirectDestination::App { scheme: "com.example.app".to_string() }
+        );
+        assert!(!redirect_destination("com.example.app:/oauth2redirect").recognised());
+    }
+
+    #[test]
+    fn an_unparseable_redirect_is_not_recognised() {
+        assert_eq!(redirect_destination("not a uri"), RedirectDestination::Unreadable);
+        assert!(!RedirectDestination::Unreadable.recognised());
+    }
+
+    #[test]
+    fn a_name_that_claims_a_known_client_is_caught_in_any_case_and_inside_other_words() {
+        assert_eq!(claimed_known_client("Claude"), Some("Claude"));
+        assert_eq!(claimed_known_client("my CLAUDE helper"), Some("Claude"));
+        assert_eq!(claimed_known_client("ChatGPT connector"), Some("ChatGPT"));
+        assert_eq!(claimed_known_client("OpenAI tools"), Some("OpenAI"));
+        assert_eq!(claimed_known_client("by anthropic"), Some("Anthropic"));
+        assert_eq!(claimed_known_client("Codex CLI"), None);
+    }
+
+    #[test]
+    fn invisible_and_compatibility_characters_do_not_hide_a_claimed_name() {
+        assert_eq!(claimed_known_client("Cl\u{200B}au\u{202E}de"), Some("Claude"));
+        // Fullwidth letters fold to ASCII under NFKC.
+        assert_eq!(claimed_known_client("\u{FF23}laude"), Some("Claude"));
+    }
+
+    #[test]
+    fn a_client_name_loses_controls_and_invisible_characters_and_keeps_its_words() {
+        assert_eq!(client_name_display("  My\u{202E} app\n\tv2\u{200B} "), "My app v2");
+        assert_eq!(client_name_display("\u{200B}\u{FEFF}\r\n"), "");
+        assert_eq!(client_name_display("Zed"), "Zed");
+    }
+
+    // ---- redirect rules that apply only to a self-registered client ----
+
+    const PUBLIC: &str = "https://lumberroom.example";
+
+    #[test]
+    fn a_self_registered_client_may_use_a_named_https_host_a_loopback_or_an_app_scheme() {
+        for ok in [
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://tool.example/cb",
+            "http://127.0.0.1:53682/callback",
+            "http://localhost:9000/cb",
+            "http://[::1]:9000/cb",
+            "com.example.app:/oauth2redirect",
+        ] {
+            assert!(check_self_registered_redirect(ok, PUBLIC).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn a_self_registered_client_may_not_send_codes_to_an_ip_address() {
+        assert!(check_self_registered_redirect("https://203.0.113.7/cb", PUBLIC).is_err());
+        assert!(check_self_registered_redirect("https://[2001:db8::1]/cb", PUBLIC).is_err());
+    }
+
+    #[test]
+    fn a_self_registered_client_may_not_send_codes_to_this_server() {
+        assert!(check_self_registered_redirect("https://lumberroom.example/cb", PUBLIC).is_err());
+        assert!(
+            check_self_registered_redirect("https://LUMBERROOM.example:8443/x", PUBLIC).is_err()
+        );
+        assert!(check_self_registered_redirect("https://other.example/cb", PUBLIC).is_ok());
+    }
+
+    #[test]
+    fn a_loopback_server_still_accepts_a_loopback_cli_on_another_port() {
+        let local = "http://127.0.0.1:8798";
+        assert!(check_self_registered_redirect("http://127.0.0.1:53682/callback", local).is_ok());
+        assert!(check_self_registered_redirect("http://127.0.0.1:8798/oauth/cb", local).is_err());
     }
 }
