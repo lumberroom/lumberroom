@@ -18,6 +18,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use super::Ctx;
 use crate::config::AuthMode;
+use crate::domain::oauth::{client_name_display, invisible_char};
 use crate::ports::oauth::OauthClientRecord;
 use crate::ports::OauthStore;
 
@@ -126,32 +127,15 @@ fn stamp(c: &OauthClientRecord, group: &[&OauthClientRecord]) -> String {
     format!("{} #{place}", at.format(FORMATS[2]))
 }
 
-/// Characters that change nothing a reader sees: zero-width spaces and joiners, the soft hyphen,
-/// the byte-order mark, and the bidi embedding, override and isolate controls. A right-to-left
-/// override is the dangerous one, since it can make a name print as a different name.
-fn invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{034F}'
-            | '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
-    )
-}
-
 /// The form two names are compared in: invisible characters removed, NFKC, lowercased, and
-/// whitespace runs collapsed and trimmed.
+/// whitespace runs collapsed and trimmed. The invisible list is the domain's, so registration and
+/// this comparison cannot disagree about which characters a reader sees.
 ///
 /// `to_lowercase` is simple case mapping rather than full case folding, so "STRASSE" and "straße"
 /// stay two names. Look-alike letters from other scripts, a Cyrillic "С" for a Latin "C", are not
 /// caught either; NFKC does not map across scripts.
 fn comparable(name: &str) -> String {
-    let stripped: String = name.chars().filter(|c| !invisible(*c)).collect();
+    let stripped: String = name.chars().filter(|c| !invisible_char(*c)).collect();
     let folded = stripped.nfkc().collect::<String>().to_lowercase();
     folded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -160,16 +144,11 @@ fn comparable(name: &str) -> String {
 /// on: the digest prints a writer inside one bullet, so a newline in a name would open a section of
 /// its own, and a bidi override would reorder the words after it.
 fn display(name: &str) -> String {
-    let flat: String = name
-        .chars()
-        .filter(|c| !invisible(*c))
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let joined = flat.split_whitespace().collect::<Vec<_>>().join(" ");
-    if joined.is_empty() {
+    let cleaned = client_name_display(name);
+    if cleaned.is_empty() {
         UNNAMED.to_string()
     } else {
-        joined
+        cleaned
     }
 }
 
@@ -285,6 +264,9 @@ mod tests {
             unimplemented!()
         }
         async fn rotate_refresh(&self, _: &str) -> Result<RefreshOutcome> {
+            unimplemented!()
+        }
+        async fn refresh_owner(&self, _: &str) -> Result<Option<String>> {
             unimplemented!()
         }
         async fn revoke_family(&self, _: uuid::Uuid) -> Result<()> {
@@ -505,5 +487,17 @@ mod tests {
     fn a_name_that_is_only_invisible_characters_reads_as_unnamed() {
         let names = name_clients(&[approved("a", "\u{200B}\u{202E} \n")]);
         assert_eq!(names["a"], "unnamed client");
+    }
+
+    /// Tag characters, variation selectors and the Hangul fillers joined the domain's list after
+    /// this module kept its own. A name padded with them must print and compare as the bare name.
+    #[test]
+    fn characters_the_domain_counts_as_invisible_vanish_here_too() {
+        let names = name_clients(&[
+            client("a", "Codex", at(2026, 9, 1, 9, 0, 0), true),
+            client("b", "Co\u{E0041}dex\u{FE0F}\u{3164}", at(2026, 9, 2, 9, 0, 0), true),
+        ]);
+        assert_eq!(names["a"], "Codex (added 1 Sep)");
+        assert_eq!(names["b"], "Codex (added 2 Sep)");
     }
 }

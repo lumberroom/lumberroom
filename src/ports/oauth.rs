@@ -166,6 +166,12 @@ pub trait OauthStore: Send + Sync {
     async fn insert_refresh(&self, r: NewRefreshToken) -> Result<()>;
     /// Atomic, for the same reason as `consume_code`.
     async fn rotate_refresh(&self, token_hash: &str) -> Result<RefreshOutcome>;
+    /// The client a live refresh token was issued to, read without spending it. `None` for a token
+    /// that is unknown, spent, revoked or expired. `rotate` asks this first so a caller presenting
+    /// another client's live token is refused before the spend; checking afterwards burned the
+    /// legitimate client's token. A spent token answers `None` so it still reaches
+    /// `rotate_refresh`, whose replay verdict revokes the family whoever presented it.
+    async fn refresh_owner(&self, token_hash: &str) -> Result<Option<String>>;
     /// Kills every access and refresh token descended from one authorization.
     async fn revoke_family(&self, family_id: uuid::Uuid) -> Result<()>;
 

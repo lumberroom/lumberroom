@@ -274,6 +274,9 @@ mod tests {
         async fn rotate_refresh(&self, _token_hash: &str) -> Result<RefreshOutcome> {
             unimplemented!("not on the authentication path")
         }
+        async fn refresh_owner(&self, _token_hash: &str) -> Result<Option<String>> {
+            unimplemented!("not on the authentication path")
+        }
         async fn revoke_family(&self, _family_id: uuid::Uuid) -> Result<()> {
             unimplemented!("not on the authentication path")
         }

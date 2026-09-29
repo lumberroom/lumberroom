@@ -10,7 +10,10 @@
 //! actually be handed.
 
 use crate::console::pages::FAVICON;
-use crate::domain::oauth::GrantProfile;
+use crate::domain::oauth::{
+    claimed_known_client, client_name_display, redirect_destination, GrantProfile,
+    RedirectDestination,
+};
 
 /// The mark, above the heading on all three pages.
 ///
@@ -151,7 +154,9 @@ may reach.</p>\
 autofocus required>\
 <p class=\"actions\"><button type=\"submit\">Sign in</button></p></form>\
 <p class=\"foot\">Signing in does not grant anything. The next page is where you choose.</p>",
-            client = escape(client_name),
+            // Cleaned again here: a row stored before the invisible-character list grew can still
+            // hold a bidi override.
+            client = escape(&client_name_display(client_name)),
             banner = banner,
             fields = flow.hidden_inputs(),
         ),
@@ -179,14 +184,10 @@ pub fn consent(
         ));
     }
 
-    // The origin of the client is the single most useful thing on this page. A self-registered
-    // client chose its own name, and the name is the only thing about it the owner recognises.
-    let origin = if client.self_registered {
-        "<p class=\"warn\">This client registered itself. Its name and icon are whatever it sent, \
-and nothing has checked them. Grant it only what you would grant a stranger with that name.</p>"
-            .to_string()
+    let (destination, origin) = if client.self_registered {
+        self_registered_notice(client)
     } else {
-        String::new()
+        (String::new(), String::new())
     };
 
     let again = match client.current_profile {
@@ -209,7 +210,7 @@ replaces it.</p>",
         "lumberroom: grant access",
         &format!(
             "{MARK}<p class=\"mark\">lumberroom</p>\
-<h1>Give <b>{client}</b> access to lumberroom?</h1>\
+<h1>Give <b>{client}</b> access to lumberroom?</h1>{destination}\
 <p class=\"lede\">It will be able to read and write memories inside the boundary you pick, on \
 every surface, until you revoke it.</p>\
 {origin}{again}\
@@ -223,7 +224,8 @@ every surface, until you revoke it.</p>\
 <p class=\"actions\"><button type=\"submit\" name=\"action\" value=\"allow\">Allow</button>\
 <button type=\"submit\" name=\"action\" value=\"deny\" class=\"secondary\">Deny</button></p></form>\
 <p class=\"foot\">Change or revoke this at <code>/console/clients</code> whenever you like. <code>lumberroom clients</code> lists what is registered.</p>",
-            client = escape(client.client_name),
+            client = escape(&client_name_display(client.client_name)),
+            destination = destination,
             origin = origin,
             again = again,
             redirect = escape(client.redirect_uri),
@@ -239,6 +241,72 @@ every surface, until you revoke it.</p>\
             choices = choices,
         ),
     )
+}
+
+/// The destination line under the headline and the warning, for a client that registered itself.
+///
+/// The name in the headline is whatever the registrant typed, so an attacker can register "Claude"
+/// with its own redirect URI and the headline reads "Give Claude access". The redirect host is the
+/// one fact on this page the registrant cannot dress up, since the code lands there, so it goes
+/// next to the headline and decides whether the owner is warned. The name only sharpens the
+/// wording of a warning the host has already earned.
+///
+/// Only loopback draws no warning. A known host such as claude.ai serves many accounts, so it
+/// proves the service and not the person: anyone can add a connector in their own account that
+/// points here, then send the victim the authorize link. The recognised host gets a short warning
+/// about that link and no mismatch alarm.
+fn self_registered_notice(client: &ClientView) -> (String, String) {
+    let destination = redirect_destination(client.redirect_uri);
+    let target = match &destination {
+        RedirectDestination::Host { host, .. } => format!("<b>{}</b>", escape(host)),
+        RedirectDestination::App { scheme } => format!("<b>{}</b>", escape(scheme)),
+        RedirectDestination::Unreadable => "<b>an address this server cannot read</b>".to_string(),
+    };
+    let (line, place) = match &destination {
+        RedirectDestination::App { .. } => (
+            format!("Codes go to the app on this device that claims {target}"),
+            format!("the app that claims {target}"),
+        ),
+        _ => (format!("Codes go to {target}"), format!("the app at {target}")),
+    };
+    let line = format!("<p class=\"dest\">{line}</p>");
+
+    if destination.is_local() {
+        return (line, String::new());
+    }
+
+    if destination.recognised() {
+        let warning =
+            "<p class=\"warn\">Allow only if you pressed Connect in your own account just \
+now. A link someone sent you connects their account.</p>"
+                .to_string();
+        return (line, warning);
+    }
+
+    let (class, mismatch) = match claimed_known_client(client.client_name) {
+        Some(brand) => (
+            "warn alarm",
+            format!(
+                "This client calls itself {brand}, but {target} is not where {brand} sends its \
+codes. "
+            ),
+        ),
+        None => ("warn", String::new()),
+    };
+    // Registration lets plain http through only to loopback, which returned above, or to the
+    // owner's own network, so the sentence can name the local network.
+    let cleartext = if destination.is_plain_http() {
+        " Anyone on your local network could be listening at that address, and the code travels there unencrypted."
+    } else {
+        ""
+    };
+    let warning = format!(
+        "<p class=\"{class}\">{mismatch}Whoever registered this client chose the name <b>{name}</b>, \
+and this server cannot vouch for it. Allow only if you started this connection from \
+{place}.{cleartext}</p>",
+        name = escape(&client_name_display(client.client_name)),
+    );
+    (line, warning)
 }
 
 /// Any failure that must not be reported by redirecting. Everything before the redirect URI has been
@@ -290,6 +358,18 @@ mod tests {
             software_id: Some("anthropic-claude"),
             self_registered: true,
             current_profile: None,
+        }
+    }
+
+    #[test]
+    fn a_stored_name_with_a_bidi_override_renders_without_it_on_every_page() {
+        let dirty = "Cl\u{202E}au\u{3164}de";
+        let consent_page = render(&registered(dirty, "https://tool.example/cb"));
+        let login_page = login(&flow(), dirty, None);
+        for page in [consent_page, login_page] {
+            assert!(!page.contains('\u{202E}'));
+            assert!(!page.contains('\u{3164}'));
+            assert!(page.contains("<b>Claude</b>"));
         }
     }
 
@@ -382,15 +462,153 @@ mod tests {
     #[test]
     fn the_consent_page_says_when_a_client_registered_itself() {
         let page = consent(&flow(), &view(), "tok", GrantProfile::Standard);
-        assert!(page.contains("registered itself"));
+        assert!(page.contains("by itself, through dynamic client registration"));
         assert!(page.contains("anthropic-claude"));
         assert!(page.contains("https://claude.ai/api/mcp/auth_callback"));
 
         let mut issued = view();
         issued.self_registered = false;
         let page = consent(&flow(), &issued, "tok", GrantProfile::Standard);
-        assert!(!page.contains("registered itself"));
+        assert!(!page.contains("by itself"));
         assert!(page.contains("by you"));
+    }
+
+    /// A self-registered client sending its codes to `redirect_uri`, under `name`.
+    fn registered(name: &'static str, redirect_uri: &'static str) -> ClientView<'static> {
+        ClientView { client_name: name, redirect_uri, ..view() }
+    }
+
+    fn render(client: &ClientView) -> String {
+        consent(&flow(), client, "tok", GrantProfile::Standard)
+    }
+
+    const UNVOUCHED: &str = "this server cannot vouch for it";
+    const MISMATCH: &str = "is not where";
+    const FORWARDED: &str = "A link someone sent you connects their account";
+
+    #[test]
+    fn the_destination_host_sits_under_the_headline_for_a_self_registered_client() {
+        let page = render(&registered("Zed", "https://zed.example/oauth/cb"));
+        let headline = page.find("<h1>").unwrap();
+        let destination = page.find("class=\"dest\"").expect("destination line");
+        let details = page.find("<dl>").unwrap();
+        assert!(headline < destination && destination < details);
+        assert!(page.contains("Codes go to <b>zed.example</b>"));
+    }
+
+    #[test]
+    fn a_known_client_host_still_warns_that_a_forwarded_link_connects_someone_elses_account() {
+        let page = render(&view());
+        assert!(page.contains("Codes go to <b>claude.ai</b>"));
+        assert!(page.contains("class=\"warn"));
+        assert!(!page.contains("class=\"warn alarm"), "the host is real, so no mismatch alarm");
+        assert!(page.contains(FORWARDED));
+        assert!(!page.contains(UNVOUCHED), "the host is not in doubt, the sender is");
+    }
+
+    #[test]
+    fn a_loopback_destination_draws_no_warning() {
+        let page = render(&registered("lumberroom CLI", "http://127.0.0.1:53682/callback"));
+        assert!(page.contains("Codes go to <b>127.0.0.1</b>"));
+        assert!(!page.contains("class=\"warn"));
+    }
+
+    #[test]
+    fn an_unknown_host_draws_a_warning_that_names_the_host() {
+        let page = render(&registered("Zed", "https://zed.example/oauth/cb"));
+        assert!(page.contains("class=\"warn"));
+        assert!(page.contains(UNVOUCHED));
+        assert!(page.contains("the app at <b>zed.example</b>"));
+        assert!(!page.contains(MISMATCH), "Zed claims no known client");
+    }
+
+    #[test]
+    fn a_known_host_used_as_a_prefix_is_an_unknown_host() {
+        let page = render(&registered("Zed", "https://claude.ai.attacker.example/cb"));
+        assert!(page.contains("Codes go to <b>claude.ai.attacker.example</b>"));
+        assert!(page.contains(UNVOUCHED));
+    }
+
+    #[test]
+    fn an_ip_address_destination_draws_a_warning() {
+        let page = render(&registered("Zed", "https://203.0.113.7/cb"));
+        assert!(page.contains("Codes go to <b>203.0.113.7</b>"));
+        assert!(page.contains(UNVOUCHED));
+    }
+
+    const CLEARTEXT: &str = "the code travels there unencrypted";
+
+    #[test]
+    fn a_plain_http_lan_destination_warns_that_the_code_travels_unencrypted() {
+        let page = render(&registered("OpenWebUI", "http://192.168.1.10:3000/oauth/callback"));
+        assert!(page.contains("Codes go to <b>192.168.1.10</b>"));
+        assert!(page.contains("class=\"warn"));
+        assert!(page.contains(UNVOUCHED));
+        assert!(page.contains(CLEARTEXT));
+        let named = render(&registered("OpenWebUI", "http://nas.local:3000/oauth/callback"));
+        assert!(named.contains(CLEARTEXT));
+    }
+
+    #[test]
+    fn only_a_plain_http_lan_destination_carries_the_unencrypted_line() {
+        for uri in [
+            "https://192.168.1.10:3000/oauth/callback",
+            "https://zed.example/oauth/cb",
+            "http://127.0.0.1:53682/callback",
+            "com.example.zed:/oauth2redirect",
+        ] {
+            let page = render(&registered("Zed", uri));
+            assert!(!page.contains(CLEARTEXT), "{uri}");
+        }
+        assert!(!render(&view()).contains(CLEARTEXT), "a known https host");
+    }
+
+    #[test]
+    fn a_private_use_scheme_draws_a_warning_that_names_the_scheme() {
+        let page = render(&registered("Zed", "com.example.zed:/oauth2redirect"));
+        assert!(page.contains("<b>com.example.zed</b>"));
+        assert!(page.contains(UNVOUCHED));
+    }
+
+    #[test]
+    fn a_name_borrowed_from_a_known_client_is_called_out_against_its_host() {
+        let page = render(&registered("Claude", "https://attacker.example/cb"));
+        assert!(page.contains(UNVOUCHED));
+        assert!(page.contains(MISMATCH));
+        assert!(page.contains("<b>attacker.example</b> is not where Claude"));
+    }
+
+    #[test]
+    fn a_borrowed_name_hidden_behind_case_and_invisible_characters_is_still_called_out() {
+        let page = render(&registered("my CHAT\u{200B}GPT helper", "https://attacker.example/cb"));
+        assert!(page.contains("is not where ChatGPT"));
+    }
+
+    #[test]
+    fn a_client_the_owner_issued_draws_no_warning_wherever_it_sends_codes() {
+        let mut issued = registered("Claude", "https://attacker.example/cb");
+        issued.self_registered = false;
+        let page = render(&issued);
+        assert!(!page.contains("class=\"warn"));
+        assert!(!page.contains("class=\"dest\""));
+    }
+
+    #[test]
+    fn a_hostile_host_is_escaped_in_the_destination_and_the_warning() {
+        // `&`, `'` and `"` are legal in a URL host, and the page puts the host in text and could
+        // one day put it in an attribute.
+        let page = render(&registered("Claude", "https://a&b'c\"d.example/cb"));
+        assert!(!page.contains("a&b'c\"d.example"));
+        assert!(page.contains("Codes go to <b>a&amp;b&#39;c&quot;d.example</b>"));
+        assert!(page.contains("<b>a&amp;b&#39;c&quot;d.example</b> is not where Claude"));
+    }
+
+    #[test]
+    fn a_hostile_name_is_escaped_inside_the_warning() {
+        let page =
+            render(&registered("<img src=x onerror=alert(1)>Claude", "https://x.example/cb"));
+        assert!(!page.contains("<img src=x"));
+        assert!(page.contains("&lt;img src=x onerror=alert(1)&gt;Claude"));
     }
 
     #[test]

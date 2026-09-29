@@ -29,6 +29,9 @@ button{font:inherit;font-weight:600;padding:.62rem 1.15rem;border-radius:7px;bor
 button.secondary{background:#fff;color:#17181a;border-color:#b9bbc0}
 .warn{padding:.7rem .9rem;border-radius:8px;background:#fdf1e7;border:1px solid #eccfae;
  font-size:.9rem;margin:0 0 1.1rem}
+.dest{margin:.1rem 0 1rem;font-size:1rem;color:#17181a}
+.dest b{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:600;word-break:break-all}
+.warn.alarm{background:#fdeaea;border-color:#d98c8c}
 .error{padding:.7rem .9rem;border-radius:8px;background:#fdeaea;border:1px solid #e9b7b7;
  font-size:.9rem;margin:0 0 1.1rem}
 .foot{margin:1.25rem 0 0;color:#83868c;font-size:.82rem}
@@ -41,5 +44,7 @@ button.secondary{background:#fff;color:#17181a;border-color:#b9bbc0}
  button{background:#eceded;color:#111214;border-color:#eceded}
  button.secondary{background:transparent;color:#eceded;border-color:#3a3e44}
  .warn{background:#2a2013;border-color:#5c4520}
+ .dest{color:#eceded}
+ .warn.alarm{background:#2a1414;border-color:#7a2a2a}
  .error{background:#2a1414;border-color:#5c2020}
 }
