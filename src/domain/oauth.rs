@@ -469,7 +469,19 @@ pub fn validate_redirect_uris(uris: &[String]) -> Result<()> {
 }
 
 /// Structural check at registration time. Must reject: a non-absolute URI, a fragment, plain
-/// http to a non-loopback host, and anything that is not http/https or a private-use scheme.
+/// http to a host that can sit outside the owner's network, and anything that is not http/https
+/// or a private-use scheme.
+///
+/// Plain http passes for loopback, a private or link-local IP literal, and a LAN-only name (see
+/// [`is_lan_only`]). RFC 8252 §7.3 allows http for loopback alone, and this departs from it on
+/// purpose: a stock OpenWebUI on a home network serves `http://192.168.1.10:3000` and registers
+/// that as its callback, and the owner ruled on 29 September 2026 that it must connect. Two things
+/// hold the risk down. PKCE with S256 is mandatory here, so a code read off the wire is useless
+/// without the verifier, which never leaves the client. And each allowed host resolves or routes
+/// only on the network the owner's browser sits on, so a remote attacker cannot stand up a
+/// listener that receives the redirect. What stays exposed is someone already on that network:
+/// they can read the code in transit, or register a client whose redirect points at their own
+/// machine and receive the code outright if the owner presses Allow. The consent page says both.
 ///
 /// This validates, it does not normalise. The stored string is whatever the client registered,
 /// because `/authorize` compares byte for byte and a URI that was lowercased or given a
@@ -499,15 +511,18 @@ pub fn validate_redirect_uri(uri: &str) -> Result<()> {
             }
             Ok(())
         }
-        // A local CLI receives its code on a loopback listener, which cannot hold a certificate,
-        // so RFC 8252 §7.3 allows plain http there and only there. Any port, because the port is
-        // chosen at run time.
+        // A local CLI receives its code on a loopback listener, and a LAN service such as
+        // OpenWebUI rarely holds a certificate. Any port, because a CLI picks its port at run
+        // time. The doc comment above carries why the LAN half is safe enough.
         "http" => {
-            if is_loopback(&parsed) {
+            if is_loopback(&parsed) || is_lan_only(&parsed) {
                 Ok(())
             } else {
                 Err(DomainError::validation(
-                    "plain http is allowed only for a loopback redirect_uri. Use https.",
+                    "plain http is allowed only for a loopback, private IP or LAN-only \
+                     redirect_uri: localhost, 127.0.0.1, [::1], a private or link-local IP address, \
+                     a single-label name such as nas, or a name under .local, .lan, .internal or \
+                     .home.arpa. Use https.",
                 ))
             }
         }
@@ -515,9 +530,40 @@ pub fn validate_redirect_uri(uri: &str) -> Result<()> {
         // Requiring the dot is also what keeps `javascript:` and `data:` out.
         scheme if scheme.contains('.') => Ok(()),
         scheme => Err(DomainError::validation(format!(
-            "redirect_uri scheme {scheme:?} is not supported. Use https, a loopback http URI, or \
-             a private-use scheme such as com.example.app:/callback."
+            "redirect_uri scheme {scheme:?} is not supported. Use https, a loopback or LAN http \
+             URI, or a private-use scheme such as com.example.app:/callback."
         ))),
+    }
+}
+
+/// Names the public DNS does not answer for: `.local` belongs to mDNS (RFC 6762), `.home.arpa` to
+/// home networks (RFC 8375), and ICANN reserved `.internal` for private use in 2024. `.lan` has no
+/// reservation behind it. Home routers hand it out by default and ICANN has never delegated it; if
+/// that ever changes, drop it from this list.
+const LAN_SUFFIXES: &[&str] = &[".local", ".lan", ".internal", ".home.arpa"];
+
+/// A host that only the owner's own network can answer for: a private or link-local IP literal,
+/// a single-label name, or a name under [`LAN_SUFFIXES`].
+///
+/// Suffix match on the whole label, so `nas.local.example.com` is public. The parser has already
+/// lowercased the host. One trailing dot is tolerated on a suffixed name, since `nas.local.` names
+/// the same host. A single label with a trailing dot is refused: `nas.` is an absolute name, a
+/// top-level domain the resolver asks the internet about, while a bare `nas` goes through the
+/// owner's own search domains.
+fn is_lan_only(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => private_v4(ip),
+        Some(url::Host::Ipv6(ip)) => private_v6(ip),
+        Some(url::Host::Domain(d)) => {
+            if !d.contains('.') {
+                return !d.is_empty();
+            }
+            let d = d.strip_suffix('.').unwrap_or(d);
+            LAN_SUFFIXES.iter().any(|s| {
+                d.strip_suffix(s).is_some_and(|name| !name.is_empty() && !name.ends_with('.'))
+            })
+        }
+        None => false,
     }
 }
 
@@ -558,8 +604,9 @@ pub enum RedirectDestination {
     /// a Cyrillic look-alike of a known host prints as `xn--...` instead of as the host it mimics.
     ///
     /// `local` is true for loopback only: the code stays on the owner's machine. `recognised` also
-    /// covers the known hosts, which are shared by every user of that service.
-    Host { host: String, recognised: bool, local: bool },
+    /// covers the known hosts, which are shared by every user of that service. `plain_http` marks a
+    /// code that crosses the wire unencrypted; off loopback, registration allows that only on a LAN.
+    Host { host: String, recognised: bool, local: bool, plain_http: bool },
     /// A private-use scheme. The code goes to whichever app on the device claimed the scheme, and
     /// any app can claim any scheme, so this server cannot say which one that is.
     App { scheme: String },
@@ -577,6 +624,10 @@ impl RedirectDestination {
     pub fn is_local(&self) -> bool {
         matches!(self, RedirectDestination::Host { local: true, .. })
     }
+
+    pub fn is_plain_http(&self) -> bool {
+        matches!(self, RedirectDestination::Host { plain_http: true, .. })
+    }
 }
 
 /// Read a redirect URI as the place a code will land, and say whether that place belongs to a
@@ -584,15 +635,16 @@ impl RedirectDestination {
 ///
 /// Loopback counts as recognised: a code sent there stays on the owner's machine. A known host
 /// counts only over https, since plain http to a public host is a code anyone on the path can read.
+/// A plain-http LAN host is never recognised, so the consent page warns about it.
 pub fn redirect_destination(uri: &str) -> RedirectDestination {
     let Ok(parsed) = Url::parse(uri) else { return RedirectDestination::Unreadable };
     match parsed.scheme() {
         "https" | "http" => {
             let Some(host) = parsed.host_str() else { return RedirectDestination::Unreadable };
             let local = is_loopback(&parsed);
-            let recognised =
-                local || (parsed.scheme() == "https" && KNOWN_CLIENT_HOSTS.contains(&host));
-            RedirectDestination::Host { host: host.to_string(), recognised, local }
+            let plain_http = parsed.scheme() == "http";
+            let recognised = local || (!plain_http && KNOWN_CLIENT_HOSTS.contains(&host));
+            RedirectDestination::Host { host: host.to_string(), recognised, local, plain_http }
         }
         scheme => RedirectDestination::App { scheme: scheme.to_string() },
     }
@@ -608,23 +660,32 @@ pub fn claimed_known_client(name: &str) -> Option<&'static str> {
 }
 
 /// Characters that change nothing a reader sees: zero-width spaces and joiners, the soft hyphen,
-/// the byte-order mark, and the bidi embedding, override and isolate controls. A right-to-left
-/// override is the dangerous one, since it can make a name print as a different name.
+/// the byte-order mark, the word joiner and invisible operators, variation selectors, tag
+/// characters, the Hangul fillers, and the bidi embedding, override and isolate controls. A
+/// right-to-left override is the dangerous one, since it can make a name print as a different name.
+/// The fillers and tag characters render blank, so they pad a name or spell text no reader sees.
 ///
-/// The same list as `services::sources::invisible`, which predates this one and cannot be imported
-/// from here because domain does not import services.
-fn invisible(c: char) -> bool {
+/// The one list. `services::sources` compares and prints writer names through it, so a character
+/// added here disappears from the consent page, the clients listing and the digest together.
+pub fn invisible_char(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
             | '\u{034F}'
             | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
             | '\u{180E}'
             | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
             | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{E0000}'..='\u{E007F}'
+            | '\u{E0100}'..='\u{E01EF}'
     )
 }
 
@@ -632,12 +693,13 @@ fn invisible(c: char) -> bool {
 /// turned into spaces, whitespace runs collapsed and trimmed. May come back empty; the caller picks
 /// the placeholder.
 ///
-/// Cleaned once at registration rather than at every render, because the name also reaches the log,
-/// the clients listing and the digest, and a newline in a log field forges a log line.
+/// Cleaned at registration because the name also reaches the log, the clients listing and the
+/// digest, and a newline in a log field forges a log line. Cleaned again at render, because a row
+/// stored before this list grew still holds whatever it held.
 pub fn client_name_display(name: &str) -> String {
     let flat: String = name
         .chars()
-        .filter(|c| !invisible(*c))
+        .filter(|c| !invisible_char(*c))
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     flat.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -657,12 +719,20 @@ fn comparable_client_name(name: &str) -> String {
 ///
 /// Two refusals, both about a destination the consent page cannot describe to the owner:
 ///
-/// - An IP address in place of a host name, loopback aside. The owner cannot tell whose machine
-///   `203.0.113.7` is, and no MCP client this server knows of registers one. An owner who runs such
-///   a client issues it by hand, where this rule does not apply.
-/// - This server's own host. No client lives at the authorization server, and a code sent back here
-///   lands in its access log. On loopback the comparison is the whole origin, because the CLI
-///   listens on the same address as a local server, on another port.
+/// - A globally routable IP address in place of a host name. The owner cannot tell whose machine
+///   `203.0.113.7` is, and no MCP client this server knows of registers one. Loopback and private
+///   ranges pass (RFC 1918, 100.64.0.0/10 as Tailscale uses it, link-local, IPv6 ULA and
+///   link-local): an attacker cannot receive a code on the owner's own network, and a self-hosted
+///   owner reaches a client there by LAN address. The consent page still prints the address as the
+///   host and warns, since an IP is never a recognised client host.
+/// - This server's own origin. No client lives at the authorization server, and a code sent back
+///   here lands in its access log. The comparison is the whole origin (scheme, host, port with the
+///   scheme default filled in), never the host alone: a self-hosted owner runs OpenWebUI on the
+///   same LAN address or `.local` name as this server, on another port, and the CLI does the same
+///   on loopback. [`origin_key`] folds the aliases a host can hide behind: an IPv4-mapped IPv6
+///   host, a trailing dot, and `localhost` against a loopback address. Without that,
+///   `[::ffff:192.168.1.10]` would slip past a server at `192.168.1.10`, and `127.0.0.1:8787` past
+///   one at `localhost:8787`.
 ///
 /// A private-use scheme passes: it has no host to judge, and the consent page warns about it.
 pub fn check_self_registered_redirect(uri: &str, public_url: &str) -> Result<()> {
@@ -671,20 +741,20 @@ pub fn check_self_registered_redirect(uri: &str, public_url: &str) -> Result<()>
         return Ok(());
     }
 
-    let ip_host = matches!(parsed.host(), Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)));
-    if ip_host && !is_loopback(&parsed) {
+    let public_ip = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => !private_v4(ip),
+        Some(url::Host::Ipv6(ip)) => !private_v6(ip),
+        _ => false,
+    };
+    if public_ip && !is_loopback(&parsed) {
         return Err(DomainError::validation(
-            "a self-registered client must name its redirect host, not an IP address. Ask the \
-             owner to issue a client for this address.",
+            "a self-registered client must name its redirect host, not a public IP address. Ask \
+             the owner to issue a client for this address.",
         ));
     }
 
     if let Ok(public) = Url::parse(public_url) {
-        let same = if is_loopback(&parsed) {
-            parsed.origin() == public.origin()
-        } else {
-            parsed.host_str().is_some() && parsed.host_str() == public.host_str()
-        };
+        let same = origin_key(&parsed).is_some() && origin_key(&parsed) == origin_key(&public);
         if same {
             return Err(DomainError::validation(
                 "redirect_uri points at this authorization server, which is not a client",
@@ -692,6 +762,51 @@ pub fn check_self_registered_redirect(uri: &str, public_url: &str) -> Result<()>
         }
     }
     Ok(())
+}
+
+/// Scheme, host and port, with the scheme's default port filled in. `None` for a URL with no host
+/// or no known port, which matches nothing.
+///
+/// The host is folded so an alias of this server compares equal to it: an IPv4-mapped IPv6 host
+/// becomes IPv4, one trailing dot comes off a domain (`lumberroom.example.` is the same DNS name),
+/// and `localhost` with every loopback address becomes one key. The last errs wide: a server on
+/// `127.0.0.1:8787` also refuses `127.0.0.2:8787`, which a server bound to all interfaces answers
+/// anyway, and no real client registers it.
+fn origin_key(url: &Url) -> Option<(String, url::Host<String>, u16)> {
+    const LOOPBACK: &str = "localhost";
+    let host = match url.host()? {
+        url::Host::Ipv6(ip) => match ip.to_ipv4_mapped() {
+            Some(v4) if v4.is_loopback() => url::Host::Domain(LOOPBACK.to_string()),
+            Some(v4) => url::Host::Ipv4(v4),
+            None if ip.is_loopback() => url::Host::Domain(LOOPBACK.to_string()),
+            None => url::Host::Ipv6(ip),
+        },
+        url::Host::Ipv4(ip) if ip.is_loopback() => url::Host::Domain(LOOPBACK.to_string()),
+        url::Host::Ipv4(ip) => url::Host::Ipv4(ip),
+        url::Host::Domain(d) => {
+            let d = d.strip_suffix('.').unwrap_or(d);
+            url::Host::Domain(d.to_ascii_lowercase())
+        }
+    };
+    Some((url.scheme().to_string(), host, url.port_or_known_default()?))
+}
+
+/// Private IPv4 space: RFC 1918, link-local, and 100.64.0.0/10 (shared address space, which
+/// Tailscale uses). `Ipv4Addr::is_shared` is unstable, so the CGNAT range is spelled out.
+fn private_v4(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    ip.is_private() || ip.is_link_local() || (o[0] == 100 && (o[1] & 0xC0) == 64)
+}
+
+/// Private IPv6 space: unique local fc00::/7 and link-local fe80::/10, both spelled out because
+/// the std predicates for them are unstable. An IPv4-mapped address takes the IPv4 verdict, so
+/// `::ffff:203.0.113.7` cannot pass as private.
+fn private_v6(ip: std::net::Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return private_v4(v4);
+    }
+    let first = ip.segments()[0];
+    (first & 0xFE00) == 0xFC00 || (first & 0xFFC0) == 0xFE80
 }
 
 #[cfg(test)]
@@ -1039,13 +1154,66 @@ mod tests {
     }
 
     #[test]
-    fn plain_http_to_anything_other_than_loopback_is_refused() {
-        assert!(validate_redirect_uri("http://lumberroom.example/cb").is_err());
-        assert!(
-            validate_redirect_uri("http://localhost.attacker.example/cb").is_err(),
-            "a host that merely contains 'localhost' is not loopback"
-        );
-        assert!(validate_redirect_uri("http://127.0.0.1.attacker.example/cb").is_err());
+    fn plain_http_to_a_public_host_is_refused() {
+        for bad in [
+            "http://lumberroom.example/cb",
+            "http://example.com/cb",
+            "http://8.8.8.8/cb",
+            "http://203.0.113.7:3000/cb",
+            "http://[2001:db8::1]/cb",
+            "http://[::ffff:8.8.8.8]/cb",
+            // A LAN suffix in the middle of a public name is a public name.
+            "http://nas.local.example.com/cb",
+            "http://nas.lan.example/cb",
+            "http://localhost.attacker.example/cb",
+            "http://127.0.0.1.attacker.example/cb",
+            // A trailing dot makes a single label an absolute name: a top-level domain, which the
+            // victim's resolver looks up on the internet rather than on the local network.
+            "http://nas./cb",
+            // The edges of the private ranges are public.
+            "http://172.32.0.1/cb",
+            "http://100.128.0.1/cb",
+            "http://[fe00::1]/cb",
+        ] {
+            assert!(validate_redirect_uri(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn plain_http_to_a_private_address_or_a_lan_only_name_is_accepted() {
+        for ok in [
+            "http://192.168.1.10:3000/cb",
+            "http://10.0.0.5/cb",
+            "http://172.16.0.1/cb",
+            "http://100.64.0.1/cb",
+            "http://169.254.10.20/cb",
+            "http://[fd00::1]:3000/cb",
+            "http://[fe80::1]/cb",
+            "http://[::ffff:192.168.1.10]:3000/cb",
+            "http://nas.local:3000/cb",
+            "http://NAS.Local/cb",
+            "http://nas.local./cb",
+            "http://nas:3000/cb",
+            "http://printer.lan/cb",
+            "http://svc.internal/cb",
+            "http://box.home.arpa/cb",
+        ] {
+            assert!(validate_redirect_uri(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn a_lan_suffix_with_no_name_in_front_of_it_is_refused() {
+        assert!(validate_redirect_uri("http://home.arpa/cb").is_err());
+    }
+
+    #[test]
+    fn the_plain_http_refusal_names_what_plain_http_may_reach() {
+        let e = validate_redirect_uri("http://example.com/cb").unwrap_err();
+        let message = e.client_message();
+        for part in ["loopback", "private IP", ".local", ".home.arpa", "https"] {
+            assert!(message.contains(part), "{part} missing from {message}");
+        }
     }
 
     #[test]
@@ -1247,6 +1415,24 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_http_lan_redirect_is_neither_recognised_nor_local() {
+        let lan = redirect_destination("http://192.168.1.10:3000/oauth/callback");
+        assert_eq!(host("http://192.168.1.10:3000/oauth/callback"), ("192.168.1.10".into(), false));
+        assert!(!lan.is_local());
+        assert!(lan.is_plain_http());
+        assert!(!redirect_destination("http://nas.local:3000/cb").recognised());
+    }
+
+    #[test]
+    fn only_an_http_redirect_is_plain_http() {
+        assert!(redirect_destination("http://127.0.0.1:53682/callback").is_plain_http());
+        assert!(redirect_destination("HTTP://nas.local/cb").is_plain_http());
+        assert!(!redirect_destination("https://nas.local/cb").is_plain_http());
+        assert!(!redirect_destination("com.example.app:/cb").is_plain_http());
+        assert!(!RedirectDestination::Unreadable.is_plain_http());
+    }
+
+    #[test]
     fn an_international_host_is_shown_in_its_ascii_form() {
         // Punycode is what stops a look-alike host from reading as the real one.
         assert!(host("https://cl\u{0430}ude.ai/cb").0.starts_with("xn--"));
@@ -1292,6 +1478,27 @@ mod tests {
         assert_eq!(client_name_display("Zed"), "Zed");
     }
 
+    #[test]
+    fn a_client_name_loses_selectors_tags_fillers_and_invisible_operators() {
+        for (label, c) in [
+            ("variation selector", '\u{FE0F}'),
+            ("variation selector supplement", '\u{E0100}'),
+            ("tag character", '\u{E0041}'),
+            ("tag cancel", '\u{E007F}'),
+            ("hangul choseong filler", '\u{115F}'),
+            ("hangul jungseong filler", '\u{1160}'),
+            ("hangul filler", '\u{3164}'),
+            ("halfwidth hangul filler", '\u{FFA0}'),
+            ("mongolian vowel separator", '\u{180E}'),
+            ("word joiner", '\u{2060}'),
+            ("invisible plus", '\u{2064}'),
+        ] {
+            let name = format!("Cl{c}aude");
+            assert_eq!(client_name_display(&name), "Claude", "{label}");
+            assert_eq!(claimed_known_client(&name), Some("Claude"), "{label}");
+        }
+    }
+
     // ---- redirect rules that apply only to a self-registered client ----
 
     const PUBLIC: &str = "https://lumberroom.example";
@@ -1311,18 +1518,172 @@ mod tests {
     }
 
     #[test]
-    fn a_self_registered_client_may_not_send_codes_to_an_ip_address() {
+    fn a_self_registered_client_may_not_send_codes_to_a_public_ip_address() {
         assert!(check_self_registered_redirect("https://203.0.113.7/cb", PUBLIC).is_err());
+        assert!(check_self_registered_redirect("https://8.8.8.8/cb", PUBLIC).is_err());
         assert!(check_self_registered_redirect("https://[2001:db8::1]/cb", PUBLIC).is_err());
+        assert!(check_self_registered_redirect("https://[2606:4700::1111]/cb", PUBLIC).is_err());
+    }
+
+    #[test]
+    fn a_self_registered_client_may_send_codes_to_a_private_ip_address() {
+        for ok in [
+            "https://10.0.0.5/cb",
+            "https://172.16.0.1/cb",
+            "https://172.31.255.254/cb",
+            "https://192.168.1.10/cb",
+            "https://100.64.0.1/cb",
+            "https://100.127.255.254/cb",
+            "https://169.254.10.20/cb",
+            "https://[fc00::1]/cb",
+            "https://[fd12:3456::1]/cb",
+            "https://[fe80::1]/cb",
+            "https://[::ffff:192.168.1.10]/cb",
+        ] {
+            assert!(check_self_registered_redirect(ok, PUBLIC).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn the_edges_of_the_private_ranges_stay_public() {
+        for bad in [
+            "https://172.15.255.255/cb",
+            "https://172.32.0.1/cb",
+            "https://100.63.255.255/cb",
+            "https://100.128.0.1/cb",
+            "https://11.0.0.1/cb",
+            "https://[fbff::1]/cb",
+            "https://[fe00::1]/cb",
+            "https://[fec0::1]/cb",
+        ] {
+            assert!(check_self_registered_redirect(bad, PUBLIC).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_ipv4_mapped_public_address_is_refused() {
+        assert!(check_self_registered_redirect("https://[::ffff:203.0.113.7]/cb", PUBLIC).is_err());
+        assert!(check_self_registered_redirect("https://[::ffff:8.8.8.8]/cb", PUBLIC).is_err());
     }
 
     #[test]
     fn a_self_registered_client_may_not_send_codes_to_this_server() {
         assert!(check_self_registered_redirect("https://lumberroom.example/cb", PUBLIC).is_err());
-        assert!(
-            check_self_registered_redirect("https://LUMBERROOM.example:8443/x", PUBLIC).is_err()
-        );
+        assert!(check_self_registered_redirect("https://LUMBERROOM.example/x", PUBLIC).is_err());
         assert!(check_self_registered_redirect("https://other.example/cb", PUBLIC).is_ok());
+    }
+
+    #[test]
+    fn the_default_https_port_counts_as_the_same_origin_written_or_not() {
+        assert!(
+            check_self_registered_redirect("https://lumberroom.example:443/cb", PUBLIC).is_err()
+        );
+        let explicit = "https://lumberroom.example:443";
+        assert!(check_self_registered_redirect("https://lumberroom.example/cb", explicit).is_err());
+    }
+
+    #[test]
+    fn another_scheme_or_port_on_this_servers_host_is_another_origin() {
+        assert!(check_self_registered_redirect("https://lumberroom.example:8443/x", PUBLIC).is_ok());
+        assert!(check_self_registered_redirect("http://lumberroom.example/x", PUBLIC).is_ok());
+    }
+
+    /// Both checks in the order `/oauth/register` runs them.
+    fn dcr(uri: &str, public_url: &str) -> Result<()> {
+        validate_redirect_uri(uri).and_then(|()| check_self_registered_redirect(uri, public_url))
+    }
+
+    /// A stock OpenWebUI serves plain http on :3000 and derives its callback from the URL it is
+    /// reached at, so it registers an http LAN redirect. The owner ruled on 29 September 2026 that
+    /// this must register.
+    #[test]
+    fn dcr_accepts_a_plain_http_lan_redirect_for_a_lan_server() {
+        let lan = "https://192.168.1.10:8787";
+        for uri in [
+            "http://192.168.1.10:3000/cb",
+            "http://10.0.0.5/cb",
+            "http://nas.local:3000/cb",
+            "http://nas:3000/cb",
+            "http://[fd00::1]:3000/cb",
+        ] {
+            assert!(dcr(uri, lan).is_ok(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn dcr_refuses_a_plain_http_redirect_to_a_public_host() {
+        let lan = "https://192.168.1.10:8787";
+        for uri in [
+            "http://example.com/cb",
+            "http://8.8.8.8/cb",
+            "http://nas.local.example.com/cb",
+            "http://localhost.attacker.example/cb",
+        ] {
+            assert!(dcr(uri, lan).is_err(), "{uri}");
+        }
+    }
+
+    #[test]
+    fn a_plain_http_lan_redirect_at_this_servers_own_origin_is_refused() {
+        let lan = "http://192.168.1.10:8787";
+        assert!(dcr("http://192.168.1.10:8787/cb", lan).is_err());
+        assert!(dcr("http://192.168.1.10:3000/cb", lan).is_ok());
+    }
+
+    #[test]
+    fn a_trailing_dot_on_this_servers_host_is_still_this_server() {
+        assert!(check_self_registered_redirect("https://lumberroom.example./cb", PUBLIC).is_err());
+        let dotted = "https://lumberroom.example.";
+        assert!(check_self_registered_redirect("https://lumberroom.example/cb", dotted).is_err());
+    }
+
+    #[test]
+    fn localhost_and_a_loopback_address_are_one_origin() {
+        let local = "http://localhost:8787";
+        for uri in [
+            "http://127.0.0.1:8787/cb",
+            "http://127.0.0.2:8787/cb",
+            "http://[::1]:8787/cb",
+            "http://localhost.:8787/cb",
+        ] {
+            assert!(check_self_registered_redirect(uri, local).is_err(), "{uri}");
+        }
+        let numeric = "http://127.0.0.1:8787";
+        assert!(check_self_registered_redirect("http://localhost:8787/cb", numeric).is_err());
+        assert!(check_self_registered_redirect("http://localhost:53682/cb", numeric).is_ok());
+    }
+
+    #[test]
+    fn a_lan_client_on_this_servers_ip_and_another_port_is_accepted() {
+        let lan = "https://192.168.1.10:8787";
+        let openwebui = "https://192.168.1.10:3000/oauth/callback";
+        assert!(check_self_registered_redirect(openwebui, lan).is_ok());
+        assert!(check_self_registered_redirect("https://192.168.1.10:8787/cb", lan).is_err());
+    }
+
+    #[test]
+    fn a_local_hostname_client_on_another_port_is_accepted() {
+        let nas = "https://nas.local:8787";
+        assert!(
+            check_self_registered_redirect("https://nas.local:3000/oauth/callback", nas).is_ok()
+        );
+        assert!(
+            check_self_registered_redirect("https://nas.local:8787/oauth/callback", nas).is_err()
+        );
+    }
+
+    #[test]
+    fn an_ipv4_mapped_form_of_this_servers_address_is_the_same_origin() {
+        let lan = "https://192.168.1.10:8787";
+        let mapped = "https://[::ffff:192.168.1.10]:8787/cb";
+        assert!(check_self_registered_redirect(mapped, lan).is_err());
+        let mapped_server = "https://[::ffff:192.168.1.10]:8787";
+        assert!(
+            check_self_registered_redirect("https://192.168.1.10:8787/cb", mapped_server).is_err()
+        );
+        assert!(
+            check_self_registered_redirect("https://[::ffff:192.168.1.10]:3000/cb", lan).is_ok()
+        );
     }
 
     #[test]

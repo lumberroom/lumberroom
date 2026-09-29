@@ -68,7 +68,7 @@ use super::{closed, data, page, redirect, trimmed, Console};
 use crate::authserver::pages::escape;
 use crate::authserver::session::{OwnerSession, Sessions};
 use crate::console::pages::{self, Health, Tab};
-use crate::domain::oauth::hash_token;
+use crate::domain::oauth::{client_name_display, hash_token};
 use crate::domain::policy::NamespaceGrant;
 use crate::domain::presets::Preset;
 use crate::domain::types::Sensitivity;
@@ -754,7 +754,9 @@ fn client_card(
 <span class=\"cli-meta\">{origin} &middot; {last} &middot; <code>{id}</code></span></div>\
 <div class=\"cli-grant\">{read}{write}{caps}</div>{controls}</article>",
         gone = if revoked { " gone" } else { "" },
-        name = escape(&c.client_name),
+        // Cleaned at render as well as at registration: a row stored before the invisible list grew
+        // still holds a bidi override that would reorder the card around it.
+        name = escape(&client_name_display(&c.client_name)),
         state = state,
         origin = origin,
         last = escape(&last),
@@ -1038,4 +1040,44 @@ should stay public: PKCE binds its exchange. Shown once, stored as a hash.</span
             form_id: "new",
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn named(name: &str) -> OauthClientRecord {
+        OauthClientRecord {
+            client_id: "c1".into(),
+            secret_hash: None,
+            client_name: name.into(),
+            redirect_uris: vec!["https://tool.example/cb".into()],
+            grant_types: vec!["authorization_code".into()],
+            registered_via: "dcr".into(),
+            software_id: None,
+            read: Vec::new(),
+            write: Vec::new(),
+            registry_write: false,
+            sealed_capable: false,
+            may_delete: false,
+            may_ingest: false,
+            may_read_history: false,
+            consented_at: None,
+            profile: None,
+            created_at: Utc::now(),
+            last_used_at: None,
+            revoked_at: Some(Utc::now()),
+        }
+    }
+
+    #[test]
+    fn a_stored_name_prints_without_its_bidi_override_and_stays_escaped() {
+        let card = client_card(&named("<b>Evil\u{202E}gnp.exe</b>\n"), &[], &|_, _| String::new());
+        assert!(!card.contains('\u{202E}'), "{card}");
+        assert!(
+            card.contains("<span class=\"cli-name\">&lt;b&gt;Evilgnp.exe&lt;/b&gt;</span>"),
+            "{card}"
+        );
+    }
 }

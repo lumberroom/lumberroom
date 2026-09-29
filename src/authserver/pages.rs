@@ -11,7 +11,8 @@
 
 use crate::console::pages::FAVICON;
 use crate::domain::oauth::{
-    claimed_known_client, redirect_destination, GrantProfile, RedirectDestination,
+    claimed_known_client, client_name_display, redirect_destination, GrantProfile,
+    RedirectDestination,
 };
 
 /// The mark, above the heading on all three pages.
@@ -153,7 +154,9 @@ may reach.</p>\
 autofocus required>\
 <p class=\"actions\"><button type=\"submit\">Sign in</button></p></form>\
 <p class=\"foot\">Signing in does not grant anything. The next page is where you choose.</p>",
-            client = escape(client_name),
+            // Cleaned again here: a row stored before the invisible-character list grew can still
+            // hold a bidi override.
+            client = escape(&client_name_display(client_name)),
             banner = banner,
             fields = flow.hidden_inputs(),
         ),
@@ -221,7 +224,7 @@ every surface, until you revoke it.</p>\
 <p class=\"actions\"><button type=\"submit\" name=\"action\" value=\"allow\">Allow</button>\
 <button type=\"submit\" name=\"action\" value=\"deny\" class=\"secondary\">Deny</button></p></form>\
 <p class=\"foot\">Change or revoke this at <code>/console/clients</code> whenever you like. <code>lumberroom clients</code> lists what is registered.</p>",
-            client = escape(client.client_name),
+            client = escape(&client_name_display(client.client_name)),
             destination = destination,
             origin = origin,
             again = again,
@@ -273,9 +276,10 @@ fn self_registered_notice(client: &ClientView) -> (String, String) {
     }
 
     if destination.recognised() {
-        let warning = "<p class=\"warn\">Allow only if you pressed Connect in your own account just \
+        let warning =
+            "<p class=\"warn\">Allow only if you pressed Connect in your own account just \
 now. A link someone sent you connects their account.</p>"
-            .to_string();
+                .to_string();
         return (line, warning);
     }
 
@@ -289,10 +293,18 @@ codes. "
         ),
         None => ("warn", String::new()),
     };
+    // Registration lets plain http through only to loopback, which returned above, or to the
+    // owner's own network, so the sentence can name the local network.
+    let cleartext = if destination.is_plain_http() {
+        " Anyone on your local network could be listening at that address, and the code travels there unencrypted."
+    } else {
+        ""
+    };
     let warning = format!(
         "<p class=\"{class}\">{mismatch}Whoever registered this client chose the name <b>{name}</b>, \
-and this server cannot vouch for it. Allow only if you started this connection from {place}.</p>",
-        name = escape(client.client_name),
+and this server cannot vouch for it. Allow only if you started this connection from \
+{place}.{cleartext}</p>",
+        name = escape(&client_name_display(client.client_name)),
     );
     (line, warning)
 }
@@ -346,6 +358,18 @@ mod tests {
             software_id: Some("anthropic-claude"),
             self_registered: true,
             current_profile: None,
+        }
+    }
+
+    #[test]
+    fn a_stored_name_with_a_bidi_override_renders_without_it_on_every_page() {
+        let dirty = "Cl\u{202E}au\u{3164}de";
+        let consent_page = render(&registered(dirty, "https://tool.example/cb"));
+        let login_page = login(&flow(), dirty, None);
+        for page in [consent_page, login_page] {
+            assert!(!page.contains('\u{202E}'));
+            assert!(!page.contains('\u{3164}'));
+            assert!(page.contains("<b>Claude</b>"));
         }
     }
 
@@ -510,6 +534,33 @@ mod tests {
         let page = render(&registered("Zed", "https://203.0.113.7/cb"));
         assert!(page.contains("Codes go to <b>203.0.113.7</b>"));
         assert!(page.contains(UNVOUCHED));
+    }
+
+    const CLEARTEXT: &str = "the code travels there unencrypted";
+
+    #[test]
+    fn a_plain_http_lan_destination_warns_that_the_code_travels_unencrypted() {
+        let page = render(&registered("OpenWebUI", "http://192.168.1.10:3000/oauth/callback"));
+        assert!(page.contains("Codes go to <b>192.168.1.10</b>"));
+        assert!(page.contains("class=\"warn"));
+        assert!(page.contains(UNVOUCHED));
+        assert!(page.contains(CLEARTEXT));
+        let named = render(&registered("OpenWebUI", "http://nas.local:3000/oauth/callback"));
+        assert!(named.contains(CLEARTEXT));
+    }
+
+    #[test]
+    fn only_a_plain_http_lan_destination_carries_the_unencrypted_line() {
+        for uri in [
+            "https://192.168.1.10:3000/oauth/callback",
+            "https://zed.example/oauth/cb",
+            "http://127.0.0.1:53682/callback",
+            "com.example.zed:/oauth2redirect",
+        ] {
+            let page = render(&registered("Zed", uri));
+            assert!(!page.contains(CLEARTEXT), "{uri}");
+        }
+        assert!(!render(&view()).contains(CLEARTEXT), "a known https host");
     }
 
     #[test]
