@@ -1,6 +1,10 @@
 # Reusable build environment. Keeps the toolchain and system libraries out of every
 # throwaway container: ONNX Runtime links libstdc++, and sqlx/reqwest link OpenSSL.
-FROM rust:1-slim
+FROM rust:1.98.0-slim
+# rustfmt and clippy because rust-toolchain.toml lists them. An image without them sends rustup to
+# the network at the start of every scripts/cargo.sh run to fetch clippy into a container that is
+# about to be deleted.
+RUN rustup component add rustfmt clippy
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates g++ curl xz-utils \
       musl-tools gcc-x86-64-linux-gnu \
@@ -10,8 +14,7 @@ RUN apt-get update \
 # them inside the container on every release build. The scout measured roughly 60s of the 188s run
 # on that repeat. Baking them in also takes the last root-only step out of that script, which is
 # what lets it run under the same non-root uid as everything else. `rustup target add` stays in the
-# script: RUSTUP_HOME is world-writable here and rust-toolchain.toml pins a channel this image does
-# not carry, so a target added at build time would belong to the wrong toolchain.
+# script, which keeps the cross targets out of an image every test run pulls.
 
 # watchexec drives the `dev` service in docker-compose.yml: it watches the bind-mounted sources and
 # restarts the debug binary when one changes. Rust has no hot reload of its own, and cargo has no

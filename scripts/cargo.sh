@@ -103,6 +103,12 @@ trap 'cleanup; exit 143' TERM
 # The host account's own uid, so that on a Linux host the bind-mounted tree stays writable by the
 # user who owns it; under Colima on macOS the mount answers to any uid and only the non-zero part
 # matters. Measured cost: 13ms of stat per run, plus one 1.0s chown of the two volumes, once.
+
+# XDG_CACHE_HOME puts ort-sys's downloaded ONNX Runtime inside the target volume. Left at its
+# default it lands in this container's $HOME and dies with the container, while the build-script
+# output that names its path survives in target/. The next recompile of ort-sys then fails with
+# "could not find native static library `onnxruntime`", which reads like a toolchain fault. A target volume that already holds the stale output needs
+# `./scripts/cargo.sh clean -p ort-sys` once, because the build script does not rerun on this variable.
 docker run --rm --name "$NAME" \
   --label "lumberroom.cargo.owner=$$" \
   -e BUILDER_UID="$(id -u)" \
@@ -113,6 +119,7 @@ docker run --rm --name "$NAME" \
   -v lumberroom-cargo:/usr/local/cargo/registry \
   -e DATABASE_URL="postgres://${POSTGRES_USER:-lumberroom}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-lumberroom}" \
   -e CARGO_TERM_COLOR=never \
+  -e XDG_CACHE_HOME=/app/target/.cache \
   -e RUST_BACKTRACE=1 \
   lumberroom-builder cargo "$@"
 status=$?
