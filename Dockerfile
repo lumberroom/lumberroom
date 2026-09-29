@@ -6,7 +6,7 @@
 #            build dies at the link step with "cannot find -lstdc++".
 #   network  `ort` downloads a prebuilt ONNX Runtime, and the prefetch downloads model weights.
 
-FROM rust:1-slim AS base
+FROM rust:1.98.0-slim AS base
 WORKDIR /build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates g++ \
