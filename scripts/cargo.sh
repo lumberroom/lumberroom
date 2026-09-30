@@ -3,6 +3,7 @@
 #
 #   ./scripts/cargo.sh check --all-targets
 #   ./scripts/cargo.sh test
+#   ./scripts/cargo.sh test-fast        # the same binaries, six at a time: scripts/lib/test-fast.sh
 #
 # The builder image carries g++ (ONNX Runtime links libstdc++) and the OpenSSL headers; a bare
 # rust:slim does not. Build it once with:  docker build -t lumberroom-builder -f Dockerfile.builder .
@@ -18,7 +19,14 @@ cd "$(dirname "$0")/.."
 # force `-j 1` by default so nobody has to rediscover this. Only for `test`, and only when the
 # caller has not already picked a `-j`: `check` gets real parallelism because it never links two
 # binaries at once.
-if [ "$1" = "test" ]; then
+#
+# `test-fast` builds like `test`, so it takes the same default, and then runs the built binaries N at
+# a time through scripts/lib/test-fast.sh.
+FAST=
+if [ "${1:-}" = "test-fast" ]; then
+  FAST=1
+fi
+if [ "${1:-}" = "test" ] || [ "$FAST" = 1 ]; then
   has_j=0
   for arg in "$@"; do
     case "$arg" in
@@ -31,6 +39,24 @@ if [ "$1" = "test" ]; then
     set -- "$sub" -j 1 "$@"
   fi
 fi
+
+# ── mold, and an image that carries it ───────────────────────────────────────────────────────────
+#
+# The linker for every build this script runs, and only for those. Dockerfile.builder says why the
+# flag lives here and not in the image. One value for every subcommand: check, clippy and test share
+# build scripts and proc macros, and a RUSTFLAGS that differs between them rebuilds those on every
+# switch.
+#
+# lumberroom-cloud builds the same image tag, so the image holds whatever the last checkout to build
+# it put there. Refused here, naming the fix, rather than as gcc's "cannot find ld" from the first
+# build script link.
+builder_linker="$(docker image inspect -f '{{ index .Config.Labels "lumberroom.linker" }}' lumberroom-builder 2>/dev/null || true)"
+if [ "$builder_linker" != mold ]; then
+  echo "cargo.sh: the lumberroom-builder image carries no mold. Rebuild it from this checkout:" >&2
+  echo "  docker build -t lumberroom-builder -f Dockerfile.builder ." >&2
+  exit 1
+fi
+RUSTFLAGS_MOLD="-C link-arg=-fuse-ld=mold"
 
 # ── the container outlives the command that started it, unless something stops it ────────────────
 #
@@ -69,6 +95,14 @@ sweep
 trap 'cleanup' EXIT
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
+
+# The command the container runs. `test-fast` swaps cargo for the pool script and drops its own name.
+if [ "$FAST" = 1 ]; then
+  shift
+  set -- sh /app/scripts/lib/test-fast.sh "$@"
+else
+  set -- cargo "$@"
+fi
 
 # target/ in a named volume rather than on the bind mount, and the same volume the `dev` compose
 # service uses. Two reasons. Rust build I/O through virtiofs dominates a rebuild on macOS, and
@@ -121,7 +155,9 @@ docker run --rm --name "$NAME" \
   -e CARGO_TERM_COLOR=never \
   -e XDG_CACHE_HOME=/app/target/.cache \
   -e RUST_BACKTRACE=1 \
-  lumberroom-builder cargo "$@"
+  -e RUSTFLAGS="$RUSTFLAGS_MOLD" \
+  ${TEST_FAST_JOBS:+-e TEST_FAST_JOBS="$TEST_FAST_JOBS"} \
+  lumberroom-builder "$@"
 status=$?
 
 # ── prune, after the build and never before it ───────────────────────────────────────────────────

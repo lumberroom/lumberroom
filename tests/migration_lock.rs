@@ -15,16 +15,18 @@ async fn a_failed_migration_leaves_no_advisory_lock_behind() {
     let b = base();
     let cut = b.rfind('/').unwrap();
     let admin = PgPool::connect(&format!("{}/postgres", &b[..cut])).await.expect("admin");
-    let _ =
-        sqlx::raw_sql(AssertSqlSafe("DROP DATABASE IF EXISTS migration_lock_probe WITH (FORCE)"))
-            .execute(&admin)
-            .await;
-    sqlx::raw_sql(AssertSqlSafe("CREATE DATABASE migration_lock_probe"))
+    // The pid keeps two checkouts on one cluster apart: `DROP ... WITH (FORCE)` on a shared name
+    // kills the other run's probe connection mid-test.
+    let probe = format!("migration_lock_probe_{}", std::process::id());
+    let _ = sqlx::raw_sql(AssertSqlSafe(format!("DROP DATABASE IF EXISTS {probe} WITH (FORCE)")))
+        .execute(&admin)
+        .await;
+    sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {probe}")))
         .execute(&admin)
         .await
         .expect("create");
 
-    let url = format!("{}/migration_lock_probe", &b[..cut]);
+    let url = format!("{}/{probe}", &b[..cut]);
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1) // one connection, so a leaked lock is observable
         .connect(&url)
@@ -42,10 +44,17 @@ async fn a_failed_migration_leaves_no_advisory_lock_behind() {
     let failed = lumberroom_server::adapters::postgres::migrate(&pool).await;
     assert!(failed.is_err(), "the poisoned migration set was accepted");
 
-    let held: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")
-        .fetch_one(&pool)
-        .await
-        .expect("lock count");
+    // This database's locks only. `pg_locks` lists the whole cluster, so another test binary's suite
+    // lock, or another checkout's suite on the same cluster, counted here as a leak. sqlx takes its
+    // migration lock inside the database it migrates, so a real leak still shows up here.
+    let held: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks
+          WHERE locktype = 'advisory'
+            AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("lock count");
     assert_eq!(held, 0, "a failed migration left {held} advisory lock(s) held");
 
     // And the real proof: a second attempt returns its error instead of hanging.
@@ -58,8 +67,7 @@ async fn a_failed_migration_leaves_no_advisory_lock_behind() {
     assert!(again.unwrap().is_err(), "the second migrate should still report the same problem");
 
     pool.close().await;
-    let _ =
-        sqlx::raw_sql(AssertSqlSafe("DROP DATABASE IF EXISTS migration_lock_probe WITH (FORCE)"))
-            .execute(&admin)
-            .await;
+    let _ = sqlx::raw_sql(AssertSqlSafe(format!("DROP DATABASE IF EXISTS {probe} WITH (FORCE)")))
+        .execute(&admin)
+        .await;
 }
