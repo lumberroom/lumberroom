@@ -166,6 +166,15 @@ exists can still pick different uids and chown in turn; that settles after one c
 sees `Permission denied` on a crate source only if it is fetching at that moment. Landed 8
 September 2026.
 
+**lumberroom-cloud rebuilds the same builder image.** Both repositories tag their
+`Dockerfile.builder` as `lumberroom-builder`, so the image holds whatever the last checkout to build
+it put there. On 30 September 2026 the image on the maintainer's machine dated from 8 September. It
+carried no clippy, although both Dockerfiles install it, so every run downloaded clippy. And
+lumberroom-cloud's lld setting had never reached it, so every build there linked with GNU ld. The two
+Dockerfiles now install the same packages and carry the same `lumberroom.linker=mold` label, and
+`scripts/cargo.sh` reads the label and refuses to start without mold, naming the rebuild command.
+`docker image inspect lumberroom-builder -f '{{.Created}} {{.Config.Labels}}'` shows what is there.
+
 **A root process writing into a claimed build volume leaves files no later run can replace.** The
 ownership marker `.builder-owner` records which uid claimed `lumberroom-target` or
 `lumberroom-cargo`, and the entrypoint reads the marker rather than walking 41,000 inodes on every
@@ -191,6 +200,15 @@ passed alone and two failed in a full run, with assertions that read like logic 
 `tests/common/mod.rs` takes a Postgres advisory lock, which the session holds and every process sees.
 The guard has to be carried out of `setup`; an unused-variable warning was the only tell when it was
 not.
+
+**A catalog view in a test sees every database on the cluster.** `pg_locks`, `pg_stat_activity` and
+`pg_db_role_setting` are cluster-wide. `tests/migration_lock.rs` counted every advisory lock on the
+cluster to prove a failed migration released its own, and passed because `cargo test` runs one binary
+at a time. In lumberroom-cloud's copy of the test, the first run of `scripts/cargo.sh test-fast` put
+another binary's suite lock beside it and it failed with "left 2 advisory lock(s) held". Filter on
+`current_database()`, or on the role or pid the test owns. Two suites from two worktrees sharing the
+cluster break the unfiltered form the same way. The probe database carries the pid for the same
+reason: a fixed name lets one run's `DROP ... WITH (FORCE)` kill the other's connection.
 
 **The integration suite skips rather than fails with no database reachable**, so a run reporting a low
 count is not a pass. Check the split, not the exit code.
