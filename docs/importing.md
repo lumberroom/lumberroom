@@ -44,9 +44,10 @@ data. claude.ai puts one behind Settings, Privacy, Export data, and mails a mani
 parts: `light_metadata`, `projects`, `memories` and `conversations`.
 
 **A memory store** sometimes comes in that archive and sometimes does not. claude.ai ships the
-`memories` part. ChatGPT holds its saved memories somewhere the export does not reach, so the only
-route to that store is to ask the assistant holding it. That is what the dump prompt below is for,
-and you are the transport.
+`memories` part. OpenAI does not document saved memories as part of the ChatGPT export, so check the
+archive you receive before relying on it. When the archive has no memory file, the route to that
+store is to ask the assistant holding it. That is what the dump prompt below is for, and you are
+the transport.
 
 Conversations go through extraction and spend provider tokens. A memory dump arrives already sorted
 into facts, so it needs no extraction pass. Whatever the route, nothing writes to the store: every
