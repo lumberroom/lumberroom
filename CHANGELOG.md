@@ -122,6 +122,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The consent page catches a client that claims one service and sends codes to another.** A
+  self-registered client named Claude that redirected to chatgpt.com used to draw only the
+  shared-account reminder, because every recognised host shared one allowlist. Each known service
+  now owns its hosts, and a claimed brand at another service's host raises the mismatch alarm
+  naming both (#91).
 - **A search no longer deadlocks a write on the rows it returned.** The access bump after every
   search locked its rows in scan order and held them until the statement ended, while a
   supersession locks its two rows in id order, so a search that returned both could hold one while
