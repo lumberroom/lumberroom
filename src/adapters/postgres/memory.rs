@@ -264,6 +264,16 @@ macro_rules! search_sql {
                    AND m.sensitivity = 'open'
                    AND to_tsvector('english', m.content) @@ websearch_to_tsquery('english', $8)
                    AND "#, $live, r#"
+                   -- A lexical weight of 0 turns this arm off: both blends multiply its term by
+                   -- $10, so the GIN scan and ts_rank would buy a score nobody reads. Postgres
+                   -- plans a qual on parameters alone as a one-time filter, so at 0 the scan
+                   -- never runs, under a generic plan too. It is the setting for stores in
+                   -- Chinese, Japanese or Thai, where the english parser makes each sentence one
+                   -- token and nothing matches anyway (issue 75).
+                   --
+                   -- The cast stays. This is the first place $10 appears in the text, and Postgres
+                   -- types a bare `$10 > 0` as an integer there, ahead of the float uses below.
+                   AND $10::float8 > 0
                  ORDER BY lexical DESC
                  LIMIT $7
             ),
@@ -2590,6 +2600,11 @@ impl MemoryRepository for PgMemoryRepository {
     /// write it raced, and the write could be the side Postgres aborts. SKIP LOCKED leaves a held
     /// row alone, and FOR NO KEY UPDATE rather than FOR UPDATE keeps a foreign-key check on this
     /// row from queueing behind the bump.
+    ///
+    /// Both columns it writes stay out of every index on `memory`, key and predicate alike, so the
+    /// update takes the HOT path and writes no index entry. One partial index on
+    /// `last_accessed_at` once made each search a write to every index, HNSW graph included;
+    /// `tests/search_touch_hot.rs` reads the catalog to keep it that way.
     fn touch_accessed(&self, tenant: &str, ids: Vec<uuid::Uuid>) {
         if ids.is_empty() {
             return;
@@ -2826,7 +2841,12 @@ impl MemoryRepository for PgMemoryRepository {
         })
     }
 
-    /// The review queue, not a reaper. Matches the `memory_never_accessed` partial index.
+    /// The review queue, not a reaper.
+    ///
+    /// No index serves `last_accessed_at IS NULL`, on purpose. `memory_never_accessed` did, and it
+    /// turned every search's touch into a write to every index on `memory`; migration 026 dropped
+    /// it. The plan walks `memory_created_at` oldest first and filters, so a page costs as many rows
+    /// as precede the first unread ones.
     async fn stale(
         &self,
         tenant: &str,
@@ -3390,6 +3410,17 @@ mod tests {
                 2,
                 "the vector arm and the lexical arm"
             );
+        }
+    }
+
+    /// Weight 0 must skip the GIN scan, so the guard sits in the lexical arm and only there. In the
+    /// vector arm it would empty the result of a store tuned for vector-only search.
+    #[test]
+    fn a_zero_lexical_weight_turns_off_the_lexical_arm_alone() {
+        for sql in EVERY_SEARCH_SQL.into_iter().chain(TAGGED_SEARCH_SQL.map(|(sql, _)| sql)) {
+            assert_eq!(sql.matches("AND $10::float8 > 0").count(), 1);
+            let lex = &sql[sql.find("lex AS (").unwrap()..sql.find("merged AS (").unwrap()];
+            assert!(lex.contains("AND $10::float8 > 0"), "the guard left the lexical arm");
         }
     }
 

@@ -99,6 +99,8 @@ services:
       PORT: 8787
       HOST: 0.0.0.0
       DATABASE_URL: postgres://${POSTGRES_USER:-lumberroom}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-lumberroom}
+      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-}
+      DB_ACQUIRE_TIMEOUT_SECS: ${DB_ACQUIRE_TIMEOUT_SECS:-}
       TENANT_ID: ${TENANT_ID:-me}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # Every externally visible URL (MCP endpoint, OAuth issuer, metadata documents, redirect
@@ -166,6 +168,7 @@ services:
       BOOTSTRAP_MAX_CHARS_BY_CLIENT: ${BOOTSTRAP_MAX_CHARS_BY_CLIENT:-}
       SEARCH_DEFAULT_LIMIT: ${SEARCH_DEFAULT_LIMIT:-}
       SEARCH_USAGE_WEIGHT: ${SEARCH_USAGE_WEIGHT:-}
+      SEARCH_LEXICAL_WEIGHT: ${SEARCH_LEXICAL_WEIGHT:-}
       # Compose passes an explicit map rather than the whole .env, so a variable absent here never
       # reaches the container however the operator sets it. Empty parses as linear.
       SEARCH_FUSION: ${SEARCH_FUSION:-}

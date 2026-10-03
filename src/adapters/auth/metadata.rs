@@ -123,6 +123,7 @@ mod tests {
             host: "0.0.0.0".into(),
             tenant_id: "me".into(),
             database_url: String::new(),
+            db: Default::default(),
             run_migrations_on_boot: false,
             public_url: "https://lumberroom.example.com".into(),
             auth: AuthConfig {
