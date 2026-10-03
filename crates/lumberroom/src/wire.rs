@@ -241,6 +241,13 @@ pub struct ClientRecord {
     pub registered_via: String,
     pub consented_at: Option<String>,
     pub revoked_at: Option<String>,
+    /// What the owner typed, when they named the client. An older server omits both fields.
+    #[serde(default)]
+    pub owner_label: Option<String>,
+    /// The resolved name the server prints: the owner's label, else the registered name, with
+    /// `(added ...)` stamps where two approved clients read the same.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// `POST /oauth/register`, RFC 7591.

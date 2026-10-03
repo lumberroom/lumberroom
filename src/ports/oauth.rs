@@ -52,6 +52,9 @@ pub struct OauthClientRecord {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The name the owner gave this client, cleaned. `None` until the owner names it, and always
+    /// `None` on a client nobody approved. `client_name` keeps what the client registered with.
+    pub owner_label: Option<String>,
 }
 
 impl OauthClientRecord {
@@ -152,6 +155,10 @@ pub trait OauthStore: Send + Sync {
     async fn set_client_grant(&self, client_id: &str, g: ClientGrantUpdate) -> Result<()>;
     /// Revokes the client and every token it holds.
     async fn revoke_client(&self, client_id: &str) -> Result<bool>;
+    /// Sets or clears the owner's name for an approved client, revoked ones included. Writes
+    /// `owner_label` and no other column: no grant, no `consented_at`, no token. `false` when no
+    /// approved client has that id.
+    async fn set_client_label(&self, client_id: &str, label: Option<&str>) -> Result<bool>;
     fn touch_client(&self, client_id: &str);
 
     async fn insert_code(&self, c: NewAuthCode) -> Result<()>;

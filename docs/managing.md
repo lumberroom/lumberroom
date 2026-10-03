@@ -78,6 +78,41 @@ client's grant lives in `AUTH_TOKENS`, which is read once at boot, so changing o
 `.env` and restarting. And a grant change leaves no audit row, so the console shows what a client
 holds now and never what it used to hold.
 
+### Naming a client
+
+A client's name is the one it sent at registration, and an agent sometimes sends a long one such as
+`Claude Code (plugin:lumberroom-memory:lumberroom)`. You can give a client your own name. The
+registered name stays on record beside it.
+
+Three places set it:
+
+- **The consent page.** "Name this connection" opens prefilled with the registered name, cleaned of
+  control characters. Leave it as it is and the server stores nothing. Type something else and that
+  becomes the name.
+- **The console.** An approved card, a revoked one included, carries a rename form. **Save name**
+  stores what you typed. **Use the registered name** clears it.
+- **The CLI.** `lumberroom clients rename <client_id> <name...>` sets it and `lumberroom clients
+  rename <client_id> --clear` clears it. It answers with the name the client now reads as. A client
+  you have not approved answers `no approved client has id <client_id>`, because only an approved
+  client can hold a name.
+
+Every MCP answer that names a memory's source prints your name alone, never the registered one, and
+the digest, the console and `lumberroom clients` follow on their next read. A rename also clears the
+cached digest, so a session that starts right after reads the new name. The listing shows the
+registered name beside yours.
+
+When two approved clients print the same name, `source` adds `(added 1 Sep)` to tell them apart.
+Name one of them and it prints bare, while the other keeps its date. Name both and both keep it.
+
+A name cannot end in `(added ...)` or `(not approved)`, because the server appends those words and a
+name ending in one could pass for another client's.
+
+A rename changes the name and nothing else. The grant, the tokens and every stored row stay as they
+were, and no audit row is written; the server logs one line with the client id. The consent page
+keeps judging a client on the name it registered and the host its codes go to, so renaming a client
+never softens a warning. Implemented and covered by `tests/client_label.rs` and the unit tests in `src/console/clients.rs`;
+not yet run against a live server.
+
 ### Approving a client that registered itself
 
 A client that runs dynamic registration exists and holds nothing. Its card shows **awaiting

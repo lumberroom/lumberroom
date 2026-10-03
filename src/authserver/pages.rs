@@ -50,6 +50,14 @@ pub struct ClientView<'a> {
     pub self_registered: bool,
     /// The profile this client already holds, when it is being re-consented.
     pub current_profile: Option<&'a str>,
+    /// What the "Name this connection" field holds when the page opens: the owner's label when this
+    /// client is being re-consented and has one, else the registered name, cleaned. `None` leaves
+    /// the field and its hint off the page. The engine always passes `Some`; the hosted fork passes
+    /// `None` when the person consenting may not name this client.
+    pub name_field: Option<&'a str>,
+    /// Other approved clients, live or revoked, whose cleaned registered name compares equal to
+    /// this one's.
+    pub same_name: usize,
 }
 
 /// The stylesheet. `include_str!` in a release build, read from disk on every render in a
@@ -183,10 +191,10 @@ pub fn consent(
         ));
     }
 
-    let (destination, origin) = if client.self_registered {
+    let (destination, origin, alarm) = if client.self_registered {
         self_registered_notice(client)
     } else {
-        (String::new(), String::new())
+        (String::new(), String::new(), false)
     };
 
     let again = match client.current_profile {
@@ -197,6 +205,8 @@ replaces it.</p>",
         ),
         None => String::new(),
     };
+
+    let naming = name_field(client, alarm);
 
     let software = match client.software_id {
         Some(id) if !id.is_empty() => {
@@ -219,7 +229,7 @@ every surface, until you revoke it.</p>\
 <dt>Client id</dt><dd>{client_id}</dd>\
 <dt>Registered</dt><dd>{registered}</dd></dl>\
 <form method=\"post\" action=\"/oauth/consent\">{fields}{csrf}\
-<fieldset><legend>What it may reach</legend>{choices}</fieldset>\
+<fieldset><legend>What it may reach</legend>{choices}</fieldset>{naming}\
 <p class=\"actions\"><button type=\"submit\" name=\"action\" value=\"allow\">Allow</button>\
 <button type=\"submit\" name=\"action\" value=\"deny\" class=\"secondary\">Deny</button></p></form>\
 <p class=\"foot\">Change or revoke this at <code>/console/clients</code> whenever you like. <code>lumberroom clients</code> lists what is registered.</p>",
@@ -238,7 +248,38 @@ every surface, until you revoke it.</p>\
             fields = flow.hidden_inputs(),
             csrf = hidden("csrf", csrf),
             choices = choices,
+            naming = naming,
         ),
+    )
+}
+
+/// The "Name this connection" field and its hint, or nothing when the caller passed no name.
+///
+/// The owner's label reaches this page here and nowhere else: as the input's `value`. The headline,
+/// the list and every warning keep reading `client_name`, because a stranger can register a client
+/// under the name the owner gave another one, and the page must judge what registered, not what the
+/// owner once called something.
+///
+/// The same-name count claims nothing about this client and sits below every warning. It goes
+/// away under the brand alarm: a page telling the owner a client borrowed a brand must not also
+/// tell them they approved that name before.
+fn name_field(client: &ClientView, alarm: bool) -> String {
+    let Some(value) = client.name_field else { return String::new() };
+    let count = match client.same_name {
+        0 => String::new(),
+        _ if alarm => String::new(),
+        1 => "1 other approved client registered under this name. ".to_string(),
+        n => format!("{n} other approved clients registered under this name. "),
+    };
+    format!(
+        "<label class=\"field\" for=\"label\">Name this connection</label>\
+<input id=\"label\" name=\"label\" type=\"text\" maxlength=\"200\" value=\"{value}\" \
+autocomplete=\"off\" spellcheck=\"false\">\
+<p class=\"hint\">{count}You see this name beside everything this client writes. Leave it as it \
+is to keep the name the client registered.</p>",
+        // Cleaned here as well as at write: a label stored before the invisible-character list
+        // grew can still hold a bidi override.
+        value = escape(&client_name_display(value)),
     )
 }
 
@@ -255,7 +296,10 @@ every surface, until you revoke it.</p>\
 /// points here, then send the victim the authorize link. The recognised host gets a short warning
 /// about that link. It also gets the mismatch alarm when the name claims a different service,
 /// "Claude" sending codes to chatgpt.com, since a recognised host vouches only for its own brand.
-fn self_registered_notice(client: &ClientView) -> (String, String) {
+///
+/// The third value is true when the warning carries the brand alarm, so the naming hint can drop
+/// its same-name count.
+fn self_registered_notice(client: &ClientView) -> (String, String, bool) {
     let destination = redirect_destination(client.redirect_uri);
     let target = match &destination {
         RedirectDestination::Host { host, .. } => format!("<b>{}</b>", escape(host)),
@@ -272,7 +316,7 @@ fn self_registered_notice(client: &ClientView) -> (String, String) {
     let line = format!("<p class=\"dest\">{line}</p>");
 
     if destination.is_local() {
-        return (line, String::new());
+        return (line, String::new(), false);
     }
 
     let claimed = mismatched_claim(client.client_name, &destination);
@@ -296,7 +340,7 @@ to {owner}. ",
             "<p class=\"{class}\">{mismatch}Allow only if you pressed Connect in your own account \
 just now. A link someone sent you connects their account.</p>"
         );
-        return (line, warning);
+        return (line, warning, claimed.is_some());
     }
 
     let (class, mismatch) = match claimed {
@@ -322,7 +366,7 @@ and this server cannot vouch for it. Allow only if you started this connection f
 {place}.{cleartext}</p>",
         name = escape(&client_name_display(client.client_name)),
     );
-    (line, warning)
+    (line, warning, claimed.is_some())
 }
 
 /// Any failure that must not be reported by redirecting. Everything before the redirect URI has been
@@ -374,6 +418,8 @@ mod tests {
             software_id: Some("anthropic-claude"),
             self_registered: true,
             current_profile: None,
+            name_field: Some("Claude"),
+            same_name: 0,
         }
     }
 
@@ -714,6 +760,118 @@ to Claude."
         let page = consent(&flow(), &again, "tok", GrantProfile::Standard);
         assert!(page.contains("already holds"));
         assert!(page.contains("<b>narrow</b>"));
+    }
+
+    // ---- the "Name this connection" field ----
+
+    const HINT: &str = "You see this name beside everything this client writes.";
+
+    /// The page with the label input removed, so an assertion can see everything the owner reads
+    /// outside the field.
+    fn without_the_input(page: &str) -> String {
+        let start = page.find("<input id=\"label\"").expect("label input");
+        let end = start + page[start..].find('>').unwrap() + 1;
+        format!("{}{}", &page[..start], &page[end..])
+    }
+
+    #[test]
+    fn the_label_field_carries_the_name_field_escaped() {
+        let mut named = view();
+        named.name_field = Some("Tom & Jerry's laptop");
+        let page = render(&named);
+        assert!(page.contains("<label class=\"field\" for=\"label\">Name this connection</label>"));
+        assert!(page.contains(
+            "<input id=\"label\" name=\"label\" type=\"text\" maxlength=\"200\" \
+value=\"Tom &amp; Jerry&#39;s laptop\" autocomplete=\"off\" spellcheck=\"false\">"
+        ));
+        assert!(page.contains(HINT));
+        let fieldset = page.find("</fieldset>").unwrap();
+        let input = page.find("<input id=\"label\"").unwrap();
+        let allow = page.find("value=\"allow\"").unwrap();
+        assert!(fieldset < input && input < allow, "between the profiles and the buttons");
+    }
+
+    #[test]
+    fn the_label_field_drops_a_bidi_override_from_the_name_field() {
+        let mut named = view();
+        named.name_field = Some("Co\u{202E}dex\nlaptop");
+        let page = render(&named);
+        assert!(page.contains("value=\"Codex laptop\""));
+    }
+
+    #[test]
+    fn no_name_field_renders_no_input_and_no_hint() {
+        let mut fork = view();
+        fork.name_field = None;
+        fork.same_name = 3;
+        let page = render(&fork);
+        assert!(!page.contains("name=\"label\""));
+        assert!(!page.contains("class=\"hint\""));
+        assert!(!page.contains("Name this connection"));
+        assert!(!page.contains("other approved"));
+    }
+
+    #[test]
+    fn a_label_never_reaches_the_headline_or_the_warning() {
+        let mut client = registered("Helper", "https://evil.example/cb");
+        client.name_field = Some("Claude Desktop");
+        let page = render(&client);
+        assert!(page.contains("value=\"Claude Desktop\""));
+        let rest = without_the_input(&page);
+        assert!(rest.matches("Helper").count() >= 2, "headline, list and warning name Helper");
+        assert!(!rest.contains("Claude Desktop"));
+        assert!(rest.contains("<h1>Give <b>Helper</b> access"));
+        assert!(rest.contains("chose the name <b>Helper</b>"));
+    }
+
+    #[test]
+    fn the_same_name_count_sits_in_the_hint() {
+        let mut two = registered("Codex", "https://zed.example/cb");
+        two.same_name = 2;
+        let page = render(&two);
+        assert!(page.contains(&format!(
+            "<p class=\"hint\">2 other approved clients registered under this name. {HINT}"
+        )));
+
+        let mut one = two;
+        one.same_name = 1;
+        let page = render(&one);
+        assert!(page.contains(&format!(
+            "<p class=\"hint\">1 other approved client registered under this name. {HINT}"
+        )));
+
+        one.same_name = 0;
+        let page = render(&one);
+        assert!(page.contains(&format!("<p class=\"hint\">{HINT}")));
+        assert!(!page.contains("other approved"));
+    }
+
+    #[test]
+    fn the_same_name_count_is_absent_under_the_brand_alarm() {
+        let mut crossed = registered("Claude", "https://chatgpt.com/cb");
+        crossed.same_name = 2;
+        let page = render(&crossed);
+        assert!(page.contains(ALARM));
+        assert!(!page.contains("other approved"));
+        assert!(page.contains(HINT), "the field and its hint stay");
+    }
+
+    #[test]
+    fn the_same_name_count_shows_under_a_warning_without_the_alarm() {
+        let mut unknown = registered("Zed", "https://zed.example/cb");
+        unknown.same_name = 1;
+        let page = render(&unknown);
+        assert!(page.contains("class=\"warn\""));
+        assert!(page.contains("1 other approved client"));
+    }
+
+    #[test]
+    fn a_hostile_name_field_cannot_close_the_attribute() {
+        let mut hostile = view();
+        hostile.name_field = Some("\"><script>alert(1)</script>");
+        let page = render(&hostile);
+        assert!(!page.contains("<script>"));
+        assert!(page.contains("&quot;&gt;&lt;script&gt;"));
     }
 
     #[test]

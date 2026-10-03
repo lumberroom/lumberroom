@@ -205,6 +205,7 @@ mod tests {
             created_at: Utc::now(),
             last_used_at: None,
             revoked_at: None,
+            owner_label: None,
         }
     }
 
@@ -254,6 +255,9 @@ mod tests {
             unimplemented!("not on the authentication path")
         }
         async fn revoke_client(&self, _client_id: &str) -> Result<bool> {
+            unimplemented!("not on the authentication path")
+        }
+        async fn set_client_label(&self, _client_id: &str, _label: Option<&str>) -> Result<bool> {
             unimplemented!("not on the authentication path")
         }
         async fn insert_code(&self, _c: NewAuthCode) -> Result<()> {

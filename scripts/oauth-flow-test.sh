@@ -50,6 +50,13 @@ trap 'rm -rf "$WORK"' EXIT
 
 SCRATCH_DB=lumberroom_oauth_flow_test
 SCRATCH_NAME="${LUMBERROOM_OAUTH_FLOW_TEST_SERVER:-lumberroom-oauth-flow-test-server}"
+# The server image this run starts. lumberroom-server:0.4.0 is whatever `docker compose build server`
+# last produced from whichever checkout ran it, so a branch that adds a route has to name an image
+# built from its own tree, or step 13 asks a server that predates the route. Built and named without
+# retagging 0.4.0, which every other scratch gate on this machine also starts:
+#   docker build --target runtime --build-arg EMBED_PROVIDER=hash -t lumberroom-server:<branch> .
+#   LUMBERROOM_OAUTH_FLOW_TEST_IMAGE=lumberroom-server:<branch> ./scripts/oauth-flow-test.sh
+SERVER_IMAGE="${LUMBERROOM_OAUTH_FLOW_TEST_IMAGE:-lumberroom-server:0.4.0}"
 # AUTH_MODE=oauth needs no static bearer grant. scratch_require only checks this is non-empty; an
 # empty array is never sent to the container, since this run's whole point is exercising the
 # built-in authorization server instead.
@@ -92,7 +99,7 @@ scratch_start_oauth() {
     psql -U "$SCRATCH_PG_USER" -d postgres -c "CREATE DATABASE $SCRATCH_DB" >/dev/null
 
   local owner_password_hash
-  owner_password_hash="$(printf '%s\n' "$PASSWORD" | docker run --rm -i lumberroom-server:0.4.0 lumberroom-server hash-password \
+  owner_password_hash="$(printf '%s\n' "$PASSWORD" | docker run --rm -i "$SERVER_IMAGE" lumberroom-server hash-password \
     2>"$WORK/hash-password.err")" || {
     echo "could not hash the scratch owner password: $(cat "$WORK/hash-password.err")" >&2
     return 1
@@ -114,7 +121,7 @@ scratch_start_oauth() {
     -e OAUTH_COOKIE_SECRET="$oauth_cookie_secret" \
     -e EMBED_PROVIDER=hash -e EMBED_DIM=768 \
     -e KEK_PROVIDER=none \
-    lumberroom-server:0.4.0 >/dev/null
+    "$SERVER_IMAGE" >/dev/null
 
   i=0
   until curl -sf "http://127.0.0.1:${SCRATCH_PORT}/readyz" >/dev/null 2>&1; do
@@ -226,7 +233,7 @@ mcp_result_field() {
 
 REDIRECT_URI="http://127.0.0.1:$((30000 + 0x${NONCE:0:4} % 20000))/callback"
 
-say "1/13 protected-resource metadata, both paths"
+say "1/14 protected-resource metadata, both paths"
 http GET /.well-known/oauth-protected-resource
 if [ "$STATUS" = 200 ] && [ -n "$(json_field authorization_servers.0)" ]; then
   pass "GET /.well-known/oauth-protected-resource names an authorization server"
@@ -240,7 +247,7 @@ else
   die "the path-suffixed variant did not answer (status $STATUS)"
 fi
 
-say "2/13 an unauthenticated call to /mcp is a 401 with a WWW-Authenticate pointer, not a 200"
+say "2/14 an unauthenticated call to /mcp is a 401 with a WWW-Authenticate pointer, not a 200"
 http POST /mcp -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' --data "$MCP_INIT_BODY"
 WWW="$(header WWW-Authenticate)"
 if [ "$STATUS" = 401 ]; then
@@ -254,7 +261,7 @@ else
   die "WWW-Authenticate is missing resource_metadata: got [$WWW]"
 fi
 
-say "3/13 authorization-server metadata advertises S256 and refuses to offer plain"
+say "3/14 authorization-server metadata advertises S256 and refuses to offer plain"
 http GET /.well-known/oauth-authorization-server
 METHODS="$(json_field code_challenge_methods_supported || true)"
 if [ "$STATUS" = 200 ] && printf '%s' "$METHODS" | grep -q 'S256'; then
@@ -268,7 +275,7 @@ else
   die "code_challenge_methods_supported offers plain, which lets a client downgrade PKCE: $METHODS"
 fi
 
-say "4/13 dynamic client registration"
+say "4/14 dynamic client registration"
 http POST /oauth/register \
   -H 'content-type: application/json' \
   --data "$(node -e '
@@ -398,7 +405,7 @@ authorize_login_consent() {
   fi
 }
 
-say "5/13 authorize, sign in, and consent: the code arrives in a redirect, never a browser"
+say "5/14 authorize, sign in, and consent: the code arrives in a redirect, never a browser"
 read -r VERIFIER CHALLENGE <<EOF
 $(pkce)
 EOF
@@ -406,7 +413,7 @@ STATE="run-a-$NONCE"
 authorize_login_consent "$CHALLENGE" "$STATE" "flow A"
 CODE_A="$LAST_CODE"
 
-say "6/13 the token exchange, form encoded"
+say "6/14 the token exchange, form encoded"
 http POST /oauth/token \
   -H 'content-type: application/x-www-form-urlencoded' \
   --data-urlencode "grant_type=authorization_code" \
@@ -424,7 +431,7 @@ else
   die "token exchange failed (status $STATUS): $(body | head -c 300)"
 fi
 
-say "7/13 the same code cannot be redeemed twice"
+say "7/14 the same code cannot be redeemed twice"
 http POST /oauth/token \
   -H 'content-type: application/x-www-form-urlencoded' \
   --data-urlencode "grant_type=authorization_code" \
@@ -441,7 +448,7 @@ else
   die "a replayed code should have been refused with invalid_grant (status $STATUS, error [$REPLAY_ERROR])"
 fi
 
-say "8/13 a wrong PKCE verifier is refused"
+say "8/14 a wrong PKCE verifier is refused"
 read -r VERIFIER_B CHALLENGE_B <<EOF
 $(pkce)
 EOF
@@ -462,7 +469,7 @@ else
   die "a wrong code_verifier should have been refused (status $STATUS)"
 fi
 
-say "9/13 a redirect_uri that does not match exactly is refused"
+say "9/14 a redirect_uri that does not match exactly is refused"
 read -r VERIFIER_C CHALLENGE_C <<EOF
 $(pkce)
 EOF
@@ -512,7 +519,7 @@ else
   die "flow D: token exchange failed (status $STATUS): $(body | head -c 300)"
 fi
 
-say "10/13 the access token opens the MCP surface: initialize, tools/list, one real call"
+say "10/14 the access token opens the MCP surface: initialize, tools/list, one real call"
 mcp_call "$ACCESS_TOKEN" "$MCP_INIT_BODY"
 if [ "$STATUS" = 200 ]; then
   pass "initialize succeeds with the issued access token"
@@ -538,7 +545,7 @@ else
   die "context_bootstrap failed over the OAuth-issued token (status $STATUS, isError $IS_ERROR)"
 fi
 
-say "11/13 refreshing the access token"
+say "11/14 refreshing the access token"
 http POST /oauth/token \
   -H 'content-type: application/x-www-form-urlencoded' \
   --data-urlencode "grant_type=refresh_token" \
@@ -553,10 +560,10 @@ else
   die "refreshing the access token failed (status $STATUS)"
 fi
 
-say "12/13 the new access token works"
+say "12/14 the new access token works"
 # Checked before the reuse-detection test on purpose: reuse detection commonly revokes the whole
 # token family it was issued from, which can include the access token step 11 just minted. Proving
-# this token works first means step 13's refusal is read as reuse detection, not as fallout from
+# this token works first means step 14's refusal is read as reuse detection, not as fallout from
 # testing reuse detection.
 mcp_call "${NEW_ACCESS_TOKEN:-$ACCESS_TOKEN}" '{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}'
 if [ "$STATUS" = 200 ]; then
@@ -565,7 +572,56 @@ else
   die "the refreshed access token did not work (status $STATUS)"
 fi
 
-say "13/13 the rotated-out refresh token is refused on reuse"
+say "13/14 the owner names the client from the CLI, and the listing prints that name"
+# Before step 14 on purpose: reuse detection there revokes the token family this step signs in with.
+# The consent in step 5 picked the full profile, which carries registry_write, the bar the rename
+# route sets.
+#
+# LUMBERROOM_CLI, if set, is a lumberroom binary that runs on this host. Otherwise the Linux binary
+# is built in the builder image and runs there, inside the scratch server's network namespace, so it
+# reaches the server on 127.0.0.1 the way a host binary would. Reaching it by container name fails:
+# the CLI drops the bearer header on plain http to any host that is not loopback, and the route
+# answers 401. The config path points at nothing, so the owner's ~/.config/lumberroom never reaches
+# this run.
+CLI_TOKEN="${NEW_ACCESS_TOKEN:-$ACCESS_TOKEN}"
+if [ -n "${LUMBERROOM_CLI:-}" ]; then
+  cli() {
+    LUMBERROOM_URL="$URL" LUMBERROOM_TOKEN="$CLI_TOKEN" LUMBERROOM_CONFIG="$WORK/cli-config.json" \
+      "$LUMBERROOM_CLI" "$@"
+  }
+else
+  echo "building lumberroom in the builder image..."
+  "$REPO_DIR/scripts/cargo.sh" build --release -p lumberroom >/dev/null
+  cli() {
+    # The binary sits in the lumberroom-target volume that scripts/cargo.sh builds into, never on
+    # the host. A bind mount of $REPO_DIR/target/release/lumberroom finds no file, so Docker
+    # creates an empty directory at that path and the exec fails with "Permission denied".
+    # Every worktree shares the volume: a release build of lumberroom from another checkout
+    # between the build above and this call replaces the binary under this run.
+    #
+    # The token goes in through the environment rather than as -e KEY=VALUE, which would put it on
+    # this process's argv where `ps` reads it back.
+    LUMBERROOM_TOKEN="$CLI_TOKEN" docker run --rm --network "container:$SCRATCH_NAME" \
+      -v lumberroom-target:/app/target \
+      -e LUMBERROOM_URL="http://127.0.0.1:${SCRATCH_PORT}" -e LUMBERROOM_TOKEN \
+      -e LUMBERROOM_CONFIG=/tmp/lumberroom-oauth-flow-test.json \
+      -e BUILDER_UID="$(id -u)" -e BUILDER_GID="$(id -g)" \
+      lumberroom-builder /app/target/release/lumberroom "$@"
+  }
+fi
+if RENAMED="$(cli clients rename "$CLIENT_ID" flow gate 2>&1)" \
+  && printf '%s' "$RENAMED" | grep -qF "$CLIENT_ID now reads as flow gate"; then
+  pass "lumberroom clients rename answers with the new name: $RENAMED"
+else
+  die "lumberroom clients rename failed: $RENAMED"
+fi
+if LISTED="$(cli clients 2>&1)" && printf '%s' "$LISTED" | grep -qF "flow gate"; then
+  pass "lumberroom clients prints the owner's name for the client"
+else
+  die "lumberroom clients does not show flow gate: $LISTED"
+fi
+
+say "14/14 the rotated-out refresh token is refused on reuse"
 http POST /oauth/token \
   -H 'content-type: application/x-www-form-urlencoded' \
   --data-urlencode "grant_type=refresh_token" \
@@ -592,7 +648,8 @@ cat <<SUMMARY
   10 the access token drives a real MCP session: initialize, tools/list, context_bootstrap
   11 the refresh grant rotates in a new access token
   12 the rotated-in token is itself live
-  13 the token it rotated out is refused if presented again
+  13 the owner names the client with lumberroom clients rename, and lumberroom clients prints it
+  14 the token it rotated out is refused if presented again
 
   every row this ran wrote lived in $SCRATCH_DB, dropped when this script exited.
 SUMMARY

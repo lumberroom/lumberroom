@@ -43,6 +43,7 @@ fn client(name: &str, via: &str, consented: bool, revoked: bool) -> OauthClientR
         created_at: Utc::now() - chrono::Duration::days(3),
         last_used_at: Some(Utc::now() - chrono::Duration::hours(2)),
         revoked_at: revoked.then(Utc::now),
+        owner_label: None,
     }
 }
 
