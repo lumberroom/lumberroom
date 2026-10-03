@@ -4,11 +4,13 @@
 //! client never sees a tool it cannot call. The filter shapes what a model tries; every service
 //! checks the grant again on the call, which is what refuses a client that names a tool anyway.
 //!
-//! Descriptions are written as instructions rather than blurbs. They are the only lever that makes
-//! a model read memory before working and write memory after learning something (PRD §6.4), and on
-//! every surface except OpenWebUI they are the only lever at all. Signatures extend and never
-//! rename: a client pinned to an older argument list keeps working, and a renamed tool is a tool the
-//! model has to be told about again.
+//! Descriptions say what a tool does, what comes back and when it applies. They give no orders
+//! about behaviour: when to read or write memory is the owner's rule, kept in the owner's own agent
+//! configuration (docs/connect-*.md carries the snippets), and a server that issues those orders
+//! itself fails connector directory review. Every tool also carries a title and the hints a
+//! client reads to decide what runs without a prompt; `tests/mcp_tool_annotations.rs` fails a tool
+//! that lacks them. Signatures extend and never rename: a client pinned to an older argument list
+//! keeps working, and a renamed tool is a tool the model has to be told about again.
 
 pub mod tools;
 
@@ -37,6 +39,20 @@ pub mod views;
 
 pub const SERVER_NAME: &str = "lumberroom";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What a client reads at `initialize`. Facts about the server and its tools, with no orders.
+pub const SERVER_INSTRUCTIONS: &str = "Durable memory for this user, shared across the agents and \
+machines they use. context_bootstrap returns what is already known: the user's preferences, the \
+active project and the infrastructure registry. memory_search finds facts by meaning, and \
+registry_get looks up an exact operational value. memory_write records one durable fact per call: \
+a decision, preference, constraint or convention, with its numbers and identifiers. Which tools \
+appear depends on what the client's credential grants.";
+
+/// Every tool the server registers, as `tools/list` would show it to a credential that holds every
+/// grant. Exists so a test can read the annotations without a database or a request.
+pub fn tool_definitions() -> Vec<rmcp::model::Tool> {
+    (Lumberroom::tool_router() + Lumberroom::extra_tool_router()).list_all()
+}
 
 /// Registered only for a principal whose grant carries `may_delete`, so it does not appear in
 /// `tools/list` for anyone else. Named here because both the filter and the guard read it.
@@ -190,11 +206,16 @@ impl Lumberroom {
 
     #[tool(
         name = "context_bootstrap",
-        description = "Run this once at the start of a session, before any substantive work, and \
-before asking the user a question they may have already answered in an earlier session. It returns \
-everything already known about this user, their standing preferences, the active project, and the \
-infrastructure registry. One call, one round trip, typically under 200ms. If you skip it you will \
-re-ask questions that were answered weeks ago."
+        title = "Load session context",
+        description = "Returns what is already known about this user: standing preferences, the \
+active project's memory and the infrastructure registry, in one call. It suits the start of a \
+session, or the moment before asking a question an earlier session may have answered. project, a \
+path or slug, promotes that project's memory.",
+        annotations(
+            title = "Load session context",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn context_bootstrap(
         &self,
@@ -211,11 +232,13 @@ re-ask questions that were answered weeks ago."
 
     #[tool(
         name = "memory_search",
-        description = "Search durable memory for what is already known before answering from \
-assumption or asking the user. Use it whenever a task depends on a past decision, a preference, a \
-host, a credential location, or \"how do we usually do this\". Semantic, so ask in full sentences. \
-Superseded facts are excluded: every hit is what is believed now. Each hit's source is the name \
-of the app that wrote it. Pass tags to keep only facts carrying all of them."
+        title = "Search memory",
+        description = "Semantic search over durable memory. It applies when a task depends on a \
+past decision, a preference, a host, a credential location, or how something is usually done. \
+Queries retrieve best as full sentences. Superseded facts are excluded, so each hit is what is \
+believed now; include_superseded and as_of change that. Each hit's source is the name of the app \
+that wrote it. tags keeps only facts carrying all of them.",
+        annotations(title = "Search memory", read_only_hint = true, open_world_hint = false)
     )]
     async fn memory_search(
         &self,
@@ -258,20 +281,21 @@ of the app that wrote it. Pass tags to keep only facts carrying all of them."
     // nothing acts on them, and the store accumulates two versions of one fact (Phase 4 §1).
     #[tool(
         name = "memory_write",
-        description = "Record a durable fact the moment it appears: a decision, a stated \
-preference, a constraint, a host or service detail, a convention. Call this without asking \
-permission and without announcing it. Write one fact per call, phrased so it stands alone in six \
-months, carrying the numbers, identifiers, paths and dates the fact needs, and the cause, scope \
-qualifier and reversal condition whenever the fact turns on them. Leave out the trail of how you \
-came to believe it: the search you ran, the file you read on the way, the argument for the claim. \
-No hedges, no evaluative words, no restated context, no inventory of what you did not change. \
-Long is right when the fact is long, a list or a timeline; long prose about a short fact is not. \
-When a second fact turns up in the same exchange, write it in a second call. Do not \
-record transient chatter, file contents, or anything you would not want repeated back next month. \
-If the response comes back with possible_conflicts, read them: when one of them states the OLD \
-version of the fact you just wrote, call memory_write again with the same content and supersedes \
-set to that memory's id, which retires it. When it is a different fact that merely sounds \
-similar, leave it alone."
+        title = "Save a memory",
+        description = "Records one durable fact: a decision, a stated preference, a constraint, a \
+host or service detail, a convention. The content should stand alone in six months and carry the \
+numbers, identifiers, paths and dates the fact needs, with the cause or reversal condition when the \
+fact turns on one. One fact per call, so a second fact is a second call. Transient chatter and file \
+contents do not belong in it. The response can carry possible_conflicts, older facts close to the \
+new one. When one of them states the old version of the fact just written, a second call with the \
+same content and supersedes set to that memory's id retires it, and the old row stays readable in \
+memory_history. A different fact that merely sounds similar needs no action.",
+        annotations(
+            title = "Save a memory",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn memory_write(
         &self,
@@ -304,10 +328,16 @@ similar, leave it alone."
 
     #[tool(
         name = "registry_get",
+        title = "Look up a registry value",
         description = "Exact lookup of a known operational value: a host, a service endpoint, \
-where a credential lives, a model route, a dataset. Use this instead of guessing an address or \
-asking the user to repeat it. Returns found:false when nothing is recorded, so then ask and write \
-the answer with memory_write. source is the name of the app that wrote the value."
+where a credential lives, a model route, a dataset. It does not guess or fuzzy-match, which suits a \
+value where a wrong address would break something. Returns found:false when nothing is recorded. \
+source is the name of the app that wrote the value.",
+        annotations(
+            title = "Look up a registry value",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn registry_get(
         &self,
@@ -333,11 +363,18 @@ the answer with memory_write. source is the name of the app that wrote the value
 
     #[tool(
         name = "memory_forget",
-        description = "Delete one memory permanently, by id. Only for a fact the user has told you \
-to remove, or one they have just contradicted and asked you to drop. This cannot be undone and \
-there is no copy: for a private memory the key that opens it goes with the row. Prefer memory_write \
-with supersedes for a fact that CHANGED, which keeps the history and is almost always what is \
-wanted. Call it with dry_run true first unless the user named this exact memory."
+        title = "Delete a memory",
+        description = "Deletes one memory permanently, by id. The delete cannot be undone and \
+leaves no copy: for a private memory the key that opens it goes with the row. For a fact that \
+changed, memory_write with supersedes keeps the history instead. reason is recorded with the \
+deletion. dry_run true lists what would go and deletes nothing. The tool appears only for a \
+credential granted mayDelete.",
+        annotations(
+            title = "Delete a memory",
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn memory_forget(
         &self,
@@ -464,13 +501,8 @@ fn tool_error(tool: &str, e: &DomainError) -> CallToolResult {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Lumberroom {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Durable memory for this user, shared across every agent and machine they use. Call \
-             context_bootstrap before substantive work. Call memory_write whenever an exchange \
-             establishes a decision, preference, or durable fact, silently, without asking. Write \
-             the fact with its numbers and identifiers, one fact per call, and leave out the case \
-             for it.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 
     /// The tool list is per client, because `memory_forget` is per grant.

@@ -63,6 +63,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Every MCP tool carries a title and annotations.** Reads declare `readOnlyHint`,
+  `memory_forget` and `review_decide` declare `destructiveHint`, and every tool declares
+  `openWorldHint: false`, so a client can decide what to approve without a prompt (#92).
+  `tests/mcp_tool_annotations.rs` fails when a new tool ships without them. The server instructions
+  and tool descriptions now say what each tool does and drop orders about how the model should
+  behave; the owner's own agent rules carry those.
 - **The cleanup pass writes its rationales as sentences.** A near-duplicate reads "These two say
   the same thing." in place of "these two say the same thing at a cosine of 0.971."; the score
   stays in the proposal's `similarity` field. The exact and stale rationales now start with a
