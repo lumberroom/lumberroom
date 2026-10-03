@@ -99,6 +99,8 @@ services:
       PORT: 8787
       HOST: 0.0.0.0
       DATABASE_URL: postgres://${POSTGRES_USER:-lumberroom}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-lumberroom}
+      DB_MAX_CONNECTIONS: ${DB_MAX_CONNECTIONS:-}
+      DB_ACQUIRE_TIMEOUT_SECS: ${DB_ACQUIRE_TIMEOUT_SECS:-}
       TENANT_ID: ${TENANT_ID:-me}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # Every externally visible URL (MCP endpoint, OAuth issuer, metadata documents, redirect
