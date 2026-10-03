@@ -22,6 +22,7 @@ macro_rules! live {
 
 mod alias;
 mod cleanup;
+pub mod conflict_wake;
 mod ingest;
 mod memory;
 mod oauth;

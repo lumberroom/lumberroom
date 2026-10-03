@@ -151,6 +151,7 @@ async fn run() -> Result<()> {
         spawn_oauth_purge(Arc::clone(&oauth));
     }
     spawn_cleanup(Arc::clone(&cfg), Arc::clone(&cleanup));
+    spawn_conflict_sweep(Arc::clone(&cfg), Arc::clone(&state.repos.memories), pool.clone());
 
     let app = http::router(Arc::clone(&state), auth)
         // The digest is a few KB; anything much larger is a mistake or an attack.
@@ -386,6 +387,50 @@ fn spawn_cleanup(cfg: Arc<config::Config>, repo: Arc<dyn ports::CleanupRepositor
             }
         }
     });
+}
+
+/// The conflict sweeper: the only caller of `memory_conflict_record`, and the backfill.
+///
+/// Two wakes drive one loop. The listener hears the `memory_conflict` notification a writer's
+/// commit sends; the timer covers every notification Postgres dropped while nobody listened, and
+/// the rows that existed before this process started. A listener that fails at boot costs latency
+/// and nothing else, so its error is a warning and boot goes on.
+///
+/// The listener holds one pooled connection for the life of the process. The default pool of 10
+/// leaves nine for requests; an owner who sets `DB_MAX_CONNECTIONS` low should count it.
+///
+/// `CONFLICT_SWEEP_SECS=0` turns off the timer and the listener together. Nothing else records a
+/// pair, so the log line says so.
+fn spawn_conflict_sweep(
+    cfg: Arc<config::Config>,
+    repo: Arc<dyn ports::MemoryRepository>,
+    pool: sqlx::PgPool,
+) {
+    let secs = cfg.quality.conflict_sweep_secs;
+    if secs == 0 {
+        tracing::info!(
+            "conflict sweeper is off (CONFLICT_SWEEP_SECS=0): no conflict pairs will be recorded"
+        );
+        return;
+    }
+    let wakes = Arc::new(services::conflicts::Wakes::default());
+    let on_wake = Arc::clone(&wakes);
+    tokio::spawn(async move {
+        if let Err(e) = pg::conflict_wake::listen(&pool, move |t| on_wake.wake(t)).await {
+            tracing::warn!(
+                error = %e.log_message(),
+                "conflict wake listener did not start; pairs wait for the timer sweep"
+            );
+        }
+    });
+    tokio::spawn(services::conflicts::run_loop(
+        repo,
+        cfg.tenant_id.clone(),
+        cfg.quality.conflict_threshold,
+        std::time::Duration::from_millis(cfg.quality.conflict_sweep_budget_ms),
+        std::time::Duration::from_secs(secs),
+        wakes,
+    ));
 }
 
 fn spawn_oauth_purge(store: Arc<dyn ports::OauthStore>) {
