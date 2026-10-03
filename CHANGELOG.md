@@ -4,6 +4,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.1-rc.1] - 2026-10-03
+
 ### Added
 
 - **A fact can stop being true without being replaced.** A row gains a second clock,
