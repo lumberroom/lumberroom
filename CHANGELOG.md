@@ -127,6 +127,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A search no longer rewrites every index on `memory`.** The touch after each search changed
+  `last_accessed_at`, which the partial index `memory_never_accessed` named in its predicate, so
+  Postgres could never apply it in place and wrote a new entry into every index, the HNSW graph
+  included (#72). Migration `20261003000026` drops that index and sets `fillfactor = 90` on
+  `memory`. Pages written before the migration keep their old fill until `VACUUM FULL` or
+  `pg_repack` rewrites them.
+- **`SEARCH_LEXICAL_WEIGHT=0` skips the text-search scan.** The lexical arm now carries
+  `$10::float8 > 0`, so a store written in Chinese, Japanese or Thai, where Postgres text search
+  matches nothing, can turn the arm off and stop paying for it (#75). Compose now passes the
+  setting through.
 - **A search no longer deadlocks a write on the rows it returned.** The access bump after every
   search locked its rows in scan order and held them until the statement ended, while a
   supersession locks its two rows in id order, so a search that returned both could hold one while

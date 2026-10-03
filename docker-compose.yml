@@ -168,6 +168,7 @@ services:
       BOOTSTRAP_MAX_CHARS_BY_CLIENT: ${BOOTSTRAP_MAX_CHARS_BY_CLIENT:-}
       SEARCH_DEFAULT_LIMIT: ${SEARCH_DEFAULT_LIMIT:-}
       SEARCH_USAGE_WEIGHT: ${SEARCH_USAGE_WEIGHT:-}
+      SEARCH_LEXICAL_WEIGHT: ${SEARCH_LEXICAL_WEIGHT:-}
       # Compose passes an explicit map rather than the whole .env, so a variable absent here never
       # reaches the container however the operator sets it. Empty parses as linear.
       SEARCH_FUSION: ${SEARCH_FUSION:-}
