@@ -408,7 +408,7 @@ fn spawn_oauth_purge(store: Arc<dyn ports::OauthStore>) {
 /// in a shell history. `install.sh` pipes it in with no TTY, so this reads stdin either way and only
 /// bothers with the prompt and the echo dance when a person is typing.
 fn hash_password() -> Result<()> {
-    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::password_hash::PasswordHasher;
     use argon2::Argon2;
 
     let password = read_password()?;
@@ -422,16 +422,14 @@ fn hash_password() -> Result<()> {
         ));
     }
 
-    // 16 bytes from the OS. `SaltString::generate` would work too and would pull in a second RNG
-    // path; this is the same CSPRNG every key in `crypto` comes from.
+    // 16 bytes from the OS. `hash_password` would generate a salt too, through password-hash's own
+    // getrandom path; this keeps the salt on the same CSPRNG every key in `crypto` comes from.
     let mut salt = [0u8; 16];
     getrandom::fill(&mut salt)
         .map_err(|e| DomainError::internal(format!("os rng failure: {e}")))?;
-    let salt = SaltString::encode_b64(&salt)
-        .map_err(|e| DomainError::internal(format!("cannot encode a salt: {e}")))?;
 
     let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), &salt)
         .map_err(|e| DomainError::internal(format!("argon2 failed: {e}")))?
         .to_string();
 
