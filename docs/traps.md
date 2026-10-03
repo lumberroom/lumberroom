@@ -39,6 +39,18 @@ against every live row. `similar_pairs` does, and a test asserts the `OR` that m
 a quiet run advances nothing, so every later run re-reads the same rows forever. `newest_in_scope`
 exists for that.
 
+**A column named in a partial index predicate counts as indexed, and that turns off HOT.** The
+`memory_never_accessed` index carried `WHERE last_accessed_at IS NULL`, so the touch after every
+search wrote a new entry into every index on `memory`, the HNSW graph included. On a 5,000-row
+scratch store, 2,400 touches ran 0 HOT with the index and 2,027 HOT after migration 026 dropped it.
+Never name `last_accessed_at` or `access_count` in an index on `memory`, key or predicate;
+`tests/search_touch_hot.rs` reads the catalog for it, and that covers indexes a fork adds.
+
+**A bare parameter takes its type from the first place it appears.** `PREPARE p AS SELECT 1 WHERE
+$1 > 0 AND $1 * 1.0::float8 > 0` gives `$1` the type `integer` on Postgres 17, the later float
+use notwithstanding. A guard added ahead of a parameter's existing uses can retype it. Cast it where
+it first appears, as the lexical arm's `$10::float8 > 0` does.
+
 ## Policy and disclosure
 
 **Four disclosures shipped, and no gate could have caught them.** Each published a value computed

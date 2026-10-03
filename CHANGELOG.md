@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`DB_MAX_CONNECTIONS` and `DB_ACQUIRE_TIMEOUT_SECS`** set the Postgres pool, defaulting to
+  the 10 connections and 5 seconds the server used before (#73). At boot the server compares the
+  pool with the database's `max_connections`, less the superuser reserve and 3 spare. An explicit
+  size that does not fit refuses boot with every number named; the default size logs a warning
+  and boots, so an upgrade never stops a small server.
 - **A memory provider for Hermes Agent, in its own repository.**
   [`lumberroom/lumberroom-hermes`](https://github.com/lumberroom/lumberroom-hermes) makes lumberroom
   Hermes's memory through the existing `/mcp` endpoint and needed no engine change. Decision 0021
@@ -128,6 +133,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The consent page catches a client that claims one service and sends codes to another.** A
+  self-registered client named Claude that redirected to chatgpt.com used to draw only the
+  shared-account reminder, because every recognised host shared one allowlist. Each known service
+  now owns its hosts, and a claimed brand at another service's host raises the mismatch alarm
+  naming both (#91).
+- **A search no longer rewrites every index on `memory`.** The touch after each search changed
+  `last_accessed_at`, which the partial index `memory_never_accessed` named in its predicate, so
+  Postgres could never apply it in place and wrote a new entry into every index, the HNSW graph
+  included (#72). Migration `20261003000026` drops that index and sets `fillfactor = 90` on
+  `memory`. Pages written before the migration keep their old fill until `VACUUM FULL` or
+  `pg_repack` rewrites them.
+- **`SEARCH_LEXICAL_WEIGHT=0` skips the text-search scan.** The lexical arm now carries
+  `$10::float8 > 0`, so a store written in Chinese, Japanese or Thai, where Postgres text search
+  matches nothing, can turn the arm off and stop paying for it (#75). Compose now passes the
+  setting through.
 - **A search no longer deadlocks a write on the rows it returned.** The access bump after every
   search locked its rows in scan order and held them until the statement ended, while a
   supersession locks its two rows in id order, so a search that returned both could hold one while
