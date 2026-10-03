@@ -1599,6 +1599,25 @@ const UNRECOGNISED_ALG: &str = "unrecognised";
 
 #[async_trait]
 impl MemoryRepository for PgMemoryRepository {
+    // Placeholders from the interface lock. E1-T1 replaces both with the statements in spec 4.6.
+    async fn sweep_conflicts(
+        &self,
+        _tenant: &str,
+        _floor: f64,
+        _limit: i64,
+    ) -> Result<crate::ports::ConflictSweep> {
+        Err(DomainError::internal("conflict sweep not built"))
+    }
+
+    async fn conflicts_pending(
+        &self,
+        _tenant: &str,
+        _floor: f64,
+        _reader: &[NamespaceGrant],
+    ) -> Result<i64> {
+        Err(DomainError::internal("conflict sweep not built"))
+    }
+
     /// The ciphertext columns for rows the caller already holds, so the service can decrypt them.
     ///
     /// Kept apart from every other read rather than folded into one: `Memory` has no ciphertext

@@ -448,6 +448,12 @@ pub struct QualityConfig {
     /// The join is O(n squared) per namespace: a dev-container probe timed 2.48s at 1,400 rows,
     /// 13.33s at 3,000 and 34.96s at 5,000, so past this the queue refuses instead of hanging.
     pub conflict_scan_max: i64,
+    /// Seconds between timer sweeps of unscanned rows. The timer is the fallback for a wake the
+    /// listener lost, which a pooler in transaction mode does to every wake. Zero turns the sweeper
+    /// and its listener off, so no pair is recorded and every new row stays pending.
+    pub conflict_sweep_secs: u64,
+    /// Time one sweep may spend on a tenant before it yields until the next tick or wake.
+    pub conflict_sweep_budget_ms: u64,
     /// A live row never retrieved and older than this appears in `lumberroom review --stale`.
     pub stale_days: i32,
     /// Highest sensitivity the Obsidian export may include. Private content in a vault synced to a
@@ -939,6 +945,8 @@ pub fn load() -> Result<Config> {
             conflict_threshold: env_num("CONFLICT_THRESHOLD", 0.90f64)?,
             conflict_limit: env_num("CONFLICT_LIMIT", 3i64)?,
             conflict_scan_max: env_num("CONFLICT_SCAN_MAX", 2_000i64)?,
+            conflict_sweep_secs: env_num("CONFLICT_SWEEP_SECS", 60u64)?,
+            conflict_sweep_budget_ms: env_num("CONFLICT_SWEEP_BUDGET_MS", 5_000u64)?,
             stale_days: env_num("STALE_DAYS", 365i32)?,
             export_max_sensitivity: env_sensitivity("EXPORT_MAX_SENSITIVITY", Sensitivity::Open)?,
             archive_max_decompressed_bytes: env_num(
@@ -1053,6 +1061,21 @@ fn validate_cleanup(c: &CleanupConfig) -> Result<()> {
     Ok(())
 }
 
+/// Split out of `validate` so a test can reach it without building a whole `Config`.
+fn validate_conflict_sweep(q: &QualityConfig) -> Result<()> {
+    // One scan took 10 to 19 ms on a scratch copy at 1,691 rows a namespace, so 100 ms buys a
+    // handful of rows a pass and less turns a backfill into a crawl. Past 25 seconds one sweep
+    // holds the loop for most of the default 60-second interval, and wakes queue behind it.
+    if !(100..=25_000).contains(&q.conflict_sweep_budget_ms) {
+        return Err(DomainError::validation(format!(
+            "CONFLICT_SWEEP_BUDGET_MS is {}, outside 100 to 25000. Below 100 a sweep scans almost \
+             nothing per pass; above 25000 one sweep holds the loop while wakes queue behind it.",
+            q.conflict_sweep_budget_ms
+        )));
+    }
+    Ok(())
+}
+
 /// What `AUTH_MODE=oidc` needs before the server will answer with an external issuer's tokens.
 /// Split out so a test can reach it without assembling a whole `Config`.
 fn validate_oidc(auth: &AuthConfig) -> Result<()> {
@@ -1121,6 +1144,7 @@ fn validate_static_token(client: &str, token: &str) -> Result<()> {
 fn validate(cfg: &Config) -> Result<()> {
     validate_cleanup(&cfg.cleanup)?;
     validate_db(&cfg.db)?;
+    validate_conflict_sweep(&cfg.quality)?;
 
     // Every mode honours static tokens, so a deployment with no token and no other credential
     // source can authenticate nobody. That is a configuration error rather than a lockout to
@@ -1416,6 +1440,55 @@ mod tests {
             c.interval_secs = secs;
             assert!(validate_cleanup(&c).is_ok(), "{secs} should be accepted");
         }
+    }
+
+    /// Quality settings that pass, so each sweep test below changes exactly one thing.
+    fn valid_quality() -> QualityConfig {
+        QualityConfig {
+            dedupe_threshold: 0.97,
+            conflict_threshold: 0.90,
+            conflict_limit: 3,
+            conflict_scan_max: 2_000,
+            conflict_sweep_secs: 60,
+            conflict_sweep_budget_ms: 5_000,
+            stale_days: 365,
+            export_max_sensitivity: Sensitivity::Open,
+            archive_max_decompressed_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn a_sweep_budget_under_a_hundred_milliseconds_is_refused() {
+        let mut q = valid_quality();
+        q.conflict_sweep_budget_ms = 99;
+        let e = validate_conflict_sweep(&q).unwrap_err();
+        assert!(e.client_message().contains("CONFLICT_SWEEP_BUDGET_MS"), "{}", e.client_message());
+        assert!(e.client_message().contains("99"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn a_sweep_budget_over_twenty_five_seconds_is_refused() {
+        let mut q = valid_quality();
+        q.conflict_sweep_budget_ms = 25_001;
+        let e = validate_conflict_sweep(&q).unwrap_err();
+        assert!(e.client_message().contains("CONFLICT_SWEEP_BUDGET_MS"), "{}", e.client_message());
+        assert!(e.client_message().contains("25001"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn both_sweep_budget_bounds_and_the_default_are_accepted() {
+        for ms in [100u64, 5_000, 25_000] {
+            let mut q = valid_quality();
+            q.conflict_sweep_budget_ms = ms;
+            assert!(validate_conflict_sweep(&q).is_ok(), "{ms} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_sweep_interval_of_zero_turns_the_sweeper_off_and_is_not_an_error() {
+        let mut q = valid_quality();
+        q.conflict_sweep_secs = 0;
+        assert!(validate_conflict_sweep(&q).is_ok());
     }
 
     #[test]
