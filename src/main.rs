@@ -78,7 +78,7 @@ async fn run() -> Result<()> {
         "starting"
     );
 
-    let pool = pg::connect(&cfg.database_url).await?;
+    let pool = pg::connect_with(&cfg.database_url, &cfg.db).await?;
 
     if cfg.run_migrations_on_boot {
         pg::migrate(&pool).await?;
@@ -508,7 +508,7 @@ async fn verify_kek_command() -> Result<()> {
     println!("kek_id:       {}", keys.kek_id());
     println!("fingerprint:  {fingerprint}");
 
-    let pool = pg::connect(&cfg.database_url).await?;
+    let pool = pg::connect_with(&cfg.database_url, &cfg.db).await?;
     let check =
         pg::verify_kek(&pool, &cfg.tenant_id, &keys.kek_id(), &fingerprint, keys.provider())
             .await?;

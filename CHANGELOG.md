@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`DB_MAX_CONNECTIONS` and `DB_ACQUIRE_TIMEOUT_SECS`** set the Postgres pool, defaulting to
+  the 10 connections and 5 seconds the server used before (#73). At boot the server compares the
+  pool with the database's `max_connections`, less the superuser reserve and 3 spare. An explicit
+  size that does not fit refuses boot with every number named; the default size logs a warning
+  and boots, so an upgrade never stops a small server.
 - **A memory provider for Hermes Agent, in its own repository.**
   [`lumberroom/lumberroom-hermes`](https://github.com/lumberroom/lumberroom-hermes) makes lumberroom
   Hermes's memory through the existing `/mcp` endpoint and needed no engine change. Decision 0021

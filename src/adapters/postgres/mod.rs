@@ -67,10 +67,16 @@ pub struct Repositories {
     pub cleanup: Arc<dyn CleanupRepository>,
 }
 
+/// Pool with the defaults, for callers that have no `Config`: the integration harness. The server
+/// and the CLI use `connect_with` so `DB_MAX_CONNECTIONS` and `DB_ACQUIRE_TIMEOUT_SECS` apply.
 pub async fn connect(database_url: &str) -> Result<PgPool> {
-    PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(Duration::from_secs(5))
+    connect_with(database_url, &crate::config::DbConfig::default()).await
+}
+
+pub async fn connect_with(database_url: &str, db: &crate::config::DbConfig) -> Result<PgPool> {
+    let pool = PgPoolOptions::new()
+        .max_connections(db.max_connections)
+        .acquire_timeout(Duration::from_secs(db.acquire_timeout_secs))
         // A pathological query must not hold a connection until the client gives up.
         .after_connect(|conn, _meta| {
             Box::pin(async move {
@@ -80,7 +86,34 @@ pub async fn connect(database_url: &str) -> Result<PgPool> {
         })
         .connect(database_url)
         .await
-        .map_err(|e| DomainError::unavailable("cannot reach the database").with_source(e))
+        .map_err(|e| DomainError::unavailable("cannot reach the database").with_source(e))?;
+
+    // Checked on the live server because Postgres enforces max_connections only when a connection
+    // arrives, so an oversized pool boots clean and fails under load.
+    let (server_max, superuser_reserved): (i64, i64) = sqlx::query_as(
+        "SELECT current_setting('max_connections')::bigint, \
+                current_setting('superuser_reserved_connections')::bigint",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        DomainError::unavailable("cannot read the database's connection limit").with_source(e)
+    })?;
+    match crate::config::enforce_pool_fit(db, server_max, superuser_reserved) {
+        Ok(None) => {}
+        Ok(Some(warning)) => tracing::warn!(
+            max_connections = db.max_connections,
+            server_max,
+            superuser_reserved,
+            "{}",
+            warning.client_message()
+        ),
+        Err(e) => {
+            pool.close().await;
+            return Err(e);
+        }
+    }
+    Ok(pool)
 }
 
 pub fn repositories(pool: &PgPool, search: &crate::config::SearchConfig) -> Repositories {
