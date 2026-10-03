@@ -49,10 +49,10 @@ use crate::ports::{
 const LOGIN_FAILURE_DELAY: Duration = Duration::from_millis(750);
 
 /// Caps on attacker-supplied registration metadata. The name and the software id are rendered on the
-/// consent page, and the redirect list is walked on every authorize.
-const MAX_CLIENT_NAME: usize = 200;
+/// consent page, and the redirect list is walked on every authorize. The name cap lives in the
+/// domain because the owner's label shares it.
 const MAX_SOFTWARE_FIELD: usize = 100;
-use crate::domain::oauth::{MAX_REDIRECT_URI, MAX_REDIRECT_URIS};
+use crate::domain::oauth::{MAX_CLIENT_NAME, MAX_REDIRECT_URI, MAX_REDIRECT_URIS};
 
 /// Informational only. Authorization is the `GrantProfile` the owner picked, which no client can
 /// influence, so this string exists because RFC 6749 §5.1 has a field for it and clients display it.
@@ -1392,6 +1392,8 @@ fn consent_page(
         software_id: client.software_id.as_deref(),
         self_registered: client.registered_via == "dcr",
         current_profile: client.profile.as_deref(),
+        name_field: Some(&client.client_name),
+        same_name: 0,
     };
     page(status, pages::consent(&flow_fields(intent), &view, &csrf, app.default_profile()))
 }
@@ -1790,6 +1792,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             last_used_at: None,
             revoked_at: None,
+            owner_label: None,
         }
     }
 
@@ -2060,6 +2063,13 @@ mod tests {
             async fn revoke_client(&self, _client_id: &str) -> Result<bool> {
                 unimplemented!("not on the refresh path")
             }
+            async fn set_client_label(
+                &self,
+                _client_id: &str,
+                _label: Option<&str>,
+            ) -> Result<bool> {
+                unimplemented!("not on the refresh path")
+            }
             async fn insert_code(&self, _c: NewAuthCode) -> Result<()> {
                 unimplemented!("not on the refresh path")
             }
@@ -2110,6 +2120,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 last_used_at: None,
                 revoked_at: None,
+                owner_label: None,
             }
         }
 

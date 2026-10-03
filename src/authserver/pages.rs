@@ -50,6 +50,14 @@ pub struct ClientView<'a> {
     pub self_registered: bool,
     /// The profile this client already holds, when it is being re-consented.
     pub current_profile: Option<&'a str>,
+    /// What the "Name this connection" field holds when the page opens: the owner's label when this
+    /// client is being re-consented and has one, else the registered name, cleaned. `None` leaves
+    /// the field and its hint off the page. The engine always passes `Some`; the hosted fork passes
+    /// `None` when the person consenting may not name this client.
+    pub name_field: Option<&'a str>,
+    /// Other approved clients, live or revoked, whose cleaned registered name compares equal to
+    /// this one's.
+    pub same_name: usize,
 }
 
 /// The stylesheet. `include_str!` in a release build, read from disk on every render in a
@@ -374,6 +382,8 @@ mod tests {
             software_id: Some("anthropic-claude"),
             self_registered: true,
             current_profile: None,
+            name_field: Some("Claude"),
+            same_name: 0,
         }
     }
 

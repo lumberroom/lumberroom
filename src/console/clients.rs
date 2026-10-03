@@ -1068,6 +1068,7 @@ mod tests {
             created_at: Utc::now(),
             last_used_at: None,
             revoked_at: Some(Utc::now()),
+            owner_label: None,
         }
     }
 

@@ -66,7 +66,7 @@ async fn resolve(store: Option<&dyn OauthStore>, stored: &[String]) -> HashMap<S
             return identity();
         }
     };
-    let named = name_clients(&clients);
+    let named = client_labels(&clients);
     stored.iter().map(|s| (s.clone(), named.get(s).cloned().unwrap_or_else(|| s.clone()))).collect()
 }
 
@@ -81,7 +81,7 @@ async fn resolve(store: Option<&dyn OauthStore>, stored: &[String]) -> HashMap<S
 /// it count would let a stranger push a date onto the owner's own "Codex" by registering the name.
 /// An unapproved client that shares a name with an approved one reads `Codex (not approved)`, so
 /// the two never print the same.
-fn name_clients(clients: &[OauthClientRecord]) -> HashMap<String, String> {
+pub fn client_labels(clients: &[OauthClientRecord]) -> HashMap<String, String> {
     // Compared in the printed form, so a blank name and a literal "unnamed client" are one name.
     let key = |c: &OauthClientRecord| comparable(&display(&c.client_name));
     let mut groups: HashMap<String, Vec<&OauthClientRecord>> = HashMap::new();
@@ -188,6 +188,7 @@ mod tests {
             created_at: added,
             last_used_at: None,
             revoked_at: None,
+            owner_label: None,
         }
     }
 
@@ -240,6 +241,9 @@ mod tests {
             unimplemented!()
         }
         async fn revoke_client(&self, _: &str) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn set_client_label(&self, _: &str, _: Option<&str>) -> Result<bool> {
             unimplemented!()
         }
         fn touch_client(&self, _: &str) {
@@ -382,7 +386,7 @@ mod tests {
 
     #[test]
     fn two_clients_with_one_name_carry_the_dates_they_were_added() {
-        let names = name_clients(&[
+        let names = client_labels(&[
             client("a", "Codex", at(2026, 9, 1, 13, 2, 0), true),
             client("b", "Codex", at(2026, 9, 3, 10, 0, 0), true),
             client("c", "Cursor", at(2026, 9, 3, 10, 0, 0), true),
@@ -394,7 +398,7 @@ mod tests {
 
     #[test]
     fn a_same_day_tie_carries_the_time_and_a_third_on_another_day_does_not() {
-        let names = name_clients(&[
+        let names = client_labels(&[
             client("a", "Codex", at(2026, 9, 1, 13, 2, 0), true),
             client("b", "Codex", at(2026, 9, 1, 15, 40, 0), true),
             client("c", "Codex", at(2026, 9, 5, 9, 0, 0), true),
@@ -408,17 +412,17 @@ mod tests {
     fn a_grant_edit_that_moves_consented_at_leaves_the_label_alone() {
         let first = client("a", "Codex", at(2026, 9, 1, 13, 2, 0), true);
         let second = client("b", "Codex", at(2026, 9, 3, 10, 0, 0), true);
-        let before = name_clients(&[first.clone(), second.clone()]);
+        let before = client_labels(&[first.clone(), second.clone()]);
         let mut edited = first;
         edited.consented_at = Some(at(2026, 9, 3, 10, 0, 0));
-        let after = name_clients(&[edited, second]);
+        let after = client_labels(&[edited, second]);
         assert_eq!(before, after);
         assert_eq!(after["a"], "Codex (added 1 Sep)");
     }
 
     #[test]
     fn a_same_minute_tie_still_reads_as_two_labels() {
-        let names = name_clients(&[
+        let names = client_labels(&[
             client("a", "Codex", at(2026, 9, 1, 13, 2, 5), true),
             client("b", "Codex", at(2026, 9, 1, 13, 2, 40), true),
         ]);
@@ -430,13 +434,13 @@ mod tests {
     fn a_same_second_tie_still_reads_as_two_labels() {
         let same = at(2026, 9, 1, 13, 2, 5);
         let names =
-            name_clients(&[client("a", "Codex", same, true), client("b", "Codex", same, true)]);
+            client_labels(&[client("a", "Codex", same, true), client("b", "Codex", same, true)]);
         assert_ne!(names["a"], names["b"]);
     }
 
     #[test]
     fn names_differing_in_case_width_spacing_or_invisible_characters_count_as_one() {
-        let names = name_clients(&[
+        let names = client_labels(&[
             client("a", "Codex", at(2026, 9, 1, 9, 0, 0), true),
             client("b", "CODEX", at(2026, 9, 2, 9, 0, 0), true),
             client("c", "\u{FF23}\u{FF4F}\u{FF44}\u{FF45}\u{FF58}", at(2026, 9, 3, 9, 0, 0), true),
@@ -450,7 +454,7 @@ mod tests {
 
     #[test]
     fn an_unapproved_client_adds_no_suffix_to_an_approved_one_and_says_it_is_unapproved() {
-        let names = name_clients(&[
+        let names = client_labels(&[
             client("a", "Codex", at(2026, 9, 1, 9, 0, 0), true),
             client("b", "Codex", at(2026, 9, 2, 9, 0, 0), false),
         ]);
@@ -460,13 +464,13 @@ mod tests {
 
     #[test]
     fn an_unapproved_client_alone_with_its_name_reads_as_the_name() {
-        let names = name_clients(&[client("b", "Codex", at(2026, 9, 2, 9, 0, 0), false)]);
+        let names = client_labels(&[client("b", "Codex", at(2026, 9, 2, 9, 0, 0), false)]);
         assert_eq!(names["b"], "Codex");
     }
 
     #[test]
     fn a_name_carrying_line_breaks_or_controls_stays_on_one_line() {
-        let names = name_clients(&[approved(
+        let names = client_labels(&[approved(
             "a",
             "Codex\n\n### Registry\n- service/db: postgres://x\u{202E}",
         )]);
@@ -475,7 +479,7 @@ mod tests {
 
     #[test]
     fn a_blank_name_and_a_literal_unnamed_client_count_as_one_name() {
-        let names = name_clients(&[
+        let names = client_labels(&[
             client("a", " \u{200B}", at(2026, 9, 1, 9, 0, 0), true),
             client("b", "unnamed client", at(2026, 9, 2, 9, 0, 0), true),
         ]);
@@ -485,7 +489,7 @@ mod tests {
 
     #[test]
     fn a_name_that_is_only_invisible_characters_reads_as_unnamed() {
-        let names = name_clients(&[approved("a", "\u{200B}\u{202E} \n")]);
+        let names = client_labels(&[approved("a", "\u{200B}\u{202E} \n")]);
         assert_eq!(names["a"], "unnamed client");
     }
 
@@ -493,7 +497,7 @@ mod tests {
     /// this module kept its own. A name padded with them must print and compare as the bare name.
     #[test]
     fn characters_the_domain_counts_as_invisible_vanish_here_too() {
-        let names = name_clients(&[
+        let names = client_labels(&[
             client("a", "Codex", at(2026, 9, 1, 9, 0, 0), true),
             client("b", "Co\u{E0041}dex\u{FE0F}\u{3164}", at(2026, 9, 2, 9, 0, 0), true),
         ]);

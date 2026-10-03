@@ -13,7 +13,7 @@
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
-use crate::domain::errors::Result;
+use crate::domain::errors::{DomainError, Result};
 use crate::domain::policy::NamespaceGrant;
 use crate::ports::{
     AccessTokenRecord, ClientGrantUpdate, CodeOutcome, NewAccessToken, NewAuthCode, NewOauthClient,
@@ -57,6 +57,9 @@ fn client_from_row(r: &sqlx::postgres::PgRow) -> OauthClientRecord {
         created_at: r.get("created_at"),
         last_used_at: r.get("last_used_at"),
         revoked_at: r.get("revoked_at"),
+        // Placeholder until the column joins the SELECT lists below. Reading it here before then
+        // panics on every row, since `get` indexes by name.
+        owner_label: None,
     }
 }
 
@@ -161,6 +164,11 @@ impl OauthStore for PgOauthStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn set_client_label(&self, client_id: &str, label: Option<&str>) -> Result<bool> {
+        let _ = (client_id, label);
+        Err(DomainError::internal("not built"))
     }
 
     async fn revoke_client(&self, client_id: &str) -> Result<bool> {

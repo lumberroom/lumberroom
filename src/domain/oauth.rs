@@ -774,6 +774,27 @@ fn comparable_client_name(name: &str) -> String {
     client_name_display(name).nfkc().collect::<String>().to_lowercase()
 }
 
+/// The longest client name stored, in bytes of UTF-8 after cleaning. Registration and the owner's
+/// label share it.
+pub const MAX_CLIENT_NAME: usize = 200;
+
+/// True when a name, cleaned and lowercased, ends in a parenthesis that opens with `(added ` or
+/// reads `(not approved)`. Those are the words `services::sources` appends to tell duplicates
+/// apart, so a name ending in one could pass for another client's disambiguated label.
+pub fn claims_a_stamp(name: &str) -> bool {
+    let _ = name;
+    todo!("E1")
+}
+
+/// What the owner typed, as it is stored. Cleaned by `client_name_display`, then, in this order:
+/// empty, or equal to the cleaned registered name, answers `Ok(None)`, which clears the label;
+/// longer than `MAX_CLIENT_NAME` bytes answers a validation error; a name `claims_a_stamp` accepts
+/// answers a validation error; anything else is the label.
+pub fn owner_label(typed: &str, registered: &str) -> Result<Option<String>> {
+    let _ = (typed, registered);
+    todo!("E1")
+}
+
 /// Redirect rules for a client that registered itself, on top of [`validate_redirect_uri`].
 ///
 /// Two refusals, both about a destination the consent page cannot describe to the owner:
