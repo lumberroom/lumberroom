@@ -123,9 +123,10 @@ canonical MCP endpoint:
 codex mcp add lumberroom --url https://mcp.lumberroom.cloud/mcp
 ```
 
-`codex mcp add` detects OAuth support and starts the login at once, printing an authorization URL.
-Approve the consent screen in the browser. To sign in again later, run `codex mcp login lumberroom`
-(`--no-browser` prints the URL instead of opening it). For your own engine, put your `/mcp` URL in
+Recent Codex releases (0.159 and later) detect OAuth support and start the login at once, printing
+an authorization URL. If yours does not, run `codex mcp login lumberroom`. Approve the consent
+screen in the browser. The same command signs you in again later (`--no-browser` prints the URL
+instead of opening it). For your own engine, put your `/mcp` URL in
 place of the hosted one. On your own engine the consent screen sets this client's grant, and
 [`../deploy/oauth.md`](../deploy/oauth.md) section 4 covers narrowing or revoking it later.
 
