@@ -1,6 +1,6 @@
 # Write-time conflict pairs: implementation plan
 
-> **Draft.** Design only. Nothing is built yet, and this document changes as the build proceeds.
+> **Draft.** PR E1 (the pair tables, triggers and sweeper) is built on branch `feat/write-time-conflicts`. Readers (PR E2) are not built yet, and this document changes as the build proceeds.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

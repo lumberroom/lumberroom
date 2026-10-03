@@ -1,6 +1,6 @@
 # 0022. Conflict pairs are recorded when a row is written
 
-> **Draft.** Design only. Nothing is built yet, and this document changes as the build proceeds.
+> **Draft.** PR E1 (the pair tables, triggers and sweeper) is built on branch `feat/write-time-conflicts`. Readers (PR E2) are not built yet, and this document changes as the build proceeds.
 
 3 October 2026. Proposed, design; nothing built, nothing run. Revised the same day (revision 1,
 below): a trigger on `memory` wakes the sweeper, and the write path's call to the scan is withdrawn.

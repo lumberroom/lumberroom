@@ -51,6 +51,23 @@ $1 > 0 AND $1 * 1.0::float8 > 0` gives `$1` the type `integer` on Postgres 17, t
 use notwithstanding. A guard added ahead of a parameter's existing uses can retype it. Cast it where
 it first appears, as the lexical arm's `$10::float8 > 0` does.
 
+**A conflict scan inside a trigger on `memory`, or inside the inserting transaction, loses pairs.**
+Under `READ COMMITTED` a scan sees only rows committed before its statement starts. Two writes into
+one namespace that overlap each scan before the other commits, both rows get marked scanned, and the
+pair between them is never found or retried. The same holds for an `AFTER INSERT` trigger and for a
+deferred constraint trigger. Only the sweeper calls `memory_conflict_record`, and it runs after commit:
+a wake reaches it once Postgres releases the notification, and a timer sweep reads committed rows.
+`tests/conflict_pairs.rs` reads `pg_proc` and fails if any trigger function on `memory` calls
+`memory_conflict_record` or inserts into `memory_conflict`. The argument is in
+[`specs/write-time-conflicts.md`](specs/write-time-conflicts.md) section 6.
+
+**A pooler in transaction mode drops conflict wakes.** `LISTEN` binds to one server session, and
+transaction pooling hands that session to other clients, so the listener hears nothing and raises no
+error. Rows stay pending until the next timer sweep, up to `CONFLICT_SWEEP_SECS` (default 60), and
+then record normally. Nothing is lost and nothing warns. Set `CONFLICT_SWEEP_SECS=0` and the same
+deployment records no pairs at all, which looks identical to a quiet store until the pending count
+stops falling. Spec section 5 lists the wake failure path.
+
 ## Policy and disclosure
 
 **Four disclosures shipped, and no gate could have caught them.** Each published a value computed

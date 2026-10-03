@@ -1,6 +1,6 @@
 # Write-time conflict pairs
 
-> **Draft.** Design only. Nothing is built yet, and this document changes as the build proceeds.
+> **Draft.** PR E1 (the pair tables, triggers and sweeper) is built on branch `feat/write-time-conflicts`. Readers (PR E2) are not built yet, and this document changes as the build proceeds.
 
 3 October 2026. Status: design, nothing built. Revised the same day: a trigger on `memory` now
 wakes the sweeper, and the write path no longer calls the scan (section 11 records the shapes that
