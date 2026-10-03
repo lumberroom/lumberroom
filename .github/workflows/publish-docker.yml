@@ -140,9 +140,15 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ matrix.image }}
+          # `latest` moves only on a release tag. A prerelease such as v0.4.1-rc.1 gets its own
+          # version tag and leaves `latest` where it was, by the hyphen rule cli-release.yml uses to
+          # publish it as a GitHub prerelease. The flavor's default, latest=auto, adds `latest` to
+          # every type=match tag, so it is off and the raw line below is the only source.
+          flavor: |
+            latest=false
           tags: |
             type=match,pattern=v(.*),group=1
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Join the per-platform digests into one manifest
         run: |
