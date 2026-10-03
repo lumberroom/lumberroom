@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
-use axum::extract::{ConnectInfo, Extension, Form, Query, State};
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, Extension, Form, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -31,15 +32,16 @@ use crate::authserver::session::{OwnerSession, Sessions};
 use crate::config::{Config, ResourceAudience};
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::oauth::{
-    canonical_resource, check_self_registered_redirect, client_name_display, hash_token,
-    hashes_match, random_token, resource_matches, validate_redirect_uri, verify_pkce_s256,
-    AuthorizeIntent, AuthorizeRequest, GrantProfile, OauthError, RegistrationRequest,
-    RegistrationResponse, TokenResponse,
+    canonical_resource, check_self_registered_redirect, claims_a_stamp, client_name_display,
+    hash_token, hashes_match, owner_label, random_token, resource_matches, validate_redirect_uri,
+    verify_pkce_s256, AuthorizeIntent, AuthorizeRequest, GrantProfile, OauthError,
+    RegistrationRequest, RegistrationResponse, TokenResponse,
 };
 use crate::ports::{
     ClientGrantUpdate, CodeOutcome, NewAccessToken, NewAuthCode, NewOauthClient, NewRefreshToken,
     OauthClientRecord, OauthStore, RefreshOutcome,
 };
+use crate::services::{bootstrap, sources};
 
 /// Paid on every failed password, before the response is written.
 ///
@@ -111,6 +113,7 @@ pub fn routes() -> Router<AuthServer> {
         .route("/oauth/token", post(token))
         .route("/oauth/revoke", post(revoke))
         .route("/oauth/clients", get(clients))
+        .route("/oauth/clients/{client_id}/label", post(label))
 }
 
 // ---- RFC 8414 metadata ----
@@ -281,6 +284,14 @@ async fn register(
                 format!("client_name is longer than {MAX_CLIENT_NAME} characters"),
             )
         }
+        // A name ending in the words `services::sources` appends to tell duplicates apart would
+        // print like another client's dated label once two clients share a name.
+        Some(name) if claims_a_stamp(&name) => return registration_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_metadata",
+            "client_name cannot end in \"(added ...)\" or \"(not approved)\": this server adds \
+                 those words itself",
+        ),
         Some(name) if !name.is_empty() => name.to_string(),
         _ => "unnamed client".to_string(),
     };
@@ -380,7 +391,7 @@ async fn authorize(
     };
 
     match app.sessions.verify(&headers, now()) {
-        Some(session) => consent_page(&app, &client, &intent, &session, StatusCode::OK),
+        Some(session) => consent_page(&app, &client, &intent, &session, StatusCode::OK).await,
         None => login_page(&client, &intent, StatusCode::OK, None),
     }
 }
@@ -416,6 +427,10 @@ struct FlowForm {
     scope: Option<String>,
     #[serde(default)]
     resource: Option<String>,
+    /// The "Name this connection" field. Absent on a page rendered before the field existed, and
+    /// absent means "leave the label alone", never "clear it".
+    #[serde(default)]
+    label: Option<String>,
 }
 
 impl FlowForm {
@@ -514,7 +529,7 @@ async fn login(
         return page_internal(&DomainError::internal("issued a session that does not verify"));
     };
 
-    let mut response = consent_page(&app, &client, &intent, &session, StatusCode::OK);
+    let mut response = consent_page(&app, &client, &intent, &session, StatusCode::OK).await;
     // Set-Cookie is attached here rather than inside consent_page so the page renderer has no
     // reason to know about cookies.
     if let Ok(cookie) = header::HeaderValue::from_str(&app.sessions.set_cookie(&value)) {
@@ -588,6 +603,22 @@ async fn consent(
         );
     };
 
+    // Validated before any write, so a name the owner has to change grants nothing. The outer
+    // `Option` is whether the field arrived; the inner one is the label to store, `None` clearing.
+    let label = match form.label.as_deref().map(|typed| owner_label(typed, &client.client_name)) {
+        None => None,
+        Some(Ok(label)) => Some(label),
+        Some(Err(e)) => {
+            return page(
+                StatusCode::BAD_REQUEST,
+                pages::error_page(
+                    "name not saved",
+                    &format!("{} Nothing was granted. Go back and change it.", e.client_message()),
+                ),
+            )
+        }
+    };
+
     let update = ClientGrantUpdate {
         profile: Some(profile.as_str().to_string()),
         read: profile.read(),
@@ -600,6 +631,24 @@ async fn consent(
     };
     if let Err(e) = app.store.set_client_grant(&client.client_id, update).await {
         return page_internal(&e);
+    }
+
+    // After the grant, because the store refuses a label on a client nobody approved. A failed
+    // write logs and the consent completes: the grant is what the owner came for, and the name can
+    // be set afterwards from the console or the CLI.
+    if let Some(label) = label {
+        match app.store.set_client_label(&client.client_id, label.as_deref()).await {
+            Ok(true) => bootstrap::clear_cache(),
+            Ok(false) => tracing::warn!(
+                client_id = %client.client_id,
+                "the label was not saved: the client is not approved after its grant was written"
+            ),
+            Err(e) => tracing::warn!(
+                client_id = %client.client_id,
+                error = %e.log_message(),
+                "the label was not saved; the grant stands"
+            ),
+        }
     }
 
     let code = match random_token(32) {
@@ -1020,10 +1069,19 @@ async fn clients(
     let include_revoked =
         matches!(query.get("include_revoked").map(String::as_str), Some("1" | "true" | "yes"));
 
-    match app.store.list_clients(include_revoked).await {
+    // Every client, revoked included, so the labels come out of the same set `sources::labels`
+    // reads and the listing prints the name MCP prints. Revoked rows drop afterwards.
+    match app.store.list_clients(true).await {
         Ok(records) => {
-            let clients: Vec<serde_json::Value> =
-                records.iter().map(client_listing_entry).collect();
+            let labels = sources::client_labels(&records);
+            let clients: Vec<serde_json::Value> = records
+                .iter()
+                .filter(|c| include_revoked || c.is_live())
+                .map(|c| {
+                    let label = labels.get(&c.client_id).map(String::as_str).unwrap_or_default();
+                    client_listing_entry(c, label)
+                })
+                .collect();
             (
                 [(header::CACHE_CONTROL, "no-store")],
                 Json(serde_json::json!({ "count": clients.len(), "clients": clients })),
@@ -1040,10 +1098,14 @@ async fn clients(
 /// The name goes through [`client_name_display`] here as well as at registration: a row stored
 /// before that cleaning existed still holds whatever its registrant sent, and the CLI prints this
 /// field to a terminal, where a bidi override or an escape sequence can rewrite what the owner reads.
-fn client_listing_entry(c: &OauthClientRecord) -> serde_json::Value {
+/// `owner_label` is cleaned for the same reason. `label` is the name `services::sources` resolves,
+/// the one MCP prints.
+fn client_listing_entry(c: &OauthClientRecord, label: &str) -> serde_json::Value {
     serde_json::json!({
         "client_id": c.client_id,
         "client_name": client_name_display(&c.client_name),
+        "owner_label": c.owner_label.as_deref().map(client_name_display).filter(|l| !l.is_empty()),
+        "label": label,
         "redirect_uris": c.redirect_uris,
         "grant_types": c.grant_types,
         "registered_via": c.registered_via,
@@ -1061,6 +1123,122 @@ fn client_listing_entry(c: &OauthClientRecord) -> serde_json::Value {
         "revoked_at": c.revoked_at,
         "confidential": c.secret_hash.is_some(),
     })
+}
+
+// ---- POST /oauth/clients/{client_id}/label ----
+
+const LABEL_REQUIRED: &str = "label is required; send null to clear it";
+const LABEL_NOT_TEXT: &str = "label must be a string, or null to clear it";
+
+/// The owner renames a client. Writes `owner_label` and nothing else: no grant, no token, no
+/// audit row.
+///
+/// Bearer only, holding `registry_write`, the bar `GET /oauth/clients` sets for listing. The
+/// consent session cookie is refused: a cookie-authenticated JSON write would need a CSRF defence
+/// of its own, and the console already has a form for the browser.
+async fn label(
+    State(app): State<AuthServer>,
+    headers: HeaderMap,
+    Path(client_id): Path<String>,
+    // Bytes rather than `Json`, so a missing content type or a malformed body answers in this
+    // route's JSON error shape instead of axum's plain-text rejection.
+    body: Bytes,
+) -> Response {
+    let authorization = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    match app.auth.authenticate(authorization).await {
+        Ok(principal) if principal.registry_write => {}
+        Ok(principal) => {
+            return label_error(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                &format!("client {} may not rename OAuth clients", principal.client),
+            )
+        }
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                Json(serde_json::json!({ "error": "unauthorized" })),
+            )
+                .into_response()
+        }
+    }
+
+    let typed = match requested_label(&body) {
+        Ok(typed) => typed,
+        Err(detail) => return label_error(StatusCode::BAD_REQUEST, "invalid_request", detail),
+    };
+
+    let client = match app.store.find_client(&client_id).await {
+        Ok(Some(c)) if c.has_consent() => c,
+        Ok(_) => return label_not_found(),
+        Err(e) => return internal_json(&e),
+    };
+
+    let stored = match typed.as_deref().map(|t| owner_label(t, &client.client_name)) {
+        None => None,
+        Some(Ok(label)) => label,
+        Some(Err(e)) => {
+            return label_error(StatusCode::BAD_REQUEST, "invalid_label", e.client_message())
+        }
+    };
+
+    match app.store.set_client_label(&client_id, stored.as_deref()).await {
+        Ok(true) => bootstrap::clear_cache(),
+        // Approved a moment ago and not now: the row went between the read and the write.
+        Ok(false) => return label_not_found(),
+        Err(e) => return internal_json(&e),
+    }
+    // The text stays out of the log: a label is owner input and can carry anything.
+    tracing::info!(client_id = %client_id, cleared = stored.is_none(), "owner renamed a client");
+
+    // Read after the write, so a date the new name earns against another client shows at once.
+    let resolved = match app.store.list_clients(true).await {
+        Ok(records) => sources::client_labels(&records).remove(&client_id),
+        Err(e) => {
+            tracing::warn!(error = %e.log_message(), "could not resolve the label after a rename");
+            None
+        }
+    };
+    let registered = client_name_display(&client.client_name);
+    let resolved = resolved.unwrap_or_else(|| stored.clone().unwrap_or_else(|| registered.clone()));
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "client_id": client_id,
+            "client_name": registered,
+            "owner_label": stored,
+            "label": resolved,
+        })),
+    )
+        .into_response()
+}
+
+/// The `label` key of a JSON object: a string to set, `null` to clear. Any other shape is refused,
+/// so a client that sent the wrong body learns it instead of clearing a name by accident.
+fn requested_label(body: &[u8]) -> std::result::Result<Option<String>, &'static str> {
+    let Ok(serde_json::Value::Object(mut object)) = serde_json::from_slice(body) else {
+        return Err(LABEL_REQUIRED);
+    };
+    match object.remove("label") {
+        None => Err(LABEL_REQUIRED),
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text)),
+        Some(_) => Err(LABEL_NOT_TEXT),
+    }
+}
+
+fn label_error(status: StatusCode, error: &str, detail: &str) -> Response {
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "error": error, "detail": detail })),
+    )
+        .into_response()
+}
+
+fn label_not_found() -> Response {
+    label_error(StatusCode::NOT_FOUND, "not_found", "there is no approved client with that id")
 }
 
 // ---- shared machinery ----
@@ -1371,13 +1549,14 @@ fn login_page(
     page(status, pages::login(&flow_fields(intent), &client.client_name, error))
 }
 
-fn consent_page(
+async fn consent_page(
     app: &AuthServer,
     client: &OauthClientRecord,
     intent: &AuthorizeIntent,
     session: &OwnerSession,
     status: StatusCode,
 ) -> Response {
+    let same_name = same_name_count(app.store.as_ref(), client).await;
     let csrf = app.sessions.csrf(
         session,
         &intent.client_id,
@@ -1392,10 +1571,53 @@ fn consent_page(
         software_id: client.software_id.as_deref(),
         self_registered: client.registered_via == "dcr",
         current_profile: client.profile.as_deref(),
-        name_field: Some(&client.client_name),
-        same_name: 0,
+        // The owner's label when there is one, else the registered name. A label that cleans to
+        // nothing falls back too, so the field never opens empty and clears a name by being sent.
+        name_field: Some(
+            client
+                .owner_label
+                .as_deref()
+                .filter(|l| !client_name_display(l).is_empty())
+                .unwrap_or(&client.client_name),
+        ),
+        same_name,
     };
     page(status, pages::consent(&flow_fields(intent), &view, &csrf, app.default_profile()))
+}
+
+/// How many other approved clients registered under this client's name, for the naming hint.
+///
+/// A store error answers 0: a hint never blocks a consent.
+async fn same_name_count(store: &dyn OauthStore, client: &OauthClientRecord) -> usize {
+    match store.list_clients(true).await {
+        Ok(clients) => same_name(&clients, client),
+        Err(e) => {
+            tracing::warn!(error = %e.log_message(), "could not count clients sharing a name");
+            0
+        }
+    }
+}
+
+/// Approved clients, live or revoked, other than `client`, whose registered name compares equal to
+/// its own. Registered names only: the hint tells the owner what the stranger's registration
+/// collides with, and a label the owner chose is not something a registrant can collide with.
+fn same_name(clients: &[OauthClientRecord], client: &OauthClientRecord) -> usize {
+    let mine = name_key(&client.client_name);
+    clients
+        .iter()
+        .filter(|c| c.client_id != client.client_id && c.has_consent())
+        .filter(|c| name_key(&c.client_name) == mine)
+        .count()
+}
+
+/// The form `services::sources` groups names in: cleaned, the blank name read as "unnamed client",
+/// NFKC, lowercased. Kept in step with it by hand, because the hint and the `(added ...)` dates
+/// must agree on which clients share a name; neither module exports its helper.
+fn name_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let cleaned = client_name_display(name);
+    let printed = if cleaned.is_empty() { "unnamed client" } else { cleaned.as_str() };
+    printed.nfkc().collect::<String>().to_lowercase()
 }
 
 fn page(status: StatusCode, body: String) -> Response {
@@ -1800,9 +2022,77 @@ mod tests {
     fn the_clients_listing_cleans_a_stored_client_name() {
         let mut dirty = record(None);
         dirty.client_name = "Cl\u{202E}au\u{200B}de\n\tDesktop".into();
-        let entry = client_listing_entry(&dirty);
+        let entry = client_listing_entry(&dirty, "Claude Desktop");
         assert_eq!(entry["client_name"], "Claude Desktop");
         assert_eq!(entry["client_id"], "abc");
+    }
+
+    #[test]
+    fn the_clients_listing_carries_the_owner_label_cleaned_and_the_resolved_label() {
+        let mut named = record(None);
+        named.owner_label = Some("Co\u{202E}dex\nlaptop".into());
+        let entry = client_listing_entry(&named, "Codex laptop (added 3 Sep)");
+        assert_eq!(entry["owner_label"], "Codex laptop");
+        assert_eq!(entry["label"], "Codex laptop (added 3 Sep)");
+        assert_eq!(entry["client_name"], "Claude");
+
+        let unnamed = client_listing_entry(&record(None), "Claude");
+        assert!(unnamed["owner_label"].is_null());
+        assert_eq!(unnamed["label"], "Claude");
+    }
+
+    fn approved(id: &str, name: &str) -> OauthClientRecord {
+        OauthClientRecord { client_id: id.into(), client_name: name.into(), ..record(None) }
+    }
+
+    #[test]
+    fn the_same_name_count_counts_other_approved_clients_live_or_revoked() {
+        let me = approved("me", "Codex");
+        let mut revoked = approved("old", "codex");
+        revoked.revoked_at = Some(chrono::Utc::now());
+        let mut unapproved = approved("new", "Codex");
+        unapproved.consented_at = None;
+        let clients = vec![
+            me.clone(),
+            approved("twin", "CO\u{200B}DEX"),
+            revoked,
+            unapproved,
+            approved("other", "Claude"),
+        ];
+        assert_eq!(same_name(&clients, &me), 2, "twin and old; not me, not new, not Claude");
+    }
+
+    #[test]
+    fn the_same_name_count_compares_registered_names_and_ignores_labels() {
+        let me = approved("me", "Codex");
+        let mut labelled_away = approved("a", "Codex");
+        labelled_away.owner_label = Some("Work laptop".into());
+        let mut labelled_onto = approved("b", "Codex CLI");
+        labelled_onto.owner_label = Some("Codex".into());
+        let clients = vec![me.clone(), labelled_away, labelled_onto];
+        assert_eq!(same_name(&clients, &me), 1);
+    }
+
+    #[test]
+    fn a_label_body_carries_a_string_or_null() {
+        assert_eq!(requested_label(br#"{"label":"Codex"}"#), Ok(Some("Codex".into())));
+        assert_eq!(requested_label(br#"{"label":null}"#), Ok(None));
+        assert_eq!(requested_label(br#"{"label":"x","other":1}"#), Ok(Some("x".into())));
+    }
+
+    #[test]
+    fn a_label_body_without_the_key_is_refused_with_the_spec_message() {
+        assert_eq!(requested_label(b"{}"), Err(LABEL_REQUIRED));
+        assert_eq!(requested_label(b""), Err(LABEL_REQUIRED));
+        assert_eq!(requested_label(b"not json"), Err(LABEL_REQUIRED));
+        assert_eq!(requested_label(br#"["label"]"#), Err(LABEL_REQUIRED));
+        assert_eq!(requested_label(br#""label""#), Err(LABEL_REQUIRED));
+    }
+
+    #[test]
+    fn a_label_that_is_neither_a_string_nor_null_is_refused() {
+        assert_eq!(requested_label(br#"{"label":5}"#), Err(LABEL_NOT_TEXT));
+        assert_eq!(requested_label(br#"{"label":["x"]}"#), Err(LABEL_NOT_TEXT));
     }
 
     #[test]
@@ -2138,7 +2428,7 @@ mod tests {
 
         // Built by hand for the reason `adapters::auth::metadata` gives: `config::load` reads the
         // process environment, and parallel tests mutating it flake.
-        fn cfg() -> Config {
+        pub(super) fn cfg() -> Config {
             use crate::config::*;
             Config {
                 cleanup: CleanupConfig { interval_secs: 0, namespace: None, limit: 500 },
@@ -2369,6 +2659,290 @@ mod tests {
                 (StatusCode::UNAUTHORIZED, "invalid_client".into())
             );
             assert_eq!(*s.rotations.lock().unwrap(), 1);
+        }
+    }
+
+    /// `POST /oauth/clients/{id}/label` against an in-memory store, so the refusals can show that
+    /// nothing reached `set_client_label`.
+    mod label_route {
+        use super::*;
+        use crate::domain::types::Principal;
+        use crate::ports::{AccessTokenRecord, NewOauthClient};
+        use async_trait::async_trait;
+        use axum::body::Bytes;
+        use axum::extract::Path;
+        use std::sync::Mutex;
+
+        struct Store {
+            clients: Mutex<Vec<OauthClientRecord>>,
+            writes: Mutex<Vec<(String, Option<String>)>>,
+        }
+
+        #[async_trait]
+        impl OauthStore for Store {
+            async fn find_client(&self, client_id: &str) -> Result<Option<OauthClientRecord>> {
+                Ok(self.clients.lock().unwrap().iter().find(|c| c.client_id == client_id).cloned())
+            }
+            async fn list_clients(&self, include_revoked: bool) -> Result<Vec<OauthClientRecord>> {
+                let all = self.clients.lock().unwrap().clone();
+                Ok(all.into_iter().filter(|c| include_revoked || c.is_live()).collect())
+            }
+            /// The adapter's statement: approved rows only, one column.
+            async fn set_client_label(&self, client_id: &str, label: Option<&str>) -> Result<bool> {
+                self.writes.lock().unwrap().push((client_id.into(), label.map(str::to_string)));
+                let mut clients = self.clients.lock().unwrap();
+                match clients.iter_mut().find(|c| c.client_id == client_id && c.has_consent()) {
+                    Some(c) => {
+                        c.owner_label = label.map(str::to_string);
+                        Ok(true)
+                    }
+                    None => Ok(false),
+                }
+            }
+            async fn refresh_owner(&self, _token_hash: &str) -> Result<Option<String>> {
+                unimplemented!("not on the label path")
+            }
+            async fn rotate_refresh(&self, _token_hash: &str) -> Result<RefreshOutcome> {
+                unimplemented!("not on the label path")
+            }
+            async fn revoke_family(&self, _family_id: uuid::Uuid) -> Result<()> {
+                unimplemented!("not on the label path")
+            }
+            async fn insert_token(&self, _t: NewAccessToken) -> Result<()> {
+                unimplemented!("not on the label path")
+            }
+            async fn insert_refresh(&self, _r: NewRefreshToken) -> Result<()> {
+                unimplemented!("not on the label path")
+            }
+            fn touch_client(&self, _client_id: &str) {}
+            async fn register_client(&self, _c: NewOauthClient) -> Result<()> {
+                unimplemented!("not on the label path")
+            }
+            async fn set_client_grant(
+                &self,
+                _client_id: &str,
+                _g: ClientGrantUpdate,
+            ) -> Result<()> {
+                unimplemented!("not on the label path")
+            }
+            async fn revoke_client(&self, _client_id: &str) -> Result<bool> {
+                unimplemented!("not on the label path")
+            }
+            async fn insert_code(&self, _c: NewAuthCode) -> Result<()> {
+                unimplemented!("not on the label path")
+            }
+            async fn consume_code(&self, _code_hash: &str) -> Result<CodeOutcome> {
+                unimplemented!("not on the label path")
+            }
+            async fn find_token(&self, _token_hash: &str) -> Result<Option<AccessTokenRecord>> {
+                unimplemented!("not on the label path")
+            }
+            async fn revoke_token(&self, _token_hash: &str) -> Result<bool> {
+                unimplemented!("not on the label path")
+            }
+            async fn purge_expired(&self) -> Result<u64> {
+                unimplemented!("not on the label path")
+            }
+        }
+
+        /// `Bearer owner` holds registry_write, `Bearer narrow` does not, anything else fails.
+        struct Tokens;
+
+        #[async_trait]
+        impl Authenticator for Tokens {
+            fn mode(&self) -> &'static str {
+                "oauth"
+            }
+            async fn authenticate(&self, authorization: Option<&str>) -> Result<Principal> {
+                let registry_write = match authorization {
+                    Some("Bearer owner") => true,
+                    Some("Bearer narrow") => false,
+                    _ => return Err(DomainError::forbidden("no bearer")),
+                };
+                let client = if registry_write { "owner" } else { "narrow" };
+                Ok(Principal {
+                    client: client.into(),
+                    token_id: "t".into(),
+                    mode: "token",
+                    scopes: vec![],
+                    read: vec![],
+                    write: vec![],
+                    registry_write,
+                    sealed_capable: false,
+                    may_delete: false,
+                    may_ingest: false,
+                    may_read_history: false,
+                })
+            }
+        }
+
+        fn client(id: &str, name: &str) -> OauthClientRecord {
+            OauthClientRecord { client_id: id.into(), client_name: name.into(), ..record(None) }
+        }
+
+        fn setup(clients: Vec<OauthClientRecord>) -> (Arc<Store>, AuthServer) {
+            let store =
+                Arc::new(Store { clients: Mutex::new(clients), writes: Mutex::new(vec![]) });
+            let dyn_store: Arc<dyn OauthStore> = store.clone();
+            let app = AuthServer::new(Arc::new(super::refresh::cfg()), dyn_store, Arc::new(Tokens));
+            (store, app)
+        }
+
+        fn bearer(token: &str) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+            headers
+        }
+
+        async fn call(
+            app: &AuthServer,
+            headers: HeaderMap,
+            id: &str,
+            body: &str,
+        ) -> (StatusCode, HeaderMap, serde_json::Value) {
+            let response = label(
+                State(app.clone()),
+                headers,
+                Path(id.to_string()),
+                Bytes::from(body.to_string()),
+            )
+            .await;
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            (status, headers, serde_json::from_slice(&body).unwrap())
+        }
+
+        #[tokio::test]
+        async fn a_request_without_a_bearer_is_refused_with_401() {
+            let (store, app) = setup(vec![client("a", "Codex")]);
+            let mut cookie_only = HeaderMap::new();
+            cookie_only.insert(header::COOKIE, "lumberroom_session=x".parse().unwrap());
+            let (status, headers, body) = call(&app, cookie_only, "a", r#"{"label":"x"}"#).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(headers.get(header::WWW_AUTHENTICATE).unwrap(), "Bearer");
+            assert_eq!(body, serde_json::json!({ "error": "unauthorized" }));
+            assert!(store.writes.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_token_without_registry_write_is_refused_with_403() {
+            let (store, app) = setup(vec![client("a", "Codex")]);
+            let (status, _, body) = call(&app, bearer("narrow"), "a", r#"{"label":"x"}"#).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body["error"], "forbidden");
+            assert_eq!(body["detail"], "client narrow may not rename OAuth clients");
+            assert!(store.writes.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_body_without_the_label_key_is_refused_with_400() {
+            let (store, app) = setup(vec![client("a", "Codex")]);
+            let (status, _, body) = call(&app, bearer("owner"), "a", "{}").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"], "invalid_request");
+            assert_eq!(body["detail"], "label is required; send null to clear it");
+            assert!(store.writes.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_unknown_or_unapproved_client_answers_404() {
+            let mut pending = client("p", "Codex");
+            pending.consented_at = None;
+            let (store, app) = setup(vec![pending]);
+            for id in ["p", "nobody"] {
+                let (status, _, body) = call(&app, bearer("owner"), id, r#"{"label":"x"}"#).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+                assert_eq!(body["error"], "not_found");
+                assert_eq!(body["detail"], "there is no approved client with that id");
+            }
+            assert!(store.writes.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_rename_stores_the_cleaned_name_and_answers_the_resolved_label() {
+            let (store, app) = setup(vec![client("a", "Co\u{202E}dex CLI")]);
+            let typed = serde_json::json!({ "label": "  Codex\u{200B} laptop " }).to_string();
+            let (status, headers, body) = call(&app, bearer("owner"), "a", &typed).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "client_id": "a",
+                    "client_name": "Codex CLI",
+                    "owner_label": "Codex laptop",
+                    "label": "Codex laptop",
+                })
+            );
+            assert_eq!(
+                *store.writes.lock().unwrap(),
+                vec![("a".to_string(), Some("Codex laptop".to_string()))]
+            );
+        }
+
+        #[tokio::test]
+        async fn null_and_the_registered_name_both_clear_the_label() {
+            let mut named = client("a", "Codex CLI");
+            named.owner_label = Some("Work".into());
+            let (store, app) = setup(vec![named]);
+            for body in [r#"{"label":null}"#, r#"{"label":"Codex CLI"}"#] {
+                let (status, _, answer) = call(&app, bearer("owner"), "a", body).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert!(answer["owner_label"].is_null(), "{body}");
+                assert_eq!(answer["label"], "Codex CLI", "{body}");
+            }
+            assert_eq!(
+                *store.writes.lock().unwrap(),
+                vec![("a".to_string(), None), ("a".to_string(), None)]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_revoked_client_can_be_renamed() {
+            let mut revoked = client("a", "Codex");
+            revoked.revoked_at = Some(chrono::Utc::now());
+            let (_, app) = setup(vec![revoked]);
+            let (status, _, body) = call(&app, bearer("owner"), "a", r#"{"label":"Old"}"#).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["label"], "Old");
+        }
+
+        #[tokio::test]
+        async fn a_stamp_shaped_name_is_refused_with_the_domain_message() {
+            let (store, app) = setup(vec![client("a", "Codex CLI")]);
+            let (status, _, body) =
+                call(&app, bearer("owner"), "a", r#"{"label":"Codex (added 1 Sep)"}"#).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"], "invalid_label");
+            assert!(body["detail"].as_str().unwrap().contains("(added ...)"));
+            assert!(store.writes.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_name_over_200_bytes_is_refused_with_the_domain_message() {
+            let (store, app) = setup(vec![client("a", "Codex CLI")]);
+            let long = "\u{0915}".repeat(70);
+            let (status, _, body) =
+                call(&app, bearer("owner"), "a", &serde_json::json!({ "label": long }).to_string())
+                    .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"], "invalid_label");
+            assert!(body["detail"].as_str().unwrap().contains("200 bytes"));
+            assert!(store.writes.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_name_two_clients_share_comes_back_with_its_date() {
+            let a = client("a", "Codex CLI");
+            let mut b = client("b", "Work");
+            b.owner_label = Some("Codex".into());
+            b.created_at = a.created_at - chrono::Duration::days(3);
+            let (_, app) = setup(vec![a, b]);
+            let (status, _, body) = call(&app, bearer("owner"), "a", r#"{"label":"Codex"}"#).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["owner_label"], "Codex");
+            assert!(body["label"].as_str().unwrap().starts_with("Codex (added "), "{body}");
         }
     }
 }

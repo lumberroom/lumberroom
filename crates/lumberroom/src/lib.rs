@@ -48,7 +48,7 @@ pub fn prompt(text: &str) {
 }
 
 const COMMANDS: &str =
-    "doctor, whoami, login, clients, bootstrap, search, write, forget, review, supersede, fill-date, \
+    "doctor, whoami, login, clients, clients rename, bootstrap, search, write, forget, review, supersede, fill-date, \
 registry, stats, export, archive, ingest, import, cleanup, history, alias, seal, unseal, recall, tools, \
 currency, arity, graph, \
 hash-password, eval-longmemeval, version, help";

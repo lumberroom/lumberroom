@@ -1040,6 +1040,9 @@ fn write_note(root: &std::path::Path, m: &wire::Memory) -> Result<()> {
 }
 
 pub async fn clients(c: &Client, args: &Args) -> Result<()> {
+    if args.positional_at(1) == Some("rename") {
+        return clients_rename(c, args).await;
+    }
     require_token(c, &c.file.borrow().path.display().to_string())?;
     let (status, body) = c.http_get("/oauth/clients").await?;
     if status == 404 {
@@ -1061,6 +1064,46 @@ pub async fn clients(c: &Client, args: &Args) -> Result<()> {
         out(&format::client_line(record));
     }
     Ok(())
+}
+
+/// `clients rename <client_id> <name...>` or `--clear`. The server cleans and validates the name;
+/// this side sends what the owner typed and prints the server's answer.
+async fn clients_rename(c: &Client, args: &Args) -> Result<()> {
+    require_token(c, &c.file.borrow().path.display().to_string())?;
+    let id = args
+        .positional_at(2)
+        .ok_or_else(|| err("usage: lumberroom clients rename <client_id> <name...> | --clear"))?;
+    let label = if args.present("clear") {
+        Value::Null
+    } else {
+        let mut words = Vec::new();
+        let mut i = 3;
+        while let Some(w) = args.positional_at(i) {
+            words.push(w);
+            i += 1;
+        }
+        if words.is_empty() {
+            return Err(err("usage: lumberroom clients rename <client_id> <name...> | --clear"));
+        }
+        Value::String(words.join(" "))
+    };
+    let path = format!("/oauth/clients/{id}/label");
+    let (status, body) = c
+        .http_request(reqwest::Method::POST, &path, Some(serde_json::json!({ "label": label })))
+        .await?;
+    match status {
+        200 => {
+            let shown = body.get("label").and_then(Value::as_str).unwrap_or(id);
+            out(&format!("{id} now reads as {shown}"));
+            Ok(())
+        }
+        404 => Err(err(format!("no approved client has id {id}"))),
+        400 => {
+            let detail = body.get("detail").and_then(Value::as_str);
+            Err(err(detail.map(str::to_string).unwrap_or_else(|| compact(&body))))
+        }
+        _ => Err(err(format!("rename failed ({status}): {}", compact(&body)))),
+    }
 }
 
 // ---- eval ----

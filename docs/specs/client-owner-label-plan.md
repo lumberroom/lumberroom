@@ -1,7 +1,5 @@
 # The owner names a client: implementation plan
 
-> **Draft.** Design only. Nothing is built yet, and this document changes as the build proceeds.
-
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** An approved OAuth client carries an owner-chosen `owner_label` beside `client_name`; the

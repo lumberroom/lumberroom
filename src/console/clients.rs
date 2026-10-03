@@ -68,15 +68,17 @@ use super::{closed, data, page, redirect, trimmed, Console};
 use crate::authserver::pages::escape;
 use crate::authserver::session::{OwnerSession, Sessions};
 use crate::console::pages::{self, Health, Tab};
-use crate::domain::oauth::{client_name_display, hash_token};
+use crate::domain::oauth::{claims_a_stamp, client_name_display, hash_token, owner_label};
 use crate::domain::policy::NamespaceGrant;
 use crate::domain::presets::Preset;
 use crate::domain::types::Sensitivity;
 use crate::ports::oauth::{ClientGrantUpdate, NewOauthClient, OauthClientRecord};
+use crate::services::sources::client_labels;
 
 const NEW_ACTION: &str = "client-new";
 const REVOKE_ACTION: &str = "client-revoke";
 const ACCESS_ACTION: &str = "client-access";
+const LABEL_ACTION: &str = "client-label";
 /// One target for the create form, because it decides nothing that already exists.
 const NEW_TARGET: &str = "new";
 
@@ -325,6 +327,26 @@ pub async fn create(State(app): State<Console>, headers: HeaderMap, body: Bytes)
     }
 
     let name = trimmed(form.one("name")).unwrap_or("unnamed client").to_string();
+    // A manual client is named by whoever fills this form, so a name that ends in a stamp would
+    // pass for another client's disambiguated label (decision 0023). `owner_label` carries the
+    // domain's wording for the refusal; against an empty registered name it can only fail on the
+    // length or the stamp, and either is a reason to refuse this name.
+    if claims_a_stamp(&name) {
+        let message = match owner_label(&name, "") {
+            Err(e) => e.client_message().to_string(),
+            Ok(_) => "that name ends in a word lumberroom adds itself".to_string(),
+        };
+        return listing(
+            &app,
+            sessions,
+            &session,
+            None,
+            Some(&message),
+            StatusCode::BAD_REQUEST,
+            None,
+        )
+        .await;
+    }
     let grant = match grant_of(&form) {
         Ok(g) => g,
         Err(e) => {
@@ -510,6 +532,104 @@ pub async fn access(
     }
 }
 
+/// Sets or clears the owner's name for one approved client.
+///
+/// Writes `owner_label` and nothing else: no grant, no token, no audit field changes with a name
+/// (decision 0023). A revoked client may be renamed, because the row stays in the listing and the
+/// audit trail keeps printing its name. An unapproved one answers 404, the same answer the store
+/// gives, so the page never offers a name to a client nobody approved.
+pub async fn label(
+    State(app): State<Console>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let session = match app.guard(&headers, "/console/clients") {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+    let Some(sessions) = app.sessions.as_ref() else {
+        return closed();
+    };
+    let form = Posted::parse(&body);
+    if !sessions.console_csrf_ok(&session, LABEL_ACTION, &id, form.one("csrf")) {
+        tracing::warn!("console client rename refused: the form token did not match");
+        return stale();
+    }
+
+    let missing =
+        || ("There is no approved client with that id.".to_string(), StatusCode::NOT_FOUND);
+    let client = match app.state.oauth.find_client(&id).await {
+        Ok(Some(c)) if c.consented_at.is_some() => c,
+        Ok(_) => {
+            let (message, status) = missing();
+            return listing(&app, sessions, &session, None, Some(&message), status, None).await;
+        }
+        Err(e) => {
+            let message = e.client_message().to_string();
+            return listing(
+                &app,
+                sessions,
+                &session,
+                None,
+                Some(&message),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+            )
+            .await;
+        }
+    };
+
+    let chosen = if form.one("action") == "clear" {
+        None
+    } else {
+        match owner_label(form.one("label"), &client.client_name) {
+            Ok(label) => label,
+            Err(e) => {
+                let message = e.client_message().to_string();
+                return listing(
+                    &app,
+                    sessions,
+                    &session,
+                    None,
+                    Some(&message),
+                    StatusCode::BAD_REQUEST,
+                    None,
+                )
+                .await;
+            }
+        }
+    };
+
+    match app.state.oauth.set_client_label(&id, chosen.as_deref()).await {
+        Ok(true) => {
+            // The digest caches its rendered source names, so without this the old name prints
+            // until the cache window closes.
+            crate::services::bootstrap::clear_cache();
+            tracing::info!(client_id = %id, cleared = chosen.is_none(), "owner renamed a client");
+            redirect("/console/clients?done=renamed")
+        }
+        // Lost a race with nothing the page could have known: the row is no longer approved.
+        Ok(false) => {
+            let (message, status) = missing();
+            listing(&app, sessions, &session, None, Some(&message), status, None).await
+        }
+        Err(e) => {
+            let message = e.client_message().to_string();
+            listing(
+                &app,
+                sessions,
+                &session,
+                None,
+                Some(&message),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+            )
+            .await
+        }
+    }
+}
+
 pub async fn revoke(
     State(app): State<Console>,
     headers: HeaderMap,
@@ -665,8 +785,12 @@ means issuing another client.</p>",
 <p>Point a client at this server and approve it when it asks, or issue one below.</p></div>",
         );
     } else {
+        // The same resolver the digest uses, so the page and the MCP tools print one name.
+        let labels = client_labels(v.clients);
         for c in v.clients {
-            body.push_str(&client_card(c, v.namespaces, csrf));
+            let resolved =
+                labels.get(&c.client_id).cloned().unwrap_or_else(|| c.client_name.clone());
+            body.push_str(&client_card(c, &resolved, v.namespaces, csrf));
         }
     }
     body.push_str(&new_form(v.namespaces, csrf));
@@ -684,6 +808,7 @@ fn done_line(word: &str) -> Option<&'static str> {
         ),
         "already-revoked" => Some("Nothing changed. That client was already revoked."),
         "access" => Some("Saved. The new grant decides that client's next call."),
+        "renamed" => Some("Name saved."),
         _ => None,
     }
 }
@@ -695,6 +820,7 @@ fn done_line(word: &str) -> Option<&'static str> {
 /// reach looks wrong.
 fn client_card(
     c: &OauthClientRecord,
+    label: &str,
     namespaces: &[String],
     csrf: &dyn Fn(&str, &str) -> String,
 ) -> String {
@@ -733,30 +859,47 @@ fn client_card(
         .map(|l| format!("<span class=\"chip cap\">{l}</span>"))
         .collect();
 
-    // A revoked client keeps its row and loses its controls: it is a record of what happened.
+    // A revoked client keeps its row and loses its grant controls: it is a record of what
+    // happened. It keeps the rename form, because a name is how the owner reads that record.
+    let rename = if c.consented_at.is_some() { rename_form(c, csrf) } else { String::new() };
     let controls = if revoked {
-        String::new()
+        if rename.is_empty() {
+            String::new()
+        } else {
+            format!("<div class=\"cli-acts\">{rename}</div>")
+        }
     } else {
         format!(
-            "<div class=\"cli-acts\">{editor}\
+            "<div class=\"cli-acts\">{rename}{editor}\
 <form method=\"post\" action=\"/console/clients/{id}/revoke\">\
 <input type=\"hidden\" name=\"csrf\" value=\"{token}\">\
 <button type=\"submit\" class=\"danger\">Revoke</button></form></div>",
+            rename = rename,
             editor = access_form(c, namespaces, csrf),
             id = escape(&c.client_id),
             token = escape(&csrf(REVOKE_ACTION, &c.client_id)),
         )
     };
+    // Only an owner-chosen name earns the extra line. The consent warning still reads the
+    // registered name, so the owner needs to see what the client calls itself.
+    let registered = match c.owner_label {
+        Some(_) => {
+            format!(" &middot; registered as {}", escape(&client_name_display(&c.client_name)))
+        }
+        None => String::new(),
+    };
 
     format!(
         "<article class=\"cli{gone}\">\
 <div class=\"cli-head\"><span class=\"cli-name\">{name}</span>{state}\
-<span class=\"cli-meta\">{origin} &middot; {last} &middot; <code>{id}</code></span></div>\
+<span class=\"cli-meta\">{origin} &middot; {last}{registered} &middot; <code>{id}</code></span></div>\
 <div class=\"cli-grant\">{read}{write}{caps}</div>{controls}</article>",
         gone = if revoked { " gone" } else { "" },
         // Cleaned at render as well as at registration: a row stored before the invisible list grew
-        // still holds a bidi override that would reorder the card around it.
-        name = escape(&client_name_display(&c.client_name)),
+        // still holds a bidi override that would reorder the card around it. The label is the
+        // resolver's, which cleans too, but a caller could pass anything.
+        name = escape(&client_name_display(label)),
+        registered = registered,
         state = state,
         origin = origin,
         last = escape(&last),
@@ -765,6 +908,23 @@ fn client_card(
         write = side("writes", &c.write),
         caps = caps,
         controls = controls,
+    )
+}
+
+/// The owner's name for one client. Prefilled with the owner's label only: the resolved label may
+/// carry an `(added ...)` stamp, and saving that back would be refused.
+fn rename_form(c: &OauthClientRecord, csrf: &dyn Fn(&str, &str) -> String) -> String {
+    format!(
+        "<form class=\"cli-name-form\" method=\"post\" action=\"/console/clients/{id}/label\">\
+<input type=\"hidden\" name=\"csrf\" value=\"{token}\">\
+<input type=\"text\" name=\"label\" value=\"{value}\" placeholder=\"{placeholder}\" \
+autocomplete=\"off\" aria-label=\"Name shown for this client\">\
+<button type=\"submit\">Save name</button>\
+<button type=\"submit\" name=\"action\" value=\"clear\">Use the registered name</button></form>",
+        id = escape(&c.client_id),
+        token = escape(&csrf(LABEL_ACTION, &c.client_id)),
+        value = escape(c.owner_label.as_deref().unwrap_or_default()),
+        placeholder = escape(&client_name_display(&c.client_name)),
     )
 }
 
@@ -1072,13 +1232,64 @@ mod tests {
         }
     }
 
+    fn card(c: &OauthClientRecord, label: &str) -> String {
+        client_card(c, label, &[], &|action, target| format!("tok-{action}-{target}"))
+    }
+
     #[test]
     fn a_stored_name_prints_without_its_bidi_override_and_stays_escaped() {
-        let card = client_card(&named("<b>Evil\u{202E}gnp.exe</b>\n"), &[], &|_, _| String::new());
+        let card = card(&named("<b>Evil\u{202E}gnp.exe</b>\n"), "<b>Evilgnp.exe</b>");
         assert!(!card.contains('\u{202E}'), "{card}");
         assert!(
             card.contains("<span class=\"cli-name\">&lt;b&gt;Evilgnp.exe&lt;/b&gt;</span>"),
             "{card}"
         );
+    }
+
+    #[test]
+    fn a_named_card_shows_the_label_and_the_registered_name_escaped() {
+        let mut c = named("Claude <x>");
+        c.consented_at = Some(Utc::now());
+        c.revoked_at = None;
+        c.owner_label = Some("Desk <1>".into());
+        let card = card(&c, "Desk <1>");
+        assert!(card.contains("<span class=\"cli-name\">Desk &lt;1&gt;</span>"), "{card}");
+        assert!(card.contains("registered as Claude &lt;x&gt;"), "{card}");
+        assert!(card.contains("action=\"/console/clients/c1/label\""), "{card}");
+        assert!(card.contains("value=\"tok-client-label-c1\""), "{card}");
+        assert!(card.contains("name=\"action\" value=\"clear\""), "{card}");
+    }
+
+    #[test]
+    fn an_unnamed_card_has_no_registered_as_line() {
+        let mut c = named("Claude");
+        c.consented_at = Some(Utc::now());
+        c.revoked_at = None;
+        let card = card(&c, "Claude");
+        assert!(!card.contains("registered as"), "{card}");
+    }
+
+    #[test]
+    fn a_revoked_card_keeps_its_rename_form() {
+        let mut c = named("Claude");
+        c.consented_at = Some(Utc::now());
+        assert!(c.revoked_at.is_some());
+        let card = card(&c, "Claude");
+        assert!(card.contains("/console/clients/c1/label"), "{card}");
+        assert!(!card.contains("/console/clients/c1/revoke"), "{card}");
+    }
+
+    #[test]
+    fn an_unapproved_card_has_no_rename_form() {
+        let mut c = named("Claude");
+        c.revoked_at = None;
+        assert!(c.consented_at.is_none());
+        let card = card(&c, "Claude");
+        assert!(!card.contains("/console/clients/c1/label"), "{card}");
+    }
+
+    #[test]
+    fn the_renamed_word_reads_as_a_sentence() {
+        assert_eq!(done_line("renamed"), Some("Name saved."));
     }
 }

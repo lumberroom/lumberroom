@@ -260,6 +260,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/console/clients/new", post(clients::create))
         .route("/console/clients/{id}/access", post(clients::access))
         .route("/console/clients/{id}/revoke", post(clients::revoke))
+        .route("/console/clients/{id}/label", post(clients::label))
         .route("/console/aliases", get(aliases::index))
         .route("/console/aliases/record", post(aliases::record))
         .route("/console/aliases/forget", post(aliases::forget))
