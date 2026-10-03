@@ -17,7 +17,7 @@ Without `--domain` the server binds `127.0.0.1:8787`, opens no public port, and 
 SSH tunnel.
 
 **How do I connect a client?**
-`./client/wire-mac.sh --url <url> --token <token>` registers the MCP server with Claude Code,
+`LUMBERROOM_TOKEN=<token> ./client/wire-mac.sh --url <url>` registers the MCP server with Claude Code,
 installs the session hook and appends the write rule. For the OAuth surfaces, the client registers
 itself and waits at the consent screen. [connect-claude-code.md](connect-claude-code.md) walks the
 Mac path end to end.

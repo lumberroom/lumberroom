@@ -1,9 +1,10 @@
 //! The portable memory-dump prompt, baked into the binary.
 //!
 //! Conversations come out of ChatGPT and claude.ai in an export archive. A memory store does not
-//! always follow: claude.ai ships a `memories` part in its export manifest, and ChatGPT has no
-//! equivalent, so the only way to reach what ChatGPT saved about a person is to ask the assistant
-//! holding it. This prompt is that ask, and the owner is the transport.
+//! always follow: claude.ai ships a `memories` part in its export manifest. OpenAI does not
+//! document saved memories as part of the ChatGPT export, and lumberroom has no reader for a
+//! ChatGPT archive. This prompt is the route to ChatGPT's saved memories: ask the assistant holding
+//! them, and the owner is the transport.
 //!
 //! **Anthropic shipped this pattern first and the format here stays compatible with theirs on
 //! purpose.** Their cross-provider import on the claude.ai memory settings page hands the owner a
