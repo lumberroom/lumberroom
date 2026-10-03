@@ -23,21 +23,46 @@ const READS: [&str; 7] = [
     "review_queue",
 ];
 
-/// Tools that delete or retire data. `readOnlyHint: false`, `destructiveHint: true`.
-const DESTRUCTIVE: [&str; 2] = ["memory_forget", "review_decide"];
+/// Tools that delete, retire or overwrite data. `readOnlyHint: false`, `destructiveHint: true`.
+///
+/// `alias_set` sits here because its upsert replaces the canonical name, since and until of an
+/// alias already recorded, and no history table keeps the earlier pairing.
+const DESTRUCTIVE: [&str; 3] = ["memory_forget", "review_decide", "alias_set"];
 
 /// Tools that add or replace a row and keep the old one reachable. `destructiveHint: false`.
-const ADDITIVE: [&str; 3] = ["memory_write", "registry_set", "alias_set"];
+const ADDITIVE: [&str; 2] = ["memory_write", "registry_set"];
 
 /// Wording that orders the model to act in a way the person has not asked for. The directory's
 /// review criteria reject it, and the owner's own agent rules already carry it.
-const ORDERS: [&str; 6] = [
+///
+/// The second half came out of the argument descriptions. Each one guarded a real trap, and the
+/// fact behind it stays in the text: what the argument does, and what goes wrong with a bad value.
+///
+/// A denylist catches the phrasings it names and nothing else. The last group are the imperatives
+/// this file's first rewrite removed, so restoring any of them fails here.
+const ORDERS: [&str; 22] = [
     "silently",
     "without asking",
     "without announcing",
     "always call",
     "before any substantive work",
     "before substantive work",
+    "pass it",
+    "omit it unless",
+    "never infer",
+    "never pass",
+    "only when the person",
+    "set it whenever",
+    "set it only when",
+    "use it first",
+    "pass true only",
+    "copy it from",
+    "omit to",
+    "omit for",
+    "do not",
+    "leave it out",
+    "only pass",
+    "should reflect",
 ];
 
 #[test]
@@ -120,9 +145,10 @@ fn the_additive_writers_are_not_destructive() {
     }
 }
 
-/// `alias_set` is an upsert on (namespace, alias), so repeating a call leaves the same row. The
-/// others append a version or a row each time, and claiming otherwise would let a client retry
-/// them blindly.
+/// `alias_set` is an upsert on (namespace, alias), so repeating the same call leaves the same row.
+/// Idempotent and destructive are separate claims: a call with a new canonical name still
+/// overwrites the old one. The others append a version or a row each time, and claiming otherwise
+/// would let a client retry them blindly.
 #[test]
 fn idempotent_is_claimed_only_for_the_upsert() {
     for tool in tool_definitions() {
@@ -146,4 +172,67 @@ fn no_description_or_instruction_orders_the_model_to_act() {
         assert!(!text.contains('\u{2014}'), "{what} contains an em dash");
         assert!(!text.trim().is_empty(), "{what} is empty");
     }
+}
+
+/// Every `description` string in a schema, at any depth, with the path that reached it. Nested
+/// `items` and `$defs` carry descriptions a client shows beside the argument, so stopping at the
+/// top level would miss them.
+fn schema_descriptions(value: &serde_json::Value, path: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let here = format!("{path}.{key}");
+                match (key.as_str(), child) {
+                    ("description", serde_json::Value::String(text)) => {
+                        out.push((here, text.clone()))
+                    }
+                    _ => schema_descriptions(child, &here, out),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                schema_descriptions(child, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A model reads an argument description in the same pass as the tool description, so an order
+/// moved from one into the other is still an order. Walks every tool, gated or not.
+#[test]
+fn no_argument_description_orders_the_model_to_act() {
+    for tool in tool_definitions() {
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        let mut found = Vec::new();
+        schema_descriptions(&schema, &tool.name, &mut found);
+        for (what, text) in found {
+            // schemars keeps the doc comment's line breaks, so "never\npass" has to match too.
+            let lower = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+            for order in ORDERS {
+                assert!(!lower.contains(order), "{what} contains {order:?}: {text}");
+            }
+            assert!(!text.contains('\u{2014}'), "{what} contains an em dash");
+            assert!(!text.trim().is_empty(), "{what} is empty");
+        }
+    }
+}
+
+/// A walk that finds no descriptions passes every assertion in the test above, so this one pins the
+/// other side: every argument of every tool carries a description a client can show. A new argument
+/// without a doc comment fails here by name, where a count floor would let it through.
+#[test]
+fn every_argument_of_every_tool_carries_a_description() {
+    let mut arguments = 0;
+    for tool in tool_definitions() {
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        let properties = schema.get("properties").and_then(|p| p.as_object());
+        for (name, property) in properties.into_iter().flatten() {
+            arguments += 1;
+            let described = property.get("description").and_then(|d| d.as_str()).unwrap_or("");
+            assert!(!described.trim().is_empty(), "{}.{name} has no description", tool.name);
+        }
+    }
+    assert!(arguments > 0, "no tool exposes any argument, so the schema shape changed");
 }

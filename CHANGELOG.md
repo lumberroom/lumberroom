@@ -75,6 +75,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Tool arguments describe what they do instead of telling the model what to do.** Every
+  argument description on the 12 tools now states what a value means, what the server does with
+  it and what it refuses. "Pass it whenever you know it", "Omit it unless" and "Never infer a
+  date" became the facts behind them: a tag the fact was never filed under makes the search report
+  nothing known, a wrong `as_of` can hide a current fact or return a retired one, and a date within
+  the last day fails the write unless the fact states it. Six arguments that had no description
+  gained one. `registry_history`'s `namespace` no longer claims a project lookup the tool never
+  makes, and `alias_set` declares `destructiveHint`, since it overwrites an alias row in place.
+  `tests/mcp_tool_annotations.rs` walks every argument schema and fails on an order or a missing
+  description.
 - **Dependencies.** argon2 0.6 (#41): `lumberroom-server hash-password` passes its 16-byte OS
   salt to `hash_password_with_salt`, and hashes from 0.5 and 0.6 verify under both, so an existing
   `OWNER_PASSWORD_HASH` keeps working. tower-http 0.7 (#66), where the server uses only

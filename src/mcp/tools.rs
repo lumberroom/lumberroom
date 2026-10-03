@@ -34,12 +34,14 @@ use crate::domain::errors::{DomainError, Result};
 /// form and the sentence about bare months close that gap. Keep both.
 pub const OCCURRED_AT_DESCRIPTION: &str = "When this fact became true in the world. Two forms are \
 accepted: a date, `2026-03-01`, read as midnight UTC, or a full RFC 3339 instant, \
-`2026-03-01T09:30:00Z`. A bare month or year has no form here, so \"since March\" is omitted \
-rather than turned into a day you chose. Set it whenever the time is stated rather than worked \
-out: by the user, as in \"we moved to Postgres 16 on 4 June 2026\", or by the fact itself naming \
-the day an event happened, as in \"the regulator approved it on 19 August 2026\". Never infer a \
-date from context, and never pass today's date because today is when you heard it: the store \
-already records that separately.";
+`2026-03-01T09:30:00Z`. A bare month or year has no form here, so \"since March\" leaves the \
+argument absent rather than carrying a day nobody stated. The argument holds a time that was \
+stated rather than worked out: by the user, as in \"we moved to Postgres 16 on 4 June 2026\", or \
+by the fact itself naming the day an event happened, as in \"the regulator approved it on 19 \
+August 2026\". A date inferred from context is a guess the store then reports as fact. A stated \
+time left out is lost: the row then reads as true since the store heard it. By default a date \
+within the last day is refused unless the fact's text states it, because the store already records \
+when it heard the fact, so today's date alone fails the write. A future date is refused.";
 
 /// The `as_of` argument on `memory_search`, and the one place its wording lives.
 ///
@@ -47,11 +49,13 @@ already records that separately.";
 /// sentences have to disagree about nothing: one says when a fact became true, the other asks what
 /// held at an instant, and a model reading them together must not conclude it may invent either.
 pub const AS_OF_DESCRIPTION: &str = "What the store held at this instant, as a date, \
-`2026-03-01`, read as midnight UTC, or a full RFC 3339 instant. Pass it only when the person named \
-a time. Working one out from the question is a guess, and a guess here is worse than no argument \
-at all: the filter drops every fact that started after the instant you chose, so a date that is too \
-early answers \"nothing is known\" about facts the store holds. Omit it and the search answers as \
-of now, which is what almost every question wants.";
+`2026-03-01`, read as midnight UTC, or a full RFC 3339 instant. The filter drops every fact that \
+started after the instant, so an instant earlier than a fact's start hides that fact and the search \
+answers \"nothing is known\" about something the store holds. An instant the person named reflects \
+what they asked; one worked out from the question is a guess. A wrong guess can hide a fact that \
+holds now or return one a later correction retired, and leaving as_of absent risks neither. When \
+absent, the search answers as of now, which is what almost every question wants. It needs a credential that may read history, and it cannot be set beside \
+include_superseded.";
 
 /// The date form, accepted beside RFC 3339 and read as midnight UTC.
 const DATE_ONLY: &str = "%Y-%m-%d";
@@ -133,13 +137,17 @@ fn clip(value: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Phrases a model has to see. Each one is a prohibition that a rewrite for brevity would drop
-    /// first, so the test names them rather than checking the length of the string.
-    const REQUIRED: [&str; 4] = [
-        "never pass today's date",
-        "Never infer a date from context",
-        "the store already records that separately",
+    /// Phrases a model has to see. Each one states a trap that a rewrite for brevity would drop
+    /// first, so the test names them rather than checking the length of the string. They used to
+    /// be prohibitions; connector review rejects orders, so each now states the consequence.
+    const REQUIRED: [&str; 7] = [
+        "is refused unless the fact's text states it",
+        "today's date alone fails the write",
+        "A stated time left out is lost",
+        "A date inferred from context is a guess",
+        "the store already records when it heard the fact",
         "A bare month or year has no form here",
+        "stated rather than worked out",
     ];
 
     fn squash(text: &str) -> String {
@@ -220,7 +228,7 @@ mod tests {
 
     /// The fence itself. An edit that softens the wording fails here rather than passing review.
     #[test]
-    fn description_keeps_every_prohibition() {
+    fn description_keeps_every_trap() {
         for phrase in REQUIRED {
             assert!(
                 OCCURRED_AT_DESCRIPTION.contains(phrase),
@@ -250,8 +258,11 @@ mod tests {
 
         assert_eq!(squash(described), squash(AS_OF_DESCRIPTION));
         for phrase in [
-            "only when the person named a time",
+            "An instant the person named",
             "is a guess",
+            "return one a later correction retired",
+            "leaving as_of absent risks neither",
+            "earlier than a fact's start hides that fact",
             "nothing is known",
             "answers as of now",
         ] {
