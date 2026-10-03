@@ -1,4 +1,4 @@
-//! MCP surface: the four tools from PRD §5, plus five behind a capability each.
+//! MCP surface: twelve tools, seven open to every client and five behind a capability each.
 //!
 //! `src/mcp/capability.rs` holds which grant opens which tool, and `list_tools` filters on it so a
 //! client never sees a tool it cannot call. The filter shapes what a model tries; every service
@@ -112,40 +112,50 @@ pub struct SearchArgs {
     // `as_of` asks for one it was given, and two guesses compound.
     /// What you want to know, in natural language. Full sentences retrieve better than keywords.
     pub query: String,
-    /// Restrict the search to exactly these namespaces. Omit it unless you have a reason.
+    /// The namespaces to search. When absent, the search covers the user namespace, global and the
+    /// project's namespace when project is set, as primary hits, then every other namespace the
+    /// credential can read at a lower rank unless the operator turned that wider reach off. A
+    /// non-empty list searches only the listed namespaces and their aliases, so it narrows the
+    /// search. Namespaces the credential cannot read are left out either way.
     #[serde(default)]
     pub namespaces: Option<Vec<String>>,
     /// Maximum rows. Default 8.
     #[serde(default)]
     pub limit: Option<i64>,
-    /// Slug or path of the project you are in. Pass it whenever you know it.
+    /// Slug or path of the current project. Its namespace joins the user namespace and global in
+    /// the default set, so its facts rank as primary hits. When the operator turned off the wider
+    /// reach, a project not named here or in namespaces is not searched at all. It has no effect
+    /// when namespaces is set.
     #[serde(default)]
     pub project: Option<String>,
-    /// Include facts that a later correction replaced. Off by default, because a superseded fact
-    /// read as current is worse than a missing one. Pass true only to answer "what did we believe
-    /// before".
+    /// true includes facts that a later correction replaced, which answers "what did we believe
+    /// before". Off by default, because a superseded fact read as current is worse than a missing
+    /// one. It needs a credential that may read history, and it cannot be set beside as_of.
     #[serde(default)]
     pub include_superseded: Option<bool>,
     /// What the store held at this instant, as a date, `2026-03-01`, read as midnight UTC, or a
-    /// full RFC 3339 instant. Pass it only when the person named a time. Working one out from the
-    /// question is a guess, and a guess here is worse than no argument at all: the filter drops
-    /// every fact that started after the instant you chose, so a date that is too early answers
-    /// "nothing is known" about facts the store holds. Omit it and the search answers as of now,
-    /// which is what almost every question wants.
+    /// full RFC 3339 instant. The filter drops every fact that started after the instant, so an
+    /// instant earlier than a fact's start hides that fact and the search answers "nothing is
+    /// known" about something the store holds. An instant the person named reflects what they
+    /// asked; one worked out from the question is a guess. A wrong guess can hide a fact that holds
+    /// now or return one a later correction retired, and leaving as_of absent risks neither. When
+    /// absent, the search answers as of now, which is what almost every question wants. It needs a credential that may read history, and it cannot be set
+    /// beside include_superseded.
     #[serde(default)]
     pub as_of: Option<String>,
-    /// Keep only facts carrying every one of these tags. Omit it unless the person asked for a tag
-    /// or you know the tag the fact was filed under: a fact filed without the tag is dropped, and
-    /// the search then reports nothing known about something the store holds.
+    /// Keeps only facts carrying every one of these tags. A fact filed without one of them is
+    /// dropped, so a tag the fact was never filed under makes the search report nothing known about
+    /// something the store holds. Absent or empty, no tag filter applies.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WriteArgs {
-    /// The durable fact, self-contained, still making sense in six months with no surrounding
-    /// conversation. Name the subject. Keep the numbers, identifiers, paths and dates, and the
-    /// cause or reversal condition the fact turns on; drop the trail of how you came to believe it.
+    /// The durable fact, self-contained, so it still makes sense in six months with no surrounding
+    /// conversation. A fact that names its subject and keeps its numbers, identifiers, paths, dates
+    /// and the cause or reversal condition it turns on stays usable; the trail of how it came to be
+    /// believed adds nothing a later reader needs.
     pub content: String,
     /// 'user:me' for facts about the person, 'project:<slug>' for one codebase, 'global' for facts
     /// true everywhere, 'personal:<slug>' such as 'personal:finance' for a private area of life.
@@ -163,12 +173,14 @@ pub struct WriteArgs {
     pub sensitivity: Option<String>,
     /// When this fact became true in the world. Two forms are accepted: a date, `2026-03-01`, read
     /// as midnight UTC, or a full RFC 3339 instant, `2026-03-01T09:30:00Z`. A bare month or year
-    /// has no form here, so "since March" is omitted rather than turned into a day you chose. Set
-    /// it whenever the time is stated rather than worked out: by the user, as in "we moved to
-    /// Postgres 16 on 4 June 2026", or by the fact itself naming the day an event happened, as in
-    /// "the regulator approved it on 19 August 2026". Never infer a date from context, and never
-    /// pass today's date because today is when you heard it: the store already records that
-    /// separately.
+    /// has no form here, so "since March" leaves the argument absent rather than carrying a day
+    /// nobody stated. The argument holds a time that was stated rather than worked out: by the
+    /// user, as in "we moved to Postgres 16 on 4 June 2026", or by the fact itself naming the day
+    /// an event happened, as in "the regulator approved it on 19 August 2026". A date inferred from
+    /// context is a guess the store then reports as fact. A stated time left out is lost: the row
+    /// then reads as true since the store heard it. By default a date within the last day is
+    /// refused unless the fact's text states it, because the store already records when it heard
+    /// the fact, so today's date alone fails the write. A future date is refused.
     pub occurred_at: Option<String>,
 }
 
@@ -178,9 +190,12 @@ pub struct RegistryArgs {
     pub kind: String,
     /// Exact key. This lookup does not guess or fuzzy-match.
     pub key: String,
-    /// Where to look. Omit to check the project, then the user namespace, then global.
+    /// Where to look. When absent, the lookup checks the project's namespace, then the user
+    /// namespace, then global, and the first match answers.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Slug or path of the current project. When namespace is absent, its namespace is checked
+    /// first, so a project override beats a global default.
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -192,8 +207,9 @@ pub struct ForgetArgs {
     /// Why it is being deleted, recorded with the deletion. Required: a delete with no reason is
     /// indistinguishable from a mistake a month later.
     pub reason: String,
-    /// List what would go without deleting anything. Use it first whenever the user's instruction
-    /// was not explicit about this exact memory.
+    /// true lists what would go and deletes nothing, so the person can see the exact memory before
+    /// a delete removes it. A delete on an instruction that did not name this exact memory can
+    /// remove the wrong one, and nothing restores it.
     #[serde(default)]
     pub dry_run: Option<bool>,
 }
@@ -283,13 +299,15 @@ that wrote it. tags keeps only facts carrying all of them.",
         name = "memory_write",
         title = "Save a memory",
         description = "Records one durable fact: a decision, a stated preference, a constraint, a \
-host or service detail, a convention. The content should stand alone in six months and carry the \
-numbers, identifiers, paths and dates the fact needs, with the cause or reversal condition when the \
-fact turns on one. One fact per call, so a second fact is a second call. Transient chatter and file \
-contents do not belong in it. The response can carry possible_conflicts, older facts close to the \
-new one. When one of them states the old version of the fact just written, a second call with the \
-same content and supersedes set to that memory's id retires it, and the old row stays readable in \
-memory_history. A different fact that merely sounds similar needs no action.",
+host or service detail, a convention. Content that names its subject and keeps the numbers, \
+identifiers, paths, dates and the cause or reversal condition stays usable in six months, when a \
+reader sees only the row. Each call stores one row; transient chatter or a file's contents stored \
+here come back in every later search. The response can carry possible_conflicts, older facts close \
+to the new one, and the new row is already stored either way. When one of them states the old \
+version of the fact just written, a second call with the same content and supersedes set to that \
+memory's id retires it and stores the content again, so the row from the first call stays live \
+beside the new one until a review merges them. The old row stays readable in memory_history. \
+possible_conflicts can also list a different fact that only sounds similar.",
         annotations(
             title = "Save a memory",
             read_only_hint = false,
