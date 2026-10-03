@@ -11,8 +11,7 @@
 
 use crate::console::pages::FAVICON;
 use crate::domain::oauth::{
-    claimed_known_client, client_name_display, redirect_destination, GrantProfile,
-    RedirectDestination,
+    client_name_display, mismatched_claim, redirect_destination, GrantProfile, RedirectDestination,
 };
 
 /// The mark, above the heading on all three pages.
@@ -254,7 +253,8 @@ every surface, until you revoke it.</p>\
 /// Only loopback draws no warning. A known host such as claude.ai serves many accounts, so it
 /// proves the service and not the person: anyone can add a connector in their own account that
 /// points here, then send the victim the authorize link. The recognised host gets a short warning
-/// about that link and no mismatch alarm.
+/// about that link. It also gets the mismatch alarm when the name claims a different service,
+/// "Claude" sending codes to chatgpt.com, since a recognised host vouches only for its own brand.
 fn self_registered_notice(client: &ClientView) -> (String, String) {
     let destination = redirect_destination(client.redirect_uri);
     let target = match &destination {
@@ -275,15 +275,31 @@ fn self_registered_notice(client: &ClientView) -> (String, String) {
         return (line, String::new());
     }
 
-    if destination.recognised() {
-        let warning =
-            "<p class=\"warn\">Allow only if you pressed Connect in your own account just \
-now. A link someone sent you connects their account.</p>"
-                .to_string();
+    let claimed = mismatched_claim(client.client_name, &destination);
+
+    if let Some(owner) = destination.service() {
+        // The brand and the owner come from the known-service table, never from the registrant.
+        // They go through `escape` anyway, so a table entry with an ampersand still renders.
+        let (class, mismatch) = match claimed {
+            Some(brand) => (
+                "warn alarm",
+                format!(
+                    "This client calls itself {brand}, but codes go to {target}, which belongs \
+to {owner}. ",
+                    brand = escape(brand),
+                    owner = escape(owner),
+                ),
+            ),
+            None => ("warn", String::new()),
+        };
+        let warning = format!(
+            "<p class=\"{class}\">{mismatch}Allow only if you pressed Connect in your own account \
+just now. A link someone sent you connects their account.</p>"
+        );
         return (line, warning);
     }
 
-    let (class, mismatch) = match claimed_known_client(client.client_name) {
+    let (class, mismatch) = match claimed {
         Some(brand) => (
             "warn alarm",
             format!(
@@ -582,6 +598,86 @@ mod tests {
     fn a_borrowed_name_hidden_behind_case_and_invisible_characters_is_still_called_out() {
         let page = render(&registered("my CHAT\u{200B}GPT helper", "https://attacker.example/cb"));
         assert!(page.contains("is not where ChatGPT"));
+    }
+
+    // ---- a claimed brand against its own service's hosts ----
+
+    const CHATGPT_CB: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+    const CLAUDE_CB: &str = "https://claude.ai/api/mcp/auth_callback";
+    const ALARM: &str = "class=\"warn alarm\"";
+
+    #[test]
+    fn a_brand_at_its_own_services_host_gets_the_shared_account_reminder_alone() {
+        for (name, uri) in [
+            ("ChatGPT", CHATGPT_CB),
+            ("OpenAI connector", CHATGPT_CB),
+            ("Anthropic", "https://claude.com/api/mcp/auth_callback"),
+        ] {
+            let page = render(&registered(name, uri));
+            assert!(page.contains(FORWARDED), "{name}");
+            assert!(!page.contains(ALARM), "{name}");
+        }
+    }
+
+    #[test]
+    fn claude_sending_codes_to_chatgpt_raises_the_alarm_and_keeps_the_reminder() {
+        let page = render(&registered("Claude", CHATGPT_CB));
+        assert!(page.contains(ALARM));
+        assert!(page.contains(
+            "This client calls itself Claude, but codes go to <b>chatgpt.com</b>, which belongs \
+to ChatGPT."
+        ));
+        assert!(page.contains(FORWARDED));
+    }
+
+    #[test]
+    fn chatgpt_sending_codes_to_claude_raises_the_alarm_and_keeps_the_reminder() {
+        let page = render(&registered("ChatGPT", CLAUDE_CB));
+        assert!(page.contains(ALARM));
+        assert!(page.contains(
+            "This client calls itself ChatGPT, but codes go to <b>claude.ai</b>, which belongs \
+to Claude."
+        ));
+        assert!(page.contains(FORWARDED));
+    }
+
+    #[test]
+    fn an_unknown_name_at_a_recognised_host_gets_the_reminder_and_no_alarm() {
+        for uri in [CLAUDE_CB, CHATGPT_CB] {
+            let page = render(&registered("Zed", uri));
+            assert!(page.contains(FORWARDED), "{uri}");
+            assert!(!page.contains(ALARM), "{uri}");
+        }
+    }
+
+    #[test]
+    fn a_crossed_brand_survives_case_spacing_and_a_numbered_suffix() {
+        for name in ["CLAUDE", "  claude   code ", "Claude (2)", "Cl\u{200B}aude"] {
+            let page = render(&registered(name, CHATGPT_CB));
+            assert!(page.contains(ALARM), "{name:?}");
+            assert!(page.contains("calls itself Claude"), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_brand_name_at_loopback_still_draws_no_warning() {
+        let page = render(&registered("Claude Code", "http://127.0.0.1:53682/callback"));
+        assert!(!page.contains("class=\"warn"));
+    }
+
+    #[test]
+    fn a_brand_name_at_a_private_use_scheme_keeps_the_existing_alarm() {
+        let page = render(&registered("Claude", "com.anthropic.claude:/cb"));
+        assert!(page.contains(ALARM));
+        assert!(page.contains("<b>com.anthropic.claude</b> is not where Claude"));
+        assert!(page.contains(UNVOUCHED));
+    }
+
+    #[test]
+    fn a_hostile_name_at_a_crossed_host_renders_no_markup() {
+        let page = render(&registered("<img src=x onerror=alert(1)>Claude", CHATGPT_CB));
+        assert!(page.contains(ALARM));
+        assert!(!page.contains("<img src=x"));
     }
 
     #[test]

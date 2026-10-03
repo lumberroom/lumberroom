@@ -127,6 +127,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The consent page catches a client that claims one service and sends codes to another.** A
+  self-registered client named Claude that redirected to chatgpt.com used to draw only the
+  shared-account reminder, because every recognised host shared one allowlist. Each known service
+  now owns its hosts, and a claimed brand at another service's host raises the mismatch alarm
+  naming both (#91).
 - **A search no longer rewrites every index on `memory`.** The touch after each search changed
   `last_accessed_at`, which the partial index `memory_never_accessed` named in its predicate, so
   Postgres could never apply it in place and wrote a new entry into every index, the HNSW graph
