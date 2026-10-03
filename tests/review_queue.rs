@@ -21,8 +21,8 @@ use lumberroom_server::domain::types::{Invocation, Memory, Principal, Sensitivit
 use lumberroom_server::mcp::AppState;
 use lumberroom_server::ports::OauthStore;
 use lumberroom_server::services::review_queue::{
-    self, Decision, ProposalDecided, ProposalDecision, ProposalField, ProposalItem, ProposalSource,
-    QueueQuery, Source, Verdict, Via,
+    self, Decided, Decision, ProposalDecided, ProposalDecision, ProposalField, ProposalItem,
+    ProposalSource, QueueQuery, Source, Verdict, Via,
 };
 use lumberroom_server::services::{review, write, Ctx, Repos};
 use sqlx::PgPool;
@@ -1153,6 +1153,100 @@ async fn a_merge_whose_second_retirement_fails_reports_the_leftover_in_unfinishe
         "the expired row is reported rather than silently dropped: {:?}",
         decided.unfinished
     );
+}
+
+/// Merges a conflict pair into `content` and returns what the queue answered.
+async fn merge_into(h: &Harness, older: &str, newer: &str, content: &str) -> Decided {
+    review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{older}:{newer}"),
+            verdict: Verdict::Merge,
+            keep: None,
+            id: None,
+            content: Some(content.into()),
+            tags: None,
+            occurred_at: None,
+            reason: None,
+            version: None,
+            via: Via::Http,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn live_holding(pool: &PgPool, content: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM memory WHERE content = $1 AND superseded_by IS NULL",
+    )
+    .bind(content)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|u| u.to_string())
+    .collect()
+}
+
+/// A reviewer who keeps the newer source's wording merges into text that row already holds.
+#[tokio::test]
+async fn a_merge_whose_content_is_the_newer_source_retires_both_sources() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let older =
+        write_at(&h.ctx, &format!("the gate code is 4411 {}", nonce("mnew")), "global").await;
+    set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
+    let text = format!("the gate code is 4412 {}", nonce("mnew"));
+    let newer = write_at(&h.ctx, &text, "global").await;
+
+    let decided = merge_into(&h, &older, &newer, &text).await;
+    let written = decided.written.expect("the merge names the row holding the fact");
+    assert!(decided.unfinished.is_empty(), "{:?}", decided.unfinished);
+    assert!(!live(&h.pool, &older).await.1 && !live(&h.pool, &newer).await.1);
+    assert_eq!(live_holding(&h.pool, &text).await, vec![written]);
+}
+
+/// A reviewer who keeps the older source's wording merges into text that row already holds. The
+/// written row must not come back as a retirement the merge failed to make.
+#[tokio::test]
+async fn a_merge_whose_content_is_the_older_source_reports_nothing_unfinished() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let text = format!("the gate code is 5511 {}", nonce("mold"));
+    let older = write_at(&h.ctx, &text, "global").await;
+    set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
+    let newer =
+        write_at(&h.ctx, &format!("the gate code is 5512 {}", nonce("mold")), "global").await;
+
+    let decided = merge_into(&h, &older, &newer, &text).await;
+    let written = decided.written.expect("the merge names the row holding the fact");
+    assert!(decided.unfinished.is_empty(), "{:?}", decided.unfinished);
+    assert!(!live(&h.pool, &newer).await.1, "the newer source retired");
+    assert_eq!(live_holding(&h.pool, &text).await, vec![written]);
+}
+
+/// Two live rows with the same content, the shape repeated supersedes writes left in older
+/// stores. Merging them into that content leaves one live row.
+#[tokio::test]
+async fn a_merge_of_an_identical_pair_leaves_one_live_row() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let text = format!("the gate code is 6611 {}", nonce("mpair"));
+    let older = write_at(&h.ctx, &text, "global").await;
+    set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
+    let newer =
+        write_at(&h.ctx, &format!("the gate code is 6612 {}", nonce("mpair")), "global").await;
+    sqlx::query("UPDATE memory SET content = $2 WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&newer).unwrap())
+        .bind(&text)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let decided = merge_into(&h, &older, &newer, &text).await;
+    let written = decided.written.expect("the merge names the row holding the fact");
+    assert!(decided.unfinished.is_empty(), "{:?}", decided.unfinished);
+    assert!(!live(&h.pool, &older).await.1 && !live(&h.pool, &newer).await.1);
+    assert_eq!(live_holding(&h.pool, &text).await, vec![written]);
 }
 
 #[tokio::test]

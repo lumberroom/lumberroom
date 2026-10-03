@@ -197,6 +197,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   spaces, so a crafted callback URL cannot send an escape sequence to the terminal. Without a
   description the line reads as before. Gate: `./scripts/cargo.sh test -j 1 -p lumberroom --lib
   oauth::`.
+- **Replacing a fact through `supersedes` leaves one live row.** The documented `memory_write`
+  flow stores the correction, reads the old row back from `possible_conflicts`, and repeats the
+  write with `supersedes` set. The repeat used to skip the exact-duplicate check and insert a
+  second copy of the correction, and the review queue then paired the two copies as a conflict.
+  It now retires the target in favour of the live row that already holds the content, confirms
+  that row, and answers with its id, `deduplicated: true` and `superseded` set. The write still
+  stores its own row when the content is the target's own, when the caller may write the
+  namespace but not read it, when it sends a tag the existing row lacks, or when its
+  `occurred_at` differs from the existing row's at microsecond precision. A review queue merge
+  into one source's own text leaves one live row and reports nothing unfinished. Gate:
+  `./scripts/cargo.sh test -j 1 --test integration supersedes_` and `./scripts/cargo.sh test -j 1
+  --test review_queue a_merge_`.
 
 ### Security
 

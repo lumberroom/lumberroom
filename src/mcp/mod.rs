@@ -305,8 +305,8 @@ reader sees only the row. Each call stores one row; transient chatter or a file'
 here come back in every later search. The response can carry possible_conflicts, older facts close \
 to the new one, and the new row is already stored either way. When one of them states the old \
 version of the fact just written, a second call with the same content and supersedes set to that \
-memory's id retires it and stores the content again, so the row from the first call stays live \
-beside the new one until a review merges them. The old row stays readable in memory_history. \
+memory's id retires it in favour of the row the first call stored, which leaves one live row for \
+the fact. The old row stays readable in memory_history. \
 possible_conflicts can also list a different fact that only sounds similar.",
         annotations(
             title = "Save a memory",
