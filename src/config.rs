@@ -1076,6 +1076,21 @@ fn validate_conflict_sweep(q: &QualityConfig) -> Result<()> {
     Ok(())
 }
 
+/// The conflict wake listener opens its `PgListener` from the shared pool and keeps that
+/// connection for the life of the process. With a pool of one, every request then waits
+/// `DB_ACQUIRE_TIMEOUT_SECS` and fails, and nothing at boot shows it.
+fn validate_listener_pool(db: &DbConfig, q: &QualityConfig) -> Result<()> {
+    if q.conflict_sweep_secs > 0 && db.max_connections < 2 {
+        return Err(DomainError::validation(format!(
+            "DB_MAX_CONNECTIONS is {}, but CONFLICT_SWEEP_SECS={} starts a listener that holds one \
+             pooled connection for the life of the process, which leaves none for requests. Set \
+             DB_MAX_CONNECTIONS to at least 2, or set CONFLICT_SWEEP_SECS=0 to turn the sweeper off.",
+            db.max_connections, q.conflict_sweep_secs
+        )));
+    }
+    Ok(())
+}
+
 /// What `AUTH_MODE=oidc` needs before the server will answer with an external issuer's tokens.
 /// Split out so a test can reach it without assembling a whole `Config`.
 fn validate_oidc(auth: &AuthConfig) -> Result<()> {
@@ -1145,6 +1160,7 @@ fn validate(cfg: &Config) -> Result<()> {
     validate_cleanup(&cfg.cleanup)?;
     validate_db(&cfg.db)?;
     validate_conflict_sweep(&cfg.quality)?;
+    validate_listener_pool(&cfg.db, &cfg.quality)?;
 
     // Every mode honours static tokens, so a deployment with no token and no other credential
     // source can authenticate nobody. That is a configuration error rather than a lockout to
@@ -1489,6 +1505,28 @@ mod tests {
         let mut q = valid_quality();
         q.conflict_sweep_secs = 0;
         assert!(validate_conflict_sweep(&q).is_ok());
+    }
+
+    #[test]
+    fn one_connection_with_the_sweeper_on_is_refused() {
+        let db = DbConfig { max_connections: 1, ..DbConfig::default() };
+        let e = validate_listener_pool(&db, &valid_quality()).unwrap_err();
+        assert!(e.client_message().contains("DB_MAX_CONNECTIONS"), "{}", e.client_message());
+        assert!(e.client_message().contains("CONFLICT_SWEEP_SECS"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn one_connection_with_the_sweeper_off_is_accepted() {
+        let db = DbConfig { max_connections: 1, ..DbConfig::default() };
+        let mut q = valid_quality();
+        q.conflict_sweep_secs = 0;
+        assert!(validate_listener_pool(&db, &q).is_ok());
+    }
+
+    #[test]
+    fn two_connections_with_the_sweeper_on_are_accepted() {
+        let db = DbConfig { max_connections: 2, ..DbConfig::default() };
+        assert!(validate_listener_pool(&db, &valid_quality()).is_ok());
     }
 
     #[test]

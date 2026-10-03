@@ -212,7 +212,7 @@ queue still reads pairs the old way in this release, so recording changes nothin
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CONFLICT_SWEEP_SECS` | `60` | Seconds between timer sweeps. The timer covers a wake the listener lost. `0` stops all pair recording: no listener, no sweeps, and every new row stays pending. |
+| `CONFLICT_SWEEP_SECS` | `60` | Seconds between timer sweeps. The timer covers a wake the listener lost. `0` stops all pair recording: no listener, no sweeps, and every new row stays pending. Above `0`, the listener holds one pooled connection for the life of the process, so boot refuses `DB_MAX_CONNECTIONS` below 2. |
 | `CONFLICT_SWEEP_BUDGET_MS` | `5000` | Time one sweep may spend on the tenant before it yields. Boot refuses a value below 100 or above 25000. |
 
 Behind a connection pooler in transaction mode `LISTEN` does not hold and every wake goes missing.
