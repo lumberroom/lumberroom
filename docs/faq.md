@@ -107,7 +107,7 @@ citations.
 **Why was my write refused?**
 Four common reasons. The content tripped the credential tripwire, which refuses anything shaped like
 a secret. The namespace classifies `private` and no key is configured, so the server refuses rather
-than storing it in the clear. `occurred_at` fell inside the near-now fence. Or the write asked for a
+than storing it in the clear. `occurred_at` fell inside the near-now fence or lay in the future. Or the write asked for a
 sensitivity the credential's ceiling does not reach. The refusal names which.
 
 **How do I delete something for good?**

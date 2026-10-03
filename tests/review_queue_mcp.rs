@@ -620,6 +620,58 @@ async fn a_bare_date_on_occurred_at_is_refused_because_the_tool_takes_rfc_3339_o
     assert!(text(&result).contains("occurred_at"), "{}", text(&result));
 }
 
+/// A future `occurred_at` is refused for being in the future. The refusal used to say the date was
+/// inside the last 86400 seconds, which a caller sending next year's date cannot act on.
+#[tokio::test]
+async fn memory_write_refuses_a_future_date_by_naming_the_future() {
+    let h = ctx_or_skip!(|_| {});
+    let ahead = (Utc::now() + Duration::days(400)).date_naive().format("%Y-%m-%d").to_string();
+
+    let result = h
+        .call(
+            "memory_write",
+            serde_json::json!({
+                "content": format!("the rota changes {}", nonce("f1")),
+                "namespace": "global",
+                "occurred_at": ahead,
+            }),
+        )
+        .await;
+    assert!(refused(&result), "{result:?}");
+    let message = text(&result);
+    assert!(
+        message.contains(&format!("occurred_at {ahead}T00:00:00+00:00 is in the future")),
+        "{message}"
+    );
+    assert!(!message.contains("inside the last"), "{message}");
+}
+
+/// The merge path writes through the same fence, so it draws the same message.
+#[tokio::test]
+async fn a_merge_with_a_future_date_is_refused_by_naming_the_future() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
+    let id =
+        write_at(&h.ctx, &format!("the merge target still holds {}", nonce("f2")), "global").await;
+    make_stale(&h.pool, &id).await;
+    let ahead = (Utc::now() + Duration::days(400)).to_rfc3339();
+
+    let result = h
+        .call(
+            "review_decide",
+            serde_json::json!({
+                "key": format!("stale:{id}"),
+                "verdict": "merge",
+                "content": "the merged fact",
+                "occurred_at": ahead,
+            }),
+        )
+        .await;
+    assert!(refused(&result), "{result:?}");
+    let message = text(&result);
+    assert!(message.contains("is in the future"), "{message}");
+    assert!(!message.contains("inside the last"), "{message}");
+}
+
 #[tokio::test]
 async fn a_proposal_decided_through_the_tool_without_a_reason_is_refused_reason_required() {
     let h = ctx_or_skip!(|_| {});

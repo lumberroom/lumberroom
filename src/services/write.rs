@@ -645,7 +645,8 @@ async fn validate_supersedes_target(ctx: &Ctx, raw: &str) -> Result<(uuid::Uuid,
 /// A valid time this close to now repeats `created_at`, which every row carries already, so the
 /// refusal destroys no information and the writes it stops are the ones where the column would say
 /// nothing. It refuses a future date too: a date ahead of now is inside every window, which is why
-/// there is one bound here and one message rather than two of each.
+/// one setting covers both. Each case gets its own message, because a caller told that next year
+/// sits inside the last day cannot act on the reason.
 ///
 /// **The message never offers an older date as the fix, and that wording is the fence.** A model
 /// told to send an older date sends one it invented. An invented date lands outside the window,
@@ -659,6 +660,17 @@ fn fence_occurred_at(
     content: &str,
 ) -> Result<()> {
     let Some(stated) = occurred_at else { return Ok(()) };
+    // Ahead of the window arithmetic, so the refusal holds at any window size and the content
+    // exemption below never sees a future date. Content asserting a future date is a plan rather
+    // than a record, and a future `occurred_at` reads live and never reads as-of.
+    if stated > now {
+        return Err(DomainError::validation(format!(
+            "occurred_at {} is in the future. Omit occurred_at. It records when a fact became true \
+             in the world, so a date that has not happened yet is refused. Sending some other date \
+             in place of omitting it stores a guess.",
+            stated.to_rfc3339()
+        )));
+    }
     // `try_from` rather than `as`: config refuses anything above a year, and a value that wrapped
     // negative here would widen the fence into accepting everything.
     let required = i64::try_from(min_age_secs).unwrap_or(i64::MAX);
@@ -674,12 +686,8 @@ fn fence_occurred_at(
     // is that a date nobody can check reads afterwards exactly like a date the owner stated. A date
     // written verbatim in the content is checkable forever, by anyone, against the row itself. It
     // is corroboration stored beside the claim, which is the one thing an invented timestamp can
-    // never have.
-    //
-    // The future stays shut. A date ahead of now is refused whatever the text says, because content
-    // asserting a future date is a plan rather than a record, and a future `occurred_at` reads live
-    // and never reads as-of.
-    if stated <= now && crate::domain::dates::states(content, stated.date_naive()) {
+    // never have. The future refusal above runs first, so no text opens it.
+    if crate::domain::dates::states(content, stated.date_naive()) {
         return Ok(());
     }
     Err(DomainError::validation(format!(
@@ -1030,15 +1038,102 @@ mod tests {
             .is_err());
     }
 
-    /// One bound covers both ends. `WRITE_MAX_FUTURE_OCCURRED_SECS` was cut for this reason: a date
-    /// ahead of now is inside every window, so a second setting would refuse the same writes with a
-    /// second message.
+    /// One setting covers both ends. `WRITE_MAX_FUTURE_OCCURRED_SECS` was cut for this reason: a
+    /// date ahead of now is inside every window, so a second setting would refuse the same writes.
+    /// The two cases share the bound and differ in the message.
     #[test]
     fn a_future_date_is_refused_by_the_same_bound() {
         let now = Utc::now();
         let next_year = now + chrono::Duration::seconds(365 * DAY);
         assert!(fence_occurred_at(Some(next_year), DAY as u64, now, "a fact with no date in it")
             .is_err());
+    }
+
+    /// A future date is refused for being in the future. Telling the caller it sits inside the
+    /// last day names a window the date is nowhere near, and the caller cannot act on the reason.
+    #[test]
+    fn a_future_date_is_refused_with_a_message_that_names_the_future() {
+        let now = "2026-08-19T18:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let ahead = Some("2027-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
+        let err = fence_occurred_at(ahead, DAY as u64, now, "a fact with no date in it")
+            .unwrap_err()
+            .client_message()
+            .to_string();
+        assert!(
+            err.contains("occurred_at 2027-01-01T00:00:00+00:00 is in the future"),
+            "the reason is the future: {err}"
+        );
+        assert!(!err.contains("inside the last"), "the window is not the reason: {err}");
+        assert!(err.contains("Omit occurred_at"), "the fix has to be stated: {err}");
+        assert!(!err.contains("older"), "an older date is not the fix: {err}");
+        assert!(!err.contains("earlier"), "an earlier date is not the fix: {err}");
+    }
+
+    #[test]
+    fn a_near_now_date_is_refused_with_a_message_that_names_the_window() {
+        let now = "2026-08-19T18:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let hour_ago = Some(now - chrono::Duration::seconds(3600));
+        let err = fence_occurred_at(hour_ago, DAY as u64, now, "a fact with no date in it")
+            .unwrap_err()
+            .client_message()
+            .to_string();
+        assert!(err.contains("is inside the last 86400 seconds"), "{err}");
+        assert!(!err.contains("in the future"), "{err}");
+    }
+
+    /// The two messages split at now. One second ahead is the future; now itself has happened and
+    /// falls in the window.
+    #[test]
+    fn the_two_messages_split_at_now() {
+        let now = "2026-08-19T18:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let ahead = Some(now + chrono::Duration::seconds(1));
+        let err = fence_occurred_at(ahead, DAY as u64, now, "a fact with no date in it")
+            .unwrap_err()
+            .client_message()
+            .to_string();
+        assert!(err.contains("is in the future"), "{err}");
+
+        let err = fence_occurred_at(Some(now), DAY as u64, now, "a fact with no date in it")
+            .unwrap_err()
+            .client_message()
+            .to_string();
+        assert!(err.contains("is inside the last 86400 seconds"), "{err}");
+    }
+
+    /// An instant sent with an offset compares in UTC. 05:30 on 1 January at +05:30 is midnight
+    /// UTC, ahead of now, so it draws the future message and names the instant in UTC.
+    #[test]
+    fn an_instant_with_an_offset_is_judged_and_named_in_utc() {
+        let now = "2026-08-19T18:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let stated = crate::mcp::tools::parse_occurred_at("2027-01-01T05:30:00+05:30").unwrap();
+        let err = fence_occurred_at(Some(stated), DAY as u64, now, "a fact with no date in it")
+            .unwrap_err()
+            .client_message()
+            .to_string();
+        assert!(err.contains("occurred_at 2027-01-01T00:00:00+00:00 is in the future"), "{err}");
+
+        // An offset can pull an instant behind now. 01:00 on 20 August at +09:00 is 16:00 UTC on
+        // the 19th, two hours before now, so the window is the reason.
+        let stated = crate::mcp::tools::parse_occurred_at("2026-08-20T01:00:00+09:00").unwrap();
+        let err = fence_occurred_at(Some(stated), DAY as u64, now, "a fact with no date in it")
+            .unwrap_err()
+            .client_message()
+            .to_string();
+        assert!(err.contains("is inside the last 86400 seconds"), "{err}");
+    }
+
+    /// Config refuses a zero window, so this pins the function's own contract: a zero window
+    /// still shuts the future, with the future message.
+    #[test]
+    fn a_zero_window_still_refuses_a_future_date() {
+        let now = "2026-08-19T18:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let ahead = Some(now + chrono::Duration::seconds(60));
+        let err = fence_occurred_at(ahead, 0, now, "a fact with no date in it")
+            .unwrap_err()
+            .client_message()
+            .to_string();
+        assert!(err.contains("is in the future"), "{err}");
+        assert!(fence_occurred_at(Some(now), 0, now, "a fact with no date in it").is_ok());
     }
 
     /// The wording is the fence. A caller told to send an older date sends one it made up, which
@@ -1087,9 +1182,11 @@ mod tests {
     fn content_naming_a_future_day_still_cannot_date_a_row_ahead_of_now() {
         let now = "2026-08-19T18:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let ahead = Some("2027-03-12T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
-        assert!(
-            fence_occurred_at(ahead, DAY as u64, now, "the decision is due 12 March 2027").is_err()
-        );
+        let err = fence_occurred_at(ahead, DAY as u64, now, "the decision is due 12 March 2027")
+            .unwrap_err()
+            .client_message()
+            .to_string();
+        assert!(err.contains("is in the future"), "{err}");
     }
 
     /// The exemption is a private enum behind a `pub(super)` function, so a model cannot reach it
