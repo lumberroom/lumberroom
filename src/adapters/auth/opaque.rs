@@ -13,18 +13,30 @@ use chrono::Utc;
 use std::sync::Arc;
 
 use super::{bearer, fingerprint, Authenticator};
+use crate::config::ResourceAudience;
 use crate::domain::errors::{DomainError, Result};
-use crate::domain::oauth::hash_token;
+use crate::domain::oauth::{hash_token, resource_matches};
 use crate::domain::types::Principal;
 use crate::ports::OauthStore;
 
 pub struct OpaqueTokenAuthenticator {
     store: Arc<dyn OauthStore>,
+    /// The resource this deployment serves, as configured. `resource_matches` canonicalises both
+    /// sides on every call, so this is deliberately the raw string rather than a pre-canonical one:
+    /// storing a canonical copy would save nothing and would need a second field to say whether the
+    /// configured value parsed at all. A value that does not parse matches nothing, which refuses
+    /// every token, and config validation refuses to boot on it unless the setting is `Off`.
+    served_resource: String,
+    audience: ResourceAudience,
 }
 
 impl OpaqueTokenAuthenticator {
-    pub fn new(store: Arc<dyn OauthStore>) -> Self {
-        Self { store }
+    pub fn new(
+        store: Arc<dyn OauthStore>,
+        served_resource: &str,
+        audience: ResourceAudience,
+    ) -> Self {
+        Self { store, served_resource: served_resource.to_string(), audience }
     }
 }
 
@@ -53,6 +65,35 @@ impl Authenticator for OpaqueTokenAuthenticator {
         }
         if record.revoked_at.is_some() {
             return Err(DomainError::forbidden("access token has been revoked"));
+        }
+
+        // RFC 8707 binds a token to the resource it was minted for, and the binding closes token
+        // redirection: a resource server that a client also talks to can otherwise replay the token
+        // it received here. The check sits in the authenticator because this is the one place an
+        // OAuth access token becomes a `Principal`, so every route, the MCP transport and the
+        // console inherit it instead of each one remembering to compare an audience.
+        //
+        // It runs before the client lookup, so a token for the wrong audience never costs a second
+        // query. Neither refusal repeats a resource back: the caller learns what is wrong, and an
+        // operator reads the two messages apart in the log.
+        if self.audience != ResourceAudience::Off {
+            match record.resource.as_deref() {
+                // `resource_matches` answers false when either side fails to canonicalise, so an
+                // audience nobody can parse matches nothing and the failure stays closed.
+                Some(bound) => {
+                    if !resource_matches(bound, &self.served_resource) {
+                        return Err(DomainError::forbidden(
+                            "this access token was issued for a different resource",
+                        ));
+                    }
+                }
+                None if self.audience == ResourceAudience::Strict => {
+                    return Err(DomainError::forbidden(
+                        "this access token carries no resource indicator",
+                    ));
+                }
+                None => {}
+            }
         }
 
         // A token outliving its client is the case the fail-closed rule exists for. The client row
@@ -127,12 +168,16 @@ mod tests {
         touched: Mutex<Vec<String>>,
     }
 
+    /// The resource these tests pretend the deployment serves, and the one the fixture token is
+    /// bound to. One constant so a served value and a bound value cannot drift apart by a typo.
+    const SERVED: &str = "https://lumberroom.example.com/mcp";
+
     fn token(client_id: &str) -> AccessTokenRecord {
         AccessTokenRecord {
             token_hash: hash_token("opaque-token"),
             client_id: client_id.into(),
             scope: "memory.read memory.write".into(),
-            resource: Some("https://lumberroom.example.com/mcp".into()),
+            resource: Some(SERVED.into()),
             family_id: uuid::Uuid::nil(),
             expires_at: Utc::now() + Duration::hours(1),
             revoked_at: None,
@@ -167,9 +212,25 @@ mod tests {
         Arc::new(Store { token: Some(token), client, touched: Mutex::new(vec![]) })
     }
 
+    /// Serves the resource the fixture token is bound to, under the shipped default, so the tests
+    /// that predate the audience check read the same as before.
     fn auth(store: Arc<Store>) -> OpaqueTokenAuthenticator {
-        OpaqueTokenAuthenticator::new(store)
+        auth_serving(store, SERVED, ResourceAudience::Lenient)
     }
+
+    fn auth_serving(
+        store: Arc<Store>,
+        served: &str,
+        audience: ResourceAudience,
+    ) -> OpaqueTokenAuthenticator {
+        OpaqueTokenAuthenticator::new(store, served, audience)
+    }
+
+    fn token_for(client_id: &str, resource: Option<&str>) -> AccessTokenRecord {
+        AccessTokenRecord { resource: resource.map(str::to_string), ..token(client_id) }
+    }
+
+    const OTHER: &str = "https://other.example.com/mcp";
 
     #[async_trait]
     impl OauthStore for Store {
@@ -211,6 +272,9 @@ mod tests {
             unimplemented!("not on the authentication path")
         }
         async fn rotate_refresh(&self, _token_hash: &str) -> Result<RefreshOutcome> {
+            unimplemented!("not on the authentication path")
+        }
+        async fn refresh_owner(&self, _token_hash: &str) -> Result<Option<String>> {
             unimplemented!("not on the authentication path")
         }
         async fn revoke_family(&self, _family_id: uuid::Uuid) -> Result<()> {
@@ -338,5 +402,87 @@ mod tests {
         let err =
             auth(store(token("c1"), Some(client("c1")))).authenticate(None).await.unwrap_err();
         assert!(err.client_message().contains("missing Authorization header"));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_token_minted_for_another_resource() {
+        let s = store(token_for("c1", Some(OTHER)), Some(client("c1")));
+        let err = auth(Arc::clone(&s)).authenticate(HEADER).await.unwrap_err();
+        assert_eq!(err.kind.http_status(), 403);
+        assert!(err.client_message().contains("different resource"));
+        assert!(
+            !err.client_message().contains("other.example.com"),
+            "the refusal must not echo the audience the token names"
+        );
+        assert!(
+            !err.client_message().contains("lumberroom.example.com"),
+            "the refusal must not name the resource this deployment serves"
+        );
+        assert!(s.touched.lock().unwrap().is_empty());
+    }
+
+    /// The client row is missing, so a check placed after `find_client` would refuse with the
+    /// "no longer exists" message instead. Reading the mismatch message proves the audience check
+    /// ran first and the wrong audience cost no second query.
+    #[tokio::test]
+    async fn refuses_a_mismatched_token_before_it_looks_the_client_up() {
+        let s = store(token_for("c1", Some(OTHER)), None);
+        let err = auth(s).authenticate(HEADER).await.unwrap_err();
+        assert!(err.client_message().contains("different resource"));
+    }
+
+    #[tokio::test]
+    async fn admits_a_token_for_another_resource_when_the_check_is_off() {
+        let s = store(token_for("c1", Some(OTHER)), Some(client("c1")));
+        let a = auth_serving(s, SERVED, ResourceAudience::Off);
+        assert_eq!(a.authenticate(HEADER).await.unwrap().client, "c1");
+    }
+
+    /// Scheme case, host case, the explicit default port and a trailing slash all name the same
+    /// resource. A client that discovered one spelling and a deployment configured with another
+    /// is the case that makes an operator turn the whole check off.
+    #[tokio::test]
+    async fn admits_a_resource_that_differs_only_in_normalisation() {
+        let spellings = [
+            "HTTPS://lumberroom.example.com/mcp",
+            "https://LUMBERROOM.EXAMPLE.COM/mcp",
+            "https://lumberroom.example.com:443/mcp",
+            "https://lumberroom.example.com/mcp/",
+        ];
+        for spelling in spellings {
+            let s = store(token_for("c1", Some(spelling)), Some(client("c1")));
+            let outcome = auth(s).authenticate(HEADER).await;
+            assert!(outcome.is_ok(), "{spelling} names the resource this deployment serves");
+        }
+    }
+
+    #[tokio::test]
+    async fn admits_a_token_carrying_no_resource_under_lenient() {
+        let s = store(token_for("c1", None), Some(client("c1")));
+        let p = auth(s).authenticate(HEADER).await.unwrap();
+        assert_eq!(p.client, "c1", "the shipped CLI sends no resource when it refreshes");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_token_carrying_no_resource_under_strict() {
+        let s = store(token_for("c1", None), Some(client("c1")));
+        let a = auth_serving(Arc::clone(&s), SERVED, ResourceAudience::Strict);
+        let err = a.authenticate(HEADER).await.unwrap_err();
+        assert_eq!(err.kind.http_status(), 403);
+        assert!(err.client_message().contains("no resource indicator"));
+        assert!(
+            !err.client_message().contains("different resource"),
+            "an operator has to tell a missing indicator from a mismatch"
+        );
+        assert!(s.touched.lock().unwrap().is_empty());
+    }
+
+    /// `canonical_resource` returns None for a value it cannot parse, and `resource_matches`
+    /// answers false whenever either side is None, so an unparseable audience matches nothing.
+    #[tokio::test]
+    async fn refuses_a_resource_that_is_not_a_uri_even_under_lenient() {
+        let s = store(token_for("c1", Some("lumberroom.example.com/mcp")), Some(client("c1")));
+        let err = auth(s).authenticate(HEADER).await.unwrap_err();
+        assert!(err.client_message().contains("different resource"));
     }
 }

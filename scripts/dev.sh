@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 
 DB="${DEV_POSTGRES_DB:-lumberroom_dev}"
 MODELS_VOLUME=lumberroom-dev-models
-SERVER_IMAGE="${DEV_SEED_IMAGE:-lumberroom-server:0.3.1}"
+SERVER_IMAGE="${DEV_SEED_IMAGE:-lumberroom-server:0.4.0}"
 
 if [ "$1" = "--down" ]; then
   exec docker compose --profile dev down dev
@@ -53,7 +53,10 @@ if ! docker volume inspect "$MODELS_VOLUME" >/dev/null 2>&1 \
     exit 1
   fi
   echo "dev.sh: seeding $MODELS_VOLUME from $SERVER_IMAGE"
-  docker run --rm --user root -v "$MODELS_VOLUME":/dst "$SERVER_IMAGE" cp -a /models/. /dst/
+  # chmod after the copy: the dev service runs as the uid that owns the target volume now rather
+  # than as root, and root's copy is otherwise readable only by accident. Read is all it needs.
+  docker run --rm --user root --entrypoint sh -v "$MODELS_VOLUME":/dst "$SERVER_IMAGE" \
+    -c 'cp -a /models/. /dst/ && chmod -R a+rX /dst'
 fi
 
 if [ "$1" = "-d" ]; then

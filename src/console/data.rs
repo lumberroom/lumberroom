@@ -20,11 +20,12 @@ use crate::adapters::auth::{can_read, filter_readable};
 use crate::domain::errors::Result;
 use crate::domain::namespaces;
 use crate::domain::policy::NamespaceCeiling;
+use crate::domain::tags;
 use crate::domain::types::{Memory, RegistryEntry, Sensitivity};
 use crate::ports::ingest::{IngestRepository, Proposal, ProposalFilter};
 use crate::ports::memory::Retired;
-use crate::ports::RecentQuery;
 use crate::ports::Timeline;
+use crate::ports::{RecentQuery, TagCount};
 use crate::services::{search, Ctx};
 
 /// How many entries one page holds by default, and the ceiling on what a query string may ask for.
@@ -63,6 +64,13 @@ pub struct Entry {
     pub occurred_until: Option<DateTime<Utc>>,
     /// A later write replaced this one. Printed struck through, in place.
     pub retired: bool,
+    /// The period closed and no supersession closed it, so no live read returns it and nothing
+    /// replaced it. A third state beside live and retired, and the page names it.
+    ///
+    /// Read off `superseded_at` rather than the link. A restore that could not relink a successor
+    /// leaves a row stamped by a supersession with a NULL link, and that row is retired with its
+    /// successor missing rather than expired.
+    pub expired: bool,
     /// The owner restated it, so the store counted it as confirmed.
     pub confirmed: bool,
     /// True for a sealed row. The page says why the content is absent rather than drawing a box
@@ -87,6 +95,8 @@ impl Entry {
             occurred_at: m.occurred_at,
             occurred_until: m.occurred_until,
             retired: m.superseded_by.is_some(),
+            expired: m.superseded_at.is_none()
+                && m.occurred_until.is_some_and(|until| until <= Utc::now()),
             confirmed: m.last_confirmed_at.is_some(),
             withheld,
         }
@@ -192,6 +202,11 @@ pub struct Revision {
     pub occurred_at: Option<DateTime<Utc>>,
     pub occurred_until: Option<DateTime<Utc>>,
     pub retired_at: Option<DateTime<Utc>>,
+    /// When this version's period closed with no supersession closing it.
+    ///
+    /// Never set together with `retired_at`, and the reason is the predicate rather than the
+    /// column: this is set only when `superseded_at` is absent, and `retired_at` is that column.
+    pub expired_at: Option<DateTime<Utc>>,
     pub current: bool,
     pub withheld: bool,
 }
@@ -274,6 +289,14 @@ pub async fn contents(ctx: &Ctx, readable: &[NamespaceCeiling]) -> Result<Conten
     Ok(out)
 }
 
+/// Every tag on a live row this reader may see, most used first.
+///
+/// Beside `contents` because it answers the same kind of question from the same filter: the
+/// ceilings go into the query, so a tag carried only by rows past them never reaches this process.
+pub async fn tag_counts(ctx: &Ctx, readable: &[NamespaceCeiling]) -> Result<Vec<TagCount>> {
+    ctx.repos.memories.tag_summary(ctx.tenant(), readable).await
+}
+
 /// Sealed counts, for the namespaces where this reader's ceiling reaches sealed.
 ///
 /// A count is the whole answer. The bytes are encrypted by the client that stored them and the key
@@ -309,6 +332,10 @@ async fn sealed_counts(ctx: &Ctx, readable: &[NamespaceCeiling]) -> Vec<(String,
 ///
 /// `namespace` narrows to one section of the document; absent reads every namespace this reader
 /// may reach. The ceilings go into the query, so a row above them never enters this process.
+///
+/// `tags` keeps rows carrying every one of them, in the query beside the cursor, so a filtered page
+/// is full and the next one starts where it ended. Raw spellings are fine: they go through the
+/// write path's normaliser first. Empty is no filter.
 pub async fn page(
     ctx: &Ctx,
     readable: &[NamespaceCeiling],
@@ -316,6 +343,7 @@ pub async fn page(
     before: Option<Cursor>,
     limit: i64,
     include_superseded: bool,
+    tags: &[String],
 ) -> Result<Page> {
     // One more than the page, so the presence of a next page is an observation rather than a guess
     // that shows an empty page at the end.
@@ -329,6 +357,7 @@ pub async fn page(
             before: before.map(|c| (c.at, c.id)),
             limit: limit + 1,
             include_superseded,
+            tags: tags::normalise(tags),
         })
         .await?;
 
@@ -362,6 +391,11 @@ pub async fn leaf(ctx: &Ctx, id: &str) -> Result<Option<Leaf>> {
             // Dropping it would sever the chain and report a short history as a complete one, which
             // is the failure the repository's own comment warns about.
             let withheld = m.sensitivity == Sensitivity::Sealed || unopened.contains(&m.id);
+            // An expired version is not current, and it carries no `superseded_at` to date it by.
+            let expired_at = match m.superseded_at.is_none() {
+                true => m.occurred_until.filter(|until| *until <= Utc::now()),
+                false => None,
+            };
             Revision {
                 id: m.id.clone(),
                 content: if withheld { String::new() } else { m.content.clone() },
@@ -370,7 +404,8 @@ pub async fn leaf(ctx: &Ctx, id: &str) -> Result<Option<Leaf>> {
                 occurred_at: m.occurred_at,
                 occurred_until: m.occurred_until,
                 retired_at: m.superseded_at,
-                current: m.superseded_by.is_none(),
+                expired_at,
+                current: m.superseded_by.is_none() && expired_at.is_none(),
                 withheld,
             }
         })
@@ -488,6 +523,11 @@ pub async fn answer(
                 .and_then(|d| DateTime::parse_from_rfc3339(d).ok())
                 .map(|d| d.with_timezone(&Utc)),
             retired: hit.superseded_by.is_some(),
+            // A search answer never carries an expired row: `search::run` reads live rows and
+            // this console asks it for live rows. The wire shape carries no `superseded_at`, so
+            // the state cannot be computed here anyway, and inventing it from the link alone is
+            // the mistake this predicate exists to avoid.
+            expired: false,
             confirmed: false,
             withheld: hit.sensitivity == Sensitivity::Sealed,
         };

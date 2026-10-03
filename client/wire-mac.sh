@@ -5,12 +5,14 @@
 #   ./client/wire-mac.sh --url https://memory.example.com --oauth-mode              # Logto/built-in OAuth
 #   LUMBERROOM_TOKEN=<token> ./client/wire-mac.sh --url ... --dry-run   # show every change, touch nothing
 #
-# It does four things, each idempotent:
+# It does five things, each idempotent:
 #   1. writes ~/.config/lumberroom/config.json (mode 600) so lumberroom knows the endpoint
 #   2. installs lumberroom (one already on PATH, else the released binary) and the SessionStart
 #      hook script under ~/.local/bin and ~/.claude/hooks
 #   3. registers the MCP server with Claude Code and adds the SessionStart hook to settings.json
 #   4. appends the memory rules to ~/.claude/CLAUDE.md between managed markers
+#   5. appends the same rules to ~/.codex/AGENTS.md, which Codex and every other AGENTS.md reader
+#      pick up
 #
 # --token-mode (default) needs the AUTH_TOKENS value for this client, read from LUMBERROOM_TOKEN or,
 # with a terminal attached and no LUMBERROOM_TOKEN, prompted with echo off. Not a --token flag: every
@@ -32,14 +34,15 @@ SCOPE="user"
 DRY_RUN=0
 CLIENT_NAME="lumberroom"
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 BIN_DIR="${LUMBERROOM_BIN_DIR:-$HOME/.local/bin}"
 CONFIG_DIR="${LUMBERROOM_CONFIG_DIR:-$HOME/.config/lumberroom}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RELEASE_REPO="${LUMBERROOM_RELEASE_REPO:-https://github.com/the-cybersapien/lumberroom}"
-RELEASE_VERSION="${LUMBERROOM_RELEASE_VERSION:-0.3.1}"
+RELEASE_REPO="${LUMBERROOM_RELEASE_REPO:-https://github.com/lumberroom/lumberroom}"
+RELEASE_VERSION="${LUMBERROOM_RELEASE_VERSION:-0.4.0}"
 
 usage() {
-  sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -126,7 +129,7 @@ say "  scope:    $SCOPE"
 
 # ── 1. lumberroom config ──────────────────────────────────────────────────────────
 say ""
-say "1/4 lumberroom config -> $CONFIG_DIR/config.json"
+say "1/5 lumberroom config -> $CONFIG_DIR/config.json"
 if [ "$MODE" = "token" ]; then
   write_file "$CONFIG_DIR/config.json" 600 <<JSON
 {
@@ -149,10 +152,10 @@ fi
 # manual install, or the released binary for this Mac's architecture.
 #
 # There is no third way. A JavaScript client used to live at bin/lumberroom.mjs and answered to the
-# same command name; it was removed in 0.3.2 and nothing here falls back to it.
+# same command name; it was removed in 0.4.0 and nothing here falls back to it.
 install_lumberroom_binary() {
   # An earlier run of this script installed the old JavaScript client to exactly this name, so on a
-  # machine wired before 0.3.2, `command -v lumberroom` finds that instead. Accepting it would leave
+  # machine wired before 0.4.0, `command -v lumberroom` finds that instead. Accepting it would leave
   # the machine on a client that was retired, and the upgrade would report success. A node script
   # announces itself in its first line; a Rust binary does not.
   if command -v lumberroom >/dev/null 2>&1; then
@@ -203,12 +206,12 @@ install_lumberroom_binary() {
 }
 
 say ""
-say "2/4 lumberroom -> $BIN_DIR/lumberroom, hook -> $CLAUDE_DIR/hooks/lumberroom-bootstrap.sh"
+say "2/5 lumberroom -> $BIN_DIR/lumberroom, hook -> $CLAUDE_DIR/hooks/lumberroom-bootstrap.sh"
 run mkdir -p "$BIN_DIR" "$CLAUDE_DIR/hooks"
 if ! install_lumberroom_binary; then
   say ""
   say "  no lumberroom binary is available on this machine. Get one, then run this again:"
-  say "    brew install the-cybersapien/lumberroom/lumberroom"
+  say "    brew install lumberroom/lumberroom/lumberroom"
   say "    cargo install lumberroom"
   say "    or download it from ${RELEASE_REPO}/releases"
   exit 1
@@ -221,7 +224,7 @@ esac
 
 # ── 3. Claude Code: MCP server + SessionStart hook ────────────────────────────
 say ""
-say "3/4 Claude Code registration"
+say "3/5 Claude Code registration"
 if claude mcp get "$CLIENT_NAME" >/dev/null 2>&1; then
   say "  MCP server '$CLIENT_NAME' already registered; replacing it"
   run claude mcp remove "$CLIENT_NAME" --scope "$SCOPE" || true
@@ -260,32 +263,53 @@ else
 fi
 
 # ── 4. CLAUDE.md write rule ───────────────────────────────────────────────────
-say ""
-say "4/4 memory rules -> $CLAUDE_DIR/CLAUDE.md"
-CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
-SNIPPET="$REPO_DIR/client/CLAUDE.md.snippet"
-if [ -f "$CLAUDE_MD" ] && grep -q 'lumberroom:begin' "$CLAUDE_MD"; then
-  say "  markers already present; refreshing the block"
-  if [ "$DRY_RUN" = 0 ]; then
-    backup "$CLAUDE_MD"
-    tmp="$(mktemp)"
-    awk -v snippet="$SNIPPET" '
-      /lumberroom:begin/ { while ((getline line < snippet) > 0) print line; skip=1; next }
-      /lumberroom:end/   { skip=0; next }
-      skip != 1 { print }
-    ' "$CLAUDE_MD" > "$tmp" && mv "$tmp" "$CLAUDE_MD"
-  fi
-else
-  if [ "$DRY_RUN" = 1 ]; then
-    say "  would append $(wc -l < "$SNIPPET" | tr -d ' ') lines to $CLAUDE_MD"
+# install_rules <snippet> <target rules file> <directory to create>
+#
+# Both rules files carry the same block between the same markers, so one function serves both. The
+# refresh branch keys off the marker rather than the file: the snippet supplies its own begin and
+# end lines, which is why the awk drops the old end marker instead of printing it.
+install_rules() {
+  local snippet="$1" target="$2" dir="$3"
+  if [ -f "$target" ] && grep -q 'lumberroom:begin' "$target"; then
+    say "  markers already present; refreshing the block"
+    if [ "$DRY_RUN" = 0 ]; then
+      backup "$target"
+      local tmp
+      tmp="$(mktemp)"
+      awk -v snippet="$snippet" '
+        /lumberroom:begin/ { while ((getline line < snippet) > 0) print line; skip=1; next }
+        /lumberroom:end/   { skip=0; next }
+        skip != 1 { print }
+      ' "$target" > "$tmp" && mv "$tmp" "$target"
+    fi
   else
-    backup "$CLAUDE_MD"
-    mkdir -p "$CLAUDE_DIR"
-    printf '\n' >> "$CLAUDE_MD"
-    cat "$SNIPPET" >> "$CLAUDE_MD"
-    say "  appended"
+    if [ "$DRY_RUN" = 1 ]; then
+      say "  would append $(wc -l < "$snippet" | tr -d ' ') lines to $target"
+    else
+      backup "$target"
+      mkdir -p "$dir"
+      printf '\n' >> "$target"
+      cat "$snippet" >> "$target"
+      say "  appended"
+    fi
   fi
-fi
+}
+
+say ""
+say "4/5 memory rules -> $CLAUDE_DIR/CLAUDE.md"
+install_rules "$REPO_DIR/client/CLAUDE.md.snippet" "$CLAUDE_DIR/CLAUDE.md" "$CLAUDE_DIR"
+
+# ── 5. AGENTS.md write rule ───────────────────────────────────────────────────
+# Anthropic's clients read CLAUDE.md; Codex, Hermes, Cursor and the rest read AGENTS.md. Codex
+# documents its home directory as CODEX_HOME, default ~/.codex, and reads AGENTS.md there before
+# any repository file, so a global rule lands once per machine rather than once per checkout
+# (learn.chatgpt.com/docs/agent-configuration/agents-md). The per-project file is deliberately not
+# written here: this script runs from a clone of the lumberroom repo, so ./AGENTS.md would land in
+# that clone and get committed. Copy client/AGENTS.md.snippet into a project by hand when you want
+# it there as well.
+say ""
+say "5/5 memory rules -> $CODEX_DIR/AGENTS.md"
+install_rules "$REPO_DIR/client/AGENTS.md.snippet" "$CODEX_DIR/AGENTS.md" "$CODEX_DIR"
 
 # ── verify ────────────────────────────────────────────────────────────────────
 say ""

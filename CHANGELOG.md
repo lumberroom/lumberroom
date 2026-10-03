@@ -4,6 +4,223 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`DB_MAX_CONNECTIONS` and `DB_ACQUIRE_TIMEOUT_SECS`** set the Postgres pool, defaulting to
+  the 10 connections and 5 seconds the server used before (#73). At boot the server compares the
+  pool with the database's `max_connections`, less the superuser reserve and 3 spare. An explicit
+  size that does not fit refuses boot with every number named; the default size logs a warning
+  and boots, so an upgrade never stops a small server.
+- **A memory provider for Hermes Agent, in its own repository.**
+  [`lumberroom/lumberroom-hermes`](https://github.com/lumberroom/lumberroom-hermes) makes lumberroom
+  Hermes's memory through the existing `/mcp` endpoint and needed no engine change. Decision 0021
+  records why plugins talk MCP and ship from their own repositories; `client/hermes-notes.md` keeps
+  the no-code fallback. The research behind both plugins is in
+  `docs/research/hermes-openclaw-memory-plugins.md`.
+- **Tag filtering, inside the query.** `memory_search` over MCP takes `tags`, and a hit must carry
+  every one. The reading page (`RecentQuery.tags`) and search (`SearchQuery.tags`) filter with
+  `tags @> $n::text[]` in SQL, beside the cursor and in both search arms, so a filtered page comes
+  back full and the GIN index serves it. With no tags each statement's text stays byte-identical
+  to before. `MemoryRepository::tag_summary` counts live rows per tag across the namespaces and
+  ceilings a caller holds. Tags normalise through `domain::tags::normalise` on write and on filter.
+  `console::data::page` takes a new last argument, `tags`.
+
+- **One review queue** joins conflicts, stale rows and, on a server that fills any, proposals
+  behind one route and one decide path. `GET /admin/review/queue` and `POST /admin/review/decide`
+  carry `supersede`, `merge`, `keep_both`, `delete`, `confirm`, `apply` and `dismiss` as the
+  verdicts a caller's grant allows. `lumberroom review` walks the queue interactively, one item at
+  a time, or answers `--json`, `--supersede`, `--merge`, `--keep-both`, `--confirm`, `--apply` and
+  `--dismiss` without a prompt; `--delete` asks for the id typed back unless `--yes` is given.
+- **A dismissed-pair ledger.** `keep_both` on a conflict writes a row to `memory_pair_dismissed`
+  naming who dismissed the pair and when, so a pair the owner has read and kept leaves the queue
+  rather than reappearing every page. `GET /admin/review/dismissed` lists it and
+  `DELETE /admin/review/dismissed/{a}/{b}` reverses one entry.
+- **A proposal seam.** `AppState.proposals` takes any number of `ProposalSource` implementations; a
+  server with none answers `[]` in `sources.proposal` and refuses `--source proposal`,
+  `--apply` and `--dismiss` with `source_not_filled`. This engine ships the trait and fills nothing.
+- **The MCP surface gained `review_queue` and `review_decide`,** the same two operations as the
+  HTTP routes above. Both sit at `Capability::Open`, so a read grant alone can list the queue; the
+  decide path still needs write on every row it acts on, and `delete` still needs `mayDelete`, the
+  same flag `memory_forget` reads. See `docs/permissions.md`, "The two review tools".
+- **A proposal decision can now carry corrected text, a reason and the version the caller read.**
+  `ProposalItem` gained `repairable`, `held_by` and `version`; `Decision` gained `version` and a
+  `via` the handler sets and a request body cannot claim; `Decided` and `ProposalDecided` gained
+  `content_written` and `overrode`. A repair is `apply` with `content`, checked and written by the
+  source, never a new verdict. Over MCP a proposal decision now needs a `reason` and a `version`;
+  over HTTP both stay optional. Eight codes: `reason_required`, `reason_too_long`,
+  `content_not_for_verdict`, `content_empty`, `version_required`, `repair_not_offered`,
+  `repair_refused`, `proposal_moved`. See `docs/decisions/0019-a-caller-corrects-a-proposal.md`.
+  `ProposalItem` and `ProposalDecided` derive `Default`; a source should build both with
+  `..Default::default()` so a field added later still compiles against every existing
+  implementation. A source must set `version` on every item it offers `apply` or `dismiss` on; both
+  `version` and `held_by` must match `[a-z0-9_]+`, or `render` prints them as `unrenderable` rather
+  than passing free text outside the data fence. CLI 0.5.0 reads no `overrode` field and shows no
+  override on any proposal decision; that lands in the CLI's next release.
+
+- **A cleanup proposal's members carry the row's own facts.** Each `Member` in
+  `GET /admin/cleanup/proposals` and `GET /admin/cleanup/proposals/{id}` gained `created_at`,
+  `occurred_at`, `access_count` and `source_client`, read from the memory row when the proposal is
+  read, so the members of an exact cluster no longer look identical. `source_client` is the stored
+  value; no MCP tool serves a cleanup member. All four are `null` when the row is
+  gone, as `current_content` already was; `occurred_at` is also `null` on a live row with no valid
+  time. The fields are additive; code that builds a `ports::cleanup::Member` by hand has to set
+  them.
+
+### Changed
+
+- **Every MCP tool carries a title and annotations.** Reads declare `readOnlyHint`,
+  `memory_forget` and `review_decide` declare `destructiveHint`, and every tool declares
+  `openWorldHint: false`, so a client can decide what to approve without a prompt (#92).
+  `tests/mcp_tool_annotations.rs` fails when a new tool ships without them. The server instructions
+  and tool descriptions now say what each tool does and drop orders about how the model should
+  behave; the owner's own agent rules carry those.
+- **The cleanup pass writes its rationales as sentences.** A near-duplicate reads "These two say
+  the same thing." in place of "these two say the same thing at a cosine of 0.971."; the score
+  stays in the proposal's `similarity` field. The exact and stale rationales now start with a
+  capital. Proposals already stored keep their text.
+- **MCP answers name the app that wrote a row.** `context_bootstrap`, `memory_search`,
+  `memory_history`, `registry_get`, `registry_history` and `memory_forget` carry `source` in place
+  of `source_client`, and the digest trailer reads `via Codex` rather than `via <client_id>`. For a
+  built-in OAuth client `source` is the name it registered with, revoked clients included; any other
+  stored value prints as it is. Two approved clients sharing a name carry the date each was added,
+  `Codex (added 1 Sep)`, with the time on a same-day tie. The lookup runs only under
+  `AUTH_MODE=oauth`, and a failed read of the client table prints every value as stored. Storage,
+  export, the archive, the admin routes and the console keep `source_client`. A client that read
+  `source_client` from `memory_search`'s structured content reads `source` now. See
+  `docs/decisions/0020-mcp-names-the-source.md`.
+- **Confirming a stale row cleared it for a window.** `stale` gained a clause that also excludes a
+  row confirmed within `greatest(days, 1)` days, so a restated fact or a `confirm` verdict left the
+  list rather than reappearing on the next read; it returns for re-confirmation once the window
+  passes.
+- **The conflicts query took the caller's read grant and an offset.** `conflicts` ran over the
+  whole tenant and filtered each pair after the fact; the grant runs inside the query, as `stale`
+  already does, and paging is by `offset` rather than a client-side skip.
+- **A namespace past `CONFLICT_SCAN_MAX` refuses the conflict source rather than running the
+  self-join against it.** The setting defaults to 2000 live rows per namespace, validated at boot
+  like every other setting, and a refusal carries `namespace_too_large` instead of a slow answer.
+- **`GET /admin/review/stale` publishes a narrower row.** Both old review routes read through the
+  one queue now, so a stale row carries `opened`, `access_count`, `last_accessed_at` and
+  `last_confirmed_at`, and no longer carries `tags`, `source_client`, `embedding_model`,
+  `supersedes`, `occurred_until`, `superseded_by` or `superseded_at`. The envelopes, the page
+  default of 25 and the conflict pair's five fields are unchanged. A client that read a dropped
+  field should read the row by id, or move to `GET /admin/review/queue`.
+- **`GET /admin/review/stale` caps a page at 200 rather than 500**, the cap the queue applies to
+  every source.
+- **`GET /admin/review/conflicts` floors `min_similarity` at `CONFLICT_THRESHOLD` rather than
+  clamping it to `[0, 1]`.** The route now reads through `review_queue::queue`, which never answers
+  a conflict below the configured threshold; a request for 0.5 with the threshold at 0.9 gets 0.9
+  back, not 0.5.
+- **`crates/lumberroom` moved from 0.4.0 to 0.5.0** for the review loop's new flags and wire types.
+- **`review_queue` and `review_decide`'s tool descriptions changed.** An agent asked to work the
+  queue may now decide proposal items itself, one `review_decide` call per item, rather than
+  reading each one back to the person first; the data fence around row content and proposal text
+  now draws a fresh nonce per call instead of a fixed closing marker.
+- **`ProposalSource::decide` takes a `ProposalDecision` in place of a bare `Verdict`.** The
+  signature moves from `decide(&self, ctx: &Ctx, id: &str, verdict: Verdict)` to
+  `decide(&self, ctx: &Ctx, id: &str, decision: ProposalDecision<'_>)`, carrying the verdict,
+  corrected text, a reason, the version the caller read and the surface the call arrived on. Every
+  implementation of the trait changes its signature to match.
+- **The repository moved to `github.com/lumberroom/lumberroom`.** The old path,
+  `github.com/the-cybersapien/lumberroom`, redirects there. Container images now publish to
+  `ghcr.io/lumberroom/lumberroom` and `ghcr.io/lumberroom/lumberroom-server`; the old
+  `ghcr.io/the-cybersapien/lumberroom` and `ghcr.io/the-cybersapien/lumberroom-server` images stay
+  public, frozen at 0.4.0, and take no new versions. The Homebrew tap moved with it, to
+  `lumberroom/homebrew-lumberroom`: install with `brew install lumberroom/lumberroom/lumberroom`. An
+  existing `the-cybersapien/lumberroom` tap follows the redirect on the next `brew update`, and brew
+  renames it. Homebrew drops trust from a tap whose owner changed, so run
+  `brew trust lumberroom/lumberroom` once after that update; until you do, `brew upgrade` refuses the
+  formula. The installed binary keeps working either way.
+
+### Fixed
+
+- **The consent page catches a client that claims one service and sends codes to another.** A
+  self-registered client named Claude that redirected to chatgpt.com used to draw only the
+  shared-account reminder, because every recognised host shared one allowlist. Each known service
+  now owns its hosts, and a claimed brand at another service's host raises the mismatch alarm
+  naming both (#91).
+- **A search no longer rewrites every index on `memory`.** The touch after each search changed
+  `last_accessed_at`, which the partial index `memory_never_accessed` named in its predicate, so
+  Postgres could never apply it in place and wrote a new entry into every index, the HNSW graph
+  included (#72). Migration `20261003000026` drops that index and sets `fillfactor = 90` on
+  `memory`. Pages written before the migration keep their old fill until `VACUUM FULL` or
+  `pg_repack` rewrites them.
+- **`SEARCH_LEXICAL_WEIGHT=0` skips the text-search scan.** The lexical arm now carries
+  `$10::float8 > 0`, so a store written in Chinese, Japanese or Thai, where Postgres text search
+  matches nothing, can turn the arm off and stop paying for it (#75). Compose now passes the
+  setting through.
+- **A search no longer deadlocks a write on the rows it returned.** The access bump after every
+  search locked its rows in scan order and held them until the statement ended, while a
+  supersession locks its two rows in id order, so a search that returned both could hold one while
+  the write held the other. Postgres aborted one side and the write could be the victim, reported
+  as "internal error". The bump now skips any row another transaction holds, so a row mid-write
+  loses one access count. Gate: `./scripts/cargo.sh test -j 1 --test integration
+  an_access_bump_skips_a_row_another_write_holds`.
+- **`lumberroom login` prints the reason a sign-in failed.** When the authorization server
+  redirects an error to the loopback callback, the CLI prints `authorization server returned
+  error=<e>: <error_description>` and exits 1. It replaces control characters in both values with
+  spaces, so a crafted callback URL cannot send an escape sequence to the terminal. Without a
+  description the line reads as before. Gate: `./scripts/cargo.sh test -j 1 -p lumberroom --lib
+  oauth::`.
+
+## [0.4.0] - 2026-09-07
+
+Three changes since 0.3.1, all in the client. A renewal that crashes or races another one leaves a
+credential you can still spend, renewals stop piling onto each other, and the second client is gone.
+
+### Fixed
+
+- **A refresh no longer strands a spent token on disk.** The client rotates its refresh token on
+  every renewal: it sends the one in `config.json`, the server issues a replacement and retires
+  what it was given. Writing that replacement used to be a plain overwrite with no lock around the
+  exchange, so two windows cost you the credential. Lose power between the request and the write,
+  and the server has retired a token the file still holds. Run two lumberroom processes that renew
+  at the same moment, and both present the same token; the server rotates on the first and refuses
+  the second, which retires the whole family. Either way the machine stayed locked out until
+  someone ran `lumberroom login` again, and the session hook fires on every session start, so a
+  second process is the normal case rather than the odd one.
+
+  The lock now spans the whole exchange, from the read of the token through the request to the save
+  of its replacement, so a second process re-reads the rotated token before it sends anything. The
+  save writes a sibling file born at 0600, fsyncs it, renames it over the live path and fsyncs the
+  directory. A crash costs the whole write or none of it, and no reader opens half a credential
+  file. The save also re-reads under the lock before it merges, so a patch from one process no
+  longer erases a key another wrote while it was working.
+
+  A waiter that cannot take the lock gets an error naming the lock file and the process holding it.
+  That message used to suggest deleting the lock file, which is the one action that reproduces the
+  bug: unlink it while a refresh is in flight and the next process opens a fresh inode, locks that,
+  and replays the pre-rotation token.
+
+- **Two processes starting together now cost one renewal, not two.** The lock above made the
+  second process safe: it re-reads the file before it sends, so it presents the rotated token and
+  not the spent one. It still sent something. Five sessions opening at once spent five rotations,
+  and each rotation is another window in which a crash between the request and the write leaves a
+  spent token on disk.
+
+  A renewal now reads the file it has just re-read under the lock. When the access token there is
+  not the one this process holds and it has more than a minute of life left, the renewal adopts
+  that token and returns without sending. Comparing against the token in hand is what keeps this
+  honest: a process gets here because the server refused what it was holding, so a file claiming
+  the credential is good is only believable when the file holds a different one. The same token
+  with a future expiry means the server and the clock disagree, and the server wins. An expiry
+  that is missing or unreadable means renew.
+
+- **A renewal happens before the token expires rather than after the failure it would cause.** The
+  only thing that used to trigger one was a 401, so every process paid a guaranteed wasted round
+  trip after expiry, and they all paid it in the same second because they held tokens that expire
+  together. A request now renews first once the token is inside the last quarter of its life,
+  scaled by a factor each process draws once, so two processes that started together cross the line
+  up to seven minutes apart on an hour-long token. The 401 path stays as the fallback it has always
+  been.
+
+- **A refresh that fails says which thing failed.** Eight of the nine paths out of `refresh`
+  returned without printing anything, so a config file with no `client_id`, an unreachable token
+  endpoint, a server answering something that is not JSON, and a token the server had already
+  retired all reached you as the same bare 401. Each names itself now. The `invalid_grant` case
+  says the token is spent, expired or revoked and tells you to sign in again, and a save that fails
+  after the server has rotated says the tokens on disk are stale rather than leaving the next run
+  to discover it.
+
 ### Removed
 
 - **`bin/lumberroom.mjs`**, the dependency-free JavaScript client, and its redirect test. One client
@@ -23,6 +240,46 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **What this gives up, stated plainly:** the client and the server now share types, so a change made
   to both at once can look correct from inside and be wrong on the wire. That is the class of bug the
   second implementation existed to catch, and nothing catches it today.
+
+### Changed
+
+- **The token request takes a checked URL rather than a string.** `may_carry_credential` already
+  refused to put a refresh token on plain http to a host that is not loopback, and it still does,
+  so no configuration behaves differently here. The check and the send used to be two statements a
+  reader had to hold together. `CredentialUrl::checked` is now the only way to build what the send
+  accepts, so an edit that reorders those lines, or adds a second send below them, cannot skip the
+  check by accident.
+- **Dependency bumps.** `rmcp` 3.1.4 to 3.2.0, `uuid` 1.24.1 to 1.26.0, `fastembed` 6.0.0 to 6.0.2,
+  `aes-gcm` 0.11.0 to 0.11.1, `flate2` 1.1.9 to 1.1.10, and `age` 0.11.5 to 0.12.1 in
+  `crates/archive`. None of them needed a source change.
+- **`actions/checkout` 5 to 7** in the CLI release and Docker publish workflows.
+- **`tempfile` joins the client's dependencies**, as the atomic replacement maintained by somebody
+  else. It was already in the workspace lockfile, so nothing new resolves.
+
+### Known limitations
+
+- The lock is an `flock` on `<config>.lock`, which covers processes on one machine. A config
+  directory shared over NFS, or on any filesystem that does not honour `flock`, gets no protection,
+  and two machines refreshing against it still race.
+- A waiter gives up. `save` waits 30 seconds and `refresh` waits its own request timeout plus five,
+  then returns an error naming the holder. A token endpoint slow enough to outlast that turns one
+  command into a failure rather than a queue.
+- The lock file is created once and never removed, so a config directory keeps one after the first
+  run. Removing it is what the old message advised and what causes the bug.
+- The directory fsync is best effort. A filesystem that refuses to fsync a directory keeps the
+  file-contents guarantee and loses the rename-durability one, so a power cut in that window can
+  still cost the replacement.
+- A process killed between the token request returning and the write landing still strands a spent
+  token on disk. The kernel drops the lock when the process dies, so nothing in this client covers
+  that case, and the next run presents a token the server has already retired. Closing it needs the
+  server to accept a token it has just rotated, for a few seconds, rather than treating the second
+  presentation as a theft.
+- Nothing checks the wire against a second implementation any more. The Removed entry states what
+  that costs.
+- No gate opens a `.lumber` file that 0.3.x wrote against this build. Upstream states the 0.12
+  release changes the API and not the file format, and nothing under `crates/archive` changed, so
+  the risk is low. Nothing here proves it.
+- Every limitation listed under 0.3.1 and 0.3.0 still stands.
 
 ## [0.3.1] - 2026-09-01
 
@@ -352,6 +609,7 @@ softened for a release note.
 - `submit` collapses exact duplicate proposals on a content hash and misses near-duplicates, so
   overlapping chunks queue the same fact more than once.
 
+[0.4.0]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.4.0
 [0.3.1]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.3.1
 [0.3.0]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.3.0
 [0.2.0]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.2.0

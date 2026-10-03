@@ -435,14 +435,9 @@ fn parse_sensitivity(raw: Option<&str>) -> Result<Option<Sensitivity>> {
     })
 }
 
+/// The one spelling a tag filter also runs through, so a filter matches what this stored.
 fn clean_tags(tags: Option<Vec<String>>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    tags.unwrap_or_default()
-        .into_iter()
-        .map(|t| t.trim().to_ascii_lowercase())
-        .filter(|t| !t.is_empty())
-        .filter(|t| seen.insert(t.clone()))
-        .collect()
+    crate::domain::tags::normalise(tags.unwrap_or_default())
 }
 
 /// Live rows in this namespace close enough to be worth a decision, bounded by what the caller may
@@ -608,6 +603,19 @@ async fn validate_supersedes_target(ctx: &Ctx, raw: &str) -> Result<(uuid::Uuid,
             )))
         }
     };
+
+    // A closed period has no successor to write. Decision 0017 made `occurred_until` reachable
+    // without a supersession, and a supersession over an expired row would end a period that has
+    // already ended and hand `forget`'s revive an end it did not write.
+    // `domain::types::expired` holds the definition, and `RETIRE_PREDECESSOR_SQL` transcribes the
+    // same test into the UPDATE. A guard here that the statement does not share lets a row pass one
+    // door and stall at the other, which is how a supersession got reported that never landed.
+    if target.is_expired() {
+        return Err(DomainError::conflict(format!(
+            "memory {raw} expired, so its period is already closed and it takes no successor. \
+             Write the new fact on its own, or bring the old one back first."
+        )));
+    }
 
     if target.superseded_by.is_some() {
         // Naming the live head is the whole point of the error: the caller retries against it in

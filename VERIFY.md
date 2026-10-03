@@ -15,7 +15,7 @@ need Docker, `curl`, `openssl` and `node` on the host, `POSTGRES_PASSWORD` set i
 server image built once:
 
 ```bash
-docker compose build server        # builds lumberroom-server:0.3.1, which the gates run
+docker compose build server        # builds lumberroom-server:0.4.0, which the gates run
 docker compose up -d db            # Postgres 16 + pgvector; the gates reuse it if it is up
 ```
 

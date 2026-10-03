@@ -12,13 +12,42 @@ everything below goes through a builder image that carries `g++` (ONNX Runtime l
 machine tight on memory.
 
 ```bash
-docker build -t lumberroom-builder -f Dockerfile.builder .   # once
+docker build -t lumberroom-builder -f Dockerfile.builder .   # once, and again after any change to
+                                                       # Dockerfile.builder or scripts/lib/builder-entrypoint.sh
 docker compose up -d db                                # Postgres 16 + pgvector on 127.0.0.1:5432
 
 ./scripts/cargo.sh check --all-targets
-./scripts/cargo.sh test -j 1
+./scripts/cargo.sh test-fast                           # the suite, six binaries at a time
+./scripts/cargo.sh test -j 1                           # the suite, one binary at a time
 ./scripts/cargo.sh test -j 1 -p lumberroom
 ```
+
+`test-fast` builds every test binary once, as `test` does, then runs them six at a time instead of
+one after another. It prints one line per binary as it finishes, then a summary in `cargo test`'s
+shape: the totals, each failure's `---- name stdout ----` block, and the failed targets as
+`--test <name>` so you can rerun one. It exits 101 on any failure, and 1 when it found nothing to
+run. `TEST_FAST_JOBS=3` changes the width, and arguments after `--` reach every binary.
+Logs land in `test-logs/<run>/`, one per binary, and git ignores them. `scripts/test-pool-test.sh`
+tests the pool that does the running and the summing.
+
+What it costs and what it buys. Every binary that touches `lumberroom_rust_test` still queues on the
+suite lock, so the gain comes from the binaries that do not: the lib tests, the doctests,
+`migration_lock` and the ones that need no database. Nobody has timed this repository's suite both
+ways yet. Each running binary holds its own Postgres connections, so two suites sharing one cluster
+at once, from two worktrees or from this repository and lumberroom-cloud, should take
+`TEST_FAST_JOBS=3` each. A test that reads a cluster-wide catalog such as `pg_locks` sees the other
+binaries' state; see docs/traps.md. When a failure only shows up in `test-fast`, rerun that binary
+alone with `test --test <name>` before believing it.
+
+The builder links with mold, and `scripts/cargo.sh` refuses to start on an image without the
+`lumberroom.linker=mold` label. The fix it prints is the rebuild line above.
+
+Cargo runs in there as your own uid, never as root, because root ignores permission bits and every
+test that asserts a refusal from the filesystem passes under it whatever the code does. One had been
+inert for months. `scripts/lib/builder-entrypoint.sh` does the drop and takes ownership of the two
+shared volumes once, which the first container after a rebuild reports on stderr and which costs
+about a second. The image tag and both volumes are shared by name across every checkout on the
+machine, so that rebuild reaches other worktrees too.
 
 The first image build downloads 209MB of bge-base-en-v1.5 weights from huggingface.co into a BuildKit
 cache mount. Later builds copy from that mount, and the release image carries the weights at
@@ -61,7 +90,7 @@ It was kept because it shared no types with the server and so could not be accid
 by it, and it did earn that place: it caught protocol bugs the Rust tests could not. It also fell
 behind. It never learned to read an authorization server's metadata document, so it could not log in
 against a deployment whose issuer differs from its API base, and a gate running a client that cannot
-complete a login proves less than it looks like it does. Removed in 0.3.2.
+complete a login proves less than it looks like it does. Removed in 0.4.0.
 
 What it was protecting against is real and is now unprotected: the client and the server share
 types, so a change to both at once can look correct from inside. A second implementation would
@@ -127,5 +156,5 @@ contradicts an old one, mark the old record superseded rather than editing it to
 ## Reporting a vulnerability
 
 Use GitHub private vulnerability reporting on
-[the repository](https://github.com/the-cybersapien/lumberroom): Settings, Security, "Report a
+[the repository](https://github.com/lumberroom/lumberroom): Settings, Security, "Report a
 vulnerability". Do not open a public issue. [`SECURITY.md`](SECURITY.md) has the detail.

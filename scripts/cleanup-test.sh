@@ -63,6 +63,7 @@ cli_as() {
   docker run --rm --network "$SCRATCH_NETWORK" \
     -v "$REPO_DIR:$REPO_DIR" -w "$REPO_DIR" \
     -e LUMBERROOM_URL="$SCRATCH_INTERNAL_URL" -e LUMBERROOM_TOKEN="$tok" -e LUMBERROOM_CONFIG="$WORK/cfg.json" \
+    -e BUILDER_UID="$(id -u)" -e BUILDER_GID="$(id -g)" \
     lumberroom-builder "$BIN" "$@"
 }
 cli() { cli_as "$TOKEN" "$@"; }

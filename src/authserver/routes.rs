@@ -28,10 +28,11 @@ use crate::adapters::auth::Authenticator;
 use crate::authserver::limiter::{self, LoginLimiter};
 use crate::authserver::pages::{self, ClientView, FlowFields};
 use crate::authserver::session::{OwnerSession, Sessions};
-use crate::config::Config;
+use crate::config::{Config, ResourceAudience};
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::oauth::{
-    hash_token, hashes_match, random_token, validate_redirect_uri, verify_pkce_s256,
+    canonical_resource, check_self_registered_redirect, client_name_display, hash_token,
+    hashes_match, random_token, resource_matches, validate_redirect_uri, verify_pkce_s256,
     AuthorizeIntent, AuthorizeRequest, GrantProfile, OauthError, RegistrationRequest,
     RegistrationResponse, TokenResponse,
 };
@@ -146,7 +147,7 @@ pub fn metadata_document(
         // revoking it, and a public client has no other credential to offer.
         "revocation_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": scopes_supported,
-        "service_documentation": "https://github.com/the-cybersapien/lumberroom",
+        "service_documentation": "https://github.com/lumberroom/lumberroom",
     });
 
     // Advertised only when it exists. A registration endpoint in the document that answers 403 is
@@ -217,7 +218,11 @@ async fn register(
                 format!("a redirect URI is longer than {MAX_REDIRECT_URI} characters"),
             );
         }
-        if let Err(e) = validate_redirect_uri(uri) {
+        // The second check is for an anonymous registrant only. A client the owner issues by hand
+        // may still name an IP address, because the owner knows whose machine it is.
+        if let Err(e) = validate_redirect_uri(uri)
+            .and_then(|()| check_self_registered_redirect(uri, &app.cfg.public_url))
+        {
             return registration_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_redirect_uri",
@@ -264,7 +269,11 @@ async fn register(
         }
     }
 
-    let client_name = match req.client_name.as_deref().map(str::trim) {
+    // Cleaned before the cap, so the cap measures what gets stored. Cleaning drops bidi overrides
+    // and zero-width characters, which can make a name print as another name, and turns control
+    // characters into spaces, which keeps a newline out of the log line below. Look-alike letters
+    // from other scripts stay: the consent page judges the redirect host, not the name.
+    let client_name = match req.client_name.as_deref().map(client_name_display) {
         Some(name) if name.len() > MAX_CLIENT_NAME => {
             return registration_error(
                 StatusCode::BAD_REQUEST,
@@ -276,9 +285,13 @@ async fn register(
         _ => "unnamed client".to_string(),
     };
 
-    for (field, value) in
-        [("software_id", &req.software_id), ("software_version", &req.software_version)]
-    {
+    // The consent page prints software_id, so it gets the same cleaning as the name. One that
+    // cleans to nothing is stored as undeclared, which is what the page says for an absent one.
+    let clean =
+        |v: &Option<String>| v.as_deref().map(client_name_display).filter(|v| !v.is_empty());
+    let software_id = clean(&req.software_id);
+    let software_version = clean(&req.software_version);
+    for (field, value) in [("software_id", &software_id), ("software_version", &software_version)] {
         if value.as_deref().is_some_and(|v| v.len() > MAX_SOFTWARE_FIELD) {
             return registration_error(
                 StatusCode::BAD_REQUEST,
@@ -301,8 +314,8 @@ async fn register(
         client_name: client_name.clone(),
         redirect_uris: req.redirect_uris.clone(),
         grant_types: grant_types.clone(),
-        software_id: req.software_id.clone(),
-        software_version: req.software_version.clone(),
+        software_id,
+        software_version,
         registered_via: "dcr".to_string(),
     };
 
@@ -740,19 +753,9 @@ async fn exchange_code(
         return oauth_error(e);
     }
 
-    // RFC 8707. A resource on the token request must not silently widen the audience the code was
-    // bound to. Absent on the request means "the one from the authorization", which is the common case
-    // because the client already sent it at /authorize.
-    let resource = match (record.resource.clone(), field("resource")) {
-        (Some(bound), Some(asked)) if bound != asked => {
-            return oauth_error(OauthError::new(
-                "invalid_target",
-                "resource does not match the one this code was issued for",
-            ))
-        }
-        (Some(bound), _) => Some(bound),
-        (None, Some(asked)) => Some(asked.to_string()),
-        (None, None) => None,
+    let resource = match resource_for_exchange(record.resource.as_deref(), field("resource")) {
+        Ok(r) => r,
+        Err(e) => return oauth_error(e),
     };
 
     issue_tokens(app, &client, family_for(&code_hash), &record.scope, resource).await
@@ -767,7 +770,40 @@ async fn rotate(
         return oauth_error(OauthError::new("invalid_request", "refresh_token is required"));
     };
 
-    let outcome = match app.store.rotate_refresh(&hash_token(presented)).await {
+    // Before the rotation, not after. `rotate_refresh` sets consumed_at, and a resource this
+    // server does not serve is a fixable request error under RFC 6749 §5.2: the client corrects it
+    // and retries. Refusing after the spend means the retry presents a token that is already
+    // consumed, which reads as a replay and revokes the whole family. So the audience is settled
+    // while the refresh token is still worth something.
+    let resource = form.get("resource").filter(|v| !v.is_empty()).cloned();
+    if let Err(e) = resource_for_issue(
+        resource.as_deref(),
+        &app.cfg.auth.resource_url,
+        app.cfg.oauth.resource_audience,
+    ) {
+        return oauth_error(e);
+    }
+
+    let token_hash = hash_token(presented);
+
+    // Also before the spend, for the same reason. A caller presenting another client's live refresh
+    // token, or the right client with a wrong secret, is refused on a lookup that spends nothing.
+    // Refused after `rotate_refresh`, it has already burned the legitimate client's token, whose
+    // next refresh then reads as a replay and loses the family. Only a live token has an owner
+    // here. An unknown, spent, revoked or expired one falls through to `rotate_refresh`, so a spent
+    // token still revokes its family whoever presents it: a thief holding a copy must not dodge the
+    // kill by naming the wrong client.
+    let owner = match app.store.refresh_owner(&token_hash).await {
+        Ok(o) => o,
+        Err(e) => return internal_oauth(&e),
+    };
+    if let Some(owner) = owner.as_deref() {
+        if let Err(e) = refresh_caller(app, owner, &credentials).await {
+            return oauth_error(e);
+        }
+    }
+
+    let outcome = match app.store.rotate_refresh(&token_hash).await {
         Ok(o) => o,
         Err(e) => return internal_oauth(&e),
     };
@@ -798,28 +834,40 @@ async fn rotate(
         }
     };
 
-    if let Some(id) = credentials.client_id.as_deref() {
-        if id != client_id {
-            return oauth_error(OauthError::new(
-                "invalid_grant",
-                "this refresh token was not issued to that client",
-            ));
-        }
-    }
-
-    let client = match live_consented_client(app, &client_id).await {
+    // Again after the spend, as a guard against a race. The owner can revoke the client between the
+    // lookup and the spend, and a token with no live owner at the lookup skipped the first check.
+    // Only this check stands between the caller and the tokens for whatever `rotate_refresh`
+    // actually spent, so it compares the client and the secret again rather than trusting the
+    // lookup's answer.
+    let client = match refresh_caller(app, &client_id, &credentials).await {
         Ok(c) => c,
         Err(e) => return oauth_error(e),
     };
-    if let Err(e) = authenticate_client(&client, &credentials) {
-        return oauth_error(e);
-    }
 
-    // The rotated access token carries the resource the client asks for now, or none. The refresh
-    // row holds no resource of its own, and inventing one would bind a token to an audience nobody
-    // asked for.
-    let resource = form.get("resource").filter(|v| !v.is_empty()).cloned();
+    // The refresh row holds no resource of its own, so a rotated token inherits nothing. The value
+    // the client asks for now was settled above, before the spend, and `issue_tokens` stamps this
+    // deployment's own resource when the client named none. That default is safe here because this
+    // server serves exactly one resource, so the only audience it can supply is the one the client
+    // is already talking to.
     issue_tokens(app, &client, family, DEFAULT_SCOPE, resource).await
+}
+
+/// The live, consented client a refresh token belongs to, when the caller has proved to be that
+/// client. `rotate` asks before and after the spend, so both sides refuse with the same errors.
+async fn refresh_caller(
+    app: &AuthServer,
+    owner: &str,
+    credentials: &ClientCredentials,
+) -> std::result::Result<OauthClientRecord, OauthError> {
+    if credentials.client_id.as_deref().is_some_and(|id| id != owner) {
+        return Err(OauthError::new(
+            "invalid_grant",
+            "this refresh token was not issued to that client",
+        ));
+    }
+    let client = live_consented_client(app, owner).await?;
+    authenticate_client(&client, credentials)?;
+    Ok(client)
 }
 
 async fn issue_tokens(
@@ -827,8 +875,19 @@ async fn issue_tokens(
     client: &OauthClientRecord,
     family: uuid::Uuid,
     scope: &str,
-    resource: Option<String>,
+    asked: Option<String>,
 ) -> Response {
+    // The one funnel both grants reach, so the audience decision lands here once instead of in each
+    // caller. Every token this server mints leaves with a resource on it.
+    let resource = match resource_for_issue(
+        asked.as_deref(),
+        &app.cfg.auth.resource_url,
+        app.cfg.oauth.resource_audience,
+    ) {
+        Ok(r) => r,
+        Err(e) => return oauth_error(e),
+    };
+
     let access = match random_token(32) {
         Ok(t) => t,
         Err(e) => return internal_oauth(&e),
@@ -839,7 +898,7 @@ async fn issue_tokens(
         token_hash: hash_token(&access),
         client_id: client.client_id.clone(),
         scope: scope.to_string(),
-        resource,
+        resource: Some(resource),
         family_id: family,
         expires_at: now + chrono::Duration::seconds(app.cfg.oauth.access_ttl_secs),
     };
@@ -963,32 +1022,8 @@ async fn clients(
 
     match app.store.list_clients(include_revoked).await {
         Ok(records) => {
-            // snake_case throughout, because the wire contract is snake_case and the CLI reads it.
-            let clients: Vec<serde_json::Value> = records
-                .iter()
-                .map(|c| {
-                    serde_json::json!({
-                        "client_id": c.client_id,
-                        "client_name": c.client_name,
-                        "redirect_uris": c.redirect_uris,
-                        "grant_types": c.grant_types,
-                        "registered_via": c.registered_via,
-                        "software_id": c.software_id,
-                        "profile": c.profile,
-                        "read": c.read,
-                        "write": c.write,
-                        "registry_write": c.registry_write,
-                        "sealed_capable": c.sealed_capable,
-                        "may_delete": c.may_delete,
-                        "may_ingest": c.may_ingest,
-                        "consented_at": c.consented_at,
-                        "created_at": c.created_at,
-                        "last_used_at": c.last_used_at,
-                        "revoked_at": c.revoked_at,
-                        "confidential": c.secret_hash.is_some(),
-                    })
-                })
-                .collect();
+            let clients: Vec<serde_json::Value> =
+                records.iter().map(client_listing_entry).collect();
             (
                 [(header::CACHE_CONTROL, "no-store")],
                 Json(serde_json::json!({ "count": clients.len(), "clients": clients })),
@@ -997,6 +1032,35 @@ async fn clients(
         }
         Err(e) => internal_json(&e),
     }
+}
+
+/// One row of the `/oauth/clients` listing. snake_case throughout, because the wire contract is
+/// snake_case and the CLI reads it.
+///
+/// The name goes through [`client_name_display`] here as well as at registration: a row stored
+/// before that cleaning existed still holds whatever its registrant sent, and the CLI prints this
+/// field to a terminal, where a bidi override or an escape sequence can rewrite what the owner reads.
+fn client_listing_entry(c: &OauthClientRecord) -> serde_json::Value {
+    serde_json::json!({
+        "client_id": c.client_id,
+        "client_name": client_name_display(&c.client_name),
+        "redirect_uris": c.redirect_uris,
+        "grant_types": c.grant_types,
+        "registered_via": c.registered_via,
+        "software_id": c.software_id,
+        "profile": c.profile,
+        "read": c.read,
+        "write": c.write,
+        "registry_write": c.registry_write,
+        "sealed_capable": c.sealed_capable,
+        "may_delete": c.may_delete,
+        "may_ingest": c.may_ingest,
+        "consented_at": c.consented_at,
+        "created_at": c.created_at,
+        "last_used_at": c.last_used_at,
+        "revoked_at": c.revoked_at,
+        "confidential": c.secret_hash.is_some(),
+    })
 }
 
 // ---- shared machinery ----
@@ -1080,6 +1144,94 @@ fn authenticate_client(
     }
 }
 
+/// The audience the code exchange carries forward, from what the code was bound to and what the
+/// token request asks for now.
+///
+/// RFC 8707 §2.2. A resource on the token request must not widen the audience the code was bound
+/// to. An absent one means "the one from the authorization", which is the common case because the
+/// client already sent it at /authorize.
+///
+/// The two sides go through [`resource_matches`] rather than string equality. `https://host/mcp`
+/// and `https://host/mcp/` name one audience, and refusing the second is an outage the client
+/// cannot read off the error.
+///
+/// A first resource arriving here is parsed before it is kept. `AuthorizeRequest::validate` is the
+/// only other place a resource is checked and it never runs on the token endpoint, so without this
+/// a client that omitted `resource` at /authorize writes any string it likes onto the token row.
+fn resource_for_exchange(
+    bound: Option<&str>,
+    asked: Option<&str>,
+) -> std::result::Result<Option<String>, OauthError> {
+    match (bound, asked) {
+        (Some(bound), Some(asked)) => {
+            if resource_matches(bound, asked) {
+                Ok(Some(bound.to_string()))
+            } else {
+                Err(OauthError::new(
+                    "invalid_target",
+                    "resource does not match the one this code was issued for",
+                ))
+            }
+        }
+        (Some(bound), None) => Ok(Some(bound.to_string())),
+        (None, Some(asked)) => {
+            if canonical_resource(asked).is_none() {
+                return Err(OauthError::new(
+                    "invalid_target",
+                    "resource must be an absolute URI without a fragment",
+                ));
+            }
+            Ok(Some(asked.to_string()))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// The audience stamped on a token at issuance, from what the client asked for and what this
+/// deployment serves.
+///
+/// The stamp on the absent case is what makes `OAUTH_RESOURCE_AUDIENCE=strict` reachable. The CLI
+/// in this repository sends `resource` at /authorize and at the code exchange and never on the
+/// refresh grant (crates/lumberroom/src/client.rs:375-382), and `oauth_refresh` holds no resource
+/// column for a rotated token to inherit, so every token it rotates would carry NULL forever and
+/// the pre-existing NULLs would never drain. With the stamp they drain within one
+/// OAUTH_ACCESS_TTL_SECS.
+///
+/// A match keeps the client's own spelling. The row records what the client asserted, and
+/// canonicalisation is a comparison rule rather than a storage rule.
+///
+/// `Off` still stamps and still refuses a resource that is not a URI, and it stops refusing one
+/// this deployment does not serve. That is the whole point of the setting: a deployment reachable
+/// under two names has clients that legitimately name the other one, and refusing them here would
+/// leave the operator with a switch that turns off half the behaviour it is documented to turn off.
+fn resource_for_issue(
+    asked: Option<&str>,
+    served: &str,
+    audience: ResourceAudience,
+) -> std::result::Result<String, OauthError> {
+    let Some(asked) = asked else { return Ok(served.to_string()) };
+    // A value that will not parse is refused whatever the setting says. It is not an audience
+    // disagreement, it is not a URI, and storing it would put text on the token row that no
+    // comparison can ever match.
+    if canonical_resource(asked).is_none() {
+        return Err(OauthError::new(
+            "invalid_target",
+            "resource must be an absolute URI without a fragment",
+        ));
+    }
+    if audience != ResourceAudience::Off && !resource_matches(asked, served) {
+        // RFC 8707 §2.2. The description names no value: the input came off a form and echoing it
+        // back turns this error into a reflection point.
+        return Err(OauthError::new(
+            "invalid_target",
+            "this server does not issue tokens for that resource",
+        ));
+    }
+    // The row records what the client asserted. Canonicalisation is a comparison rule rather than
+    // a storage rule.
+    Ok(asked.to_string())
+}
+
 async fn live_consented_client(
     app: &AuthServer,
     client_id: &str,
@@ -1144,13 +1296,39 @@ async fn resolve_request(
         ));
     }
 
-    match request.validate(&record.redirect_uris) {
-        Ok(intent) => Ok((record, intent)),
-        Err(e) => Err(page(
-            StatusCode::BAD_REQUEST,
-            pages::error_page("cannot start", e.client_message()),
-        )),
+    let intent = match request.validate(&record.redirect_uris) {
+        Ok(intent) => intent,
+        Err(e) => {
+            return Err(page(
+                StatusCode::BAD_REQUEST,
+                pages::error_page("cannot start", e.client_message()),
+            ))
+        }
+    };
+
+    // RFC 8707 §2.1 wants a resource this server does not serve refused here, at the authorization
+    // endpoint. Doing it only at /token means the owner reads a consent screen, approves a client,
+    // and the exchange then fails after the code has been consumed, so the client has to run the
+    // whole flow again to see the same error. Refusing before a code exists costs one comparison.
+    //
+    // Rendered as a page rather than redirected with `error=`, which is the contract every error
+    // out of here follows: redirecting before the request is known to be sound is what turns this
+    // endpoint into an open redirector.
+    if app.cfg.oauth.resource_audience != ResourceAudience::Off {
+        if let Some(asked) = intent.resource.as_deref() {
+            if !resource_matches(asked, &app.cfg.auth.resource_url) {
+                return Err(page(
+                    StatusCode::BAD_REQUEST,
+                    pages::error_page(
+                        "cannot start",
+                        "This client asked for a resource this server does not serve.",
+                    ),
+                ));
+            }
+        }
     }
+
+    Ok((record, intent))
 }
 
 fn authorize_request(params: &HashMap<String, String>) -> AuthorizeRequest {
@@ -1221,7 +1399,21 @@ fn consent_page(
 fn page(status: StatusCode, body: String) -> Response {
     // no-store on every page: they carry a CSRF token bound to a session, and a cached consent screen
     // is a form that outlives the login it belongs to.
-    (status, [(header::CACHE_CONTROL, "no-store")], Html(body)).into_response()
+    //
+    // Never framed. A consent page inside someone else's frame can sit under a decoy that lines a
+    // click up with Allow. The Lax session cookie already stays home on a cross-site frame, but a
+    // same-site page that embeds this one would still carry it, and the header costs nothing.
+    // X-Frame-Options covers browsers that predate frame-ancestors.
+    (
+        status,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+        ],
+        Html(body),
+    )
+        .into_response()
 }
 
 fn page_internal(e: &DomainError) -> Response {
@@ -1442,6 +1634,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_page_refuses_to_render_inside_another_site_frame() {
+        let response = page(StatusCode::OK, String::new());
+        let headers = response.headers();
+        assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert_eq!(headers.get(header::CONTENT_SECURITY_POLICY).unwrap(), "frame-ancestors 'none'");
+        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    }
+
+    #[test]
     fn a_family_id_is_stable_for_one_code_and_different_for_another() {
         let a = family_for(&hash_token("code-a"));
         let b = family_for(&hash_token("code-b"));
@@ -1593,6 +1794,15 @@ mod tests {
     }
 
     #[test]
+    fn the_clients_listing_cleans_a_stored_client_name() {
+        let mut dirty = record(None);
+        dirty.client_name = "Cl\u{202E}au\u{200B}de\n\tDesktop".into();
+        let entry = client_listing_entry(&dirty);
+        assert_eq!(entry["client_name"], "Claude Desktop");
+        assert_eq!(entry["client_id"], "abc");
+    }
+
+    #[test]
     fn a_public_client_authenticates_with_pkce_alone() {
         let c = ClientCredentials { client_id: Some("abc".into()), secret: None };
         assert!(authenticate_client(&record(None), &c).is_ok());
@@ -1654,5 +1864,500 @@ mod tests {
     fn a_disabled_registration_endpoint_is_not_advertised() {
         let doc = document(false);
         assert!(doc.get("registration_endpoint").is_none());
+    }
+
+    // ---- RFC 8707 audience decisions ----
+
+    /// The audience this deployment serves, in the shape `cfg.auth.resource_url` carries.
+    const SERVED: &str = "https://memory.example.com/mcp";
+
+    #[test]
+    fn a_bound_resource_matches_the_same_one_asked_for_with_a_trailing_slash() {
+        let asked = "https://memory.example.com/mcp/";
+        let out = resource_for_exchange(Some(SERVED), Some(asked)).unwrap();
+        assert_eq!(out.as_deref(), Some(SERVED));
+    }
+
+    #[test]
+    fn a_bound_resource_matches_the_same_one_asked_for_with_its_default_port() {
+        let asked = "https://memory.example.com:443/mcp";
+        let out = resource_for_exchange(Some(SERVED), Some(asked)).unwrap();
+        assert_eq!(out.as_deref(), Some(SERVED));
+    }
+
+    #[test]
+    fn a_resource_naming_another_host_than_the_code_did_is_refused() {
+        let asked = "https://elsewhere.example.com/mcp";
+        let e = resource_for_exchange(Some(SERVED), Some(asked)).unwrap_err();
+        assert_eq!(e.error, "invalid_target");
+    }
+
+    #[test]
+    fn a_resource_that_is_not_an_absolute_uri_never_reaches_the_token_row() {
+        for asked in ["/mcp", "https://memory.example.com/mcp#frag", "what the client typed"] {
+            let e = resource_for_exchange(None, Some(asked)).unwrap_err();
+            assert_eq!(e.error, "invalid_target", "{asked} must not be stored");
+        }
+    }
+
+    #[test]
+    fn an_absent_resource_on_the_token_request_keeps_the_one_from_the_authorization() {
+        let out = resource_for_exchange(Some(SERVED), None).unwrap();
+        assert_eq!(out.as_deref(), Some(SERVED));
+    }
+
+    #[test]
+    fn a_first_resource_arriving_at_the_token_endpoint_is_kept_once_it_parses() {
+        let out = resource_for_exchange(None, Some(SERVED)).unwrap();
+        assert_eq!(out.as_deref(), Some(SERVED));
+    }
+
+    /// The pair that drains the NULLs. A client that named no resource anywhere leaves the exchange
+    /// with none, and issuance is what puts this deployment's own resource on the row.
+    #[test]
+    fn a_token_from_an_exchange_that_named_no_resource_still_carries_the_served_one() {
+        let out = resource_for_exchange(None, None).unwrap();
+        assert_eq!(out, None);
+        assert_eq!(
+            resource_for_issue(out.as_deref(), SERVED, ResourceAudience::Lenient).unwrap(),
+            SERVED
+        );
+    }
+
+    #[test]
+    fn issuance_stamps_the_served_resource_when_the_client_asked_for_nothing() {
+        assert_eq!(resource_for_issue(None, SERVED, ResourceAudience::Lenient).unwrap(), SERVED);
+    }
+
+    #[test]
+    fn issuance_keeps_the_spelling_the_client_sent_rather_than_the_canonical_form() {
+        let asked = "https://memory.example.com:443/mcp/";
+        assert_eq!(
+            resource_for_issue(Some(asked), SERVED, ResourceAudience::Lenient).unwrap(),
+            asked
+        );
+    }
+
+    #[test]
+    fn issuance_refuses_a_resource_this_deployment_does_not_serve() {
+        let asked = "https://elsewhere.example.com/mcp";
+        let e = resource_for_issue(Some(asked), SERVED, ResourceAudience::Lenient).unwrap_err();
+        assert_eq!(e.error, "invalid_target");
+
+        let description = e.error_description.unwrap_or_default();
+        assert!(
+            !description.contains("elsewhere"),
+            "an attacker-chosen value must not come back in the error: {description}"
+        );
+    }
+
+    /// The setting is documented as the escape hatch for a deployment reachable under two names.
+    /// If it only relaxed the authenticator, the operator would set it and still watch the token
+    /// endpoint refuse the client it was set for.
+    #[test]
+    fn issuance_stops_refusing_a_foreign_resource_when_the_check_is_off() {
+        let out = resource_for_issue(
+            Some("https://elsewhere.example.com/mcp"),
+            SERVED,
+            ResourceAudience::Off,
+        )
+        .unwrap();
+        assert_eq!(out, "https://elsewhere.example.com/mcp");
+    }
+
+    /// `off` relaxes the audience and nothing else. A value that is not a URI can never match any
+    /// comparison, so storing it would put dead text on the token row.
+    #[test]
+    fn issuance_still_refuses_an_unparseable_resource_when_the_check_is_off() {
+        let e = resource_for_issue(Some("../mcp"), SERVED, ResourceAudience::Off).unwrap_err();
+        assert_eq!(e.error, "invalid_target");
+    }
+
+    #[test]
+    fn issuance_still_stamps_the_served_resource_when_the_check_is_off() {
+        assert_eq!(resource_for_issue(None, SERVED, ResourceAudience::Off).unwrap(), SERVED);
+    }
+
+    #[test]
+    fn issuance_refuses_a_resource_it_cannot_parse() {
+        let e = resource_for_issue(Some("../mcp"), SERVED, ResourceAudience::Lenient).unwrap_err();
+        assert_eq!(e.error, "invalid_target");
+    }
+
+    /// The refresh grant against an in-memory store, so the order of the spend and the client
+    /// checks shows up as a counter instead of needing Postgres.
+    mod refresh {
+        use super::*;
+        use crate::domain::types::Principal;
+        use crate::ports::{AccessTokenRecord, NewOauthClient};
+        use async_trait::async_trait;
+        use std::sync::Mutex;
+
+        const TOKEN: &str = "refresh-token-for-a";
+
+        struct Store {
+            clients: Vec<OauthClientRecord>,
+            owner: String,
+            /// The client `rotate_refresh` reports. Equal to `owner` except in a test simulating a
+            /// store that answered the lookup and the spend differently.
+            rotates_as: String,
+            family: uuid::Uuid,
+            spent: Mutex<bool>,
+            rotations: Mutex<u32>,
+            revoked_families: Mutex<Vec<uuid::Uuid>>,
+        }
+
+        #[async_trait]
+        impl OauthStore for Store {
+            async fn find_client(&self, client_id: &str) -> Result<Option<OauthClientRecord>> {
+                Ok(self.clients.iter().find(|c| c.client_id == client_id).cloned())
+            }
+            /// Live tokens only, as the port says: a spent token answers `None`.
+            async fn refresh_owner(&self, token_hash: &str) -> Result<Option<String>> {
+                let live = token_hash == hash_token(TOKEN) && !*self.spent.lock().unwrap();
+                Ok(live.then(|| self.owner.clone()))
+            }
+            async fn rotate_refresh(&self, token_hash: &str) -> Result<RefreshOutcome> {
+                *self.rotations.lock().unwrap() += 1;
+                if token_hash != hash_token(TOKEN) {
+                    return Ok(RefreshOutcome::Unknown);
+                }
+                let mut spent = self.spent.lock().unwrap();
+                if *spent {
+                    return Ok(RefreshOutcome::Replayed { family_id: self.family });
+                }
+                *spent = true;
+                Ok(RefreshOutcome::Rotated {
+                    client_id: self.rotates_as.clone(),
+                    family_id: self.family,
+                })
+            }
+            async fn revoke_family(&self, family_id: uuid::Uuid) -> Result<()> {
+                self.revoked_families.lock().unwrap().push(family_id);
+                Ok(())
+            }
+            async fn insert_token(&self, _t: NewAccessToken) -> Result<()> {
+                Ok(())
+            }
+            async fn insert_refresh(&self, _r: NewRefreshToken) -> Result<()> {
+                Ok(())
+            }
+            fn touch_client(&self, _client_id: &str) {}
+
+            async fn register_client(&self, _c: NewOauthClient) -> Result<()> {
+                unimplemented!("not on the refresh path")
+            }
+            async fn list_clients(&self, _include_revoked: bool) -> Result<Vec<OauthClientRecord>> {
+                unimplemented!("not on the refresh path")
+            }
+            async fn set_client_grant(
+                &self,
+                _client_id: &str,
+                _g: ClientGrantUpdate,
+            ) -> Result<()> {
+                unimplemented!("not on the refresh path")
+            }
+            async fn revoke_client(&self, _client_id: &str) -> Result<bool> {
+                unimplemented!("not on the refresh path")
+            }
+            async fn insert_code(&self, _c: NewAuthCode) -> Result<()> {
+                unimplemented!("not on the refresh path")
+            }
+            async fn consume_code(&self, _code_hash: &str) -> Result<CodeOutcome> {
+                unimplemented!("not on the refresh path")
+            }
+            async fn find_token(&self, _token_hash: &str) -> Result<Option<AccessTokenRecord>> {
+                unimplemented!("not on the refresh path")
+            }
+            async fn revoke_token(&self, _token_hash: &str) -> Result<bool> {
+                unimplemented!("not on the refresh path")
+            }
+            async fn purge_expired(&self) -> Result<u64> {
+                unimplemented!("not on the refresh path")
+            }
+        }
+
+        struct NoAuth;
+
+        #[async_trait]
+        impl Authenticator for NoAuth {
+            fn mode(&self) -> &'static str {
+                "oauth"
+            }
+            async fn authenticate(&self, _authorization: Option<&str>) -> Result<Principal> {
+                unimplemented!("not on the refresh path")
+            }
+        }
+
+        fn client(client_id: &str, secret: Option<&str>) -> OauthClientRecord {
+            OauthClientRecord {
+                client_id: client_id.into(),
+                secret_hash: secret.map(hash_token),
+                client_name: client_id.into(),
+                redirect_uris: vec![],
+                grant_types: vec!["authorization_code".into(), "refresh_token".into()],
+                registered_via: "dcr".into(),
+                software_id: None,
+                read: vec![],
+                write: vec![],
+                registry_write: false,
+                sealed_capable: false,
+                may_delete: false,
+                may_ingest: false,
+                may_read_history: false,
+                consented_at: Some(chrono::Utc::now()),
+                profile: Some("standard".into()),
+                created_at: chrono::Utc::now(),
+                last_used_at: None,
+                revoked_at: None,
+            }
+        }
+
+        fn store(a_secret: Option<&str>, spent: bool) -> Arc<Store> {
+            Arc::new(Store {
+                clients: vec![client("a", a_secret), client("b", None)],
+                owner: "a".into(),
+                rotates_as: "a".into(),
+                family: uuid::Uuid::from_u128(7),
+                spent: Mutex::new(spent),
+                rotations: Mutex::new(0),
+                revoked_families: Mutex::new(vec![]),
+            })
+        }
+
+        // Built by hand for the reason `adapters::auth::metadata` gives: `config::load` reads the
+        // process environment, and parallel tests mutating it flake.
+        fn cfg() -> Config {
+            use crate::config::*;
+            Config {
+                cleanup: CleanupConfig { interval_secs: 0, namespace: None, limit: 500 },
+                port: 8787,
+                host: "0.0.0.0".into(),
+                tenant_id: "me".into(),
+                database_url: String::new(),
+                db: Default::default(),
+                run_migrations_on_boot: false,
+                public_url: "https://lumberroom.example.com".into(),
+                auth: AuthConfig {
+                    mode: AuthMode::Oauth,
+                    resource_url: "https://lumberroom.example.com/mcp".into(),
+                    grants: vec![],
+                    issuer: String::new(),
+                    audience: String::new(),
+                    jwks_uri: String::new(),
+                    required_scopes: vec![],
+                    client_claims: vec![],
+                    allowed_subjects: vec![],
+                },
+                oauth: OauthConfig {
+                    owner_password_hash: None,
+                    dcr_enabled: true,
+                    code_ttl_secs: 120,
+                    access_ttl_secs: 3600,
+                    refresh_ttl_secs: 86_400,
+                    session_ttl_secs: 900,
+                    default_profile: "standard".into(),
+                    scopes_supported: vec![],
+                    cookie_secret: "c".repeat(32),
+                    login_attempts_per_minute: 5,
+                    registrations_per_minute: 5,
+                    resource_audience: ResourceAudience::Lenient,
+                },
+                embed: EmbedConfig {
+                    provider: EmbedProvider::Hash,
+                    dim: 768,
+                    model: "test".into(),
+                    cache_dir: String::new(),
+                    allow_fallback: true,
+                },
+                bootstrap: BootstrapConfig {
+                    cache_ms: 0,
+                    profile_limit: 1,
+                    project_limit: 1,
+                    recent_limit: 1,
+                    recent_days: 1,
+                    registry_limit: 1,
+                    max_chars: 100,
+                    max_chars_by_client: HashMap::new(),
+                },
+                search: SearchConfig {
+                    graph_route: crate::domain::routing::Thresholds::default(),
+                    default_limit: 8,
+                    max_limit: 50,
+                    vector_weight: 1.0,
+                    lexical_weight: 0.35,
+                    include_all_projects: true,
+                    other_project_penalty: 0.85,
+                    usage_weight: 0.05,
+                    fusion: Fusion::Linear,
+                    rrf_k: 60.0,
+                },
+                policy: PolicyConfig {
+                    defaults: crate::domain::policy::SensitivityDefaults::default(),
+                    defaults_from_env: false,
+                    tripwire: true,
+                    max_write_sensitivity: crate::domain::types::Sensitivity::Private,
+                    max_content_chars: 8000,
+                    write_min_occurred_age_secs: DEFAULT_MIN_OCCURRED_AGE_SECS,
+                },
+                crypto: CryptoConfig {
+                    provider: KekProvider::None,
+                    kek_path: String::new(),
+                    kek_env_var: String::new(),
+                    kek_id: "kek-1".into(),
+                    require_verified_kek: true,
+                },
+                quality: QualityConfig {
+                    dedupe_threshold: 0.97,
+                    conflict_threshold: 0.90,
+                    conflict_limit: 3,
+                    conflict_scan_max: 2_000,
+                    stale_days: 365,
+                    export_max_sensitivity: crate::domain::types::Sensitivity::Open,
+                    archive_max_decompressed_bytes: 2 * 1024 * 1024 * 1024,
+                },
+                ingest: IngestConfig { emission_window_days: 90, emission_slack_secs: 300.0 },
+            }
+        }
+
+        fn server(store: &Arc<Store>) -> AuthServer {
+            let store: Arc<dyn OauthStore> = store.clone();
+            AuthServer::new(Arc::new(cfg()), store, Arc::new(NoAuth))
+        }
+
+        fn form(token: &str) -> HashMap<String, String> {
+            HashMap::from([("refresh_token".to_string(), token.to_string())])
+        }
+
+        fn as_client(id: &str, secret: Option<&str>) -> ClientCredentials {
+            ClientCredentials { client_id: Some(id.into()), secret: secret.map(str::to_string) }
+        }
+
+        async fn error_code(response: Response) -> (StatusCode, String) {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            (status, json["error"].as_str().unwrap_or_default().to_string())
+        }
+
+        #[tokio::test]
+        async fn another_clients_refresh_token_is_refused_and_left_unspent() {
+            let s = store(None, false);
+            let app = server(&s);
+
+            let refused = rotate(&app, &form(TOKEN), as_client("b", None)).await;
+            assert_eq!(
+                error_code(refused).await,
+                (StatusCode::BAD_REQUEST, "invalid_grant".into())
+            );
+            assert_eq!(
+                *s.rotations.lock().unwrap(),
+                0,
+                "a foreign caller must not reach the spend"
+            );
+
+            let owner = rotate(&app, &form(TOKEN), as_client("a", None)).await;
+            assert_eq!(owner.status(), StatusCode::OK, "the owner's token survived the refusal");
+            assert!(s.revoked_families.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_wrong_secret_leaves_the_confidential_clients_token_unspent() {
+            let s = store(Some("right"), false);
+            let app = server(&s);
+
+            let refused = rotate(&app, &form(TOKEN), as_client("a", Some("wrong"))).await;
+            assert_eq!(
+                error_code(refused).await,
+                (StatusCode::UNAUTHORIZED, "invalid_client".into())
+            );
+            assert_eq!(*s.rotations.lock().unwrap(), 0);
+
+            let owner = rotate(&app, &form(TOKEN), as_client("a", Some("right"))).await;
+            assert_eq!(owner.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn an_unknown_refresh_token_still_gets_the_unknown_answer() {
+            let s = store(None, false);
+            let app = server(&s);
+
+            let refused = rotate(&app, &form("never-issued"), as_client("a", None)).await;
+            assert_eq!(
+                error_code(refused).await,
+                (StatusCode::BAD_REQUEST, "invalid_grant".into())
+            );
+            assert_eq!(*s.rotations.lock().unwrap(), 1, "rotate_refresh owns the unknown verdict");
+        }
+
+        #[tokio::test]
+        async fn the_owner_replaying_a_spent_token_still_revokes_the_family() {
+            let s = store(None, true);
+            let app = server(&s);
+
+            let refused = rotate(&app, &form(TOKEN), as_client("a", None)).await;
+            assert_eq!(
+                error_code(refused).await,
+                (StatusCode::BAD_REQUEST, "invalid_grant".into())
+            );
+            assert_eq!(*s.revoked_families.lock().unwrap(), vec![uuid::Uuid::from_u128(7)]);
+        }
+
+        /// A copy of a spent token in the wrong hands is the case the family kill exists for.
+        /// Naming another client must not turn the replay into a quiet refusal.
+        #[tokio::test]
+        async fn a_spent_token_presented_as_another_client_still_revokes_the_family() {
+            let s = store(None, true);
+            let app = server(&s);
+
+            let refused = rotate(&app, &form(TOKEN), as_client("b", None)).await;
+            assert_eq!(
+                error_code(refused).await,
+                (StatusCode::BAD_REQUEST, "invalid_grant".into())
+            );
+            assert_eq!(*s.rotations.lock().unwrap(), 1, "the spent token reached rotate_refresh");
+            assert_eq!(*s.revoked_families.lock().unwrap(), vec![uuid::Uuid::from_u128(7)]);
+        }
+
+        /// A store whose lookup names one client and whose spend names another. Postgres cannot
+        /// produce it from one row, so the guard after the spend is the only check that sees it.
+        fn split(b_secret: Option<&str>) -> Arc<Store> {
+            Arc::new(Store {
+                clients: vec![client("a", None), client("b", b_secret)],
+                owner: "a".into(),
+                rotates_as: "b".into(),
+                family: uuid::Uuid::from_u128(7),
+                spent: Mutex::new(false),
+                rotations: Mutex::new(0),
+                revoked_families: Mutex::new(vec![]),
+            })
+        }
+
+        #[tokio::test]
+        async fn a_spend_that_names_another_client_than_the_caller_issues_nothing() {
+            let s = split(None);
+            let app = server(&s);
+
+            let refused = rotate(&app, &form(TOKEN), as_client("a", None)).await;
+            assert_eq!(
+                error_code(refused).await,
+                (StatusCode::BAD_REQUEST, "invalid_grant".into())
+            );
+            assert_eq!(*s.rotations.lock().unwrap(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_spend_that_names_a_confidential_client_demands_its_secret() {
+            let s = split(Some("right"));
+            let app = server(&s);
+
+            let anonymous = ClientCredentials { client_id: None, secret: None };
+            let refused = rotate(&app, &form(TOKEN), anonymous).await;
+            assert_eq!(
+                error_code(refused).await,
+                (StatusCode::UNAUTHORIZED, "invalid_client".into())
+            );
+            assert_eq!(*s.rotations.lock().unwrap(), 1);
+        }
     }
 }

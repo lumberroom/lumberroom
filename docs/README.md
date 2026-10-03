@@ -15,6 +15,9 @@ and `CONTRIBUTING.md` at the repository root, then `docs/decisions/README.md`.
   where it currently falls short of that.
 - [`connect-claude-code.md`](connect-claude-code.md): wiring Claude Code on a Mac to a lumberroom
   deployment: credential, MCP registration, hook, write rule, and the commands that prove the loop.
+- [`connect-agents-md.md`](connect-agents-md.md): wiring Codex, Hermes and every other `AGENTS.md`
+  reader: where each one reads the file, the snippet that carries the write rule, and the
+  credential behind it.
 - [`permissions.md`](permissions.md): writing an `AUTH_TOKENS` grant, and the asymmetry in how
   namespace globs and sensitivity ceilings interact.
 - [`ingestion.md`](ingestion.md): the ingestion pipeline: implemented, not yet run against real

@@ -40,7 +40,9 @@ pub struct Fact {
     pub namespace: String,
     pub content: String,
     pub tags: Vec<String>,
-    pub source_client: String,
+    /// The app that wrote the row, by name: `services::sources::labels` over the stored
+    /// `source_client`, which never leaves the server on this path.
+    pub source: String,
     pub sensitivity: Sensitivity,
     pub created_at: String,
 }
@@ -170,6 +172,15 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
 
     let sealed_inventory = sealed_counts(ctx, &readable).await;
 
+    let writers: Vec<String> = data
+        .profile
+        .iter()
+        .chain(data.project_context.iter())
+        .chain(data.recent.iter())
+        .map(|m| m.source_client.clone())
+        .collect();
+    let names = super::sources::labels(ctx, &writers).await;
+
     let mut digest = Digest {
         generated_at: chrono::Utc::now().to_rfc3339(),
         tenant: ctx.cfg.tenant_id.clone(),
@@ -177,9 +188,9 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
         namespaces: primary.iter().map(|c| c.namespace.clone()).collect(),
         inventory,
         sealed_inventory,
-        profile: data.profile.iter().map(to_fact).collect(),
-        project_context: data.project_context.iter().map(to_fact).collect(),
-        recent: data.recent.iter().map(to_fact).collect(),
+        profile: data.profile.iter().map(|m| to_fact(m, &names)).collect(),
+        project_context: data.project_context.iter().map(|m| to_fact(m, &names)).collect(),
+        recent: data.recent.iter().map(|m| to_fact(m, &names)).collect(),
         registry: data.registry,
         counts: Counts {
             memories: data.memories_count,
@@ -344,8 +355,10 @@ fn push_section(
         } else {
             format!(", {}", f.sensitivity)
         };
-        // `source_client` is the one field a writer cannot set, so a trailer forged inside the
-        // body contradicts the real one on the same line.
+        // The server writes this trailer, so a trailer forged inside the body sits beside the
+        // real one on the same line. Since decision 0020 the name in it is the writer's own
+        // choice for an OAuth client, approved by the owner at consent, rather than a value no
+        // writer can pick. A second client with an approved name carries the date it was added.
         lines.push(format!(
             "- {}{} _({}{}, {}, via {})_",
             one_line(&f.content),
@@ -353,18 +366,18 @@ fn push_section(
             f.namespace,
             level,
             &f.created_at[..10.min(f.created_at.len())],
-            f.source_client,
+            f.source,
         ));
     }
 }
 
-fn to_fact(m: &crate::domain::types::Memory) -> Fact {
+fn to_fact(m: &crate::domain::types::Memory, names: &HashMap<String, String>) -> Fact {
     Fact {
         id: m.id.clone(),
         namespace: m.namespace.clone(),
         content: m.content.clone(),
         tags: m.tags.clone(),
-        source_client: m.source_client.clone(),
+        source: names.get(&m.source_client).cloned().unwrap_or_else(|| m.source_client.clone()),
         sensitivity: m.sensitivity,
         created_at: m.created_at.to_rfc3339(),
     }
@@ -482,7 +495,7 @@ mod tests {
             namespace: namespace.into(),
             content: content.into(),
             tags: tags.iter().map(|s| s.to_string()).collect(),
-            source_client: "mac".into(),
+            source: "mac".into(),
             sensitivity: Sensitivity::Open,
             created_at: "2026-08-18T10:00:00+00:00".into(),
         }

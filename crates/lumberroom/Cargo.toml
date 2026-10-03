@@ -1,11 +1,11 @@
 [package]
 name = "lumberroom"
-version = "0.3.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.83"
 description = "Client for a lumberroom memory server. Runs on the machine holding the transcripts."
 license = "Apache-2.0"
-repository = "https://github.com/the-cybersapien/lumberroom"
+repository = "https://github.com/lumberroom/lumberroom"
 homepage = "https://lumberroom.cloud"
 readme = "README.md"
 keywords = ["mcp", "memory", "cli", "lumberroom"]

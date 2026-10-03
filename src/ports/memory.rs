@@ -152,14 +152,19 @@ pub struct WalkBounds {
     pub include_retired: bool,
 }
 
-/// One retired row, with what retired it.
+/// One row that left the live reads, with what took it out.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Retired {
     pub id: uuid::Uuid,
     pub namespace: String,
     pub content: String,
     pub sensitivity: crate::domain::types::Sensitivity,
-    pub superseded_at: chrono::DateTime<chrono::Utc>,
+    /// When the row left. A supersession's `superseded_at`, or the instant an expiry closed the
+    /// period. The two never both apply, because an expiry writes no successor.
+    pub retired_at: chrono::DateTime<chrono::Utc>,
+    /// The period closed with nothing replacing the fact. The row is neither live nor retired, and
+    /// `review::unexpire` brings it back.
+    pub expired: bool,
     pub occurred_at: Option<chrono::DateTime<chrono::Utc>>,
     pub occurred_until: Option<chrono::DateTime<chrono::Utc>>,
     /// The row was retired and its period never closed, so as-of reads still report it as holding.
@@ -224,6 +229,13 @@ pub struct SearchQuery {
     /// `Principal::may_read_history` before setting it. Nothing below this line can: a repository
     /// holds no principal.
     pub as_of: Option<chrono::DateTime<chrono::Utc>>,
+    /// A hit carries every one of these. Empty is no filter, and then the statement is the one this
+    /// server ran before the filter existed, down to the text.
+    ///
+    /// Matched against the stored spelling as it stands, so a caller runs what it was handed
+    /// through `domain::tags::normalise` first. The test runs inside both arms, ahead of each
+    /// LIMIT, for the reason the policy filters do.
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -343,6 +355,12 @@ pub struct RecentQuery {
     /// Retired rows come back alongside the live ones, so a correction reads as a revision in
     /// place rather than as a row that vanished.
     pub include_superseded: bool,
+    /// A row carries every one of these. Empty is no filter.
+    ///
+    /// Inside the query beside the cursor, so a page under the filter is full and the cursor walks
+    /// the filtered rows. Matched against the stored spelling, so a caller normalises first with
+    /// `domain::tags::normalise`.
+    pub tags: Vec<String>,
 }
 
 /// What one namespace holds, filtered on both axes.
@@ -354,6 +372,13 @@ pub struct NamespaceSummary {
     /// Live rows above `open`. The size of a namespace and its exposure are different questions.
     pub above_open: i64,
     pub last_write: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One tag and the live rows carrying it, filtered on both axes.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TagCount {
+    pub tag: String,
+    pub live: i64,
 }
 
 /// Rows keyed to one namespace in one table.
@@ -409,6 +434,17 @@ pub struct ConflictPair {
     pub older: ConflictCandidate,
     pub newer: ConflictCandidate,
     pub similarity: f64,
+}
+
+/// One dismissed pair, as the ledger holds it. Both columns name the caller because one cannot: a
+/// deployment putting several people behind one client writes the same `dismissed_by` for all.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DismissedPair {
+    pub lo_id: uuid::Uuid,
+    pub hi_id: uuid::Uuid,
+    pub dismissed_by: String,
+    pub dismissed_token: String,
+    pub dismissed_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// The three numbers that say whether the store is decaying: a store read often and written rarely
@@ -512,6 +548,18 @@ pub trait MemoryRepository: Send + Sync {
         readable: &[NamespaceCeiling],
     ) -> Result<Vec<NamespaceSummary>>;
 
+    /// Every tag on a live row the caller may read, with how many such rows carry it. Most rows
+    /// first, then by name.
+    ///
+    /// Both axes, for the reason `namespace_summary` gives: a tag carried only by rows above the
+    /// ceiling or outside the grant is absent rather than listed at zero. Live rows only, so a
+    /// tag that survives on retired rows alone drops out with them.
+    async fn tag_summary(
+        &self,
+        tenant: &str,
+        readable: &[NamespaceCeiling],
+    ) -> Result<Vec<TagCount>>;
+
     /// Random sample of stored content the caller may read, for the recall monitor.
     ///
     /// Takes the ceilings because the sample reaches a response: the report quotes the opening
@@ -606,6 +654,31 @@ pub trait MemoryRepository: Send + Sync {
         when: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool>;
 
+    /// Close a live row's validity with no successor, and report the instant written.
+    ///
+    /// The third thing that can happen to a row, beside a confirmation and a supersession, and the
+    /// first that retires one with nothing to retire it into. `None` says the statement moved
+    /// nothing: the row is already retired, already closed, or gone.
+    ///
+    /// Must refuse a row a successor already retired. That row's end belongs to the supersession
+    /// that wrote it.
+    async fn expire(
+        &self,
+        tenant: &str,
+        id: uuid::Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
+
+    /// Reopen a row this instant closed.
+    ///
+    /// Guarded on the instant, so a close somebody else wrote is not this caller's to undo. A
+    /// `false` return means the statement moved nothing and the row stands as it was.
+    async fn unexpire(
+        &self,
+        tenant: &str,
+        id: uuid::Uuid,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool>;
+
     /// Walk the chain to the row that is live now, so a rejection can name the current head.
     async fn supersession_head(&self, tenant: &str, id: uuid::Uuid) -> Result<Option<Memory>>;
 
@@ -697,6 +770,7 @@ pub trait MemoryRepository: Send + Sync {
         tenant: &str,
         older_than_days: i32,
         limit: i64,
+        offset: i64,
         reader: &[NamespaceGrant],
     ) -> Result<Vec<Memory>>;
 
@@ -705,12 +779,49 @@ pub trait MemoryRepository: Send + Sync {
     /// Near-duplicate live pairs, for `lumberroom review`. Computed on demand rather than recorded at
     /// write time: a stored queue drifts out of step with the store it describes, and this runs by
     /// hand rather than on the hot path.
+    ///
+    /// `offset` is bound into the statement. Reading a page and discarding its head in Rust makes
+    /// a deep page cost the whole scan, and this join has no index to lean on.
     async fn conflicts(
         &self,
         tenant: &str,
         min_similarity: f64,
         limit: i64,
+        offset: i64,
+        reader: &[NamespaceGrant],
     ) -> Result<Vec<ConflictPair>>;
+
+    /// One row in the dismissed-pair ledger. False when the pair was already there. Either id order.
+    async fn dismiss_pair(
+        &self,
+        tenant: &str,
+        a: uuid::Uuid,
+        b: uuid::Uuid,
+        by: &str,
+        token: &str,
+    ) -> Result<bool>;
+
+    /// False when there was nothing to remove. The service checks the grant on both rows first.
+    async fn undismiss_pair(&self, tenant: &str, a: uuid::Uuid, b: uuid::Uuid) -> Result<bool>;
+
+    /// Newest first. `reader` runs inside the query on both rows' namespaces, as `stale` does.
+    async fn dismissed_pairs(
+        &self,
+        tenant: &str,
+        limit: i64,
+        reader: &[NamespaceGrant],
+    ) -> Result<Vec<DismissedPair>>;
+
+    /// For the envelope's `dismissed`. Counted in the query, so it never names an id to say how many.
+    async fn dismissed_count(&self, tenant: &str, reader: &[NamespaceGrant]) -> Result<i64>;
+
+    /// Live embedded rows per readable namespace, highest first. The conflicts self-join runs per
+    /// namespace, so the largest one bounds the work and the whole-tenant total does not.
+    async fn live_embedded_counts(
+        &self,
+        tenant: &str,
+        reader: &[NamespaceGrant],
+    ) -> Result<Vec<(String, i64)>>;
 
     /// The ciphertext columns for rows the caller already holds, so the service can decrypt them.
     ///

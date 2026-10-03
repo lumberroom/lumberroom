@@ -162,8 +162,11 @@ when the digest is still empty.
 
 Read `client/CLAUDE.md.snippet` before you install it. It tells the model to call `memory_write`
 after any exchange that settles a decision, preference, constraint or durable fact, without asking
-and without announcing it, one fact per call, phrased to stand alone in six months. It names the
-three namespaces (`user:me`, `project:<slug>`, `global`) and lists what to leave out: transient
+and without announcing it, one fact per call, phrased to stand alone in six months, carrying the
+numbers, identifiers, paths and dates the fact needs, and the cause, scope qualifier and reversal
+condition whenever the fact turns on them. It tells the model to cut the trail of how it came to
+believe the fact, the hedges and the list of what it left unchanged, and that a list or a timeline
+runs long and that is right. It names the three namespaces (`user:me`, `project:<slug>`, `global`) and lists what to leave out: transient
 chatter, file contents, secrets. Step 4 of wire-mac.sh appends it to `~/.claude/CLAUDE.md` between
 managed markers and refreshes the block in place on later runs, so your own edits to the rest of
 that file survive and edits inside the markers do not.
@@ -194,7 +197,7 @@ Against the stack on `127.0.0.1:8787` in token mode, 19 August 2026:
 
 ```
 endpoint: http://127.0.0.1:8787/mcp
-healthz:  200 {"name":"lumberroom","ok":true,"version":"0.3.1"}
+healthz:  200 {"name":"lumberroom","ok":true,"version":"0.4.0"}
 readyz:   200 {"auth_mode":"token","db_ms":2,"embedder":"Xenova/bge-base-en-v1.5@q8","embedder_degraded":false,"embedding_dim":768,"kek_provider":"none","kek_verified":false,"ok":true}
 credential: static token
 whoami:   200 {"client":"claude-code-mac","embedder":"Xenova/bge-base-en-v1.5@q8","may_delete":false,"mode":"token","read":[{"max":"open","namespace":"*"}],"registry_write":true,"scopes":[],"sealed_capable":false,"tenant":"me","token_fingerprint":"aee1bc266593","write":[{"max":"open","namespace":"*"}]}
@@ -310,9 +313,19 @@ mean three different things, and `.env.example` carries the rule above `AUTH_TOK
 
 ### memory_forget is absent unless the grant carries mayDelete
 
-The MCP surface has ten tools (`src/mcp/capability.rs` is the exhaustive list). A bare grant like
-the one above sees five: `context_bootstrap`, `memory_search`, `memory_write`, `registry_get`,
-`alias_list`. `memory_forget` is missing because the grant sets no `mayDelete`, and `tools/list`
+The MCP surface has twelve tools (`src/mcp/capability.rs` is the exhaustive list). A bare grant
+like the one above sees seven: `context_bootstrap`, `memory_search`, `memory_write`,
+`registry_get`, `alias_list`, `review_queue`, `review_decide`. `review_queue` lists what the read
+grant already admits; because this grant also carries `"write":["*"]`, `review_decide` may
+supersede, merge, confirm or keep_both any row it can see, at `open`, since `writable_row` passes
+wherever read and write both hold at the row's stored level. `delete` is the one verdict this
+grant is refused, because it also needs `mayDelete`, the same flag `memory_forget` reads below. A
+read-only grant refuses every row instead; `docs/permissions.md` ("The two review tools") covers
+that empty-verdicts case. Once the person has asked it to work the queue, the model may decide a
+proposal item itself, one `review_decide` call per item; the tool's own text tells it to report
+back what it applied over a check the item had already failed, an instruction the model can ignore
+like any other.
+`memory_forget` is missing because the grant sets no `mayDelete`, and `tools/list`
 filters it out per credential (`src/mcp/mod.rs`). Keeping it out of the list keeps the idea away
 from the model in the first place; the service refuses the call again if one arrives anyway.
 `.env.example` argues this is a decision rather than an omission: a model that can delete memories

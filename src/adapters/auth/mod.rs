@@ -48,7 +48,11 @@ pub fn create(cfg: &Config, oauth: Option<Arc<dyn OauthStore>>) -> Result<Arc<dy
             let store = oauth.ok_or_else(|| {
                 DomainError::internal("AUTH_MODE=oauth needs the authorization server store")
             })?;
-            links.push(Arc::new(OpaqueTokenAuthenticator::new(store)));
+            links.push(Arc::new(OpaqueTokenAuthenticator::new(
+                store,
+                &cfg.auth.resource_url,
+                cfg.oauth.resource_audience,
+            )));
         }
         AuthMode::Oidc => links.push(Arc::new(OidcAuthenticator::new(cfg)?)),
     }

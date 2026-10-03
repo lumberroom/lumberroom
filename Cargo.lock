@@ -2402,7 +2402,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lumberroom"
-version = "0.3.1"
+version = "0.5.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "base64 0.22.1",
@@ -2434,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "lumberroom-server"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -2465,6 +2465,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "url",
  "uuid",
  "zeroize",
@@ -3778,9 +3779,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",
@@ -4502,7 +4503,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

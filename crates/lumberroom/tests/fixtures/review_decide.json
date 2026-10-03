@@ -1,0 +1,10 @@
+{
+  "key": "conflict:1111aaaa-0000-4a1b-8c3d-112233445566:2222bbbb-0000-4a1b-8c3d-112233445566",
+  "verdict": "merge",
+  "written": "2b7cabcd-0000-4a1b-8c3d-112233445566",
+  "superseded": ["1111aaaa-0000-4a1b-8c3d-112233445566", "2222bbbb-0000-4a1b-8c3d-112233445566"],
+  "deleted": [],
+  "end_left_open": false,
+  "unfinished": [],
+  "already_dismissed": false
+}

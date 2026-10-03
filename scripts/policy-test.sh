@@ -79,7 +79,7 @@ command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "node is required" >&2; exit 1; }
 command -v lumberroom >/dev/null 2>&1 || {
   echo "lumberroom is not on PATH. This gate drives the shipped client." >&2
-  echo "  brew install the-cybersapien/lumberroom/lumberroom" >&2
+  echo "  brew install lumberroom/lumberroom/lumberroom" >&2
   exit 1
 }
 

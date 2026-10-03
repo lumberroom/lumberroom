@@ -22,67 +22,7 @@ use super::Ctx;
 use crate::adapters::auth::{can_read, can_write};
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::policy;
-use crate::domain::types::{Memory, RegistryEntry, Sensitivity};
-use crate::ports::Staleness;
-
-/// How much of a row the queue prints. The point is to recognise the fact, not to read it.
-const PREVIEW_CHARS: usize = 160;
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Row {
-    pub id: String,
-    pub namespace: String,
-    pub sensitivity: Sensitivity,
-    pub preview: String,
-    pub created_at: String,
-    pub access_count: i32,
-    pub last_accessed_at: Option<String>,
-    pub last_confirmed_at: Option<String>,
-}
-
-/// Two live rows close enough that one probably should have retired the other.
-#[derive(Debug, Clone, Serialize)]
-pub struct ConflictItem {
-    pub similarity: f64,
-    pub older: Row,
-    pub newer: Row,
-    /// The command that resolves it, spelled out. The queue is only useful if acting on it is one
-    /// copy and paste rather than a lookup.
-    pub resolve_with: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct StaleItem {
-    #[serde(flatten)]
-    pub row: Row,
-    pub age_days: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct RegistryDue {
-    pub namespace: String,
-    pub kind: String,
-    pub key: String,
-    pub value: serde_json::Value,
-    pub sensitivity: Sensitivity,
-    pub version: i32,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ReviewQueue {
-    pub conflicts: Vec<ConflictItem>,
-    pub stale: Vec<StaleItem>,
-    pub registry_due: Vec<RegistryDue>,
-    /// The three decay numbers, and only for a caller whose grant reaches every row they count.
-    ///
-    /// `staleness` takes no ceilings and counts every row in the tenant, so it is a size and a shape
-    /// of the store rather than of what this caller may read. A client granted `user:me` learned the
-    /// live row count of the whole store from a queue that showed it two of its own rows.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub staleness: Option<Staleness>,
-    /// Rendered for `lumberroom review`.
-    pub text: String,
-}
+use crate::domain::types::Memory;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Resolved {
@@ -96,71 +36,14 @@ pub struct Resolved {
     pub end_left_open: bool,
 }
 
-pub async fn queue(ctx: &Ctx, limit: Option<i64>) -> Result<ReviewQueue> {
-    let limit = limit.unwrap_or(20).clamp(1, 200);
-
-    let pairs = ctx
-        .repos
-        .memories
-        .conflicts(ctx.tenant(), ctx.cfg.quality.conflict_threshold, limit)
-        .await?;
-    let mut conflicts = Vec::new();
-    for pair in pairs {
-        // Both halves have to be visible. Showing one side of a conflict is worse than showing
-        // neither: it invites a supersede against a row the caller cannot see.
-        let (Some(older), Some(newer)) =
-            (visible(ctx, &pair.older.id).await?, visible(ctx, &pair.newer.id).await?)
-        else {
-            continue;
-        };
-        conflicts.push(ConflictItem {
-            similarity: pair.similarity,
-            resolve_with: format!("lumberroom supersede {} {}", older.id, newer.id),
-            older: to_row(&older),
-            newer: to_row(&newer),
-        });
-    }
-
-    let mut stale_rows: Vec<Memory> = ctx
-        .repos
-        .memories
-        .stale(ctx.tenant(), ctx.cfg.quality.stale_days, limit, &ctx.principal.read)
-        .await?;
-    let _ = super::decrypt(ctx, stale_rows.iter_mut().collect()).await;
-    let stale: Vec<StaleItem> = stale_rows
-        .iter()
-        .map(|m| StaleItem {
-            age_days: (chrono::Utc::now() - m.created_at).num_days(),
-            row: to_row(m),
-        })
-        .collect();
-
-    let registry_due = ctx
-        .repos
-        .registry
-        .due_for_review(ctx.tenant(), limit, &ctx.principal.read)
-        .await?
-        .into_iter()
-        .map(to_registry_due)
-        .collect();
-
-    // The three numbers that say whether the store is decaying, computed over every row in the
-    // tenant and therefore published to nobody else. Best effort beyond that: a queue that fails
-    // because a summary statistic did not compute is a queue nobody uses.
-    let staleness = match super::reads_whole_store(&ctx.principal) {
-        false => None,
-        true => match ctx.repos.memories.staleness(ctx.tenant()).await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(error = %e.log_message(), "could not compute staleness for the queue");
-                Some(Staleness::default())
-            }
-        },
-    };
-
-    let mut queue = ReviewQueue { conflicts, stale, registry_due, staleness, text: String::new() };
-    queue.text = render(&queue, ctx.cfg.quality.stale_days);
-    Ok(queue)
+/// A fact whose period the owner closed, and the instant that closed it.
+///
+/// The instant is what `unexpire` is guarded on, so a caller who wants the action back has to
+/// carry it. Returning it is the whole of the undo contract.
+#[derive(Debug, Clone, Serialize)]
+pub struct Expired {
+    pub id: String,
+    pub until: DateTime<Utc>,
 }
 
 /// "This fact is still true." The cheapest of the three actions and the one that should be used
@@ -184,7 +67,8 @@ pub async fn supersede(ctx: &Ctx, old: &str, new: &str) -> Result<Resolved> {
     }
     if !new_row.is_live() {
         return Err(DomainError::conflict(format!(
-            "memory {new} is itself superseded and cannot be the replacement"
+            "memory {new} does not hold now, because something superseded it or its period closed, \
+             so it cannot be the replacement"
         )));
     }
 
@@ -269,6 +153,57 @@ pub async fn date_candidates(ctx: &Ctx, limit: Option<i64>) -> Result<Vec<DateCa
     Ok(out)
 }
 
+/// "This fact described a situation, and the situation has passed."
+///
+/// The third thing the queue can do to a row, beside confirming it and superseding it, and the
+/// first that retires one with nothing to retire it into. `CleanupKind::Stale` deletes for exactly
+/// this reason; this is the answer that keeps the text, the history and every as-of read.
+///
+/// The write grant at the row's own level and no capability flag. `may_delete` guards loss nothing
+/// brings back, and `unexpire` is one statement away.
+pub async fn expire(ctx: &Ctx, id: &str) -> Result<Expired> {
+    let (uuid, row) = writable_row(ctx, id).await?;
+    // The period first. `is_live` answers both clocks, so a row this path already closed would
+    // otherwise be reported as superseded by something that does not exist.
+    //
+    // Two ways a period is already closed, and the refusal says which. A stamp means a supersession
+    // ended it, even where the successor went missing in a restore; no stamp means this path did.
+    if let Some(until) = row.occurred_until {
+        return Err(DomainError::validation(match row.superseded_at {
+            None => format!("memory {id} already expired at {}", until.to_rfc3339()),
+            Some(_) => format!(
+                "memory {id} was retired by a supersession that ended its period at {}",
+                until.to_rfc3339()
+            ),
+        }));
+    }
+    if !row.is_live() {
+        return Err(DomainError::conflict(format!(
+            "memory {id} is already superseded, so its end is the supersession's to write"
+        )));
+    }
+    // Everything the row said is checked above, so a statement that moves nothing here means the
+    // row changed between the read and the write rather than that it was already closed.
+    let Some(until) = ctx.repos.memories.expire(ctx.tenant(), uuid).await? else {
+        return Err(DomainError::conflict(format!("memory {id} changed while this ran")));
+    };
+    super::bootstrap::clear_cache();
+    Ok(Expired { id: uuid.to_string(), until })
+}
+
+/// Reopen a fact this instant closed, and say whether the statement moved anything.
+///
+/// A false return is a row somebody else has since changed, which the caller reports rather than
+/// overrides.
+pub async fn unexpire(ctx: &Ctx, id: &str, until: DateTime<Utc>) -> Result<bool> {
+    let (uuid, _) = writable_row(ctx, id).await?;
+    let done = ctx.repos.memories.unexpire(ctx.tenant(), uuid, until).await?;
+    if done {
+        super::bootstrap::clear_cache();
+    }
+    Ok(done)
+}
+
 /// Fill a start date on a row that never carried one.
 ///
 /// Three refusals, and each one exists because the alternative stores a date nobody can check.
@@ -326,22 +261,11 @@ pub async fn delete(
     super::forget::by_id(ctx, id, reason, false).await
 }
 
-/// The row, if this caller may read it at its stored level.
-async fn visible(ctx: &Ctx, id: &str) -> Result<Option<Memory>> {
-    let Ok(uuid) = uuid::Uuid::parse_str(id) else { return Ok(None) };
-    let row = ctx.repos.memories.find_by_id(ctx.tenant(), uuid).await?;
-    let mut row = row.filter(|m| can_read(&ctx.principal, &m.namespace, m.sensitivity));
-    if let Some(m) = row.as_mut() {
-        // Kept even when it will not open. A conflict pair where one side is unreadable is still
-        // something a person should look at, and hiding it would hide the reason.
-        let _ = super::decrypt(ctx, vec![m]).await;
-    }
-    Ok(row)
-}
-
 /// A row this caller may both see and change. Resolving a conflict mutates rows, so it needs the
 /// write grant, and one message covers "missing" and "not yours" so a refusal maps nothing.
-async fn writable_row(ctx: &Ctx, id: &str) -> Result<(uuid::Uuid, Memory)> {
+///
+/// `pub(super)`: `review_queue::decide` fetches every row through this before any write.
+pub(super) async fn writable_row(ctx: &Ctx, id: &str) -> Result<(uuid::Uuid, Memory)> {
     let uuid = uuid::Uuid::parse_str(id.trim())
         .map_err(|_| DomainError::validation(format!("{id:?} is not a uuid")))?;
     match ctx.repos.memories.find_by_id(ctx.tenant(), uuid).await? {
@@ -354,177 +278,5 @@ async fn writable_row(ctx: &Ctx, id: &str) -> Result<(uuid::Uuid, Memory)> {
         _ => Err(DomainError::not_found(format!(
             "memory {id} does not exist or is not yours to change"
         ))),
-    }
-}
-
-fn to_row(m: &Memory) -> Row {
-    Row {
-        id: m.id.clone(),
-        namespace: m.namespace.clone(),
-        sensitivity: m.sensitivity,
-        preview: preview(&m.content),
-        created_at: m.created_at.to_rfc3339(),
-        access_count: m.access_count,
-        last_accessed_at: m.last_accessed_at.map(|t| t.to_rfc3339()),
-        last_confirmed_at: m.last_confirmed_at.map(|t| t.to_rfc3339()),
-    }
-}
-
-fn to_registry_due(e: RegistryEntry) -> RegistryDue {
-    RegistryDue {
-        namespace: e.namespace,
-        kind: e.kind,
-        key: e.key,
-        value: e.value,
-        sensitivity: e.sensitivity,
-        version: e.version,
-    }
-}
-
-/// An empty preview is a private row that would not decrypt. It stays in the queue: an unreadable
-/// row is a review item in its own right.
-fn preview(content: &str) -> String {
-    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.is_empty() {
-        return "(encrypted; this server could not read it)".to_string();
-    }
-    if flat.chars().count() <= PREVIEW_CHARS {
-        return flat;
-    }
-    format!("{}…", flat.chars().take(PREVIEW_CHARS).collect::<String>())
-}
-
-/// Plain text, because this is read in a terminal. Every section names the action that clears it.
-pub fn render(q: &ReviewQueue, stale_days: i32) -> String {
-    let mut lines = Vec::new();
-    lines.push("# Review".to_string());
-    // Absent rather than zeroed. Printing "0 live rows" above a queue holding rows would read as a
-    // broken store, and the number belongs to the whole tenant rather than to this caller.
-    if let Some(s) = &q.staleness {
-        lines.push(format!(
-            "{} live rows, {} never retrieved ({:.0}%), {} superseded.",
-            s.live_rows, s.never_retrieved, s.never_retrieved_pct, s.superseded_rows
-        ));
-    }
-
-    if !q.conflicts.is_empty() {
-        lines.push(String::new());
-        lines.push(format!("## Near-duplicates ({})", q.conflicts.len()));
-        lines.push(
-            "Two live rows saying nearly the same thing. Keep the newer one and retire the older."
-                .to_string(),
-        );
-        for c in &q.conflicts {
-            lines.push(String::new());
-            lines.push(format!("{:.3}  [{}]", c.similarity, c.older.namespace));
-            lines.push(format!("  older {}  {}", c.older.id, c.older.preview));
-            lines.push(format!("  newer {}  {}", c.newer.id, c.newer.preview));
-            lines.push(format!("  {}", c.resolve_with));
-        }
-    }
-
-    if !q.stale.is_empty() {
-        lines.push(String::new());
-        lines.push(format!("## Never retrieved, older than {stale_days} days ({})", q.stale.len()));
-        lines.push(
-            "Nothing here is deleted automatically. Confirm what is still true, supersede what \
-             changed, delete what is dead."
-                .to_string(),
-        );
-        for s in &q.stale {
-            lines.push(format!(
-                "- {} [{}] {}d  {}",
-                s.row.id, s.row.namespace, s.age_days, s.row.preview
-            ));
-        }
-    }
-
-    if !q.registry_due.is_empty() {
-        lines.push(String::new());
-        lines.push(format!("## Registry entries due for review ({})", q.registry_due.len()));
-        lines.push(
-            "A per-kind expectation expired. Expiry marks a row for review and never removes it."
-                .to_string(),
-        );
-        for r in &q.registry_due {
-            lines.push(format!("- {}/{} = {} [{}]", r.kind, r.key, r.value, r.namespace));
-        }
-    }
-
-    if q.conflicts.is_empty() && q.stale.is_empty() && q.registry_due.is_empty() {
-        lines.push(String::new());
-        lines.push("Nothing to review.".to_string());
-    }
-
-    lines.join("\n")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn row(id: &str, preview: &str) -> Row {
-        Row {
-            id: id.into(),
-            namespace: "user:me".into(),
-            sensitivity: Sensitivity::Open,
-            preview: preview.into(),
-            created_at: "2026-01-01T00:00:00+00:00".into(),
-            access_count: 0,
-            last_accessed_at: None,
-            last_confirmed_at: None,
-        }
-    }
-
-    fn empty() -> ReviewQueue {
-        ReviewQueue {
-            conflicts: vec![],
-            stale: vec![],
-            registry_due: vec![],
-            staleness: Some(Staleness::default()),
-            text: String::new(),
-        }
-    }
-
-    #[test]
-    fn an_empty_queue_says_so_rather_than_printing_three_empty_headings() {
-        let text = render(&empty(), 180);
-        assert!(text.contains("Nothing to review."));
-        assert!(!text.contains("## Near-duplicates"));
-    }
-
-    #[test]
-    fn a_conflict_prints_the_command_that_resolves_it() {
-        let mut q = empty();
-        q.conflicts = vec![ConflictItem {
-            similarity: 0.942,
-            older: row("aaa", "The port is 8080"),
-            newer: row("bbb", "The port is 8787"),
-            resolve_with: "lumberroom supersede aaa bbb".into(),
-        }];
-        let text = render(&q, 180);
-        assert!(text.contains("0.942"));
-        assert!(text.contains("lumberroom supersede aaa bbb"));
-        assert!(text.contains("older aaa"));
-    }
-
-    #[test]
-    fn the_stale_section_names_the_threshold_it_used() {
-        let mut q = empty();
-        q.stale = vec![StaleItem { row: row("aaa", "An old fact"), age_days: 400 }];
-        assert!(render(&q, 180).contains("older than 180 days"));
-    }
-
-    #[test]
-    fn the_stale_section_promises_nothing_is_deleted_automatically() {
-        let mut q = empty();
-        q.stale = vec![StaleItem { row: row("aaa", "An old fact"), age_days: 400 }];
-        assert!(render(&q, 180).contains("deleted automatically"));
-    }
-
-    #[test]
-    fn a_preview_is_flattened_and_bounded() {
-        assert_eq!(preview("two\n lines"), "two lines");
-        assert_eq!(preview(&"x".repeat(400)).chars().count(), PREVIEW_CHARS + 1);
     }
 }

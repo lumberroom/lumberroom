@@ -377,7 +377,7 @@ fn chat_completions_request(
     }
     if p.name == "openrouter" {
         req = req
-            .header("HTTP-Referer", "https://github.com/the-cybersapien/lumberroom")
+            .header("HTTP-Referer", "https://github.com/lumberroom/lumberroom")
             .header("X-Title", "lumberroom");
     }
     req

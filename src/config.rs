@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 
 use crate::domain::errors::{DomainError, Result};
+use crate::domain::oauth::canonical_resource;
 use crate::domain::policy::{NamespaceGrant, SensitivityDefaults};
 use crate::domain::types::Sensitivity;
 
@@ -66,6 +67,34 @@ impl Fusion {
         match self {
             Self::Linear => "linear",
             Self::Rrf => "rrf",
+        }
+    }
+}
+
+/// How strictly an OAuth access token's audience is checked when the token is spent.
+///
+/// RFC 8707 binds a token to the resource it was minted for, and until this existed the server
+/// wrote that binding down and compared it to nothing. Enforcement is a setting rather than a
+/// constant because of the tokens already in the table: every one of them predates the check and
+/// carries a NULL resource, and refusing all of those on the deploy is an outage for every live
+/// client at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceAudience {
+    /// Compare nothing. For a deployment reachable under two names that has not settled which one
+    /// its clients discover, where the check refuses a caller who did everything right.
+    Off,
+    /// A token that names a resource must name this one. A token that names none is admitted.
+    Lenient,
+    /// A token that names no resource is refused as well.
+    Strict,
+}
+
+impl ResourceAudience {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Lenient => "lenient",
+            Self::Strict => "strict",
         }
     }
 }
@@ -174,12 +203,30 @@ impl ClientGrant {
     }
 }
 
+/// Size and patience of the Postgres pool. The defaults are the values `connect()` hard-coded
+/// before these settings existed, so an unset environment changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbConfig {
+    pub max_connections: u32,
+    /// True when the owner set `DB_MAX_CONNECTIONS`. A default must never fail boot on a small
+    /// server, so only an explicit size is refused when it does not fit.
+    pub max_connections_explicit: bool,
+    pub acquire_timeout_secs: u64,
+}
+
+impl Default for DbConfig {
+    fn default() -> Self {
+        Self { max_connections: 10, max_connections_explicit: false, acquire_timeout_secs: 5 }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
     pub host: String,
     pub tenant_id: String,
     pub database_url: String,
+    pub db: DbConfig,
     pub run_migrations_on_boot: bool,
     /// The public origin this server is reached at, with no trailing slash. Every externally
     /// visible URL is derived from it: the MCP endpoint, the OAuth issuer, the metadata documents
@@ -272,6 +319,14 @@ pub struct OauthConfig {
     /// Registration is unauthenticated and writes a row, so without a ceiling one caller can fill
     /// the client table at whatever rate the network allows.
     pub registrations_per_minute: u32,
+    /// How strictly the audience on an access token is checked. See [`ResourceAudience`].
+    ///
+    /// `lenient` rather than `strict` by default, and the reason is in the data: every token issued
+    /// before this landed has a NULL resource, and the CLI in this repository omits `resource` on
+    /// the refresh grant, so it re-mints a NULL one on every rotation. `strict` on the deploy would
+    /// log all of them out. The NULLs drain within one `OAUTH_ACCESS_TTL_SECS` once the token
+    /// endpoint starts stamping a default, which is what makes `strict` reachable later.
+    pub resource_audience: ResourceAudience,
 }
 
 #[derive(Debug, Clone)]
@@ -389,6 +444,10 @@ pub struct QualityConfig {
     pub conflict_threshold: f64,
     /// How many conflict candidates a write returns.
     pub conflict_limit: i64,
+    /// Largest readable namespace, in live embedded rows, that the conflicts self-join will scan.
+    /// The join is O(n squared) per namespace: a dev-container probe timed 2.48s at 1,400 rows,
+    /// 13.33s at 3,000 and 34.96s at 5,000, so past this the queue refuses instead of hanging.
+    pub conflict_scan_max: i64,
     /// A live row never retrieved and older than this appears in `lumberroom review --stale`.
     pub stale_days: i32,
     /// Highest sensitivity the Obsidian export may include. Private content in a vault synced to a
@@ -497,6 +556,21 @@ fn env_list(key: &str, fallback: &[&str]) -> Vec<String> {
             v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
         }
         _ => fallback.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// `OAUTH_RESOURCE_AUDIENCE`, refused at boot when it is none of the three.
+///
+/// A free function for `parse_fusion`'s reason: the refusal can be tested without two tests racing
+/// on one process environment.
+fn parse_resource_audience(raw: &str) -> Result<ResourceAudience> {
+    match raw.trim() {
+        "lenient" | "" => Ok(ResourceAudience::Lenient),
+        "strict" => Ok(ResourceAudience::Strict),
+        "off" => Ok(ResourceAudience::Off),
+        other => Err(DomainError::validation(format!(
+            "OAUTH_RESOURCE_AUDIENCE must be off|lenient|strict, got {other:?}"
+        ))),
     }
 }
 
@@ -764,6 +838,10 @@ pub fn load() -> Result<Config> {
             "DATABASE_URL",
             "postgres://lumberroom:lumberroom@127.0.0.1:5432/lumberroom",
         ),
+        db: parse_db(
+            std::env::var("DB_MAX_CONNECTIONS").ok().as_deref(),
+            std::env::var("DB_ACQUIRE_TIMEOUT_SECS").ok().as_deref(),
+        )?,
         run_migrations_on_boot: env_bool("RUN_MIGRATIONS_ON_BOOT", true),
         auth: AuthConfig {
             mode,
@@ -788,6 +866,7 @@ pub fn load() -> Result<Config> {
             cookie_secret: env("OAUTH_COOKIE_SECRET", ""),
             login_attempts_per_minute: env_num("OAUTH_LOGIN_ATTEMPTS_PER_MINUTE", 5u32)?,
             registrations_per_minute: env_num("OAUTH_REGISTRATIONS_PER_MINUTE", 5u32)?,
+            resource_audience: parse_resource_audience(&env("OAUTH_RESOURCE_AUDIENCE", ""))?,
         },
         embed: EmbedConfig {
             provider,
@@ -859,6 +938,7 @@ pub fn load() -> Result<Config> {
             dedupe_threshold: env_num("DEDUPE_THRESHOLD", 0.97f64)?,
             conflict_threshold: env_num("CONFLICT_THRESHOLD", 0.90f64)?,
             conflict_limit: env_num("CONFLICT_LIMIT", 3i64)?,
+            conflict_scan_max: env_num("CONFLICT_SCAN_MAX", 2_000i64)?,
             stale_days: env_num("STALE_DAYS", 365i32)?,
             export_max_sensitivity: env_sensitivity("EXPORT_MAX_SENSITIVITY", Sensitivity::Open)?,
             archive_max_decompressed_bytes: env_num(
@@ -874,6 +954,83 @@ pub fn load() -> Result<Config> {
 
     validate(&cfg)?;
     Ok(cfg)
+}
+
+/// Connections kept free beyond `superuser_reserved_connections`: one for an operator's `psql`, one
+/// for the detached connection `migrate` holds while the pool is up, one for `verify-kek` or a
+/// second replica starting. Small on purpose. A bigger reserve refuses pools the server can carry.
+const POOL_SPARE_CONNECTIONS: i64 = 3;
+
+/// Empty and absent both mean "use the default", as in `env_num`. Takes the raw strings so a test
+/// does not have to touch the process environment.
+fn parse_db(max_connections: Option<&str>, acquire_timeout_secs: Option<&str>) -> Result<DbConfig> {
+    fn num<T: std::str::FromStr>(key: &str, raw: Option<&str>, fallback: T) -> Result<T> {
+        match raw {
+            Some(v) if !v.trim().is_empty() => v.trim().parse().map_err(|_| {
+                DomainError::validation(format!(
+                    "{key} is not a valid whole number of at least 1: {v:?}"
+                ))
+            }),
+            _ => Ok(fallback),
+        }
+    }
+    let d = DbConfig::default();
+    Ok(DbConfig {
+        max_connections_explicit: max_connections.is_some_and(|v| !v.trim().is_empty()),
+        max_connections: num("DB_MAX_CONNECTIONS", max_connections, d.max_connections)?,
+        acquire_timeout_secs: num(
+            "DB_ACQUIRE_TIMEOUT_SECS",
+            acquire_timeout_secs,
+            d.acquire_timeout_secs,
+        )?,
+    })
+}
+
+fn validate_db(c: &DbConfig) -> Result<()> {
+    // sqlx panics on a pool of zero, and a zero acquire timeout fails every request that finds the
+    // pool busy, which is the opposite of waiting for a free connection.
+    if c.max_connections < 1 {
+        return Err(DomainError::validation("DB_MAX_CONNECTIONS must be at least 1."));
+    }
+    if c.acquire_timeout_secs < 1 {
+        return Err(DomainError::validation(
+            "DB_ACQUIRE_TIMEOUT_SECS must be at least 1. Zero fails every request that finds the \
+             pool busy instead of waiting for a connection.",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a pool the server cannot hold. Postgres enforces `max_connections` only when a new
+/// connection arrives, so an oversized pool boots clean and fails under load, which is when the
+/// cause is hardest to find. `server_max` and `superuser_reserved` come from the live server.
+pub fn check_pool_fits(pool_max: u32, server_max: i64, superuser_reserved: i64) -> Result<()> {
+    let usable = (server_max - superuser_reserved - POOL_SPARE_CONNECTIONS).max(0);
+    if i64::from(pool_max) > usable {
+        return Err(DomainError::validation(format!(
+            "DB_MAX_CONNECTIONS is {pool_max}, but the database allows {server_max} connections \
+             and reserves {superuser_reserved} for superusers, which leaves {usable} after \
+             {POOL_SPARE_CONNECTIONS} spare. Lower DB_MAX_CONNECTIONS or raise max_connections \
+             on the server."
+        )));
+    }
+    Ok(())
+}
+
+/// What boot does with the answer from `check_pool_fits`. `Ok(None)` means the pool fits.
+/// `Ok(Some(e))` means it does not fit but the size is the built-in default, so the caller logs `e`
+/// and keeps booting: an upgrade onto a small server must not start failing. `Err` is an explicit
+/// size that does not fit.
+pub fn enforce_pool_fit(
+    db: &DbConfig,
+    server_max: i64,
+    superuser_reserved: i64,
+) -> Result<Option<DomainError>> {
+    match check_pool_fits(db.max_connections, server_max, superuser_reserved) {
+        Ok(()) => Ok(None),
+        Err(e) if db.max_connections_explicit => Err(e),
+        Err(e) => Ok(Some(e)),
+    }
 }
 
 /// Split out of `validate` so a test can reach it without building a whole `Config`.
@@ -963,6 +1120,7 @@ fn validate_static_token(client: &str, token: &str) -> Result<()> {
 
 fn validate(cfg: &Config) -> Result<()> {
     validate_cleanup(&cfg.cleanup)?;
+    validate_db(&cfg.db)?;
 
     // Every mode honours static tokens, so a deployment with no token and no other credential
     // source can authenticate nobody. That is a configuration error rather than a lockout to
@@ -1013,6 +1171,22 @@ fn validate(cfg: &Config) -> Result<()> {
                 "OAUTH_CODE_TTL_SECS should be between 10 and 600",
             ));
         }
+        // The audience check compares a token's resource against this string. A string that is not
+        // an absolute URI canonicalises to nothing and therefore matches nothing, so it refuses
+        // every token rather than none. Refusing to boot is the cheap version of that failure; the
+        // expensive version is every client at once reporting an invalid bearer token.
+        if cfg.oauth.resource_audience != ResourceAudience::Off
+            && canonical_resource(&cfg.auth.resource_url).is_none()
+        {
+            return Err(DomainError::validation(format!(
+                "OAUTH_RESOURCE_AUDIENCE is {} and the resource this server serves reads as {:?}, \
+                 which is not an absolute URI without a fragment. Every token would be \
+                 refused. Fix PUBLIC_URL or MCP_RESOURCE_URL, or set \
+                 OAUTH_RESOURCE_AUDIENCE=off.",
+                cfg.oauth.resource_audience.as_str(),
+                cfg.auth.resource_url
+            )));
+        }
     }
 
     if cfg.embed.dim < 8 {
@@ -1024,6 +1198,16 @@ fn validate(cfg: &Config) -> Result<()> {
             "CONFLICT_THRESHOLD must be at or below DEDUPE_THRESHOLD, otherwise the band that \
              produces conflict candidates is empty and corrections silently collapse into the row \
              they were correcting.",
+        ));
+    }
+
+    // Under a hundred rows a namespace the self-join answers in milliseconds, so a bound below
+    // that only refuses stores that were never at risk.
+    if cfg.quality.conflict_scan_max < 100 {
+        return Err(DomainError::validation(
+            "CONFLICT_SCAN_MAX must be at least 100. Below that the bound refuses namespaces the \
+             conflicts query answers in milliseconds, which removes the review queue's conflict \
+             source on a store that never needed protecting.",
         ));
     }
 
@@ -1125,6 +1309,82 @@ mod tests {
     /// Cleanup settings that pass, so each test below changes exactly one thing.
     fn valid() -> CleanupConfig {
         CleanupConfig { interval_secs: 3600, namespace: None, limit: 500 }
+    }
+
+    #[test]
+    fn absent_db_settings_reproduce_the_old_hardcoded_pool() {
+        let c = parse_db(None, None).unwrap();
+        assert_eq!((c.max_connections, c.acquire_timeout_secs), (10, 5));
+        assert_eq!(c, DbConfig::default());
+        assert_eq!(parse_db(Some(""), Some("")).unwrap(), c);
+        assert!(validate_db(&c).is_ok());
+    }
+
+    #[test]
+    fn explicit_db_settings_are_read() {
+        let c = parse_db(Some("40"), Some("15")).unwrap();
+        assert_eq!((c.max_connections, c.acquire_timeout_secs), (40, 15));
+    }
+
+    #[test]
+    fn a_db_setting_that_is_not_a_number_names_its_variable() {
+        let e = parse_db(Some("ten"), None).unwrap_err();
+        assert!(e.client_message().contains("DB_MAX_CONNECTIONS"), "{}", e.client_message());
+        let e = parse_db(None, Some("-1")).unwrap_err();
+        assert!(e.client_message().contains("DB_ACQUIRE_TIMEOUT_SECS"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn zero_connections_is_refused() {
+        let c = DbConfig { max_connections: 0, acquire_timeout_secs: 5, ..DbConfig::default() };
+        let e = validate_db(&c).unwrap_err();
+        assert!(e.client_message().contains("DB_MAX_CONNECTIONS"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn a_zero_acquire_timeout_is_refused() {
+        let c = DbConfig { max_connections: 10, acquire_timeout_secs: 0, ..DbConfig::default() };
+        let e = validate_db(&c).unwrap_err();
+        assert!(e.client_message().contains("DB_ACQUIRE_TIMEOUT_SECS"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn the_default_pool_fits_a_default_server() {
+        assert!(check_pool_fits(10, 100, 3).is_ok());
+    }
+
+    #[test]
+    fn a_pool_one_over_what_the_server_can_carry_is_refused_with_both_numbers() {
+        // 100 allowed, 3 superuser, 3 spare: 94 usable.
+        assert!(check_pool_fits(94, 100, 3).is_ok());
+        let e = check_pool_fits(95, 100, 3).unwrap_err();
+        let m = e.client_message();
+        assert!(m.contains("95") && m.contains("100") && m.contains("94"), "{m}");
+        assert!(m.contains("DB_MAX_CONNECTIONS"), "{m}");
+    }
+
+    #[test]
+    fn an_explicit_pool_size_that_does_not_fit_refuses_boot() {
+        let db = parse_db(Some("95"), None).unwrap();
+        assert!(db.max_connections_explicit);
+        assert!(enforce_pool_fit(&db, 100, 3).is_err());
+        assert!(enforce_pool_fit(&parse_db(Some("94"), None).unwrap(), 100, 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_default_pool_size_that_does_not_fit_warns_and_boots() {
+        let db = parse_db(None, None).unwrap();
+        assert!(!db.max_connections_explicit);
+        // 16 allowed, 3 superuser, 3 spare: 10 usable fits; 15 allowed leaves 9 and does not.
+        assert!(enforce_pool_fit(&db, 16, 3).unwrap().is_none());
+        let w = enforce_pool_fit(&db, 15, 3).unwrap().expect("a warning, not a refusal");
+        assert!(w.client_message().contains("15"), "{}", w.client_message());
+        assert!(!parse_db(Some(""), None).unwrap().max_connections_explicit);
+    }
+
+    #[test]
+    fn a_server_smaller_than_the_reserve_refuses_every_pool() {
+        assert!(check_pool_fits(1, 5, 3).is_err());
     }
 
     #[test]
@@ -1370,6 +1630,35 @@ mod tests {
         let err = parse_fusion("reciprocal").unwrap_err().to_string();
         assert!(err.contains("linear|rrf"), "the message has to name what to write: {err}");
         assert!(parse_fusion("RRF").is_err(), "the other enums here match lowercase only");
+    }
+
+    #[test]
+    fn the_audience_check_is_lenient_until_an_operator_asks_for_more() {
+        assert_eq!(parse_resource_audience("").unwrap(), ResourceAudience::Lenient);
+        assert_eq!(parse_resource_audience("lenient").unwrap(), ResourceAudience::Lenient);
+        assert_eq!(parse_resource_audience(" strict ").unwrap(), ResourceAudience::Strict);
+        assert_eq!(parse_resource_audience("off").unwrap(), ResourceAudience::Off);
+    }
+
+    /// An unrecognised value must not fall back to a default. A typo that silently reads as
+    /// `lenient` is an operator who believes the audience is enforced strictly and is wrong.
+    #[test]
+    fn refuses_an_audience_setting_it_does_not_implement_and_names_all_three() {
+        let err = parse_resource_audience("enforced").unwrap_err().to_string();
+        assert!(err.contains("off"), "{err}");
+        assert!(err.contains("lenient"), "{err}");
+        assert!(err.contains("strict"), "{err}");
+        assert!(
+            parse_resource_audience("Strict").is_err(),
+            "the other enums here match lowercase only"
+        );
+    }
+
+    #[test]
+    fn the_audience_names_round_trip() {
+        for a in [ResourceAudience::Off, ResourceAudience::Lenient, ResourceAudience::Strict] {
+            assert_eq!(parse_resource_audience(a.as_str()).unwrap(), a);
+        }
     }
 
     #[test]

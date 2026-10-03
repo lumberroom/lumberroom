@@ -1,5 +1,25 @@
 //! The Postgres adapter. The only module in the service that contains SQL.
 
+/// What "the store holds this now" means, in one place, for every reader that asks it.
+///
+/// Two clauses, and the second is the one decision 0017 added. `superseded_by IS NULL` is
+/// transaction time: no later row replaced this one. The period test is valid time: nobody closed
+/// the fact's validity without a replacement, which is what `review::expire` writes.
+///
+/// A conjunct rather than a rewrite, which is what keeps the `memory_live` partial index from
+/// migration 005. The index predicate is the first clause and this predicate implies it, so the
+/// planner can still prove the index applies and the period test becomes a filter above the scan.
+/// The trap `memory.rs` records at `($n OR superseded_by IS NULL)` is the opposite shape: weaker
+/// than the index predicate, so unprovable.
+///
+/// Defined here so the readers in `memory` and in `cleanup` take the same text. A statement whose
+/// alias is not `m` spells the two clauses out and names this macro in a comment.
+macro_rules! live {
+    () => {
+        "m.superseded_by IS NULL AND (m.occurred_until IS NULL OR m.occurred_until > now())"
+    };
+}
+
 mod alias;
 mod cleanup;
 mod ingest;
@@ -10,6 +30,9 @@ mod sealed;
 mod tool_calls;
 
 pub use alias::PgAliasRepository;
+/// The one glob-to-SQL translation. Any statement that filters on a caller's grants binds these
+/// three arrays, so a second translation cannot drift from the first.
+pub(crate) use cleanup::grant_arrays;
 pub use cleanup::PgCleanupRepository;
 pub use ingest::PgIngestRepository;
 pub use memory::PgMemoryRepository;
@@ -44,10 +67,16 @@ pub struct Repositories {
     pub cleanup: Arc<dyn CleanupRepository>,
 }
 
+/// Pool with the defaults, for callers that have no `Config`: the integration harness. The server
+/// and the CLI use `connect_with` so `DB_MAX_CONNECTIONS` and `DB_ACQUIRE_TIMEOUT_SECS` apply.
 pub async fn connect(database_url: &str) -> Result<PgPool> {
-    PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(Duration::from_secs(5))
+    connect_with(database_url, &crate::config::DbConfig::default()).await
+}
+
+pub async fn connect_with(database_url: &str, db: &crate::config::DbConfig) -> Result<PgPool> {
+    let pool = PgPoolOptions::new()
+        .max_connections(db.max_connections)
+        .acquire_timeout(Duration::from_secs(db.acquire_timeout_secs))
         // A pathological query must not hold a connection until the client gives up.
         .after_connect(|conn, _meta| {
             Box::pin(async move {
@@ -57,7 +86,34 @@ pub async fn connect(database_url: &str) -> Result<PgPool> {
         })
         .connect(database_url)
         .await
-        .map_err(|e| DomainError::unavailable("cannot reach the database").with_source(e))
+        .map_err(|e| DomainError::unavailable("cannot reach the database").with_source(e))?;
+
+    // Checked on the live server because Postgres enforces max_connections only when a connection
+    // arrives, so an oversized pool boots clean and fails under load.
+    let (server_max, superuser_reserved): (i64, i64) = sqlx::query_as(
+        "SELECT current_setting('max_connections')::bigint, \
+                current_setting('superuser_reserved_connections')::bigint",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| {
+        DomainError::unavailable("cannot read the database's connection limit").with_source(e)
+    })?;
+    match crate::config::enforce_pool_fit(db, server_max, superuser_reserved) {
+        Ok(None) => {}
+        Ok(Some(warning)) => tracing::warn!(
+            max_connections = db.max_connections,
+            server_max,
+            superuser_reserved,
+            "{}",
+            warning.client_message()
+        ),
+        Err(e) => {
+            pool.close().await;
+            return Err(e);
+        }
+    }
+    Ok(pool)
 }
 
 pub fn repositories(pool: &PgPool, search: &crate::config::SearchConfig) -> Repositories {

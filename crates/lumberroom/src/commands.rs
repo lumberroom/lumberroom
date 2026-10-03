@@ -13,7 +13,7 @@ use crate::args::Args;
 use crate::client::{err, err_code, Client, Result};
 use crate::{format, out, out_json, read_line, wire};
 
-fn require_token(c: &Client, config_path: &str) -> Result<()> {
+pub(crate) fn require_token(c: &Client, config_path: &str) -> Result<()> {
     if c.has_token() {
         return Ok(());
     }
@@ -28,7 +28,7 @@ pub(crate) fn compact(v: &Value) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
 }
 
-fn typed<T: serde::de::DeserializeOwned>(body: &Value, what: &str) -> Result<T> {
+pub(crate) fn typed<T: serde::de::DeserializeOwned>(body: &Value, what: &str) -> Result<T> {
     serde_json::from_value(body.clone()).map_err(|e| {
         err(format!("{what} response is not the expected shape ({e}): {}", compact(body)))
     })
@@ -39,7 +39,10 @@ fn typed<T: serde::de::DeserializeOwned>(body: &Value, what: &str) -> Result<T> 
 /// word for `field == "occurred_at"`, restated here because this crate cannot depend on that one.
 /// Two surfaces refusing the same input differently is how an owner learns to distrust both, so
 /// keep this in sync when the original changes.
-fn parse_two_date_forms(field: &str, raw: &str) -> std::result::Result<DateTime<Utc>, String> {
+pub(crate) fn parse_two_date_forms(
+    field: &str,
+    raw: &str,
+) -> std::result::Result<DateTime<Utc>, String> {
     let value = raw.trim();
 
     if let Ok(instant) = DateTime::parse_from_rfc3339(value) {
@@ -548,118 +551,6 @@ rows you meant to the rows that merely scored next.");
         }
     }
     out(&format!("deleted {deleted} of {}", candidates.len()));
-    Ok(())
-}
-
-pub async fn review(c: &Client, args: &Args) -> Result<()> {
-    require_token(c, &c.file.borrow().path.display().to_string())?;
-    let do_dates = args.present("dates");
-    let do_stale = args.present("stale");
-    let do_conflicts = args.present("conflicts");
-    let do_registry = args.present("registry");
-    let all = !do_stale && !do_conflicts && !do_registry && !do_dates;
-    let limit = args.int("limit", 25);
-
-    if do_dates {
-        let (status, body) = c.http_get(&format!("/admin/review/dates?limit={limit}")).await?;
-        if status != 200 {
-            return Err(err(format!("date review failed ({status}): {}", compact(&body))));
-        }
-        let review: wire::DateReview = typed(&body, "date review")?;
-        let ready = review.rows.iter().filter(|r| r.proposed.is_some()).count();
-        out(&format!(
-            "undated facts whose own text names a day: {} ({ready} with one date, {} with more)",
-            review.rows.len(),
-            review.rows.len() - ready
-        ));
-        for r in &review.rows {
-            match &r.proposed {
-                Some(day) => out(&format!(
-                    "  {}  [{}]  {day}\n      {}",
-                    r.id,
-                    r.namespace,
-                    r.content.chars().take(96).collect::<String>()
-                )),
-                None => out(&format!(
-                    "  {}  [{}]  names {} days: {}\n      {}",
-                    r.id,
-                    r.namespace,
-                    r.ambiguous.len(),
-                    r.ambiguous.join(", "),
-                    r.content.chars().take(96).collect::<String>()
-                )),
-            }
-        }
-        if ready > 0 {
-            out("");
-            out("Nothing was written. Fill one with:");
-            out("  lumberroom fill-date <id> <YYYY-MM-DD>");
-        }
-        return Ok(());
-    }
-
-    if all || do_stale {
-        let days = args.int("days", 90);
-        let (status, body) =
-            c.http_get(&format!("/admin/review/stale?days={days}&limit={limit}")).await?;
-        if status != 200 {
-            return Err(err(format!("stale review failed ({status}): {}", compact(&body))));
-        }
-        let review: wire::StaleReview = typed(&body, "stale review")?;
-        out(&format!("stale (never retrieved, older than {days}d): {}", review.rows.len()));
-        for r in &review.rows {
-            out(&format!(
-                "  {}  [{}]  {}  {}",
-                r.id,
-                r.namespace,
-                r.created_at,
-                r.content.chars().take(80).collect::<String>()
-            ));
-        }
-        out("");
-    }
-    if all || do_conflicts {
-        let min_sim = args.float("min-similarity", 0.9);
-        let (status, body) = c
-            .http_get(&format!("/admin/review/conflicts?min_similarity={min_sim}&limit={limit}"))
-            .await?;
-        if status != 200 {
-            return Err(err(format!("conflict review failed ({status}): {}", compact(&body))));
-        }
-        let review: wire::ConflictReview = typed(&body, "conflict review")?;
-        out(&format!("possible conflicts: {}", review.pairs.len()));
-        for p in &review.pairs {
-            out(&format!(
-                "  {:.3}  older {} [{}] {}",
-                p.similarity,
-                p.older.id,
-                p.older.namespace,
-                p.older.content.chars().take(60).collect::<String>()
-            ));
-            out(&format!(
-                "            newer {} [{}] {}",
-                p.newer.id,
-                p.newer.namespace,
-                p.newer.content.chars().take(60).collect::<String>()
-            ));
-        }
-        out("");
-    }
-    if all || do_registry {
-        let (status, body) = c.http_get(&format!("/admin/review/registry?limit={limit}")).await?;
-        if status != 200 {
-            return Err(err(format!("registry review failed ({status}): {}", compact(&body))));
-        }
-        let review: wire::RegistryReview = typed(&body, "registry review")?;
-        out(&format!("registry due for review: {}", review.due_for_review.len()));
-        for e in &review.due_for_review {
-            out(&format!("  {} {}:{}", e.namespace, e.kind, e.key));
-        }
-        out(&format!("non-canonical registry keys: {}", review.non_canonical.len()));
-        for e in &review.non_canonical {
-            out(&format!("  {} {}:{}", e.namespace, e.kind, e.key));
-        }
-    }
     Ok(())
 }
 

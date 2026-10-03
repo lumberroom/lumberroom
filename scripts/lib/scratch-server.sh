@@ -45,8 +45,8 @@ scratch_require() {
     echo "POSTGRES_PASSWORD is not set. Copy .env.example to .env and fill it in first." >&2
     return 1
   }
-  docker image inspect lumberroom-server:0.3.1 >/dev/null 2>&1 || {
-    echo "the lumberroom-server:0.3.1 image is not built. Build it once with:  docker compose build server" >&2
+  docker image inspect lumberroom-server:0.4.0 >/dev/null 2>&1 || {
+    echo "the lumberroom-server:0.4.0 image is not built. Build it once with:  docker compose build server" >&2
     return 1
   }
   return 0
@@ -108,7 +108,7 @@ scratch_start() {
     -e AUTH_TOKENS="$SCRATCH_TOKENS" \
     "${embed_args[@]}" \
     "${kek_args[@]}" \
-    lumberroom-server:0.3.1 >/dev/null
+    lumberroom-server:0.4.0 >/dev/null
 
   i=0
   until curl -sf "http://127.0.0.1:${SCRATCH_PORT}/readyz" >/dev/null 2>&1; do

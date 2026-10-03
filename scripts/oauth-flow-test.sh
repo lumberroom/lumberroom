@@ -92,7 +92,7 @@ scratch_start_oauth() {
     psql -U "$SCRATCH_PG_USER" -d postgres -c "CREATE DATABASE $SCRATCH_DB" >/dev/null
 
   local owner_password_hash
-  owner_password_hash="$(printf '%s\n' "$PASSWORD" | docker run --rm -i lumberroom-server:0.3.1 lumberroom-server hash-password \
+  owner_password_hash="$(printf '%s\n' "$PASSWORD" | docker run --rm -i lumberroom-server:0.4.0 lumberroom-server hash-password \
     2>"$WORK/hash-password.err")" || {
     echo "could not hash the scratch owner password: $(cat "$WORK/hash-password.err")" >&2
     return 1
@@ -114,7 +114,7 @@ scratch_start_oauth() {
     -e OAUTH_COOKIE_SECRET="$oauth_cookie_secret" \
     -e EMBED_PROVIDER=hash -e EMBED_DIM=768 \
     -e KEK_PROVIDER=none \
-    lumberroom-server:0.3.1 >/dev/null
+    lumberroom-server:0.4.0 >/dev/null
 
   i=0
   until curl -sf "http://127.0.0.1:${SCRATCH_PORT}/readyz" >/dev/null 2>&1; do

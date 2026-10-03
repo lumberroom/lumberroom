@@ -45,11 +45,71 @@ pub struct ToolOutput {
     pub text: String,
 }
 
+/// How much life left on the token found on disk counts as "somebody else already refreshed this".
+///
+/// Wide enough to cover the retry the caller is about to send and the clock skew between two
+/// processes on one machine, short enough to stay well inside any access token lifetime this
+/// client has been handed.
+const FRESH_ENOUGH_SECS: i64 = 60;
+
+/// The share of an access token's life during which a request may refresh before it goes out.
+const PROACTIVE_FRACTION: f64 = 0.25;
+
+/// The lifetime assumed for a token whose response carried no `expires_in`, and for a config file
+/// written before this client started recording one.
+const DEFAULT_TOKEN_LIFETIME_SECS: i64 = 3600;
+
+/// How early this process starts refreshing, as a share of `PROACTIVE_FRACTION`. Uniform over
+/// [0.5, 1.0], drawn once per client.
+///
+/// Without the draw, every lumberroom process on the machine crosses the trigger point in the same
+/// second, because they all hold a token that expires at the same instant. That is the herd this
+/// whole change exists to break up, and a fixed threshold moves it earlier rather than spreading
+/// it. Entropy that fails falls back to the middle of the range, so the worst case is the fixed
+/// threshold nobody is worse off for.
+fn random_lead() -> f64 {
+    match crate::oauth::random_bytes(2) {
+        Ok(bytes) => {
+            let n = u16::from_le_bytes([bytes[0], bytes[1]]);
+            0.5 + 0.5 * (f64::from(n) / f64::from(u16::MAX))
+        }
+        Err(_) => 0.75,
+    }
+}
+
+/// Seconds of life left on the access token this config file holds, when the file says.
+///
+/// `expires_at` has been written since the first release and read only by `doctor`, so nothing has
+/// ever depended on its shape being right. Both callers treat `None` as "no answer" rather than as
+/// "expired": a file written by hand, or by a client that spelled the instant differently, must not
+/// be able to turn a working credential into a refresh on every request or into a skipped one.
+fn seconds_until_expiry(file: &FileConfig) -> Option<i64> {
+    let at = chrono::DateTime::parse_from_rfc3339(file.oauth("expires_at")?).ok()?;
+    Some(at.timestamp() - chrono::Utc::now().timestamp())
+}
+
+/// The access token's whole life in seconds, as the token endpoint reported it.
+///
+/// The proactive refresh needs the life and not just the end of it: a quarter of an hour of margin
+/// on a token that lives an hour is prudence, and on one that lives five minutes it is a refresh
+/// before every request. `expires_in` lands beside `expires_at` from this file's own refresh, and a
+/// config last written by `login` on an older build does not carry it.
+fn access_token_lifetime(file: &FileConfig) -> i64 {
+    file.value
+        .get("oauth")
+        .and_then(|oauth| oauth.get("expires_in"))
+        .and_then(Value::as_i64)
+        .filter(|ttl| *ttl > 0)
+        .unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS)
+}
+
 pub struct Client {
     http: reqwest::Client,
     pub cfg: Resolved,
     pub file: RefCell<FileConfig>,
     token: RefCell<String>,
+    /// This process's share of the proactive refresh window, drawn once. See `random_lead`.
+    refresh_lead: Cell<f64>,
     request_id: Cell<i64>,
     endpoints: RefCell<Option<Rc<Endpoints>>>,
 }
@@ -69,6 +129,7 @@ impl Client {
             cfg,
             file: RefCell::new(file),
             token,
+            refresh_lead: Cell::new(random_lead()),
             request_id: Cell::new(0),
             endpoints: RefCell::new(None),
         })
@@ -176,6 +237,15 @@ impl Client {
         url: &str,
         payload: Payload,
     ) -> Result<reqwest::Response> {
+        // Refresh before the request when the token is near the end of its life, rather than after
+        // the 401 it is about to earn. Waiting for the 401 costs every process a guaranteed failed
+        // round trip, and they all pay it in the same second: they hold tokens that expire
+        // together, so they queue on the token endpoint together. A proactive refresh that fails
+        // has already said why on stderr, and the request goes out on the old token regardless, so
+        // the 401 handler below stays the fallback it has always been.
+        if self.refresh_is_due() {
+            self.refresh().await;
+        }
         let res =
             self.build(method.clone(), url, &payload).send().await.map_err(|e| self.net_err(e))?;
         if res.status().as_u16() != 401 {
@@ -188,6 +258,45 @@ impl Client {
             return Ok(res);
         }
         self.build(method, url, &payload).send().await.map_err(|e| self.net_err(e))
+    }
+
+    /// Whether the next request should refresh first instead of waiting for its 401.
+    ///
+    /// True once the token is inside this process's slice of the last `PROACTIVE_FRACTION` of its
+    /// life. A file with no readable `expires_at` answers false and leaves the credential to the
+    /// 401 path: an unreadable instant is not a reason to refresh before every request forever.
+    fn refresh_is_due(&self) -> bool {
+        let file = self.file.borrow();
+        if file.oauth("refresh_token").is_none() {
+            return false;
+        }
+        let Some(left) = seconds_until_expiry(&file) else {
+            return false;
+        };
+        let window = access_token_lifetime(&file) as f64 * PROACTIVE_FRACTION;
+        left <= (window * self.refresh_lead.get()) as i64
+    }
+
+    /// The access token the config file holds, when it is worth adopting instead of rotating.
+    ///
+    /// Two conditions, and the first is what makes this safe on the 401 path. A caller reaches
+    /// `refresh` because the server refused the token this client is holding, so a file claiming
+    /// the credential is still good is only believable when the file holds a *different* token
+    /// from the refused one. The same token with a future `expires_at` means the server and the
+    /// clock disagree, and the server wins.
+    ///
+    /// The second is that the token has real life left. An absent or unparseable `expires_at`
+    /// falls through to the refresh: a config written by an older client is not evidence.
+    fn fresh_token_on_disk(&self) -> Option<String> {
+        let file = self.file.borrow();
+        let access = file.oauth("access_token")?;
+        if access == self.token.borrow().as_str() {
+            return None;
+        }
+        if seconds_until_expiry(&file)? <= FRESH_ENOUGH_SECS {
+            return None;
+        }
+        Some(access.to_string())
     }
 
     /// Exchange the refresh token, persist the result, adopt the new access token.
@@ -230,6 +339,17 @@ impl Client {
         // started. The token to send is whatever is on disk now, read under the lock so nothing
         // rotates it in between.
         *self.file.borrow_mut() = FileConfig::load(path);
+
+        // Somebody else may have run this exchange while this process waited for the lock, and
+        // their result is on disk: a different access token with life ahead of it. Sending anyway
+        // spends a rotation for nothing, and every rotation is another window in which a crash
+        // between the POST and the save leaves a spent refresh token on disk and the whole family
+        // dead on the next run. Adopt the token instead and let the caller retry with it.
+        if let Some(fresh) = self.fresh_token_on_disk() {
+            *self.token.borrow_mut() = fresh;
+            drop(lock);
+            return true;
+        }
 
         let (refresh_token, client_id, client_secret, existing) = {
             let file = self.file.borrow();
@@ -328,8 +448,12 @@ it would go on the wire in the clear. Point the CLI at https, or at 127.0.0.1."
             "token_type".into(),
             body.get("token_type").cloned().unwrap_or_else(|| json!("Bearer")),
         );
-        let ttl = body.get("expires_in").and_then(Value::as_i64).unwrap_or(3600);
+        let ttl =
+            body.get("expires_in").and_then(Value::as_i64).unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
         oauth.insert("expires_at".into(), json!(crate::oauth::expires_at(ttl)));
+        // The end of the token's life is on its own not enough to decide when to refresh early.
+        // `access_token_lifetime` reads this back.
+        oauth.insert("expires_in".into(), json!(ttl));
 
         let mut patch = Map::new();
         patch.insert("oauth".into(), Value::Object(oauth));
@@ -556,6 +680,33 @@ mod tests {
             issues: u64,
             /// Every refresh_token value ever presented, spent or not.
             presentations: Vec<String>,
+            /// The bearer token on every request that was not a token exchange.
+            api_calls: Vec<String>,
+        }
+
+        fn token_server() -> Arc<Mutex<TokenServer>> {
+            Arc::new(Mutex::new(TokenServer {
+                current: "r0".into(),
+                issues: 0,
+                presentations: Vec::new(),
+                api_calls: Vec::new(),
+            }))
+        }
+
+        /// Answer up to `n` requests and stop. Returned rather than awaited by the tests that
+        /// prove a request was never sent: those leave the accept loop parked, so the test aborts
+        /// the task instead of joining it.
+        fn serve(
+            listener: TcpListener,
+            state: Arc<Mutex<TokenServer>>,
+            n: usize,
+        ) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(async move {
+                for _ in 0..n {
+                    let Ok((mut socket, _)) = listener.accept().await else { break };
+                    serve_one(&mut socket, &state).await;
+                }
+            })
         }
 
         /// One request in, one response out. Just enough HTTP for a form-encoded token request;
@@ -589,6 +740,29 @@ mod tests {
             }
             let body =
                 String::from_utf8_lossy(&buf[header_end + 4..header_end + 4 + length]).to_string();
+
+            // Anything that is not the token endpoint is an ordinary API call, and what the test
+            // wants from it is which access token it carried.
+            let path = headers.lines().next().unwrap_or_default().split(' ').nth(1).unwrap_or("");
+            if !path.contains("/oauth/token") {
+                let bearer = headers
+                    .lines()
+                    .filter_map(|l| l.split_once(':'))
+                    .find(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.trim().trim_start_matches("Bearer ").to_string())
+                    .unwrap_or_default();
+                state.lock().unwrap().api_calls.push(bearer);
+                let answer = json!({ "ok": true }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \
+                     {}\r\nconnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                return;
+            }
+
             let presented = body
                 .split('&')
                 .find_map(|pair| pair.strip_prefix("refresh_token="))
@@ -653,6 +827,27 @@ mod tests {
             path
         }
 
+        /// The same fixture with the oauth object spelled out, for the tests that turn on what
+        /// `expires_at` says.
+        fn fixture_config_with(oauth: Value) -> std::path::PathBuf {
+            let path = fixture_config();
+            std::fs::write(&path, json!({ "oauth": oauth }).to_string()).unwrap();
+            path
+        }
+
+        /// An instant `secs` from now, in the format the config file uses.
+        fn in_seconds(secs: i64) -> String {
+            crate::oauth::expires_at(secs)
+        }
+
+        fn client_on(path: &std::path::Path, port: u16) -> Client {
+            let env: HashMap<String, String> =
+                HashMap::from([("LUMBERROOM_URL".to_string(), format!("http://127.0.0.1:{port}"))]);
+            let file = FileConfig::load(path.to_path_buf());
+            let resolved = crate::config::resolve(&env, &file, None, None, None, false, None);
+            Client::new(resolved, file).unwrap()
+        }
+
         /// One CLI process: its own runtime, its own client, its own in-memory view of the
         /// config file. A thread with a runtime of its own is the closest a test gets to a
         /// second `lumberroom` invocation on one machine. The barrier stands between loading
@@ -692,19 +887,8 @@ mod tests {
         async fn two_refreshes_in_one_process_do_not_starve_each_other() {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let port = listener.local_addr().unwrap().port();
-            let state = Arc::new(Mutex::new(TokenServer {
-                current: "r0".into(),
-                issues: 0,
-                presentations: Vec::new(),
-            }));
-
-            let server_state = state.clone();
-            let server = tokio::spawn(async move {
-                for _ in 0..2 {
-                    let Ok((mut socket, _)) = listener.accept().await else { break };
-                    serve_one(&mut socket, &server_state).await;
-                }
-            });
+            let state = token_server();
+            let server = serve(listener, state.clone(), 2);
 
             let path = fixture_config();
             // A one second request timeout makes the starvation quick rather than subtle. The
@@ -736,24 +920,22 @@ mod tests {
             std::fs::remove_dir_all(path.parent().unwrap()).ok();
         }
 
+        /// Two processes reaching the token endpoint at once, which is what a machine running a
+        /// hook and an editor and a shell does. The first rotates. The second waits for the lock,
+        /// re-reads, finds an access token that is not the one it holds and has an hour of life
+        /// ahead of it, and adopts it without sending anything.
+        ///
+        /// Before the double check this test asserted the other outcome: two presentations, two
+        /// rotations, each process ending on its own access token. Nothing was wrong with that,
+        /// it just spent a rotation for a token the machine already had, and every rotation is a
+        /// window in which a crash between the POST and the save leaves a spent refresh token on
+        /// disk. The guarantee the name carries holds either way and is asserted below.
         #[tokio::test]
-        async fn two_clients_never_present_the_same_refresh_token() {
+        async fn the_second_process_adopts_the_first_refresh_rather_than_spending_another() {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let port = listener.local_addr().unwrap().port();
-            let state = Arc::new(Mutex::new(TokenServer {
-                current: "r0".into(),
-                issues: 0,
-                presentations: Vec::new(),
-            }));
-
-            let server_state = state.clone();
-            let server = tokio::spawn(async move {
-                // Two requests arrive; accept them one at a time.
-                for _ in 0..2 {
-                    let Ok((mut socket, _)) = listener.accept().await else { break };
-                    serve_one(&mut socket, &server_state).await;
-                }
-            });
+            let state = token_server();
+            let server = serve(listener, state.clone(), 2);
 
             let path = fixture_config();
             let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -774,27 +956,227 @@ mod tests {
             .unwrap();
             assert!(a, "one of the two refreshes failed");
             assert!(b, "one of the two refreshes failed");
-            server.await.unwrap();
+            server.abort();
 
             let st = state.lock().unwrap();
             let mut seen = std::collections::BTreeSet::new();
             for token in &st.presentations {
                 assert!(seen.insert(token.clone()), "refresh token {token:?} was presented twice");
             }
-            assert_eq!(st.current, "r2", "both rotations happened server-side");
+            assert_eq!(
+                st.presentations,
+                vec!["r0".to_string()],
+                "the waiter found a fresh token and sent nothing"
+            );
+            assert_eq!(st.current, "r1", "one rotation happened server-side, not two");
 
             let back: Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert_eq!(back["oauth"]["refresh_token"], json!("r2"));
-            assert_eq!(back["oauth"]["access_token"], json!("a2"));
-            // Which process won the lock first is not fixed, so the two adopted access
-            // tokens are asserted as a set.
-            let adopted = [token_a, token_b];
-            assert!(
-                adopted.iter().any(|t| t == "a1") && adopted.iter().any(|t| t == "a2"),
-                "each process ended with its own rotation's access token: {adopted:?}"
+            assert_eq!(back["oauth"]["refresh_token"], json!("r1"));
+            assert_eq!(back["oauth"]["access_token"], json!("a1"));
+            assert_eq!(
+                [token_a, token_b],
+                ["a1".to_string(), "a1".to_string()],
+                "both processes ended on the one access token the machine holds"
             );
             std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        /// The double check reads `expires_at`, which no code path has ever depended on. A file
+        /// that does not carry one, or carries something no parser accepts, has to mean "refresh"
+        /// rather than "skip" or "fail": the alternative is a client that stops refreshing because
+        /// somebody hand-edited a date.
+        #[tokio::test]
+        async fn an_unreadable_expires_at_still_refreshes() {
+            for stored in [
+                json!({ "refresh_token": "r0", "client_id": "cid", "access_token": "a9" }),
+                json!({
+                    "refresh_token": "r0",
+                    "client_id": "cid",
+                    "access_token": "a9",
+                    "expires_at": "the day after tomorrow",
+                }),
+                json!({
+                    "refresh_token": "r0",
+                    "client_id": "cid",
+                    "access_token": "a9",
+                    "expires_at": "",
+                }),
+            ] {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let state = token_server();
+                let server = serve(listener, state.clone(), 1);
+
+                // The client starts on "a0" and another process replaces the file underneath it,
+                // which is the state the double check has to judge.
+                let path = fixture_config_with(
+                    json!({ "refresh_token": "r0", "client_id": "cid", "access_token": "a0" }),
+                );
+                let client = client_on(&path, port);
+                std::fs::write(&path, json!({ "oauth": stored }).to_string()).unwrap();
+
+                assert!(client.refresh().await, "the refresh failed for {stored}");
+                server.abort();
+                assert_eq!(
+                    state.lock().unwrap().presentations,
+                    vec!["r0".to_string()],
+                    "a token endpoint request was expected for {stored}"
+                );
+                assert_eq!(client.token(), "a1", "the rotation happened for {stored}");
+                std::fs::remove_dir_all(path.parent().unwrap()).ok();
+            }
+        }
+
+        /// The other half of the same judgement: a readable instant far enough out means the
+        /// refresh has already happened and this one is waste.
+        #[tokio::test]
+        async fn a_readable_future_expires_at_skips_the_exchange() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let state = token_server();
+            let server = serve(listener, state.clone(), 1);
+
+            let path = fixture_config_with(
+                json!({ "refresh_token": "r0", "client_id": "cid", "access_token": "a0" }),
+            );
+            let client = client_on(&path, port);
+            std::fs::write(
+                &path,
+                json!({ "oauth": {
+                    "refresh_token": "r1",
+                    "client_id": "cid",
+                    "access_token": "a1",
+                    "expires_at": in_seconds(3600),
+                    "expires_in": 3600,
+                } })
+                .to_string(),
+            )
+            .unwrap();
+
+            assert!(client.refresh().await);
+            server.abort();
+            assert!(
+                state.lock().unwrap().presentations.is_empty(),
+                "nothing should have reached the token endpoint"
+            );
+            assert_eq!(client.token(), "a1", "the fresh token on disk was adopted");
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        /// A token inside its last quarter gets replaced before the request goes out, so the
+        /// request carries the new one and nobody spends a round trip on a 401 everybody else is
+        /// spending in the same second.
+        #[tokio::test]
+        async fn a_request_refreshes_before_the_token_expires() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let state = token_server();
+            let server = serve(listener, state.clone(), 2);
+
+            // Sixty seconds left on an hour-long token. The jitter puts the trigger somewhere
+            // between seven and fifteen minutes out, so every draw fires here.
+            let path = fixture_config_with(json!({
+                "refresh_token": "r0",
+                "client_id": "cid",
+                "access_token": "a0",
+                "expires_at": in_seconds(60),
+                "expires_in": 3600,
+            }));
+            let client = client_on(&path, port);
+            let url = format!("http://127.0.0.1:{port}/api/health");
+            let res = client.send(reqwest::Method::GET, &url, Payload::None).await.unwrap();
+            assert_eq!(res.status().as_u16(), 200);
+            server.abort();
+
+            let st = state.lock().unwrap();
+            assert_eq!(st.presentations, vec!["r0".to_string()], "the refresh went out first");
+            assert_eq!(
+                st.api_calls,
+                vec!["a1".to_string()],
+                "the request carried the refreshed token, and there was no 401 round trip"
+            );
+            drop(st);
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        /// The mirror: a token with most of its life left is left alone. A proactive refresh that
+        /// fires too early is the same herd arriving earlier.
+        #[tokio::test]
+        async fn a_request_leaves_a_token_with_life_left_alone() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let state = token_server();
+            let server = serve(listener, state.clone(), 2);
+
+            // Fifty minutes left on an hour-long token, past the widest trigger the jitter draws.
+            let path = fixture_config_with(json!({
+                "refresh_token": "r0",
+                "client_id": "cid",
+                "access_token": "a0",
+                "expires_at": in_seconds(3000),
+                "expires_in": 3600,
+            }));
+            let client = client_on(&path, port);
+            let url = format!("http://127.0.0.1:{port}/api/health");
+            let res = client.send(reqwest::Method::GET, &url, Payload::None).await.unwrap();
+            assert_eq!(res.status().as_u16(), 200);
+            server.abort();
+
+            let st = state.lock().unwrap();
+            assert!(st.presentations.is_empty(), "no refresh was due");
+            assert_eq!(st.api_calls, vec!["a0".to_string()]);
+            drop(st);
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        /// A short-lived token gets a proportionally short trigger. With a fixed window, a token
+        /// that lives five minutes would be refreshed before every request it ever carries.
+        #[test]
+        fn the_trigger_follows_the_token_lifetime() {
+            let path = fixture_config_with(json!({
+                "refresh_token": "r0",
+                "client_id": "cid",
+                "access_token": "a0",
+                "expires_at": in_seconds(200),
+                "expires_in": 300,
+            }));
+            let client = client_on(&path, 1);
+            assert!(
+                !client.refresh_is_due(),
+                "200 seconds left on a 300 second token is outside the last quarter"
+            );
+            std::fs::write(
+                &path,
+                json!({ "oauth": {
+                    "refresh_token": "r0",
+                    "client_id": "cid",
+                    "access_token": "a0",
+                    "expires_at": in_seconds(20),
+                    "expires_in": 300,
+                } })
+                .to_string(),
+            )
+            .unwrap();
+            *client.file.borrow_mut() = FileConfig::load(path.clone());
+            assert!(client.refresh_is_due(), "20 seconds left on a 300 second token is due");
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        /// The jitter is what keeps two processes that started together from crossing the trigger
+        /// in the same second. A draw that always returned the same number would read as working
+        /// in every test above and would rebuild the herd on the machine.
+        #[test]
+        fn the_refresh_lead_is_drawn_per_client() {
+            let draws: Vec<f64> = (0..64).map(|_| random_lead()).collect();
+            for lead in &draws {
+                assert!((0.5..=1.0).contains(lead), "{lead} is outside the window");
+            }
+            let first = draws[0];
+            assert!(
+                draws.iter().any(|lead| (lead - first).abs() > f64::EPSILON),
+                "64 draws were all identical, so the trigger point is fixed"
+            );
         }
     }
 }

@@ -403,6 +403,23 @@ impl OauthStore for PgOauthStore {
         })
     }
 
+    async fn refresh_owner(&self, token_hash: &str) -> Result<Option<String>> {
+        // The same liveness filter as the UPDATE in `rotate_refresh`. A spent, revoked or expired
+        // token answers None and falls through to `rotate_refresh`, whose replay verdict has to
+        // revoke the family whoever presented it.
+        let row = sqlx::query(
+            "SELECT client_id FROM oauth_refresh
+              WHERE token_hash = $1
+                AND consumed_at IS NULL
+                AND revoked_at IS NULL
+                AND expires_at > now()",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("client_id")))
+    }
+
     async fn revoke_family(&self, family_id: uuid::Uuid) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         sqlx::query(

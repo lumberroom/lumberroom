@@ -199,6 +199,7 @@ async fn setup() -> Option<Harness> {
             tool_calls: Arc::new(postgres::PgToolCallRepository::new(pool.clone())),
             sealed: Some(Arc::new(postgres::PgSealedRepository::new(pool.clone()))),
             ciphertext: Some(memories),
+            oauth: None,
         },
         embedder: Arc::new(HashEmbedder::new(768)),
         // A private row is in the fixture on purpose, so this half of the harness is load-bearing:

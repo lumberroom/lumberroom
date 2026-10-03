@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Report a security vulnerability
-    url: https://github.com/the-cybersapien/lumberroom/security/advisories/new
+    url: https://github.com/lumberroom/lumberroom/security/advisories/new
     about: Use GitHub private vulnerability reporting rather than a public issue.

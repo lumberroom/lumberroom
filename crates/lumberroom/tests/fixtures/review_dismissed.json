@@ -1,0 +1,27 @@
+{
+  "lo_id": "1111aaaa-0000-4a1b-8c3d-112233445566",
+  "hi_id": "2222bbbb-0000-4a1b-8c3d-112233445566",
+  "dismissed_by": "claude-code",
+  "dismissed_token": "tok_9f1c2b4e",
+  "dismissed_at": "2026-09-20T00:00:00Z",
+  "rows": [
+    {
+      "id": "1111aaaa-0000-4a1b-8c3d-112233445566",
+      "namespace": "user:me",
+      "sensitivity": "open",
+      "content": "The owner prefers tabs.",
+      "opened": true,
+      "created_at": "2026-02-01T09:00:00Z",
+      "access_count": 3
+    },
+    {
+      "id": "2222bbbb-0000-4a1b-8c3d-112233445566",
+      "namespace": "user:me",
+      "sensitivity": "open",
+      "content": "The owner prefers spaces.",
+      "opened": true,
+      "created_at": "2026-07-01T09:00:00Z",
+      "access_count": 1
+    }
+  ]
+}

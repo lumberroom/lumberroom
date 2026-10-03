@@ -345,9 +345,9 @@ async fn pass(
                 namespace: keep.namespace.clone(),
                 keep_id: Some(keep.id.clone()),
                 rationale: format!(
-                    "{} rows hold the same text once case and spacing are normalised. The \
-                         oldest survives, because it carries the reads and the date anything else \
-                         refers to.",
+                    "These {} rows hold the same text once case and spacing are normalised. \
+                         The oldest survives, because it carries the reads and the date anything \
+                         else refers to.",
                     group.len()
                 ),
                 produced_by: "exact".to_string(),
@@ -380,11 +380,11 @@ async fn pass(
                     kind: CleanupKind::Paraphrase,
                     namespace: pair.older.namespace.clone(),
                     keep_id: Some(pair.newer.id.clone()),
-                    rationale: format!(
-                        "these two say the same thing at a cosine of {:.3}. The newer one \
-                             survives, because a restatement is usually a correction.",
-                        pair.similarity
-                    ),
+                    // No score in the sentence. `similarity` carries it as its own field, and a
+                    // person reading the rationale has no scale for a cosine.
+                    rationale: "These two say the same thing. The newer one survives, because a \
+                                restatement is usually a correction."
+                        .to_string(),
                     produced_by: "cosine".to_string(),
                     similarity: Some(pair.similarity),
                     posted_by: posted_by.clone(),
@@ -447,7 +447,7 @@ async fn pass(
                     namespace: row.namespace.clone(),
                     keep_id: None,
                     rationale: format!(
-                        "nothing has read this in the {age} days since it was written, and \
+                        "Nothing has read this in the {age} days since it was written, and \
                              nothing has confirmed it."
                     ),
                     produced_by: "unread".to_string(),

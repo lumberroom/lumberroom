@@ -147,6 +147,7 @@ async fn setup_with(
             tool_calls: Arc::new(postgres::PgToolCallRepository::new(pool.clone())),
             sealed: Some(Arc::new(postgres::PgSealedRepository::new(pool.clone()))),
             ciphertext: Some(memories),
+            oauth: None,
         },
         embedder: Arc::new(HashEmbedder::new(768)),
         keys: Some(keys),
@@ -756,7 +757,8 @@ async fn published_payloads_keep_their_field_names() {
     keys.sort();
     assert_eq!(keys, vec!["deduplicated", "id", "namespace", "sensitivity"]);
 
-    // memory_search. `superseded_by` is skipped unless the caller asked for history.
+    // memory_search. `superseded_by` is skipped unless the caller asked for history. `source`
+    // replaced `source_client` in decision 0020: the stored id stays off the wire.
     let hits = search::run(&ctx, "what has something to sample", None, None, None, None, None)
         .await
         .unwrap();
@@ -775,7 +777,7 @@ async fn published_payloads_keep_their_field_names() {
             "score",
             "sensitivity",
             "similarity",
-            "source_client",
+            "source",
             "tags",
         ]
     );
@@ -1636,90 +1638,6 @@ async fn the_export_never_counts_the_rows_a_grant_excludes() {
     let full = export::run(&ctx, None, None).await.unwrap();
     assert_eq!(full.memories, 2);
     assert_eq!(full.excluded, 0);
-}
-
-/// `ReviewQueue::staleness` counts every row in the tenant and takes no ceilings, so a client shown
-/// two of its own rows was also told how large the store it cannot read is.
-#[tokio::test]
-async fn the_stale_queue_fills_its_limit_with_rows_the_caller_may_see() {
-    // The grant used to be a pass over the results, so `limit` counted rows before filtering and a
-    // restricted caller got a short page with no way to tell it was short. Rows it may not read
-    // reached its process on the way, which src/ports/memory.rs forbids in as many words.
-    let (ctx, pool, _serial) = ctx_or_skip!();
-
-    // Six unreadable, then three readable. Oldest first, so a pre-filter limit of 3 returns the
-    // six it may not see, filters them all away, and answers with nothing.
-    for i in 0..6 {
-        write::run(&ctx, &format!("vault fact {i}"), "project:vault", None, None, None, None)
-            .await
-            .unwrap();
-    }
-    for i in 0..3 {
-        write::run(&ctx, &format!("global fact {i}"), "global", None, None, None, None)
-            .await
-            .unwrap();
-    }
-    // stale() wants rows never accessed and older than the threshold.
-    sqlx::query(
-        "UPDATE memory SET created_at = now() - interval '400 days', last_accessed_at = NULL",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let limited = restricted(&ctx, &["global"], &["global"]);
-    let queue = review::queue(&limited, Some(3)).await.unwrap();
-
-    assert_eq!(
-        queue.stale.len(),
-        3,
-        "asked for 3 and got {}, so the limit counted rows the caller cannot see",
-        queue.stale.len()
-    );
-    for item in &queue.stale {
-        assert_eq!(item.row.namespace, "global", "a row outside the grant reached the caller");
-    }
-}
-
-#[tokio::test]
-async fn the_review_queue_hands_a_narrow_grant_no_tenant_wide_row_counts() {
-    let (ctx, _pool, _serial) = ctx_or_skip!();
-    write::run(
-        &ctx,
-        "a fact the narrow grant cannot reach",
-        "project:vault",
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    write::run(&ctx, "a fact the narrow grant may read", "global", None, None, None, None)
-        .await
-        .unwrap();
-
-    let limited = restricted(&ctx, &["global"], &["global"]);
-    let queue = review::queue(&limited, Some(10)).await.unwrap();
-    let published = serde_json::to_value(&queue).unwrap().to_string();
-    assert!(queue.staleness.is_none(), "live_rows counts the whole tenant: {published}");
-    assert!(
-        !published.contains("live_rows"),
-        "and it must not survive in the payload: {published}"
-    );
-    assert!(
-        !queue.text.contains("live rows"),
-        "the rendered half carries the same claim: {}",
-        queue.text
-    );
-
-    let owner = review::queue(&ctx, Some(10)).await.unwrap();
-    assert_eq!(
-        owner.staleness.as_ref().map(|s| s.live_rows),
-        Some(2),
-        "the owner still gets the decay numbers the queue exists for"
-    );
-    assert!(owner.text.contains("live rows"), "and the rendered header: {}", owner.text);
 }
 
 /// Finding 2. The `sensitivity_default` table migration 004 seeds was never read: `config::load`
@@ -2926,6 +2844,428 @@ async fn filling_a_date_takes_only_one_the_fact_itself_names_and_never_moves_an_
     );
 }
 
+// ---- decision 0017: a fact can stop being true without being replaced ----
+
+/// Does a live search for `label` return the row `id`?
+///
+/// The label is a nonce, so a hit is the row and a miss is the row being absent rather than the
+/// query having drifted.
+async fn live_search_finds(ctx: &Ctx, label: &str, id: &str) -> bool {
+    search::run(ctx, label, None, Some(20), None, None, None)
+        .await
+        .unwrap()
+        .hits
+        .iter()
+        .any(|h| h.id == id)
+}
+
+#[tokio::test]
+async fn an_expired_row_leaves_search_and_the_digest_and_comes_back() {
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let label = nonce("expire");
+    let row = write::run(
+        &ctx,
+        &format!("the sprint board {label} is where this week's work sits"),
+        "global",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(live_search_finds(&ctx, &label, &row.id).await, "a fresh fact answers a live search");
+    bootstrap::clear_cache();
+    let before = bootstrap::run(&ctx, None).await.unwrap();
+    assert!(digest_json(&before).contains(&label), "a live fact reaches the digest");
+
+    let expired = review::expire(&ctx, &row.id).await.unwrap();
+    assert_eq!(expired.id, row.id);
+
+    assert!(
+        !live_search_finds(&ctx, &label, &row.id).await,
+        "a fact whose period has closed answers no live search"
+    );
+    let after = bootstrap::run(&ctx, None).await.unwrap();
+    assert!(!digest_json(&after).contains(&label), "and it is out of the digest too");
+
+    assert!(review::unexpire(&ctx, &row.id, expired.until).await.unwrap());
+    assert!(
+        live_search_finds(&ctx, &label, &row.id).await,
+        "unexpire puts the fact back where it was"
+    );
+}
+
+/// The whole reason this closes a period rather than deleting: the text, the history and every
+/// as-of read survive the retirement.
+#[tokio::test]
+async fn an_expired_row_still_answers_as_of_a_time_inside_its_period() {
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let label = nonce("asof");
+    let a_year_ago = chrono::Utc::now() - chrono::Duration::days(365);
+    let row = write::run(
+        &ctx,
+        &format!("the {label} rate card held through the year"),
+        "global",
+        None,
+        None,
+        None,
+        Some(a_year_ago),
+    )
+    .await
+    .unwrap();
+
+    review::expire(&ctx, &row.id).await.unwrap();
+
+    let six_months_ago = chrono::Utc::now() - chrono::Duration::days(180);
+    let then =
+        search::run(&ctx, &label, None, Some(20), None, None, Some(six_months_ago)).await.unwrap();
+    assert!(
+        then.hits.iter().any(|h| h.id == row.id),
+        "an instant inside the period still gets the fact"
+    );
+    assert!(!live_search_finds(&ctx, &label, &row.id).await, "and now does not");
+}
+
+#[tokio::test]
+async fn expire_refuses_a_row_a_successor_already_retired() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let old = write::run(&ctx, "the port is 8080", "global", None, None, None, None).await.unwrap();
+    let new = write::run(&ctx, "the port is 8787", "global", None, None, None, None).await.unwrap();
+    review::supersede(&ctx, &old.id, &new.id).await.unwrap();
+
+    let ended_by_the_supersession = occurred_until(&pool, &old.id).await;
+    let err = review::expire(&ctx, &old.id).await.unwrap_err();
+    // The refusal names the supersession rather than calling the row expired, because a stamped
+    // row with a closed period was replaced and this path did not close it.
+    assert!(err.client_message().contains("retired by a supersession"), "{}", err.client_message());
+    assert_eq!(
+        occurred_until(&pool, &old.id).await,
+        ended_by_the_supersession,
+        "the end the supersession wrote is not this path's to move"
+    );
+}
+
+#[tokio::test]
+async fn unexpire_refuses_an_instant_it_did_not_write() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let label = nonce("guard");
+    let row = write::run(
+        &ctx,
+        &format!("the {label} standup runs at nine"),
+        "global",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let expired = review::expire(&ctx, &row.id).await.unwrap();
+    assert!(
+        !review::unexpire(&ctx, &row.id, chrono::Utc::now()).await.unwrap(),
+        "an instant nobody wrote reopens nothing"
+    );
+    assert_eq!(occurred_until(&pool, &row.id).await, Some(expired.until));
+
+    assert!(review::unexpire(&ctx, &row.id, expired.until).await.unwrap());
+    assert_eq!(occurred_until(&pool, &row.id).await, None);
+}
+
+#[tokio::test]
+async fn expire_needs_the_write_grant_at_the_rows_own_level() {
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let row =
+        write::run(&ctx, "a fact anyone may read", "global", None, None, None, None).await.unwrap();
+
+    let reader = restricted(&ctx, &["global"], &[]);
+    let err = review::expire(&reader, &row.id).await.unwrap_err();
+    assert_eq!(err.kind.http_status(), 404);
+    assert!(err.client_message().contains("not yours to change"), "{}", err.client_message());
+}
+
+/// The failure that made `find_exact` the first item on the review: the owner restates a fact the
+/// store closed, the write collapses into the closed row, and the fact stays absent from every
+/// live answer with nothing reporting it.
+#[tokio::test]
+async fn restating_an_expired_fact_writes_a_new_live_row_rather_than_collapsing_into_it() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let label = nonce("restate");
+    let text = format!("the {label} standing order runs monthly");
+
+    let first = write::run(&ctx, &text, "global", None, None, None, None).await.unwrap();
+    let expired = review::expire(&ctx, &first.id).await.unwrap();
+
+    let second = write::run(&ctx, &text, "global", None, None, None, None).await.unwrap();
+    assert!(!second.deduplicated, "a closed fact restated is a fact again, not a duplicate");
+    assert_ne!(second.id, first.id);
+    assert_eq!(
+        occurred_until(&pool, &first.id).await,
+        Some(expired.until),
+        "the old row stays closed"
+    );
+    assert_eq!(occurred_until(&pool, &second.id).await, None);
+    assert!(live_search_finds(&ctx, &label, &second.id).await, "the restated fact answers now");
+    assert!(!live_search_finds(&ctx, &label, &first.id).await);
+}
+
+/// A closed period takes no successor, which is what keeps `forget`'s revive honest: the revive
+/// clears `occurred_until` on every row it brings back, and only a supersession may have written
+/// one there.
+#[tokio::test]
+async fn an_expired_row_takes_no_successor_so_a_revive_cannot_wipe_its_end() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let old =
+        write::run(&ctx, "the office is on the third floor", "global", None, None, None, None)
+            .await
+            .unwrap();
+    let expired = review::expire(&ctx, &old.id).await.unwrap();
+    let new =
+        write::run(&ctx, "the office is on the ninth floor", "global", None, None, None, None)
+            .await
+            .unwrap();
+
+    let refused = review::supersede(&ctx, &old.id, &new.id).await.unwrap_err();
+    assert!(refused.client_message().contains("expired"), "{}", refused.client_message());
+
+    // The write path takes the same target through the same check, so neither door is laxer.
+    let refused_write = write::run(
+        &ctx,
+        "the office is on the tenth floor",
+        "global",
+        None,
+        Some(&old.id),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused_write.client_message().contains("expired"),
+        "{}",
+        refused_write.client_message()
+    );
+
+    assert_eq!(memory_links(&pool, &old.id).await.1, None, "nothing retired it");
+    assert_eq!(occurred_until(&pool, &old.id).await, Some(expired.until), "its end stands");
+}
+
+#[tokio::test]
+async fn expiring_a_row_twice_names_the_instant_rather_than_blaming_a_race() {
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let row =
+        write::run(&ctx, "the winter timetable is in force", "global", None, None, None, None)
+            .await
+            .unwrap();
+    let expired = review::expire(&ctx, &row.id).await.unwrap();
+
+    let again = review::expire(&ctx, &row.id).await.unwrap_err();
+    assert_eq!(again.kind.http_status(), 400);
+    assert!(again.client_message().contains("already expired at"), "{}", again.client_message());
+    assert!(
+        again.client_message().contains(&expired.until.to_rfc3339()),
+        "the refusal names the instant, which is what unexpire is guarded on: {}",
+        again.client_message()
+    );
+}
+
+/// The retired page is the one list that says what left the live reads, so an expiry belongs on it
+/// and has to be tellable from a supersession.
+#[tokio::test]
+async fn an_expired_row_reaches_the_retired_list_marked_as_expired() {
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let label = nonce("retiredlist");
+    let row = write::run(
+        &ctx,
+        &format!("the {label} car park closes at seven"),
+        "global",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    review::expire(&ctx, &row.id).await.unwrap();
+
+    let readable = vec![lumberroom_server::domain::policy::NamespaceCeiling {
+        namespace: "global".into(),
+        max: Sensitivity::Sealed,
+    }];
+    let since = chrono::Utc::now() - chrono::Duration::days(7);
+    let rows = ctx.repos.memories.retired_since(ctx.tenant(), &readable, since, 100).await.unwrap();
+
+    let found = rows
+        .iter()
+        .find(|r| r.id.to_string() == row.id)
+        .expect("the expired row is on the list of what left");
+    assert!(found.expired, "and it is marked as expired rather than as replaced");
+    assert!(found.successor_id.is_none());
+}
+
+/// A successor has to hold now. An expired row named as the replacement would retire a live fact
+/// into one that no live read returns, which is the fact disappearing with a correction's paperwork
+/// around it.
+#[tokio::test]
+async fn supersede_refuses_an_expired_row_as_the_replacement() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let old = write::run(&ctx, "the meeting is on Tuesday", "global", None, None, None, None)
+        .await
+        .unwrap();
+    let new = write::run(&ctx, "the meeting is on Thursday", "global", None, None, None, None)
+        .await
+        .unwrap();
+    review::expire(&ctx, &new.id).await.unwrap();
+
+    let refused = review::supersede(&ctx, &old.id, &new.id).await.unwrap_err();
+    assert!(refused.client_message().contains("does not hold now"), "{}", refused.client_message());
+    assert_eq!(memory_links(&pool, &old.id).await.1, None, "the live row keeps holding");
+}
+
+/// The shape a restore leaves when it cannot relink a successor: `superseded_at` and
+/// `occurred_until` set, the link NULL. It is a retirement whose successor is missing, and reading
+/// the link alone filed it as expired everywhere, took away its replace form and refused a
+/// supersession over it.
+#[tokio::test]
+async fn a_retirement_whose_successor_is_missing_reads_as_retired_rather_than_expired() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let orphan =
+        write::run(&ctx, "the invoice runs through Stripe", "global", None, None, None, None)
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE memory SET superseded_at = now(), occurred_until = now(), superseded_by = NULL
+          WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&orphan.id).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let readable = vec![lumberroom_server::domain::policy::NamespaceCeiling {
+        namespace: "global".into(),
+        max: Sensitivity::Sealed,
+    }];
+    let since = chrono::Utc::now() - chrono::Duration::days(7);
+    let rows = ctx.repos.memories.retired_since(ctx.tenant(), &readable, since, 100).await.unwrap();
+    let listed = rows
+        .iter()
+        .find(|r| r.id.to_string() == orphan.id)
+        .expect("a retirement belongs on the list of what left");
+    assert!(!listed.expired, "a stamped row with an end was superseded, not expired");
+    assert!(listed.successor_id.is_none(), "and its successor is the part that went missing");
+
+    // The replace path still works on it, which is the half that was lost.
+    let replacement = write::run(
+        &ctx,
+        "the invoice runs through GoCardless",
+        "global",
+        None,
+        Some(&orphan.id),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        memory_links(&pool, &orphan.id).await.1,
+        Some(replacement.id),
+        "the supersession landed and the link points at the new row"
+    );
+}
+
+/// A fact whose period ends next week still holds this week, and both doors say so.
+///
+/// An archive restore binds `occurred_until`, `superseded_by` and `superseded_at` one by one, so a
+/// live row with a future end reaches the store without an expiry ever running. The service check
+/// let it through and the statement guard did not, which left the caller holding a supersession the
+/// database never wrote.
+#[tokio::test]
+async fn a_future_end_takes_a_successor_at_both_doors() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let old = write::run(&ctx, "the loan runs at four percent", "global", None, None, None, None)
+        .await
+        .unwrap();
+    let ends = chrono::Utc::now() + chrono::Duration::days(7);
+    sqlx::query("UPDATE memory SET occurred_until = $2 WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&old.id).unwrap())
+        .bind(ends)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let new = write::run(&ctx, "the loan runs at five percent", "global", None, None, None, None)
+        .await
+        .unwrap();
+    review::supersede(&ctx, &old.id, &new.id).await.unwrap();
+
+    assert_eq!(
+        memory_links(&pool, &old.id).await.1,
+        Some(new.id.clone()),
+        "the retirement landed rather than matching no row"
+    );
+    assert_eq!(
+        memory_links(&pool, &new.id).await.0,
+        Some(old.id.clone()),
+        "and the mirror names the row it replaced"
+    );
+    // COALESCE keeps the end somebody stated. A supersession moves the link, never the date.
+    assert_eq!(occurred_until(&pool, &old.id).await.map(|u| u.timestamp()), Some(ends.timestamp()));
+
+    // The write path takes a target through the same check, so neither door is laxer.
+    let third =
+        write::run(&ctx, "the loan runs at six percent", "global", None, Some(&new.id), None, None)
+            .await
+            .unwrap();
+    assert_eq!(memory_links(&pool, &new.id).await.1, Some(third.id));
+}
+
+/// A retire that moves no row leaves nothing behind, least of all a mirror claiming it happened.
+///
+/// The service refuses an expired target first, and the repository refuses it again inside the
+/// transaction. The second refusal is the one under test: a caller reaching the port directly must
+/// not end up with `supersedes` written on the new row while the old row stays live, which is two
+/// rows where one claims to have replaced the other.
+#[tokio::test]
+async fn a_retire_that_moves_no_row_never_leaves_the_mirror_written() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let old =
+        write::run(&ctx, "the depot opens at six", "global", None, None, None, None).await.unwrap();
+    let new = write::run(&ctx, "the depot opens at seven", "global", None, None, None, None)
+        .await
+        .unwrap();
+    // Expired: an end that has arrived, and no supersession stamp. Written by hand because an
+    // archive restore writes it this way and `expire` is not the only path to the column.
+    sqlx::query(
+        "UPDATE memory SET occurred_until = now() - interval '1 day', superseded_at = NULL
+          WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&old.id).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let refused = review::supersede(&ctx, &old.id, &new.id).await.unwrap_err();
+    assert!(refused.client_message().contains("expired"), "{}", refused.client_message());
+
+    let from_the_port = ctx
+        .repos
+        .memories
+        .supersede(
+            ctx.tenant(),
+            uuid::Uuid::parse_str(&old.id).unwrap(),
+            uuid::Uuid::parse_str(&new.id).unwrap(),
+        )
+        .await
+        .expect_err("the statement matched no row, so the transaction has nothing to commit");
+    assert_eq!(from_the_port.kind.http_status(), 409);
+
+    assert_eq!(memory_links(&pool, &new.id).await.0, None, "no mirror on the new row");
+    assert_eq!(memory_links(&pool, &old.id).await.1, None, "and the old row keeps its own life");
+}
+
 // ---- decision 0014 part 4: the graph ----
 
 /// The severing claim, which is the production-tier one. An edge whose far end the caller may not
@@ -3758,5 +4098,286 @@ async fn the_stranded_namespace_query_sees_what_namespace_counts_misses() {
     assert!(
         found.iter().any(|(ns, t, _)| ns == "user:me" && t == "memory"),
         "user:me is reported and the caller is what skips it: {found:?}"
+    );
+}
+
+/// The access bump rides along with every search, so it must never wait on a row lock.
+///
+/// It used to be one UPDATE that locked the returned rows in scan order and held each lock until
+/// the statement ended. A supersession locks its two rows in id order, so a search that returned
+/// both rows of a pending supersession could hold one while the write held the other. Postgres
+/// then aborts one of the two, and nothing retries a deadlock, so the victim could be the user's
+/// write. The bump now skips a row somebody else holds, which leaves nothing for a cycle to form
+/// around.
+///
+/// Before the fix the bump queues behind the held row and B's count stays at zero for the whole
+/// window: the statement has not ended, so even a row it already bumped is invisible here.
+#[tokio::test]
+async fn an_access_bump_skips_a_row_another_write_holds() {
+    let Some((ctx, pool, _guard, _db)) = setup().await else { return };
+
+    let held = uuid::Uuid::new_v4();
+    let free = uuid::Uuid::new_v4();
+    for (id, content) in [(held, "the row a write holds"), (free, "the row nobody holds")] {
+        sqlx::query(
+            "INSERT INTO memory (id, tenant_id, namespace, content, source_client)
+             VALUES ($1, $2, 'user:me', $3, 'test')",
+        )
+        .bind(id)
+        .bind(ctx.tenant())
+        .bind(content)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM memory WHERE id = $1 FOR UPDATE")
+        .bind(held)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+
+    ctx.repos.memories.touch_accessed(ctx.tenant(), vec![held, free]);
+
+    let count = |id: uuid::Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i32>("SELECT access_count FROM memory WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    // The bump runs on a spawned task, so the test polls for its effect. Three seconds is far
+    // past what one UPDATE over two rows takes and short enough that a blocked bump fails fast.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut free_count = count(free).await;
+    while free_count == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        free_count = count(free).await;
+    }
+    // One statement bumps both rows, so once B shows its bump the statement has ended and A's
+    // value is final.
+    let held_count = count(held).await;
+
+    // Released before asserting, so a failure here cannot leave a lock behind for the next test.
+    writer.rollback().await.unwrap();
+
+    assert_eq!(free_count, 1, "the bump waited on a row another write holds");
+    assert_eq!(held_count, 0, "the bump reached a row another write holds");
+}
+
+// -- the tag filter and the tag count ---------------------------------------------------------------
+
+fn tag_list(tags: &[&str]) -> Option<Vec<String>> {
+    Some(tags.iter().map(|t| (*t).to_string()).collect())
+}
+
+fn page_ids(page: &lumberroom_server::console::data::Page) -> Vec<String> {
+    page.entries.iter().map(|e| e.id.clone()).collect()
+}
+
+/// The tag test sits in the reading page's WHERE clause beside the keyset comparison, so the
+/// cursor walks the filtered rows. Filtering a fetched page would return a short page and a cursor
+/// past rows the filter would have reached next.
+#[tokio::test]
+async fn the_reading_page_keeps_rows_carrying_every_listed_tag_and_pages_under_the_filter() {
+    use lumberroom_server::console::data;
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let ns = "project:tagfilter";
+    let w = |content: &'static str, tags: Option<Vec<String>>| {
+        let ctx = ctx.clone();
+        async move { write::run(&ctx, content, ns, tags, None, None, None).await.unwrap().id }
+    };
+    let alpha = w("The staging cluster runs in Frankfurt", tag_list(&["alpha"])).await;
+    let both_old = w("Backups rotate every Sunday at four", tag_list(&["alpha", "beta"])).await;
+    let _beta = w("The design system uses an eight point grid", tag_list(&["beta"])).await;
+    let _bare = w("Nobody tagged this note about the lunch order", None).await;
+    let both_new =
+        w("Invoices go out on the first working day", tag_list(&["beta", "alpha"])).await;
+
+    let readable = data::readable(&ctx).await.unwrap();
+    let page = |tags: Vec<String>, before: Option<data::Cursor>, limit: i64| {
+        let (ctx, readable) = (ctx.clone(), readable.clone());
+        async move { data::page(&ctx, &readable, Some(ns), before, limit, false, &tags).await.unwrap() }
+    };
+
+    let unfiltered = page(vec![], None, 10).await;
+    assert_eq!(unfiltered.entries.len(), 5, "no tags is no filter");
+
+    let one = page(vec!["alpha".into()], None, 10).await;
+    assert_eq!(page_ids(&one), vec![both_new.clone(), both_old.clone(), alpha.clone()]);
+
+    let two = page(vec!["beta".into(), "alpha".into()], None, 10).await;
+    assert_eq!(page_ids(&two), vec![both_new.clone(), both_old.clone()], "all of, never any of");
+
+    // The raw spelling a dashboard would send, one row a page.
+    let first = page(vec![" ALPHA ".into(), "Beta".into()], None, 1).await;
+    assert_eq!(page_ids(&first), vec![both_new.clone()]);
+    let cursor = first.older.expect("a second row carries both tags");
+    let second = page(vec![" ALPHA ".into(), "Beta".into()], Some(cursor), 1).await;
+    assert_eq!(page_ids(&second), vec![both_old.clone()]);
+    // `alpha` sits behind `both_old` unfiltered, so a cursor here would mean the filter ran after
+    // the page was cut.
+    assert!(second.older.is_none(), "no third row carries both tags");
+}
+
+/// A row that matches the text and lacks the tag never reaches the caller, on every statement the
+/// repository can choose: both blends, now and as of an instant.
+#[tokio::test]
+async fn a_tagged_search_drops_a_text_match_that_lacks_the_tag() {
+    use lumberroom_server::domain::policy::NamespaceCeiling;
+    use lumberroom_server::ports::{MemoryRepository, SearchQuery, Weights};
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let tagged = write::run(
+        &ctx,
+        "The deploy host for kestrel is fern.internal",
+        "global",
+        tag_list(&["Infra"]),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
+    let untagged = write::run(
+        &ctx,
+        "The deploy host for kestrel moved to oak.internal",
+        "project:kestrel",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
+    let asked = || Some(vec!["global".to_string(), "project:kestrel".to_string()]);
+    let q = "deploy host for kestrel";
+    let ids = |r: &search::SearchResult| r.hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+
+    let all = search::run(&ctx, q, asked(), Some(10), None, None, None).await.unwrap();
+    assert!(ids(&all).contains(&tagged), "the tagged row answers the text: {:?}", ids(&all));
+    assert!(ids(&all).contains(&untagged), "so does the untagged one: {:?}", ids(&all));
+
+    let filtered =
+        search::run_tagged(&ctx, q, asked(), Some(10), None, None, None, &[" INFRA".into()])
+            .await
+            .unwrap();
+    assert_eq!(ids(&filtered), vec![tagged.clone()]);
+
+    let later = chrono::Utc::now() + chrono::Duration::minutes(1);
+    let as_of =
+        search::run_tagged(&ctx, q, asked(), Some(10), None, None, Some(later), &["infra".into()])
+            .await
+            .unwrap();
+    assert_eq!(ids(&as_of), vec![tagged.clone()]);
+
+    // The service runs whichever blend the config names, so rank fusion is reached at the port.
+    let mut rrf_cfg = ctx.cfg.search.clone();
+    rrf_cfg.fusion = config::Fusion::Rrf;
+    let repos = [
+        postgres::PgMemoryRepository::new(pool.clone()),
+        postgres::PgMemoryRepository::new(pool.clone()).with_search(&rrf_cfg),
+    ];
+    let embedding = ctx.embedder.embed_query(q).await.unwrap();
+    let readable = |ns: &str| NamespaceCeiling { namespace: ns.into(), max: Sensitivity::Sealed };
+    for (i, repo) in repos.iter().enumerate() {
+        for (as_of, include_superseded) in [(None, false), (None, true), (Some(later), false)] {
+            let hits = repo
+                .search(SearchQuery {
+                    tenant_id: ctx.cfg.tenant_id.clone(),
+                    primary: vec![readable("global"), readable("project:kestrel")],
+                    secondary: vec![],
+                    embedding: embedding.clone(),
+                    text: q.into(),
+                    limit: 10,
+                    weights: Weights {
+                        vector: 1.0,
+                        lexical: 0.35,
+                        secondary_penalty: 0.8,
+                        usage: 0.05,
+                    },
+                    include_superseded,
+                    as_of,
+                    tags: vec!["infra".into()],
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("repo {i} as_of={as_of:?} history={include_superseded}: {e:?}")
+                });
+            let got: Vec<String> = hits.iter().map(|h| h.memory.id.clone()).collect();
+            assert_eq!(
+                got,
+                vec![tagged.clone()],
+                "repo {i} as_of={as_of:?} history={include_superseded}"
+            );
+        }
+    }
+}
+
+/// A tag name and a count say a fact exists. A row outside the namespace grant, a row above the
+/// ceiling and a retired row all stay out of both, so a tag only they carry is absent rather than
+/// listed at zero.
+#[tokio::test]
+async fn the_tag_count_counts_only_live_rows_the_caller_may_see() {
+    use lumberroom_server::console::data;
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    let w = |content: &'static str,
+             ns: &'static str,
+             tags: Option<Vec<String>>,
+             sens: Option<&'static str>| {
+        let ctx = ctx.clone();
+        async move { write::run(&ctx, content, ns, tags, None, sens, None).await.unwrap().id }
+    };
+    w("The shared runbook lives in the ops wiki", "global", tag_list(&["shared", "ops"]), None)
+        .await;
+    w("The ops pager rotation starts on Mondays", "project:ops", tag_list(&["ops"]), None).await;
+    w(
+        "The payroll run closes on the twentieth",
+        "project:ops",
+        tag_list(&["shared", "payroll"]),
+        Some("private"),
+    )
+    .await;
+    w(
+        "The hidden project ships on Fridays",
+        "project:hidden",
+        tag_list(&["shared", "hidden"]),
+        None,
+    )
+    .await;
+    let old = w("The build box is called anvil", "global", tag_list(&["retired"]), None).await;
+    write::run(&ctx, "The build box is called forge now", "global", None, Some(&old), None, None)
+        .await
+        .unwrap();
+
+    let pairs = |counts: Vec<lumberroom_server::ports::TagCount>| {
+        counts.into_iter().map(|c| (c.tag, c.live)).collect::<Vec<_>>()
+    };
+
+    let reader = restricted_at(
+        &ctx,
+        &at(&[("global", Sensitivity::Open), ("project:ops", Sensitivity::Open)]),
+        &[],
+    );
+    let readable = data::readable(&reader).await.unwrap();
+    let seen = pairs(data::tag_counts(&reader, &readable).await.unwrap());
+    assert_eq!(seen, vec![("ops".to_string(), 2), ("shared".to_string(), 1)]);
+
+    // The owner's view, to show the refused rows are in the store and ordered by count then name.
+    let readable = data::readable(&ctx).await.unwrap();
+    let all = pairs(data::tag_counts(&ctx, &readable).await.unwrap());
+    assert_eq!(
+        all,
+        vec![
+            ("shared".to_string(), 3),
+            ("ops".to_string(), 2),
+            ("hidden".to_string(), 1),
+            ("payroll".to_string(), 1),
+        ]
     );
 }

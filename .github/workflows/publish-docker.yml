@@ -28,19 +28,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: ghcr.io/the-cybersapien/lumberroom-server
+          - image: ghcr.io/lumberroom/lumberroom-server
             target: runtime
             platform: linux/amd64
             runner: ubuntu-24.04
-          - image: ghcr.io/the-cybersapien/lumberroom-server
+          - image: ghcr.io/lumberroom/lumberroom-server
             target: runtime
             platform: linux/arm64
             runner: ubuntu-24.04-arm
-          - image: ghcr.io/the-cybersapien/lumberroom
+          - image: ghcr.io/lumberroom/lumberroom
             target: cli-runtime
             platform: linux/amd64
             runner: ubuntu-24.04
-          - image: ghcr.io/the-cybersapien/lumberroom
+          - image: ghcr.io/lumberroom/lumberroom
             target: cli-runtime
             platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -116,8 +116,8 @@ jobs:
     strategy:
       matrix:
         image:
-          - ghcr.io/the-cybersapien/lumberroom-server
-          - ghcr.io/the-cybersapien/lumberroom
+          - ghcr.io/lumberroom/lumberroom-server
+          - ghcr.io/lumberroom/lumberroom
     steps:
       - uses: actions/download-artifact@v4
         with:

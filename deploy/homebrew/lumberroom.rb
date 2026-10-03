@@ -1,5 +1,5 @@
 # The published copy of this file lives at Formula/lumberroom.rb in the tap
-# the-cybersapien/homebrew-lumberroom, and that copy is what brew installs. This one is the staging
+# lumberroom/homebrew-lumberroom, and that copy is what brew installs. This one is the staging
 # copy: prepare a version here alongside the release it targets, then copy it across. brew resolves
 # formula lookups by path inside a tap, not by where the source happens to live before that.
 class Lumberroom < Formula
@@ -9,23 +9,23 @@ class Lumberroom < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/the-cybersapien/lumberroom/releases/download/v0.3.1/lumberroom-0.3.1-aarch64-apple-darwin.tar.gz"
-      sha256 "e8d046127b879623c47b7f4d2565b05a617416212848ed546b299503bd4688b3"
+      url "https://github.com/lumberroom/lumberroom/releases/download/v0.4.0/lumberroom-0.4.0-aarch64-apple-darwin.tar.gz"
+      sha256 "240f95d8cf49426db97d3af25c409fe460b0c7557028060600082062fa74d9f5"
     end
     on_intel do
-      url "https://github.com/the-cybersapien/lumberroom/releases/download/v0.3.1/lumberroom-0.3.1-x86_64-apple-darwin.tar.gz"
-      sha256 "db86e0db0e079dee77fc20b2ae2e029d135e3c0cc26cb19db91f4b541dcd8010"
+      url "https://github.com/lumberroom/lumberroom/releases/download/v0.4.0/lumberroom-0.4.0-x86_64-apple-darwin.tar.gz"
+      sha256 "6bcff41a9ec1ddb0a1ae202b45828cbff9ac81c068c50d33db2db5de625fdff4"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/the-cybersapien/lumberroom/releases/download/v0.3.1/lumberroom-0.3.1-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "7595da2f8193258910635f5942116089437f3e4c5c9d900625bda8068aef5035"
+      url "https://github.com/lumberroom/lumberroom/releases/download/v0.4.0/lumberroom-0.4.0-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "c18668c25161639182ab3e5f25e11d7bcf5cb5b91964c4b70e12622668e24800"
     end
     on_intel do
-      url "https://github.com/the-cybersapien/lumberroom/releases/download/v0.3.1/lumberroom-0.3.1-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "7fefceb23117742cf9d37400619c59dd825f0063b84c11bb8547d232a8bc0ecc"
+      url "https://github.com/lumberroom/lumberroom/releases/download/v0.4.0/lumberroom-0.4.0-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "21453b74c966ec779e8368aa4f82a519ef474564b0796018df0b61cfad0ad4bd"
     end
   end
 

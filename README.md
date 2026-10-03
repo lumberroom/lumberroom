@@ -41,16 +41,20 @@ the decisions a person has to make.
 ## Install the server
 
 ```bash
-git clone https://github.com/the-cybersapien/lumberroom.git && cd lumberroom
+git clone https://github.com/lumberroom/lumberroom.git && cd lumberroom
 sudo ./deploy/install.sh
 ```
 
 That is token mode on loopback: the server binds `127.0.0.1:8787`, opens no public port, and prints
 the client token with the command to run on your Mac. Add `--domain` and `--auth-mode oauth` when a
 browser has to reach it. The installer pulls
-`ghcr.io/the-cybersapien/lumberroom-server:0.3.1` and falls back to building from this tree when the
+`ghcr.io/lumberroom/lumberroom-server:0.4.0` and falls back to building from this tree when the
 pull fails; `--build-local` skips the pull. It pins a version rather than tracking `latest`, because
 a memory store that upgrades itself while you sleep is not a feature.
+
+Moved: the engine used to publish as `ghcr.io/the-cybersapien/lumberroom-server`. That image stays
+public, frozen at 0.4.0, and takes no new versions; pull `ghcr.io/lumberroom/lumberroom-server`
+instead.
 
 ## Install the client
 
@@ -58,8 +62,12 @@ The client runs on the machine holding your transcripts and your credentials, an
 you host. Four ways in, in the order most people want them.
 
 ```bash
-brew install the-cybersapien/lumberroom/lumberroom
+brew install lumberroom/lumberroom/lumberroom
 ```
+
+Installed from the old `the-cybersapien/lumberroom` tap? The next `brew update` follows the move and
+renames the tap. Homebrew stops trusting a tap whose owner changed, so run
+`brew trust lumberroom/lumberroom` once, or `brew upgrade` refuses the formula.
 
 ```bash
 cargo install lumberroom
@@ -68,9 +76,9 @@ cargo install lumberroom
 A binary, with no package manager. Four targets, macOS and Linux on arm64 and x86_64:
 
 ```bash
-tag=v0.3.1; target=aarch64-apple-darwin      # or x86_64-apple-darwin,
+tag=v0.4.0; target=aarch64-apple-darwin      # or x86_64-apple-darwin,
                                              # aarch64-unknown-linux-musl, x86_64-unknown-linux-musl
-base=https://github.com/the-cybersapien/lumberroom/releases/download/$tag
+base=https://github.com/lumberroom/lumberroom/releases/download/$tag
 curl -fsSLO "$base/lumberroom-${tag#v}-$target.tar.gz"
 curl -fsSL "$base/SHA256SUMS" | grep "$target.tar.gz" | shasum -a 256 -c -
 tar -xzf "lumberroom-${tag#v}-$target.tar.gz" && install -m 755 lumberroom ~/.local/bin/
@@ -84,8 +92,8 @@ On a machine where `apt` or `dnf` is how software arrives, the release also carr
 dependency:
 
 ```bash
-sudo dpkg -i lumberroom_0.3.1-1_amd64.deb     # or lumberroom_0.3.1-1_arm64.deb
-sudo rpm -i lumberroom-0.3.1-1.x86_64.rpm     # or lumberroom-0.3.1-1.aarch64.rpm
+sudo dpkg -i lumberroom_0.4.0-1_amd64.deb     # or lumberroom_0.4.0-1_arm64.deb
+sudo rpm -i lumberroom-0.4.0-1.x86_64.rpm     # or lumberroom-0.4.0-1.aarch64.rpm
 ```
 
 Then point it at your server:
@@ -103,6 +111,10 @@ rule in one pass:
 ```bash
 ./client/wire-mac.sh --url http://127.0.0.1:8787 --token <token>
 ```
+
+For Hermes Agent, [`lumberroom-hermes`](https://github.com/lumberroom/lumberroom-hermes) is a memory
+provider: recall on every turn and the engine's own tools for writes. It uses lumberroom.cloud unless
+`base_url` names your own engine, which runs the same code.
 
 Then prove the loop, which states a fact in one session and recovers it in a fresh one:
 
@@ -193,7 +205,11 @@ lumberroom doctor                       # connectivity, auth, readiness, tool li
 lumberroom clients                      # registered OAuth clients, how each registered, consent state
 lumberroom search "how do we deploy"
 lumberroom write "..." --namespace user:me --tags preference
-lumberroom review [--stale] [--conflicts] [--registry]
+lumberroom review [--source conflict,stale,proposal] [--limit N] [--days N] [--min-similarity X] [--json]
+lumberroom review --dates                # undated facts whose own text names a day
+lumberroom review --registry             # registry entries due for review, non-canonical keys
+lumberroom review --dismissed            # lists the dismissed-pair ledger
+lumberroom review --undismiss <a>,<b>    # removes one pair from the ledger
 lumberroom registry get|set|alias ...
 lumberroom stats [--hours 168] [--by-client]
 lumberroom export --obsidian ~/vault
@@ -225,7 +241,8 @@ what the credential you present resolves to from the code path that enforces it.
 ```bash
 cp .env.example .env                     # then set POSTGRES_PASSWORD
 docker compose up -d db                  # Postgres 16 + pgvector on 127.0.0.1:5432
-docker build -t lumberroom-builder -f Dockerfile.builder .
+docker build -t lumberroom-builder -f Dockerfile.builder .   # again after any change to
+                                                            # Dockerfile.builder or scripts/lib/builder-entrypoint.sh
 ./scripts/cargo.sh test -j 1
 ```
 

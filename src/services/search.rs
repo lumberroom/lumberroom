@@ -1,4 +1,4 @@
-//! memory_search(query, namespaces?, limit?, project?, include_superseded?) -> rows[]
+//! memory_search(query, namespaces?, limit?, project?, include_superseded?, as_of?, tags?) -> rows[]
 //!
 //! Namespace strategy, and why it deviates from the letter of PRD §5: the default set is
 //! 'user:me' + 'global' + the active project, exactly as specified, but other project namespaces
@@ -32,6 +32,7 @@ use crate::adapters::auth::filter_readable;
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::namespaces;
 use crate::domain::policy::NamespaceCeiling;
+use crate::domain::tags;
 use crate::domain::types::Sensitivity;
 use crate::ports::{Emission, SearchQuery, Weights};
 
@@ -57,6 +58,11 @@ pub struct Hit {
     pub namespace: String,
     pub content: String,
     pub tags: Vec<String>,
+    /// The app that wrote the row, by name (decision 0020).
+    pub source: String,
+    /// The stored id, for the console, which prints it until it moves to `source` too. Never
+    /// serialised: this struct is `memory_search`'s wire shape, and an MCP answer carries the name.
+    #[serde(skip_serializing)]
     pub source_client: String,
     pub sensitivity: Sensitivity,
     pub created_at: String,
@@ -126,6 +132,25 @@ pub async fn run(
     project: Option<&str>,
     include_superseded: Option<bool>,
     as_of: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<SearchResult> {
+    run_tagged(ctx, query, requested, limit, project, include_superseded, as_of, &[]).await
+}
+
+/// `run`, keeping only hits that carry every tag in `tags`.
+///
+/// A sibling rather than an eighth argument on `run`, so the dozen callers that never filter on a
+/// tag stay as they are. The tags go through the write path's normaliser here, so a filter spelled
+/// `" Infra"` matches the `infra` a write stored. A list that normalises to nothing is no filter.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tagged(
+    ctx: &Ctx,
+    query: &str,
+    requested: Option<Vec<String>>,
+    limit: Option<i64>,
+    project: Option<&str>,
+    include_superseded: Option<bool>,
+    as_of: Option<chrono::DateTime<chrono::Utc>>,
+    tags: &[String],
 ) -> Result<SearchResult> {
     // The capability check has to live here. A repository holds no principal, so the as-of statement
     // will hand retired rows to anything that sets the field, and a grant over live rows is not a
@@ -214,6 +239,7 @@ pub async fn run(
                 usage: ctx.cfg.search.usage_weight,
             },
             include_superseded,
+            tags: tags::normalise(tags),
         })
         .await?;
 
@@ -257,6 +283,7 @@ pub async fn run(
             namespace: hit.memory.namespace,
             content: hit.memory.content,
             tags: hit.memory.tags,
+            source: hit.memory.source_client.clone(),
             source_client: hit.memory.source_client,
             sensitivity: hit.memory.sensitivity,
             created_at: hit.memory.created_at.to_rfc3339(),
@@ -286,6 +313,14 @@ pub async fn run(
         ctx.session_id.clone(),
         emissions,
     );
+
+    let writers: Vec<String> = out.iter().map(|h| h.source_client.clone()).collect();
+    let labels = super::sources::labels(ctx, &writers).await;
+    for hit in &mut out {
+        if let Some(name) = labels.get(&hit.source_client) {
+            hit.source = name.clone();
+        }
+    }
 
     answered.sort();
     Ok(SearchResult { namespaces: names(&primary), also_searched: answered, hits: out })

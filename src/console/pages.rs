@@ -321,7 +321,11 @@ pub fn fact(
         } else {
             String::new()
         },
-        state = if e.retired { "Retired" } else { "Live" },
+        state = match (e.retired, e.expired) {
+            (true, _) => "Retired",
+            (_, true) => "Expired",
+            _ => "Live",
+        },
         level = e.sensitivity,
     );
 
@@ -333,7 +337,7 @@ for it.</div>"
         format!(
             "<div class=\"claim{struck}\">{}</div>",
             escape(&e.content),
-            struck = if e.retired { " struck" } else { "" }
+            struck = if e.retired || e.expired { " struck" } else { "" }
         )
     };
 
@@ -341,12 +345,19 @@ for it.</div>"
         Some(at) => format!("You confirmed it on <b>{}</b>.", escape(&date(at))),
         None => "You have not confirmed it.".to_string(),
     };
-    let retired = match leaf.superseded_at {
-        Some(at) => format!(
+    let retired = match (leaf.superseded_at, e.expired.then_some(e.occurred_until).flatten()) {
+        (Some(at), _) => format!(
             " A later entry replaced it on <b>{}</b>, and it stays readable here.",
             escape(&date(at))
         ),
-        None => String::new(),
+        // Nothing replaced this one. The period closed, so no live read returns it and every
+        // as-of read inside the period still does.
+        (None, Some(until)) => format!(
+            " Its period closed on <b>{}</b> with nothing replacing it, so no current answer \
+carries it.",
+            escape(&date(until))
+        ),
+        (None, None) => String::new(),
     };
     // The count and the last date are in the facts strip below. What the strip cannot say is that
     // this store never records which client did the reading, and a reader who sees a count of four
@@ -415,13 +426,13 @@ for it.</div>"
                 // store heard about it as the day the fact began.
                 let held = period(r.occurred_at, r.occurred_until)
                     .unwrap_or_else(|| "No period recorded".to_string());
-                let ended = if r.current {
-                    "holds now".to_string()
-                } else {
-                    match r.retired_at {
-                        Some(at) => format!("replaced {}", date(at)),
-                        None => "replaced, no date recorded".to_string(),
-                    }
+                // `retired_at` first, the order the sentence under the claim uses. The two are
+                // never both set, so the order is a reading convention rather than a precedence.
+                let ended = match (r.current, r.retired_at, r.expired_at) {
+                    (true, _, _) => "holds now".to_string(),
+                    (_, Some(at), _) => format!("replaced {}", date(at)),
+                    (_, None, Some(at)) => format!("expired {}", date(at)),
+                    _ => "replaced, no date recorded".to_string(),
                 };
                 format!(
                     "<div class=\"iv{class}\"><span class=\"span\">{held}<small>{ended}</small>\
@@ -492,6 +503,11 @@ fn replace_control(
     if e.withheld {
         return "<div class=\"replace\"><p class=\"why\">Sealed items are replaced from the machine \
 that holds the key, with lumberroom seal. This server never had it.</p></div>"
+            .to_string();
+    }
+    if e.expired {
+        return "<div class=\"replace\"><p class=\"why\">This entry expired, so its period is \
+already closed and the store takes no successor for it. Write the new fact on its own.</p></div>"
             .to_string();
     }
     if e.retired {
@@ -763,23 +779,33 @@ act, because a canonical key is a decision and not a note.</p>\
 /// fact from every future answer without deleting anything, and nothing else lists what a run took.
 /// An open end gets its own mark: that row is retired and still reads as holding at every instant,
 /// so an as-of read and a live read disagree about it.
+///
+/// Expired rows share the page, because they left the live reads the same way and nothing else
+/// lists them. Each says "expired" and names the day instead of pointing at a successor.
 pub fn retired(rows: &[Retired], contents: &Contents, health: &Health) -> String {
     let body = if rows.is_empty() {
         "<div class=\"note\"><div class=\"big2\">Nothing was retired this week.</div>\
 <p>A fact lands here when something replaced it, whether you pressed Replace, approved a proposal, \
-or a cleanup ran. Seven days, newest first.</p></div>"
+or a cleanup ran, and when its period closed with nothing replacing it. Seven days, newest \
+first.</p></div>"
             .to_string()
     } else {
         let items: String = rows
             .iter()
             .map(|r| {
-                let successor = match &r.successor_id {
-                    Some(id) => format!(
+                let successor = match (r.expired, &r.successor_id) {
+                    // Nothing replaced it, so there is nothing to link to and the deleted-successor
+                    // sentence would be a lie about a row that was only closed.
+                    (true, _) => format!(
+                        "<span class=\"who\">expired {when}</span>",
+                        when = escape(&date(r.retired_at))
+                    ),
+                    (false, Some(id)) => format!(
                         "<a class=\"go\" href=\"/console/fact/{id}\">what replaced it</a>",
                         id = escape(&id.to_string())
                     ),
                     // The chain was spliced past a deleted successor, so nothing here names it.
-                    None => {
+                    (false, None) => {
                         "<span class=\"who\">replaced by a row that has since been deleted</span>"
                             .to_string()
                     }
@@ -801,7 +827,7 @@ or a cleanup ran. Seven days, newest first.</p></div>"
                     id = escape(&r.id.to_string()),
                     content = escape(&r.content),
                     ns = escape(&r.namespace),
-                    at = date(r.superseded_at),
+                    at = date(r.retired_at),
                 )
             })
             .collect();
@@ -1141,7 +1167,7 @@ fn row(entry: &Entry, now: DateTime<Utc>, dated_above: bool) -> String {
     } else if entry.sensitivity == Sensitivity::Private {
         class.push_str(" private");
     }
-    if entry.retired {
+    if entry.retired || entry.expired {
         class.push_str(" retired");
     }
 
@@ -1452,6 +1478,7 @@ mod tests {
             occurred_at: None,
             occurred_until: None,
             retired: false,
+            expired: false,
             confirmed: false,
             withheld: sensitivity == Sensitivity::Sealed,
         }
@@ -1463,7 +1490,8 @@ mod tests {
             namespace: "user:me".into(),
             content: "the deploy target is fly.io".into(),
             sensitivity: Sensitivity::Open,
-            superseded_at: "2026-08-19T14:02:00Z".parse().unwrap(),
+            retired_at: "2026-08-19T14:02:00Z".parse().unwrap(),
+            expired: false,
             occurred_at: Some("2026-08-17T00:00:00Z".parse().unwrap()),
             occurred_until: if end_open {
                 None
@@ -1486,10 +1514,27 @@ mod tests {
         assert!(open.contains("19 Aug 2026"), "the retirement date is what this page sorts on");
     }
 
+    /// An expired row has no successor and was never deleted, so the deleted-successor sentence
+    /// would be a lie about a fact the owner only closed.
+    #[test]
+    fn an_expired_row_says_it_expired_rather_than_naming_a_successor() {
+        let mut row = retired_row(false, false);
+        row.expired = true;
+        let html = retired(&[row], &contents(), &health());
+        assert!(html.contains("expired 19 Aug 2026"), "{html}");
+        assert!(!html.contains("has since been deleted"), "{html}");
+    }
+
+    /// The shape a restore leaves when it cannot relink a successor: stamped by a supersession,
+    /// carrying an end, and pointing at nothing. It is a retirement whose successor is missing, so
+    /// it must not read as an expiry, and this arm is the one that says so.
     #[test]
     fn a_retirement_whose_successor_was_deleted_says_so_rather_than_linking_nowhere() {
-        let html = retired(&[retired_row(false, false)], &contents(), &health());
+        let orphan = retired_row(false, false);
+        assert!(!orphan.expired, "a stamped row with an end is retired, not expired");
+        let html = retired(&[orphan], &contents(), &health());
         assert!(html.contains("has since been deleted"), "{html}");
+        assert!(!html.contains("expired 19 Aug 2026"), "{html}");
         // One link, to the retired row itself. A missing successor must not render a dead href.
         assert_eq!(html.matches("/console/fact/").count(), 1, "{html}");
     }
@@ -1542,6 +1587,7 @@ mod tests {
                 occurred_at: entry.occurred_at,
                 occurred_until: entry.occurred_until,
                 retired_at: None,
+                expired_at: None,
                 current: true,
                 withheld: entry.withheld,
             }],
@@ -1573,6 +1619,7 @@ mod tests {
             occurred_at: at(occurred_at),
             occurred_until: at(occurred_until),
             retired_at: at(retired_at),
+            expired_at: None,
             current: retired_at.is_none(),
             withheld: false,
         }
@@ -1814,6 +1861,25 @@ mod tests {
         assert!(html.contains("name=\"csrf\" value=\"tok-write-row\""));
     }
 
+    /// Neither live nor retired. The page called an expired row Live while the version list under
+    /// it dated the same row as ended, which is one page disagreeing with itself.
+    #[test]
+    fn an_expired_entry_reads_as_expired_rather_than_live() {
+        let mut e = entry("The sprint board is the plan.", Sensitivity::Open);
+        e.expired = true;
+        e.occurred_until = Some("2026-08-19T00:00:00Z".parse().unwrap());
+        let mut leaf = leaf(e);
+        leaf.revisions[0].current = false;
+        leaf.revisions[0].expired_at = Some("2026-08-19T00:00:00Z".parse().unwrap());
+
+        let html = fact(&leaf, &contents(), &health(), "tok", DAY);
+        assert!(html.contains("Expired entry"), "{html}");
+        assert!(!html.contains("Live entry"), "{html}");
+        assert!(html.contains("claim struck"), "an expired claim reads struck through: {html}");
+        assert!(html.contains("Its period closed on"), "{html}");
+        assert!(!html.contains("action=\"/console/write\""), "no replace form on a closed period");
+    }
+
     /// `write::run` refuses a second successor and names the live row. The page says so first and
     /// points at that row, so the reader never spends a submit finding out.
     #[test]
@@ -1829,6 +1895,7 @@ mod tests {
             occurred_at: None,
             occurred_until: None,
             retired_at: None,
+            expired_at: None,
             current: true,
             withheld: false,
         });

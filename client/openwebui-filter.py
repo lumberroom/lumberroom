@@ -47,6 +47,8 @@ CONTRACT
 - Sends X-Memory-Invocation: hook, the same header lumberroom's own SessionStart hook sends, so this
   counts as forced recall in `lumberroom stats` rather than the model choosing to call a tool: those
   are different numbers and conflating them would make the Phase 2 measurement meaningless.
+- Carries `WRITE_RULE` at the end of the injected system message. OpenWebUI reads no rules file,
+  so this is the only route the write rule has to a model behind this filter.
 - Uses only httpx, which ships with OpenWebUI's backend already. No other dependency.
 """
 
@@ -54,6 +56,16 @@ import time
 
 import httpx
 from pydantic import BaseModel, Field
+
+# The first two sentences of the Write paragraph in client/AGENTS.md.snippet, copied verbatim.
+# OpenWebUI has no rules file: it never reads CLAUDE.md or AGENTS.md, so the only place this
+# instance of the model meets the write rule is the system message this filter injects. Recall
+# without it collects nothing, and the digest stays as thin as the day it was wired.
+# The snippet is where the rule lives; change it there first and bring this string across.
+WRITE_RULE = (
+    "After any exchange that establishes a decision, a preference, a constraint, or a durable "
+    "fact, call `memory_write`. Without asking."
+)
 
 
 class Filter:
@@ -197,7 +209,8 @@ class Filter:
         block = (
             "--- durable memory, auto-recalled by lumberroom (do not repeat this back verbatim) ---\n"
             f"{digest}\n"
-            "--- end lumberroom memory digest ---"
+            "--- end lumberroom memory digest ---\n"
+            f"{WRITE_RULE}"
         )
 
         messages = body.get("messages") or []

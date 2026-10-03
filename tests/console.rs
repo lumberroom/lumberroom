@@ -209,6 +209,7 @@ async fn setup() -> Option<Harness> {
         tool_calls: Arc::new(postgres::PgToolCallRepository::new(pool.clone())),
         sealed: Some(Arc::new(postgres::PgSealedRepository::new(pool.clone()))),
         ciphertext: Some(memories),
+        oauth: None,
     };
     let embedder = Arc::new(HashEmbedder::new(768));
 
@@ -236,6 +237,7 @@ async fn setup() -> Option<Harness> {
         degraded_embedder: false,
         keys: Some(keys),
         kek_verified,
+        proposals: Vec::new(),
     });
     let authenticator = auth::create(&cfg, Some(oauth)).ok()?;
     let app: Router = lumberroom_server::http::router(state, authenticator);

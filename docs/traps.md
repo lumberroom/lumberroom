@@ -39,6 +39,18 @@ against every live row. `similar_pairs` does, and a test asserts the `OR` that m
 a quiet run advances nothing, so every later run re-reads the same rows forever. `newest_in_scope`
 exists for that.
 
+**A column named in a partial index predicate counts as indexed, and that turns off HOT.** The
+`memory_never_accessed` index carried `WHERE last_accessed_at IS NULL`, so the touch after every
+search wrote a new entry into every index on `memory`, the HNSW graph included. On a 5,000-row
+scratch store, 2,400 touches ran 0 HOT with the index and 2,027 HOT after migration 026 dropped it.
+Never name `last_accessed_at` or `access_count` in an index on `memory`, key or predicate;
+`tests/search_touch_hot.rs` reads the catalog for it, and that covers indexes a fork adds.
+
+**A bare parameter takes its type from the first place it appears.** `PREPARE p AS SELECT 1 WHERE
+$1 > 0 AND $1 * 1.0::float8 > 0` gives `$1` the type `integer` on Postgres 17, the later float
+use notwithstanding. A guard added ahead of a parameter's existing uses can retype it. Cast it where
+it first appears, as the lexical arm's `$10::float8 > 0` does.
+
 ## Policy and disclosure
 
 **Four disclosures shipped, and no gate could have caught them.** Each published a value computed
@@ -154,6 +166,40 @@ Give every case a fresh path.
 weights against a 35MB binary. The earlier explanation blamed `COPY` dereferencing the HuggingFace
 cache's symlinks, and that was checked against the built image and is wrong.
 
+**Rebuilding `lumberroom-builder` changes every checkout on the machine at once.** The image tag and
+the `lumberroom-target` and `lumberroom-cargo` volumes are all shared by name, so a rebuild here
+reaches another worktree's next `scripts/cargo.sh` run with no warning. When the builder entrypoint
+landed, a checkout still on the old `cargo.sh` passed no `BUILDER_UID`, took the default, and chowned
+the registry out from under a run that had just claimed it: the symptom was
+`couldn't read .../fnv-1.0.7/lib.rs: Permission denied` in the middle of a clippy pass. The
+entrypoint now adopts whichever uid already claimed the volume when no caller names one, so an
+unconfigured checkout joins rather than fights. Two containers that both start before any marker
+exists can still pick different uids and chown in turn; that settles after one cycle and the loser
+sees `Permission denied` on a crate source only if it is fetching at that moment. Landed 8
+September 2026.
+
+**lumberroom-cloud rebuilds the same builder image.** Both repositories tag their
+`Dockerfile.builder` as `lumberroom-builder`, so the image holds whatever the last checkout to build
+it put there. On 30 September 2026 the image on the maintainer's machine dated from 8 September. It
+carried no clippy, although both Dockerfiles install it, so every run downloaded clippy. And
+lumberroom-cloud's lld setting had never reached it, so every build there linked with GNU ld. The two
+Dockerfiles now install the same packages and carry the same `lumberroom.linker=mold` label, and
+`scripts/cargo.sh` reads the label and refuses to start without mold, naming the rebuild command.
+`docker image inspect lumberroom-builder -f '{{.Created}} {{.Config.Labels}}'` shows what is there.
+
+**A root process writing into a claimed build volume leaves files no later run can replace.** The
+ownership marker `.builder-owner` records which uid claimed `lumberroom-target` or
+`lumberroom-cargo`, and the entrypoint reads the marker rather than walking 41,000 inodes on every
+run. So a `docker exec` into a running builder container, which docker gives you as root whatever
+the entrypoint did, can leave root-owned artifacts the marker says nothing about. The symptom is
+`Permission denied` on a path that plainly exists. The recovery is one line, and it re-claims the
+whole tree on the next run:
+
+```bash
+docker run --rm -v lumberroom-target:/t -v lumberroom-cargo:/c --entrypoint sh lumberroom-builder \
+  -c 'rm -f /t/.builder-owner /c/.builder-owner'
+```
+
 ## Tests
 
 **A test can pass against the mutation it exists to catch.** The cleanup window test ran through
@@ -166,6 +212,15 @@ passed alone and two failed in a full run, with assertions that read like logic 
 `tests/common/mod.rs` takes a Postgres advisory lock, which the session holds and every process sees.
 The guard has to be carried out of `setup`; an unused-variable warning was the only tell when it was
 not.
+
+**A catalog view in a test sees every database on the cluster.** `pg_locks`, `pg_stat_activity` and
+`pg_db_role_setting` are cluster-wide. `tests/migration_lock.rs` counted every advisory lock on the
+cluster to prove a failed migration released its own, and passed because `cargo test` runs one binary
+at a time. In lumberroom-cloud's copy of the test, the first run of `scripts/cargo.sh test-fast` put
+another binary's suite lock beside it and it failed with "left 2 advisory lock(s) held". Filter on
+`current_database()`, or on the role or pid the test owns. Two suites from two worktrees sharing the
+cluster break the unfiltered form the same way. The probe database carries the pid for the same
+reason: a fixed name lets one run's `DROP ... WITH (FORCE)` kill the other's connection.
 
 **The integration suite skips rather than fails with no database reachable**, so a run reporting a low
 count is not a pass. Check the split, not the exit code.
@@ -187,6 +242,16 @@ slice built that way to split a Rust file at its test module duplicated 374 line
 `#[cfg(test)]` attribute (on a helper, not the trailing `mod tests`) appeared earlier in the file
 than the block the slice was meant to isolate. Anchor on the last occurrence, or on the attribute
 immediately preceding `mod tests`. Landed 24 August 2026.
+
+**Root ignores permission bits, so a test that asserts a filesystem refusal passes under it whatever
+the code does.** `scripts/cargo.sh` ran cargo as root in the builder container for months.
+`config.rs`'s `a_save_that_cannot_complete_leaves_the_live_file_alone` chmods a directory 0500,
+probed whether the mode had taken, and returned early when it had not. libtest captures a passing
+test's stderr, so the `skipping:` line it printed reached nobody and the gate counted 387 passed with
+that test measuring nothing. Two halves to the fix, and either alone leaves the trap armed:
+`scripts/lib/builder-entrypoint.sh` drops the container to a non-root uid, and the fixture now panics
+naming the precondition rather than returning. A fixture that cannot establish its precondition is
+broken, and a broken test has to be loud. Landed 8 September 2026.
 
 ## Shell, config and rendering
 

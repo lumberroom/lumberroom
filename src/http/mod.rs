@@ -27,14 +27,18 @@ use crate::domain::types::{Invocation, Memory, Principal, Sensitivity};
 use crate::mcp::{AppState, Lumberroom, SessionId, SERVER_NAME, SERVER_VERSION};
 use crate::ports::ingest::{EmissionProbe, ProposalFilter, ProposalSource, RunTotals};
 use crate::ports::{AliasOrigin, ClientStats, Staleness, ToolCallStats};
+// The service is aliased because `mod review` below is this module's own route file, and the two
+// names would collide.
 use crate::services::{
-    alias, cleanup, currency, forget, graph, history, ingest, recall, registry, review, sealed,
-    supersession, Ctx,
+    alias, cleanup, currency, forget, graph, history, ingest, recall, registry,
+    review as review_svc, review_queue, sealed, supersession, Ctx,
 };
 
 // The whole store out as one file, and back in. Its own module because both handlers carry a
 // passphrase and the import needs a body limit no other route here wants.
 mod archive;
+// The queue, its decide path and the two ledger routes.
+mod review;
 
 pub const INVOCATION_HEADER: &str = "x-memory-invocation";
 
@@ -167,7 +171,11 @@ pub fn router(state: Arc<AppState>, auth: Arc<dyn Authenticator>) -> Router {
 
     // Merged before `with_state`, because `archive::routes()` is a `Router<Http>` and still wants
     // the state this line applies. Its body-limit layer stays scoped to those two paths.
-    let mut root = app.merge(archive::routes()).with_state(http.clone()).merge(mcp_routes);
+    let mut root = app
+        .merge(archive::routes())
+        .merge(review::routes())
+        .with_state(http.clone())
+        .merge(mcp_routes);
 
     // The built-in authorization server, at the root rather than under a prefix: the login and
     // consent forms post to the absolute paths /oauth/login and /oauth/consent.
@@ -889,7 +897,7 @@ async fn admin_memory_supersede(
         Ok(c) => c,
         Err(r) => return r,
     };
-    match review::supersede(&ctx, &id, &body.new_id).await {
+    match review_svc::supersede(&ctx, &id, &body.new_id).await {
         Ok(resolved) => Json(resolved).into_response(),
         Err(e) => domain_error(&e, "supersede_failed"),
     }
@@ -1082,7 +1090,7 @@ async fn admin_review_dates(
         Ok(c) => c,
         Err(r) => return r,
     };
-    match review::date_candidates(&ctx, q.limit).await {
+    match review_svc::date_candidates(&ctx, q.limit).await {
         Ok(rows) => Json(serde_json::json!({ "rows": rows })).into_response(),
         Err(e) => domain_error(&e, "date_review_failed"),
     }
@@ -1109,7 +1117,7 @@ async fn admin_memory_fill_date(
         Ok(w) => w,
         Err(e) => return domain_error(&e, "fill_date_failed"),
     };
-    match review::fill_date(&ctx, &id, when).await {
+    match review_svc::fill_date(&ctx, &id, when).await {
         Ok(resolved) => Json(resolved).into_response(),
         Err(e) => domain_error(&e, "fill_date_failed"),
     }
@@ -1122,6 +1130,10 @@ struct StaleQuery {
 }
 
 /// Live rows never retrieved and older than `days`. A review list, never a reaper.
+///
+/// Reads `review_queue::queue` filtered to one source, so the grant rule and the live-row
+/// predicate live in one place instead of two. `days` and `limit` clamp inside that call now,
+/// not here.
 async fn admin_review_stale(
     State(http): State<Http>,
     headers: HeaderMap,
@@ -1131,19 +1143,24 @@ async fn admin_review_stale(
         Ok(c) => c,
         Err(r) => return r,
     };
-    // The request's own window rather than the configured one: the CLI asks for 90 days by default
-    // and STALE_DAYS is 365, and quietly answering a different question than the one asked is the
-    // failure mode this whole surface exists to catch.
-    let days = q.days.unwrap_or(ctx.cfg.quality.stale_days).clamp(0, 36_500);
-    let limit = q.limit.unwrap_or(25).clamp(1, 500);
-
-    let rows = match ctx.repos.memories.stale(ctx.tenant(), days, limit, &ctx.principal.read).await
-    {
-        Ok(r) => r,
-        Err(e) => return domain_error(&e, "review_failed"),
+    // This route's own default, kept: a client that sent no limit asked for 25 before the queue
+    // existed and still means 25.
+    let query = review_queue::QueueQuery {
+        sources: Some(vec![review_queue::Source::Stale]),
+        limit: Some(q.limit.unwrap_or(25)),
+        offset: Some(0),
+        days: q.days,
+        min_similarity: None,
     };
-    Json(serde_json::json!({ "days": days, "rows": readable_rows(&ctx, rows).await }))
-        .into_response()
+    let envelope = match review_queue::queue(&ctx, &http.state.proposals, query).await {
+        Ok(e) => e,
+        Err(e) => return domain_error(&e, e.code().unwrap_or("review_failed")),
+    };
+    // The legacy shape drops unopened rows, as `readable_rows` did; `/admin/review/queue` is where
+    // an unreadable row surfaces with `opened: false`.
+    let rows: Vec<_> =
+        envelope.items.iter().flat_map(|item| item.rows.iter()).filter(|r| r.opened).collect();
+    Json(serde_json::json!({ "days": envelope.stale_days, "rows": rows })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1154,6 +1171,9 @@ struct ConflictQuery {
 
 /// Near-duplicate live pairs. Both halves have to be visible to this caller: showing one side
 /// invites a supersede against a row the caller cannot see.
+///
+/// Reads `review_queue::queue` filtered to one source. `min_similarity` and `limit` clamp inside
+/// that call now; each pair still prints the same five fields `conflict_side` used to.
 async fn admin_review_conflicts(
     State(http): State<Http>,
     headers: HeaderMap,
@@ -1163,35 +1183,46 @@ async fn admin_review_conflicts(
         Ok(c) => c,
         Err(r) => return r,
     };
-    let min_similarity =
-        q.min_similarity.unwrap_or(ctx.cfg.quality.conflict_threshold).clamp(0.0, 1.0);
-    let limit = q.limit.unwrap_or(25).clamp(1, 200);
-
-    let pairs = match ctx.repos.memories.conflicts(ctx.tenant(), min_similarity, limit).await {
-        Ok(p) => p,
-        Err(e) => return domain_error(&e, "review_failed"),
+    // This route's own default, kept, as on the stale route above.
+    let query = review_queue::QueueQuery {
+        sources: Some(vec![review_queue::Source::Conflict]),
+        limit: Some(q.limit.unwrap_or(25)),
+        offset: Some(0),
+        days: None,
+        min_similarity: q.min_similarity,
+    };
+    let envelope = match review_queue::queue(&ctx, &http.state.proposals, query).await {
+        Ok(e) => e,
+        Err(e) => return domain_error(&e, e.code().unwrap_or("review_failed")),
     };
 
-    let mut out = Vec::with_capacity(pairs.len());
-    for pair in pairs {
-        // `ConflictPair` carries no sensitivity, so each half is re-fetched at its stored level.
-        // That costs two round trips per pair on a hand-run list with a small limit.
-        let (older, newer) = match (
-            visible_memory(&ctx, &pair.older.id).await,
-            visible_memory(&ctx, &pair.newer.id).await,
-        ) {
-            (Ok(Some(a)), Ok(Some(b))) => (a, b),
-            (Err(e), _) | (_, Err(e)) => return domain_error(&e, "review_failed"),
-            _ => continue,
-        };
-        out.push(serde_json::json!({
-            "similarity": pair.similarity,
-            "older": conflict_side(&older),
-            "newer": conflict_side(&newer),
-            "resolve_with": format!("lumberroom supersede {} {}", older.id, newer.id),
-        }));
-    }
-    Json(serde_json::json!({ "min_similarity": min_similarity, "pairs": out })).into_response()
+    let pairs: Vec<_> = envelope
+        .items
+        .iter()
+        .filter_map(|item| {
+            let [older, newer] = item.rows.as_slice() else { return None };
+            Some(serde_json::json!({
+                "similarity": item.similarity,
+                "older": {
+                    "id": older.id,
+                    "namespace": older.namespace,
+                    "content": older.content,
+                    "sensitivity": older.sensitivity,
+                    "created_at": older.created_at,
+                },
+                "newer": {
+                    "id": newer.id,
+                    "namespace": newer.namespace,
+                    "content": newer.content,
+                    "sensitivity": newer.sensitivity,
+                    "created_at": newer.created_at,
+                },
+                "resolve_with": format!("lumberroom supersede {} {}", older.id, newer.id),
+            }))
+        })
+        .collect();
+    Json(serde_json::json!({ "min_similarity": envelope.min_similarity, "pairs": pairs }))
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -2000,17 +2031,6 @@ async fn readable_rows(ctx: &Ctx, rows: Vec<Memory>) -> Vec<Memory> {
         rows.retain(|m| !unopened.contains(&m.id));
     }
     rows
-}
-
-/// The three fields the review client prints for each side of a pair.
-fn conflict_side(m: &Memory) -> serde_json::Value {
-    serde_json::json!({
-        "id": m.id,
-        "namespace": m.namespace,
-        "content": m.content,
-        "sensitivity": m.sensitivity,
-        "created_at": m.created_at.to_rfc3339(),
-    })
 }
 
 async fn not_found(req: Request) -> Response {

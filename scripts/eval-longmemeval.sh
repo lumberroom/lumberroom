@@ -233,6 +233,8 @@ docker run -d --name "$SERVER_NAME" --network "$NETWORK" \
   -e SEARCH_FUSION="$FUSION" \
   -e KEK_PROVIDER=none \
   -e MODEL_CACHE_DIR=/models \
+  -e BUILDER_UID="$(id -u)" -e BUILDER_GID="$(id -g)" \
+  -e BUILDER_OWN=/models \
   lumberroom-builder cargo run --release --bin lumberroom-server >/dev/null
 
 echo "waiting for the eval server to become ready..."
@@ -283,5 +285,6 @@ else
     -e CARGO_TERM_COLOR=never \
     -e LUMBERROOM_URL="http://${SERVER_NAME}:${PORT}/mcp" \
     -e LUMBERROOM_TOKEN="$TOKEN" \
+    -e BUILDER_UID="$(id -u)" -e BUILDER_GID="$(id -g)" \
     lumberroom-builder cargo run --release -p lumberroom -- "$@"
 fi

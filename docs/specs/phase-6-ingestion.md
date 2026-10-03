@@ -1219,7 +1219,7 @@ response_format:{type:"json_object"}}`. Covers OpenAI (`https://api.openai.com/v
 (`https://openrouter.ai/api/v1`) and any custom base URL, which is where Ollama, LM Studio and vLLM
 land. The token is optional on the custom path, since a local server usually wants none, and the
 `Authorization` header is omitted rather than sent empty when no token is configured. OpenRouter
-takes two extra headers, `HTTP-Referer` and `X-Title`, and lumberroom sends `https://github.com/the-cybersapien/lumberroom`
+takes two extra headers, `HTTP-Referer` and `X-Title`, and lumberroom sends `https://github.com/lumberroom/lumberroom`
 and `lumberroom` so a run is identifiable in that dashboard.
 
 **`temperature: 0` holds, and JSON mode carries a hard requirement on GLM.** Measured on 20 August

@@ -18,6 +18,7 @@ pub mod format;
 pub mod import;
 pub mod ingest;
 pub mod oauth;
+pub mod review;
 pub mod sealed;
 pub mod wire;
 
@@ -101,7 +102,12 @@ async fn dispatch(client: &Client, args: &Args, command: &str) -> Result<()> {
         "search" => commands::search(client, args).await,
         "write" => commands::write(client, args).await,
         "forget" => commands::forget(client, args, read_line).await,
-        "review" => commands::review(client, args).await,
+        // `review::run` wants `&mut impl FnMut`; `read_line` is a bare fn item, so it is bound to
+        // a local before the borrow rather than passed directly.
+        "review" => {
+            let mut read = read_line;
+            review::run(client, args, &mut read).await
+        }
         "supersede" => commands::supersede(client, args).await,
         "fill-date" => commands::fill_date(client, args).await,
         "currency" => commands::currency(client, args).await,

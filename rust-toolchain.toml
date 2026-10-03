@@ -1,8 +1,10 @@
-# Pinned to the rustc the lumberroom-builder image carries (rust:1-slim at the time the image was built).
-# `channel = "stable"` looked right and was not: rustup resolves it to the newest stable, which the
-# image does not have, so every `scripts/cargo.sh` call downloaded a full toolchain into a
-# throwaway container before doing any work. Bump this line when Dockerfile.builder is rebuilt on a
-# newer image; `rust-version = "1.83"` in the two Cargo.toml files is the floor, not this.
+# One version, named in three places that must agree: this file, `FROM rust:1.98.0-slim` in
+# Dockerfile.builder, and the same tag in Dockerfile. The images used to say `rust:1-slim`, which
+# floats, so a rebuild moved the compiler under this pin. rustup then downloaded the pinned
+# toolchain into every `scripts/cargo.sh` container, and ort-sys, built under that second
+# toolchain, failed to link with "could not find native static library `onnxruntime`".
+# `channel = "stable"` fails the same way. Bump all three together.
+# `rust-version` in the Cargo.toml files is the floor, not this.
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]

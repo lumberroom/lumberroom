@@ -6,7 +6,7 @@
 #            build dies at the link step with "cannot find -lstdc++".
 #   network  `ort` downloads a prebuilt ONNX Runtime, and the prefetch downloads model weights.
 
-FROM rust:1-slim AS base
+FROM rust:1.98.0-slim AS base
 WORKDIR /build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates g++ \
@@ -160,7 +160,7 @@ ARG LUMBERROOM_BUILD_SHA=unknown
 ARG LUMBERROOM_BUILD_TAG=unknown
 ARG LUMBERROOM_BUILT_AT=unknown
 LABEL org.opencontainers.image.title="lumberroom-server" \
-      org.opencontainers.image.source="https://github.com/the-cybersapien/lumberroom" \
+      org.opencontainers.image.source="https://github.com/lumberroom/lumberroom" \
       org.opencontainers.image.revision="${LUMBERROOM_BUILD_SHA:-unknown}" \
       org.opencontainers.image.version="${LUMBERROOM_BUILD_TAG:-unknown}" \
       org.opencontainers.image.created="${LUMBERROOM_BUILT_AT:-unknown}"
@@ -207,7 +207,7 @@ ARG LUMBERROOM_BUILD_SHA=unknown
 ARG LUMBERROOM_BUILD_TAG=unknown
 ARG LUMBERROOM_BUILT_AT=unknown
 LABEL org.opencontainers.image.title="lumberroom" \
-      org.opencontainers.image.source="https://github.com/the-cybersapien/lumberroom" \
+      org.opencontainers.image.source="https://github.com/lumberroom/lumberroom" \
       org.opencontainers.image.revision="${LUMBERROOM_BUILD_SHA:-unknown}" \
       org.opencontainers.image.version="${LUMBERROOM_BUILD_TAG:-unknown}" \
       org.opencontainers.image.created="${LUMBERROOM_BUILT_AT:-unknown}"

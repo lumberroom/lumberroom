@@ -42,11 +42,23 @@ pub struct DomainError {
     pub kind: Kind,
     message: String,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    /// Set at the raise site so a transport publishes a stable string. No transport matches on
+    /// message text, which changes whenever the wording improves.
+    code: Option<&'static str>,
 }
 
 impl DomainError {
     pub fn new(kind: Kind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into(), source: None }
+        Self { kind, message: message.into(), source: None, code: None }
+    }
+
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
+    }
+
+    pub fn code(&self) -> Option<&'static str> {
+        self.code
     }
 
     pub fn validation(message: impl Into<String>) -> Self {

@@ -714,12 +714,29 @@ mod tests {
         restrict(&lock_path_for(&path)).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        // Root ignores directory modes, and so does any filesystem that does not enforce
-        // them. A probe that succeeds means this fixture cannot discriminate here; say so
-        // rather than pass on a setup that proved nothing.
+        // The precondition is that the kernel refuses a write into a 0500 directory. Root ignores
+        // directory modes, and so does a filesystem that does not enforce them, and under either
+        // one this fixture cannot tell working refusal logic from none at all.
+        //
+        // It fails here rather than returning. The version that returned reported `ok` for as long
+        // as cargo ran as root in the builder container, because libtest captures a passing test's
+        // stderr: the line it printed reached nobody and the gate counted a test that measured
+        // nothing. A precondition that cannot be established is a broken test, and a broken test
+        // has to be loud.
         if std::fs::write(dir.join(".probe"), b"").is_ok() {
-            eprintln!("skipping: {} does not enforce directory write permission", dir.display());
-            return;
+            use std::os::unix::fs::MetadataExt;
+            let euid = std::fs::metadata(dir.join(".probe")).unwrap().uid();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            panic!(
+                "precondition not met: writing into {} succeeded while it is mode 0500, so this \
+                 test cannot observe the refusal it exists to check. This process runs as uid \
+                 {euid}, and uid 0 ignores directory modes. Run the suite as a non-root user: \
+                 ./scripts/cargo.sh does that through scripts/lib/builder-entrypoint.sh, which \
+                 needs the lumberroom-builder image rebuilt (docker build -t lumberroom-builder \
+                 -f Dockerfile.builder .).",
+                dir.display()
+            );
         }
 
         let mut cfg = FileConfig::load(path.clone());

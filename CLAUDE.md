@@ -11,7 +11,7 @@ facts with a canonical key and provenance), policy decides (per-client grants). 
 second and third.
 
 The directory is named `memoryEngine` and the product is called lumberroom. Repo:
-`github.com/the-cybersapien/lumberroom`, `main`.
+`github.com/lumberroom/lumberroom`, `main`.
 
 Read in this order before starting work: `docs/architecture.md`, then `docs/decisions/README.md`.
 

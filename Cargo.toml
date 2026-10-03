@@ -8,12 +8,12 @@ resolver = "2"
 
 [package]
 name = "lumberroom-server"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.83"
 description = "Durable memory control plane. MCP server over Postgres and pgvector."
 license = "Apache-2.0"
-repository = "https://github.com/the-cybersapien/lumberroom"
+repository = "https://github.com/lumberroom/lumberroom"
 homepage = "https://lumberroom.cloud"
 readme = "README.md"
 keywords = ["mcp", "memory", "postgres", "pgvector", "llm"]
@@ -60,6 +60,9 @@ hmac = "0.13"
 base64 = "0.22"
 # Redirect URIs are compared exactly, but they are validated structurally before registration.
 url = "2"
+# NFKC for comparing OAuth client names, so "Codex" and a full-width copy of it read as one name
+# (decision 0020). Already in the tree through `stringprep`, which sqlx uses for SCRAM.
+unicode-normalization = "0.1"
 
 # The archive format. Its own crate because the CLI and the server both read it, and neither should
 # carry the other's dependency tree to do so.
@@ -87,6 +90,38 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[profile.dev]
+# Line tables instead of full DWARF. The dev profile links 157 test executables, each one
+# statically carrying its own copy of the debug info for the whole tree, and the default
+# `debug = true` makes that copy enormous: measured on debug/deps/console, a 410MB binary
+# held 315MB of debug sections, 271MB of it .debug_info and .debug_str. Stripped, the same
+# binary is 54MB. Multiply by the 34 test binaries over 100MB and it was 11.3GB of the
+# volume's 19GB deps directory.
+#
+# `line-tables-only` keeps .debug_line, which is what RUST_BACKTRACE=1 reads to print file
+# and line numbers, and drops the type and variable names that only a debugger consumes.
+# A panic in a test still names the file and the line. Stepping through Rust in gdb or lldb
+# is what this gives up; nobody on this repo was doing that.
+#
+# It buys link time as well as disk. The linker OOM that forces `-j 1` on `test` in
+# scripts/cargo.sh is the linker being handed 315MB of debug info per binary inside a
+# container with a 6.2GB ceiling. Less to write is less to hold.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# No debug info at all for third-party crates. `line-tables-only` above still applies to this
+# workspace, so a backtrace keeps its file and line for every frame in code anybody here can edit.
+# What this drops is the line numbers on frames inside axum, sqlx, tokio and the rest, which are
+# not addresses anybody debugs by.
+#
+# Dependencies are most of the remaining weight. On debug/deps/console after line-tables-only,
+# 71MB of the 159MB binary was still debug sections, and .debug_line and .debug_str carry an entry
+# for every dependency frame linked in. There are 1,456 rlibs in this tree.
+#
+# `"*"` is every package that is not a workspace member, which is the whole point: it needs no
+# maintenance as dependencies come and go, unlike naming crates one at a time.
+debug = 0
 
 [profile.release]
 # One binary on a small ARM box. Optimise for size and link-time work over compile speed.
