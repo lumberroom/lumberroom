@@ -6,6 +6,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A fact can stop being true without being replaced.** A row gains a second clock,
+  `occurred_until`, and the live-row predicate reads both: `superseded_by IS NULL AND
+  (occurred_until IS NULL OR occurred_until > now())`, defined once as `live!()`. A consolidation
+  pass can now close a fact whose state has passed, reversibly, where before it could only delete
+  it. An expired row takes no successor and is not one, and the console marks it "expired". History
+  readers (all and as-of search, the retired feed, chain walks) keep the link test alone. No
+  migration, no new tool or route (#67).
 - **`DB_MAX_CONNECTIONS` and `DB_ACQUIRE_TIMEOUT_SECS`** set the Postgres pool, defaulting to
   the 10 connections and 5 seconds the server used before (#73). At boot the server compares the
   pool with the database's `max_connections`, less the superuser reserve and 3 spare. An explicit
@@ -68,6 +75,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Dependencies.** argon2 0.6 (#41): `lumberroom-server hash-password` passes its 16-byte OS
+  salt to `hash_password_with_salt`, and hashes from 0.5 and 0.6 verify under both, so an existing
+  `OWNER_PASSWORD_HASH` keeps working. tower-http 0.7 (#66), where the server uses only
+  `RequestBodyLimitLayer`, which did not change. rmcp 3.4.1, jsonwebtoken 11.1, uuid 1.26.1 and
+  thiserror 2.0.21 (#86). The release workflows moved to `actions/upload-artifact` v7 and
+  `actions/download-artifact` v8 (#44, #43).
+- **Contributor tooling.** `./scripts/cargo.sh test-fast` builds the test binaries once and runs
+  them six at a time, the builder links with mold, and `migration_lock` counts only its own probe
+  database's advisory locks (#90). The builder image pins the Rust toolchain from
+  `rust-toolchain.toml` and keeps ort's ONNX Runtime download inside the target volume (#88).
+- **`memory_write` says what a memory is.** The tool description and the `content` argument's doc
+  ask for one fact per call, stated so it stands alone in six months, with the numbers,
+  identifiers, paths and dates it needs, and the cause or reversal condition when the fact turns on
+  one (#69).
 - **Every MCP tool carries a title and annotations.** Reads declare `readOnlyHint`,
   `memory_forget` and `review_decide` declare `destructiveHint`, and every tool declares
   `openWorldHint: false`, so a client can decide what to approve without a prompt (#92).
@@ -133,6 +154,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A supersession that retired nothing is refused.** `review::supersede` reads `rows_affected` on
+  the retire statement and rolls back when the predecessor stayed live, as the write path already
+  did. Since #67 the statement carries a guard that can match no row, and a review call could
+  write the `supersedes` link and report success with the old row still live (#68).
+  `domain::types::expired` defines the expired state once.
 - **The consent page catches a client that claims one service and sends codes to another.** A
   self-registered client named Claude that redirected to chatgpt.com used to draw only the
   shared-account reminder, because every recognised host shared one allowlist. Each known service
@@ -161,6 +187,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   spaces, so a crafted callback URL cannot send an escape sequence to the terminal. Without a
   description the line reads as before. Gate: `./scripts/cargo.sh test -j 1 -p lumberroom --lib
   oauth::`.
+
+### Security
+
+- **The consent page names where codes go, and registration refuses risky redirects.** Anyone can
+  self-register a client called "Claude" that sends codes to their own host. The consent page now
+  puts "Codes go to <host>" under the headline, warns for a host that is not a known MCP client,
+  and raises an alarm when the name claims a known service (#87; #95 extends the alarm to a known
+  service's host that belongs to another service). Dynamic registration refuses a public IP-literal
+  redirect and a redirect to this server's own origin. Plain http reaches only loopback, private,
+  link-local and LAN-only names, and the page says the code travels unencrypted there. Auth pages
+  send `X-Frame-Options: DENY` and `frame-ancestors 'none'`, and client names lose control, bidi,
+  zero-width and filler characters at registration and at render. A refresh-token rotation now
+  authenticates the caller before spending the token, so another client's token or a wrong secret
+  no longer burns it.
 
 ## [0.4.0] - 2026-09-07
 
