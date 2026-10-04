@@ -142,6 +142,7 @@ unreadable, in the database and in every backup.
 | [deploy/oauth.md](deploy/oauth.md) | The OAuth production path, per surface, with the consent screen |
 | [docs/permissions.md](docs/permissions.md) | Every grant field, both axes, and which tools each capability opens |
 | [docs/connect-claude-code.md](docs/connect-claude-code.md) | Wiring Claude Code on a Mac, end to end |
+| [docs/connect-claude-ai.md](docs/connect-claude-ai.md) | The memory rules for claude.ai, Cowork and other connector clients: instructions to paste, or a skill |
 | [docs/architecture.md](docs/architecture.md) | The ports-and-adapters shape and where each part lives |
 | [docs/decisions/](docs/decisions/) | Why each part is shaped the way it is, one record per choice |
 | [docs/traps.md](docs/traps.md) | Findings that cost real time, and what to do instead |
