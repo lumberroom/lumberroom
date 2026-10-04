@@ -171,11 +171,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **The conflicts query took the caller's read grant and an offset.** `conflicts` ran over the
   whole tenant and filtered each pair after the fact; the grant runs inside the query, as `stale`
   already does, and paging is by `offset` rather than a client-side skip.
-- **`CONFLICT_SCAN_MAX` and the `namespace_too_large` refusal shipped in 0.4.1-rc.1 only.** That
-  candidate refused the conflict source for a namespace past 2000 live rows rather than running the
-  self-join against it. This release reads stored pairs, drops the refusal and deprecates the
-  setting, as the stored-pairs entry above says. A deployment that skipped the candidate never
-  meets either.
+- **`CONFLICT_SCAN_MAX` and the `namespace_too_large` refusal never reached a release.** Between
+  0.4.0 and this release, `main` refused the conflict source for a namespace past 2000 live rows
+  rather than running the self-join against it. This release reads stored pairs instead, so the
+  refusal is gone and the setting is parsed, ignored and warned about, as the stored-pairs entry
+  above says. A deployment built from a tagged release never meets either.
 - **`GET /admin/review/stale` publishes a narrower row.** Both old review routes read through the
   one queue now, so a stale row carries `opened`, `access_count`, `last_accessed_at` and
   `last_confirmed_at`, and no longer carries `tags`, `source_client`, `embedding_model`,
