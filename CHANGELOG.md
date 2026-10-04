@@ -164,6 +164,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A future `occurred_at` is refused for being in the future.** `memory_write`, a review merge
+  and the console used to refuse `2027-01-01` with "is inside the last 86400 seconds", the
+  near-now message, which named a window the date was nowhere near. The fence now checks the
+  future first and says `occurred_at <instant> is in the future`. A date inside the window keeps
+  the near-now message, and both still ask the caller to omit the field. The console's date hint
+  says a future date is refused. Gate: `./scripts/cargo.sh test -j 1 --lib services::write::tests`
+  and `./scripts/cargo.sh test -j 1 --test review_queue_mcp future`.
 - **A supersession that retired nothing is refused.** `review::supersede` reads `rows_affected` on
   the retire statement and rolls back when the predecessor stayed live, as the write path already
   did. Since #67 the statement carries a guard that can match no row, and a review call could

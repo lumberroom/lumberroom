@@ -297,7 +297,7 @@ From a clone of this repo on the Mac:
 
 ```bash
 # token mode
-./client/wire-mac.sh --url https://memory.example.com --token <token from the installer>
+LUMBERROOM_TOKEN=<token from .env> ./client/wire-mac.sh --url https://memory.example.com
 
 # oauth mode: no token here, Claude Code runs its own flow on first use
 ./client/wire-mac.sh --url https://memory.example.com --oauth-mode

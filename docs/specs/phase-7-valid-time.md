@@ -42,6 +42,10 @@ with it, and each one matters more than the fence.
   on and converts a visible refusal into silent corruption.
 - **It replaces `WRITE_MAX_FUTURE_OCCURRED_SECS` rather than joining it.** One bound, one refusal,
   one setting. §4's separate future-date check and its test are deleted.
+- **Amended: the future case has its own message.** The bound and the setting stay
+  single. A future `occurred_at` now gets a refusal that says the date is in the future, because
+  the near-now wording misdescribed it. Both refusals still say "omit `occurred_at`". The "one
+  refusal" sentence above is superseded on that point.
 
 **D2, the registry stop-loss. Adopted, unanimous.** `registry.rs:109-121` upserts with
 `DO UPDATE SET value = EXCLUDED.value ... version = registry.version + 1`, so only a counter
