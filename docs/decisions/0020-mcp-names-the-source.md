@@ -1,6 +1,6 @@
 # 20. MCP names the app that wrote a memory
 
-**Date:** 23 September 2026 · **Status:** accepted, implemented · **Decided by:** the owner
+**Date:** 23 September 2026 · **Status:** accepted, implemented; partly superseded by [0023](0023-the-owner-names-a-client.md) (a client's name can be the owner's) · **Decided by:** the owner
 
 What was run, and where: on 23 September 2026, `./scripts/cargo.sh check --all-targets` and
 `./scripts/cargo.sh fmt --all -- --check` ran clean on this branch. The test suite, including

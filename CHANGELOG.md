@@ -6,6 +6,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The owner names a client.** An OAuth client gains `owner_label`, a name the owner chose, kept
+  beside the `client_name` it registered with (decision 0023, issue #89). The consent page offers
+  "Name this connection", prefilled with the cleaned registered name, and stores nothing when the
+  field comes back unchanged. Each client card in the console carries a rename form, and
+  `lumberroom clients rename <client_id> <name...>` (or `--clear`) calls the new
+  `POST /oauth/clients/{client_id}/label`. Clearing the label falls back to the registered name. Every
+  MCP `source`, the digest, the console and `lumberroom clients` print the label on their next read,
+  and a rename clears the digest cache so `context_bootstrap` follows at once. MCP prints the label
+  alone. A rename writes one column, so no grant, token or audit field changes, and the server logs
+  one info line with the client id and no label text. Migration `20261004000027` adds the column and
+  a CHECK that refuses a label on a client nobody approved, or setting `consented_at` back to NULL
+  on a row that holds one. Registration never writes the label, and the registered name stays the
+  only text the consent warnings read. In a group of approved clients whose printed names collide, a
+  single named client prints bare and the others keep their `(added ...)` stamp. Implemented and
+  covered by the gates named in decision 0023; no hosted MCP client has seen it.
 - **A fact can stop being true without being replaced.** A row gains a second clock,
   `occurred_until`, and the live-row predicate reads both: `superseded_by IS NULL AND
   (occurred_until IS NULL OR occurred_until > now())`, defined once as `live!()`. A consolidation
@@ -75,6 +90,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Registration refuses a `client_name` that ends in `(added ...)` or `(not approved)`.** Dynamic
+  registration answers 400 `invalid_client_metadata`, and trailing whitespace does not hide the
+  suffix. This is a behaviour change: a client that sent such a name used to register and now
+  fails to. `services::sources` appends those words to tell duplicates apart, so a registered name
+  ending in one could pass for another client's disambiguated label. The same refusal applies to an
+  owner label. Rows already stored keep their names and print as before.
 - **Tool arguments describe what they do instead of telling the model what to do.** Every
   argument description on the 12 tools now states what a value means, what the server does with
   it and what it refuses. "Pass it whenever you know it", "Omit it unless" and "Never infer a

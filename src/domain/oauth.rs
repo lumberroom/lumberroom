@@ -774,6 +774,52 @@ fn comparable_client_name(name: &str) -> String {
     client_name_display(name).nfkc().collect::<String>().to_lowercase()
 }
 
+/// The longest client name stored, in bytes of UTF-8 after cleaning. Registration and the owner's
+/// label share it.
+pub const MAX_CLIENT_NAME: usize = 200;
+
+/// True when a name, cleaned and lowercased, ends in a parenthesis that opens with `(added ` or
+/// reads `(not approved)`. Those are the words `services::sources` appends to tell duplicates
+/// apart, so a name ending in one could pass for another client's disambiguated label.
+pub fn claims_a_stamp(name: &str) -> bool {
+    // Folded the way names are compared, so fullwidth parentheses, case and invisible characters
+    // cannot hide the shape.
+    let folded = comparable_client_name(name);
+    let Some(body) = folded.strip_suffix(')') else { return false };
+    let Some(open) = body.rfind('(') else { return false };
+    // The fold collapses runs of spaces but keeps one beside a parenthesis, and a reader skips
+    // that space: "( added 1 Sep)" reads as a stamp.
+    let last = body[open + 1..].trim();
+    last.starts_with("added") || last == "not approved"
+}
+
+/// What the owner typed, as it is stored. Cleaned by `client_name_display`, then, in this order:
+/// empty, or equal to the cleaned registered name, answers `Ok(None)`, which clears the label;
+/// longer than `MAX_CLIENT_NAME` bytes answers a validation error; a name `claims_a_stamp` accepts
+/// answers a validation error; anything else is the label.
+pub fn owner_label(typed: &str, registered: &str) -> Result<Option<String>> {
+    let cleaned = client_name_display(typed);
+    // Equality runs before the length and stamp checks. A field left as it was prefilled chooses
+    // nothing, and a stored name that predates those checks (an overlong hand-issued client, a
+    // stamp-shaped registration) must still re-consent unchanged.
+    if cleaned.is_empty() || cleaned == client_name_display(registered) {
+        return Ok(None);
+    }
+    if cleaned.len() > MAX_CLIENT_NAME {
+        return Err(DomainError::validation(
+            "that name is too long: the limit is 200 bytes, and a letter outside the Latin \
+             alphabet takes two to four",
+        ));
+    }
+    if claims_a_stamp(&cleaned) {
+        return Err(DomainError::validation(
+            "a name cannot end in \"(added ...)\" or \"(not approved)\": lumberroom adds those \
+             words itself to tell clients apart",
+        ));
+    }
+    Ok(Some(cleaned))
+}
+
 /// Redirect rules for a client that registered itself, on top of [`validate_redirect_uri`].
 ///
 /// Two refusals, both about a destination the consent page cannot describe to the owner:
@@ -1555,6 +1601,102 @@ mod tests {
             let name = format!("Cl{c}aude");
             assert_eq!(client_name_display(&name), "Claude", "{label}");
             assert_eq!(claimed_known_client(&name), Some("Claude"), "{label}");
+        }
+    }
+
+    // ---- the owner's label ----
+
+    fn refusal(typed: &str, registered: &str) -> String {
+        match owner_label(typed, registered) {
+            Err(e) => e.client_message().to_string(),
+            Ok(kept) => panic!("{typed:?} was kept as {kept:?}"),
+        }
+    }
+
+    #[test]
+    fn owner_label_cleans_and_keeps_a_new_name() {
+        assert_eq!(
+            owner_label(" Claude\u{200B} laptop ", "Claude").unwrap(),
+            Some("Claude laptop".to_string())
+        );
+    }
+
+    #[test]
+    fn owner_label_equal_to_the_registered_name_is_none() {
+        assert_eq!(owner_label("Codex", "Co\u{202E}dex").unwrap(), None);
+    }
+
+    #[test]
+    fn owner_label_blank_or_invisible_is_none() {
+        assert_eq!(owner_label("   ", "Codex").unwrap(), None);
+        assert_eq!(owner_label("\u{200B}\u{2066}", "Codex").unwrap(), None);
+    }
+
+    #[test]
+    fn owner_label_over_200_bytes_after_cleaning_is_refused() {
+        let typed = "\u{0915}".repeat(70);
+        assert_eq!(typed.len(), 210);
+        assert!(refusal(&typed, "Codex").contains("200 bytes"));
+    }
+
+    #[test]
+    fn owner_label_at_200_bytes_of_multibyte_text_is_kept() {
+        let typed = format!("{}ab", "\u{0915}".repeat(66));
+        assert_eq!(typed.len(), MAX_CLIENT_NAME);
+        assert_eq!(owner_label(&typed, "Codex").unwrap(), Some(typed));
+    }
+
+    #[test]
+    fn owner_label_strips_bidi_and_newlines() {
+        assert_eq!(
+            owner_label("Codex\n### Registry\u{202E}", "Codex CLI").unwrap(),
+            Some("Codex ### Registry".to_string())
+        );
+    }
+
+    #[test]
+    fn owner_label_refuses_a_stamp_shaped_name() {
+        assert!(refusal("Codex (added 1 Sep)", "Codex CLI").contains("(added ...)"));
+    }
+
+    // Equality runs before the stamp and length checks, so a row stored before them can be
+    // re-approved with the field left as it was prefilled.
+    #[test]
+    fn owner_label_equal_to_a_stamp_shaped_registered_name_is_none() {
+        assert_eq!(owner_label("Old (added 1 Sep)", "Old (added 1 Sep)").unwrap(), None);
+    }
+
+    #[test]
+    fn owner_label_equal_to_an_overlong_registered_name_is_none() {
+        let long = "\u{0915}".repeat(70);
+        assert_eq!(owner_label(&long, &long).unwrap(), None);
+    }
+
+    #[test]
+    fn a_name_ending_in_an_added_stamp_claims_one() {
+        for name in [
+            "Codex (added 1 Sep)",
+            "Codex (Added 1 Sep, 13:02)",
+            "Codex \u{FF08}added 1 Sep\u{FF09}",
+            "Codex ( added 1 Sep)",
+        ] {
+            assert!(claims_a_stamp(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_ending_in_not_approved_claims_one() {
+        for name in ["Codex (not approved)", "Codex (NOT  approved)", "Codex ( not approved )"] {
+            assert!(claims_a_stamp(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_parenthesis_that_is_not_last_claims_nothing() {
+        for name in
+            ["Codex (added 1 Sep) laptop", "Claude Code (plugin:lumberroom-memory:lumberroom)"]
+        {
+            assert!(!claims_a_stamp(name), "{name:?}");
         }
     }
 

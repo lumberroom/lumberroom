@@ -1,9 +1,40 @@
 # 23. The owner names a client, beside the name it registered
 
-> **Draft.** Design only. Nothing is built yet, and this document changes as the build proceeds.
-
-**Date:** 3 October 2026 · **Status:** draft, accepted by the owner, nothing built · **Decided by:** the owner, 3 October
+**Date:** 3 October 2026 · **Status:** accepted by the owner, implemented on branch `feat/client-owner-label`, not deployed · **Decided by:** the owner, 3 October
 2026, on [`docs/specs/client-owner-label.md`](../specs/client-owner-label.md)
+
+What was run, and where: on 3 October 2026, on branch `feat/client-owner-label`. Pass counts are
+from those runs.
+
+- Red, with the new names added and no fix: `./scripts/cargo.sh test -j 1 --lib claims` gave 5
+  passed, 2 failed. `a_name_ending_in_an_added_stamp_claims_one` panicked on `"Codex ( added 1
+  Sep)"`, and `a_name_ending_in_not_approved_claims_one` failed.
+- Green, after adding `.trim()` in `claims_a_stamp`: the same command gave 7 passed, 0 failed, 988
+  filtered out.
+- `./scripts/cargo.sh test -j 1`, the full engine suite, exit 0 with zero failures. lib 995 passed;
+  `client_label` 15; `mcp_source` 10; `console` 37 passed and 1 ignored; `integration` 91;
+  `review_queue` 37; `ingest` 25; `cleanup` 23; `mcp_capability` 14; `review_queue_mcp` 12;
+  `console_cleanup` 11; `mcp_tool_annotations` 11; `archive_merge` 6; `archive_restore` 4;
+  `cleanup_unreject` 4; `permissions_doc` 3; `search_touch_hot` 3; `oauth_refresh_owner` 2;
+  `recall_settings` 2; `migration_lock` 1; `dump_console` 0 passed and 1 ignored; main, prefetch
+  and doc-tests 0.
+- `./scripts/cargo.sh test -j 1 -p lumberroom`, the CLI crate, exit 0: lib 405 passed, `tests/auth`
+  4, `tests/wire` 34.
+- `./scripts/cargo.sh fmt --all -- --check`: exit 0.
+- `./scripts/cargo.sh clippy -j 1 --workspace --all-targets`: warnings, no errors. Each hit checked
+  in a branch file falls outside the hunks this branch added.
+
+- `scripts/oauth-flow-test.sh`, run on 4 October 2026 against a scratch server started from an
+  image built on this branch (`docker build --target runtime --build-arg EMBED_PROVIDER=hash -t
+  lumberroom-server:col-owner-label .`, then `LUMBERROOM_OAUTH_FLOW_TEST_IMAGE=lumberroom-server:col-owner-label
+  ./scripts/oauth-flow-test.sh`): exit 0, 45 PASS lines, `oauth-flow-test PASSED`. Step 13 printed
+  `<client_id> now reads as flow gate` and the listing showed `flow gate`. Two earlier runs of the
+  same command failed at step 13 and fixed the script: a host bind mount of a binary that lives in
+  the `lumberroom-target` volume (`setpriv: failed to execute lumberroom: Permission denied`), then
+  a CLI reaching the server by container name over plain http, which drops the bearer header
+  (`rename failed (401)`).
+
+Not run: anything against a hosted deployment.
 
 ## Decision
 

@@ -21,8 +21,9 @@ legend{padding:0 .35rem;font-size:.8rem;text-transform:uppercase;letter-spacing:
 .choice b{font-weight:600}
 .choice span{display:block;margin:.15rem 0 0 1.4rem;color:#4a4d52;font-size:.88rem}
 label.field{display:block;margin:0 0 .35rem;font-weight:600;font-size:.9rem}
-input[type=password]{width:100%;padding:.6rem .7rem;font-size:1rem;border:1px solid #b9bbc0;
- border-radius:7px;background:#fff;color:inherit}
+input[type=password],input[type=text]{width:100%;padding:.6rem .7rem;font-size:1rem;
+ border:1px solid #b9bbc0;border-radius:7px;background:#fff;color:inherit}
+.hint{margin:.35rem 0 1rem;font-size:.85rem;color:#5b5f66}
 .actions{display:flex;gap:.6rem;flex-wrap:wrap}
 button{font:inherit;font-weight:600;padding:.62rem 1.15rem;border-radius:7px;border:1px solid #17181a;
  background:#17181a;color:#fff;cursor:pointer}
@@ -40,7 +41,8 @@ button.secondary{background:#fff;color:#17181a;border-color:#b9bbc0}
  main{background:#191b1e;border-color:#2c2f34}
  dl,fieldset{background:#15171a;border-color:#2c2f34}
  .lede,.choice span{color:#a9acb2}
- input[type=password]{background:#111214;border-color:#3a3e44;color:inherit}
+ input[type=password],input[type=text]{background:#111214;border-color:#3a3e44;color:inherit}
+ .hint{color:#a9acb2}
  button{background:#eceded;color:#111214;border-color:#eceded}
  button.secondary{background:transparent;color:#eceded;border-color:#3a3e44}
  .warn{background:#2a2013;border-color:#5c4520}

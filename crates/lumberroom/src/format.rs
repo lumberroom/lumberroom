@@ -83,7 +83,15 @@ pub fn client_stats_line(row: &ClientStatsRow) -> String {
 pub fn client_line(c: &ClientRecord) -> String {
     let consent = if c.consented_at.is_some() { "consented" } else { "pending consent" };
     let revoked = if c.revoked_at.is_some() { "  REVOKED" } else { "" };
-    format!("{}  {}  via {}  {consent}{revoked}", c.client_id, c.client_name, c.registered_via)
+    // An older server sends no `label`; the registered name is the best it can offer.
+    let name = c.label.as_deref().unwrap_or(&c.client_name);
+    // Show the registered name only when the owner named the client, so the line still says what
+    // the client calls itself on the consent page.
+    let registered = match &c.owner_label {
+        Some(_) => format!("  (registered as {})", c.client_name),
+        None => String::new(),
+    };
+    format!("{}  {name}  via {}  {consent}{revoked}{registered}", c.client_id, c.registered_via)
 }
 
 /// The candidate line `forget` prints before it asks for confirmation.
@@ -333,8 +341,38 @@ mod tests {
             registered_via: "dcr".into(),
             consented_at: None,
             revoked_at: Some("2026-08-01T00:00:00Z".into()),
+            owner_label: None,
+            label: None,
         };
         assert_eq!(client_line(&c), "cid  lumberroom  via dcr  pending consent  REVOKED");
+    }
+
+    #[test]
+    fn client_line_prints_the_label_and_the_registered_name() {
+        let c = ClientRecord {
+            client_id: "cid".into(),
+            client_name: "Claude".into(),
+            registered_via: "dcr".into(),
+            consented_at: Some("2026-08-01T00:00:00Z".into()),
+            revoked_at: None,
+            owner_label: Some("flow gate".into()),
+            label: Some("flow gate".into()),
+        };
+        assert_eq!(client_line(&c), "cid  flow gate  via dcr  consented  (registered as Claude)");
+    }
+
+    #[test]
+    fn client_line_falls_back_to_client_name_for_an_older_server() {
+        let c = ClientRecord {
+            client_id: "cid".into(),
+            client_name: "Claude".into(),
+            registered_via: "dcr".into(),
+            consented_at: Some("2026-08-01T00:00:00Z".into()),
+            revoked_at: None,
+            owner_label: None,
+            label: None,
+        };
+        assert_eq!(client_line(&c), "cid  Claude  via dcr  consented");
     }
 
     #[test]

@@ -159,6 +159,21 @@ impl Harness {
         Client { id, token }
     }
 
+    /// The owner names a client through `POST /oauth/clients/{id}/label`; `None` clears the name.
+    /// Through the route rather than the store, so the digest cache clear the route owes is part of
+    /// what a test here exercises.
+    async fn rename(&self, client_id: &str, label: Option<&str>) {
+        let res = reqwest::Client::new()
+            .post(format!("{}/oauth/clients/{client_id}/label", self.base))
+            .bearer_auth(OWNER_TOKEN)
+            .json(&json!({ "label": label }))
+            .send()
+            .await
+            .unwrap();
+        let status = res.status();
+        assert!(status.is_success(), "the rename answered {status}: {}", res.text().await.unwrap());
+    }
+
     /// `memory_write` over MCP with the given bearer, returning the new row's id.
     async fn write_as(&self, bearer: &str, content: &str) -> String {
         let written = self
@@ -559,4 +574,56 @@ async fn memory_search_keeps_only_hits_carrying_every_tag_it_was_given() {
     assert!(release.contains(&both) && release.contains(&one), "{release:?}");
     assert_eq!(search(json!(["release", "INFRA"])).await, vec![both.clone()]);
     assert!(search(json!(["release", "nowhere"])).await.is_empty(), "all of, never any of");
+}
+
+/// Decision 0023: a source the owner named reads as the owner's name alone, with no trace of what
+/// the client registered as. Two clients registered as "Codex" read with dates until the owner names
+/// one, and then neither needs a date.
+#[tokio::test]
+async fn a_renamed_client_reads_as_its_label_in_mcp() {
+    let h = harness_or_skip!(AuthMode::Oauth);
+    let laptop = h.client("Codex", Some(at(1, 13, 2))).await;
+    let other = h.client("Codex", Some(at(3, 10, 0))).await;
+    let tag = nonce("renamed");
+    let a = h.write_as(&laptop.token, &format!("the laptop codex owns the migrations {tag}")).await;
+    let b = h.write_as(&other.token, &format!("the other codex owns the release {tag}")).await;
+    assert_eq!(h.searched_source(&tag, &a).await.0, "Codex (added 1 Sep)");
+
+    h.rename(&laptop.id, Some("Work laptop")).await;
+
+    let (source, search) = h.searched_source(&tag, &a).await;
+    assert_eq!(source, "Work laptop");
+    assert!(!search.to_string().contains("registered as"), "{search}");
+    assert_no_id("memory_search", &search, &laptop.id);
+    assert_eq!(h.searched_source(&tag, &b).await.0, "Codex", "the unnamed twin keeps a date");
+
+    let history = h.call("memory_history", json!({ "id": a })).await;
+    assert_eq!(structured(&history)["versions"][0]["source"], "Work laptop", "{history}");
+
+    // No clear_cache here: the rename route owes it, and the digest is where a stale name would
+    // survive.
+    let digest = h.call("context_bootstrap", json!({})).await;
+    assert!(text(&digest).contains("via Work laptop"), "{}", text(&digest));
+    assert!(!text(&digest).contains("via Codex (added"), "{}", text(&digest));
+}
+
+#[tokio::test]
+async fn a_cleared_label_reads_as_the_registered_name_in_mcp() {
+    let h = harness_or_skip!(AuthMode::Oauth);
+    let codex = h.client("Codex", None).await;
+    let content = format!("the codex runner caches crates on the ssd {}", nonce("cleared"));
+    let id = h.write_as(&codex.token, &content).await;
+
+    h.rename(&codex.id, Some("Build box")).await;
+    assert_eq!(h.searched_source(&content, &id).await.0, "Build box");
+    let named = text(&h.call("context_bootstrap", json!({})).await);
+    assert!(named.contains("via Build box"), "{named}");
+
+    h.rename(&codex.id, None).await;
+    let (source, search) = h.searched_source(&content, &id).await;
+    assert_eq!(source, "Codex");
+    assert!(!search.to_string().contains("Build box"), "{search}");
+    let cleared = text(&h.call("context_bootstrap", json!({})).await);
+    assert!(cleared.contains("via Codex"), "{cleared}");
+    assert!(!cleared.contains("Build box"), "{cleared}");
 }
