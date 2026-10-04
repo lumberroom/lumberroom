@@ -5,6 +5,10 @@
 One memory that every AI tool you use can read from and write to, with you deciding what each one is
 allowed to see.
 
+[![Introducing Lumberroom: one shared memory for AI agents](https://i.ytimg.com/vi/W1a7X3Oee2M/maxresdefault.jpg)](https://youtu.be/W1a7X3Oee2M)
+
+More videos: [Lumberroom playlist](https://www.youtube.com/playlist?list=PLICXFDm9bubU) · [lumberroom.cloud/videos](https://lumberroom.cloud/videos)
+
 You run seven AI surfaces. Each keeps its own memory. None of them share. You re-explain your setup
 to ChatGPT, then again to Claude, then again to your coding agent, and when you correct one of them
 the others never find out. Lumberroom holds the facts once, on infrastructure you own, and every tool
@@ -52,6 +56,8 @@ browser has to reach it. The installer pulls
 `ghcr.io/lumberroom/lumberroom-server:0.4.0` and falls back to building from this tree when the
 pull fails; `--build-local` skips the pull. It pins a version rather than tracking `latest`, because
 a memory store that upgrades itself while you sleep is not a feature.
+
+Watch the self-host walkthrough: [youtu.be/Km7CcmcsS2w](https://youtu.be/Km7CcmcsS2w).
 
 Moved: the engine used to publish as `ghcr.io/the-cybersapien/lumberroom-server`. That image stays
 public, frozen at 0.4.0, and takes no new versions; pull `ghcr.io/lumberroom/lumberroom-server`
