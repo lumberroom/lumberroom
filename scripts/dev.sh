@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 
 DB="${DEV_POSTGRES_DB:-lumberroom_dev}"
 MODELS_VOLUME=lumberroom-dev-models
-SERVER_IMAGE="${DEV_SEED_IMAGE:-lumberroom-server:0.4.0}"
+SERVER_IMAGE="${DEV_SEED_IMAGE:-lumberroom-server:0.5.0}"
 
 if [ "$1" = "--down" ]; then
   exec docker compose --profile dev down dev

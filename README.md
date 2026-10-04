@@ -53,7 +53,7 @@ That is token mode on loopback: the server binds `127.0.0.1:8787`, opens no publ
 the command to run on your Mac. The client token is the first `"token"` field in the `.env` the
 installer writes (mode 600) in the clone. Add `--domain` and `--auth-mode oauth` when a
 browser has to reach it. The installer pulls
-`ghcr.io/lumberroom/lumberroom-server:0.4.0` and falls back to building from this tree when the
+`ghcr.io/lumberroom/lumberroom-server:0.5.0` and falls back to building from this tree when the
 pull fails; `--build-local` skips the pull. It pins a version rather than tracking `latest`, because
 a memory store that upgrades itself while you sleep is not a feature.
 
@@ -83,7 +83,7 @@ cargo install lumberroom
 A binary, with no package manager. Four targets, macOS and Linux on arm64 and x86_64:
 
 ```bash
-tag=v0.4.0; target=aarch64-apple-darwin      # or x86_64-apple-darwin,
+tag=v0.5.0; target=aarch64-apple-darwin      # or x86_64-apple-darwin,
                                              # aarch64-unknown-linux-musl, x86_64-unknown-linux-musl
 base=https://github.com/lumberroom/lumberroom/releases/download/$tag
 curl -fsSLO "$base/lumberroom-${tag#v}-$target.tar.gz"
@@ -99,8 +99,8 @@ On a machine where `apt` or `dnf` is how software arrives, the release also carr
 dependency:
 
 ```bash
-sudo dpkg -i lumberroom_0.4.0-1_amd64.deb     # or lumberroom_0.4.0-1_arm64.deb
-sudo rpm -i lumberroom-0.4.0-1.x86_64.rpm     # or lumberroom-0.4.0-1.aarch64.rpm
+sudo dpkg -i lumberroom_0.5.0-1_amd64.deb     # or lumberroom_0.5.0-1_arm64.deb
+sudo rpm -i lumberroom-0.5.0-1.x86_64.rpm     # or lumberroom-0.5.0-1.aarch64.rpm
 ```
 
 Then point it at your server:
