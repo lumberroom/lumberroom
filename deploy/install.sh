@@ -369,14 +369,14 @@ say "4/9 image"
 # script lives in rather than whatever directory the operator is standing in. Only the build path
 # below reads these; a pulled image already carries its own labels from the release that built it.
 export LUMBERROOM_BUILD_SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-export LUMBERROOM_BUILD_TAG="${LUMBERROOM_BUILD_TAG:-lumberroom-server:0.4.0}"
+export LUMBERROOM_BUILD_TAG="${LUMBERROOM_BUILD_TAG:-lumberroom-server:0.5.0}"
 export LUMBERROOM_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 if [ "$BUILD_LOCAL" = 1 ]; then
   info "--build-local: building the image from this checkout (bakes the embedding model in; a few minutes)"
   run "${COMPOSE[@]}" build server cleanup
 else
-  info "pulling ${LUMBERROOM_SERVER_IMAGE:-ghcr.io/lumberroom/lumberroom-server:0.4.0} (a few seconds to a minute)"
+  info "pulling ${LUMBERROOM_SERVER_IMAGE:-ghcr.io/lumberroom/lumberroom-server:0.5.0} (a few seconds to a minute)"
   if [ "$DRY_RUN" = 1 ]; then
     info "would run: docker compose pull server cleanup, and build from source on failure"
   elif "${COMPOSE[@]}" pull server cleanup; then

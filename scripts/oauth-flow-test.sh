@@ -50,13 +50,13 @@ trap 'rm -rf "$WORK"' EXIT
 
 SCRATCH_DB=lumberroom_oauth_flow_test
 SCRATCH_NAME="${LUMBERROOM_OAUTH_FLOW_TEST_SERVER:-lumberroom-oauth-flow-test-server}"
-# The server image this run starts. lumberroom-server:0.4.0 is whatever `docker compose build server`
+# The server image this run starts. lumberroom-server:0.5.0 is whatever `docker compose build server`
 # last produced from whichever checkout ran it, so a branch that adds a route has to name an image
 # built from its own tree, or step 13 asks a server that predates the route. Built and named without
-# retagging 0.4.0, which every other scratch gate on this machine also starts:
+# retagging 0.5.0, which every other scratch gate on this machine also starts:
 #   docker build --target runtime --build-arg EMBED_PROVIDER=hash -t lumberroom-server:<branch> .
 #   LUMBERROOM_OAUTH_FLOW_TEST_IMAGE=lumberroom-server:<branch> ./scripts/oauth-flow-test.sh
-SERVER_IMAGE="${LUMBERROOM_OAUTH_FLOW_TEST_IMAGE:-lumberroom-server:0.4.0}"
+SERVER_IMAGE="${LUMBERROOM_OAUTH_FLOW_TEST_IMAGE:-lumberroom-server:0.5.0}"
 # AUTH_MODE=oauth needs no static bearer grant. scratch_require only checks this is non-empty; an
 # empty array is never sent to the container, since this run's whole point is exercising the
 # built-in authorization server instead.

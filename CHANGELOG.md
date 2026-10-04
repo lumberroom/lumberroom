@@ -4,6 +4,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-04
+
 ### Added
 
 - **The memory rules for connector clients.** The server's descriptions stopped giving orders in #92,
@@ -741,6 +743,7 @@ softened for a release note.
 - `submit` collapses exact duplicate proposals on a content hash and misses near-duplicates, so
   overlapping chunks queue the same fact more than once.
 
+[0.5.0]: https://github.com/lumberroom/lumberroom/releases/tag/v0.5.0
 [0.4.0]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.4.0
 [0.3.1]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.3.1
 [0.3.0]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.3.0
