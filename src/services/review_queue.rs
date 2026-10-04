@@ -770,7 +770,9 @@ async fn merge_rows(
     let mut superseded: Vec<String> = outcome.superseded.clone().into_iter().collect();
     let mut end_left_open = outcome.end_left_open;
     let mut unfinished = Vec::new();
-    for (id, _) in rows.iter().filter(|(id, _)| *id != newest) {
+    // Content equal to the older source's own text reuses that row, so it is already the
+    // written row and has nothing left to retire into.
+    for (id, _) in rows.iter().filter(|(id, _)| *id != newest && id.to_string() != outcome.id) {
         match super::review::supersede(ctx, &id.to_string(), &outcome.id).await {
             Ok(resolved) => {
                 if let Some(s) = resolved.superseded {

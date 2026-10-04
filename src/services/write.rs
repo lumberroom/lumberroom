@@ -22,7 +22,7 @@
 //! it. Everything in this file that touches the second one exists to keep it from decaying into a
 //! copy of the first.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 
 use super::Ctx;
 use crate::adapters::auth::{assert_writable, can_read, can_write};
@@ -231,26 +231,40 @@ async fn run_inner(
     // and a write-only grant is not a grant to ask that. The neighbour path below already applies
     // the read ceiling; this is the same rule on the exact-match path. A write-only client stores
     // a second copy, which is the side of the trade this file's header commits to.
-    if supersedes_id.is_none()
-        && resolved == Sensitivity::Open
-        && can_read(&ctx.principal, &namespace, Sensitivity::Open)
-    {
+    //
+    // A write carrying `supersedes` runs the same lookup. The memory_write flow stores the
+    // correction first, reads the old row back from `possible_conflicts`, and sends the same
+    // content again with `supersedes` set. Inserting on that second call left two live copies of
+    // the correction, and the review queue then paired them as a conflict.
+    if resolved == Sensitivity::Open && can_read(&ctx.principal, &namespace, Sensitivity::Open) {
         if let Some(existing) =
             ctx.repos.memories.find_exact(ctx.tenant(), &namespace, content).await?
         {
             if existing.sensitivity == resolved {
-                // Repetition is confirmation. A restatement is evidence the fact is still true,
-                // which is exactly what the review queue needs to tell a live fact from a stale one.
-                confirm(ctx, &existing.id).await;
-                return Ok(WriteOutcome {
-                    id: existing.id,
-                    namespace,
-                    sensitivity: existing.sensitivity,
-                    deduplicated: true,
-                    superseded: None,
-                    end_left_open: false,
-                    possible_conflicts: vec![],
-                });
+                match supersedes_id {
+                    None => {
+                        // Repetition is confirmation. A restatement is evidence the fact is still
+                        // true, which is exactly what the review queue needs to tell a live fact
+                        // from a stale one.
+                        confirm(ctx, &existing.id).await;
+                        return Ok(WriteOutcome {
+                            id: existing.id,
+                            namespace,
+                            sensitivity: existing.sensitivity,
+                            deduplicated: true,
+                            superseded: None,
+                            end_left_open: false,
+                            possible_conflicts: vec![],
+                        });
+                    }
+                    Some(old) => {
+                        if let Some(outcome) =
+                            supersede_into_existing(ctx, old, existing, &tags, occurred_at).await?
+                        {
+                            return Ok(outcome);
+                        }
+                    }
+                }
             }
         }
     }
@@ -570,6 +584,57 @@ async fn confirm(ctx: &Ctx, id: &str) {
     if let Err(e) = ctx.repos.memories.confirm(ctx.tenant(), uuid).await {
         tracing::warn!(id, error = %e.log_message(), "could not record a confirmation");
     }
+}
+
+/// Retire `old` in favour of a live row that already holds the write's exact content, rather than
+/// inserting a copy of it. `None` sends the write on to the insert.
+///
+/// Every guard the insert path applies has already run by the time this is called:
+/// `validate_supersedes_target` checked `old`, and step (e) checked the read grant on `existing`.
+/// The repository's `supersede` takes the row locks, refuses a cycle and rolls back a retire that
+/// moves no row, the same call the insert path makes.
+async fn supersede_into_existing(
+    ctx: &Ctx,
+    old: uuid::Uuid,
+    existing: Memory,
+    tags: &[String],
+    occurred_at: Option<DateTime<Utc>>,
+) -> Result<Option<WriteOutcome>> {
+    let existing_id = uuid::Uuid::parse_str(&existing.id)
+        .map_err(|_| DomainError::internal("repository returned an id that is not a uuid"))?;
+    // The target holds this content itself, so no other row can take its place. The insert stores
+    // a fresh row and retires the target into it, which a review merge of two identical rows and a
+    // dated restatement of the target both rely on.
+    if existing_id == old {
+        return Ok(None);
+    }
+    // The retired row's end comes from its successor's `occurred_at`. Reusing a row whose date
+    // differs from the one the caller sent would drop that date and close the old period on the
+    // wrong day, so a dated write that disagrees stores its own row. Postgres keeps microseconds
+    // and an RFC 3339 date can carry nanoseconds, so both sides compare at the column's precision.
+    if occurred_at.is_some() && micros(occurred_at) != micros(existing.occurred_at) {
+        return Ok(None);
+    }
+    // The reused row keeps its own tags, so a tag it lacks would vanish with the write.
+    if tags.iter().any(|t| !existing.tags.contains(t)) {
+        return Ok(None);
+    }
+    let done = ctx.repos.memories.supersede(ctx.tenant(), old, existing_id).await?;
+    confirm(ctx, &existing.id).await;
+    super::bootstrap::clear_cache();
+    Ok(Some(WriteOutcome {
+        id: existing.id,
+        namespace: existing.namespace,
+        sensitivity: existing.sensitivity,
+        deduplicated: true,
+        superseded: Some(old.to_string()),
+        end_left_open: done.end_left_open,
+        possible_conflicts: vec![],
+    }))
+}
+
+fn micros(at: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    at.map(|t| t.trunc_subsecs(6))
 }
 
 /// Retiring a fact is a destructive write, so it needs the same grant as writing one, plus the read
