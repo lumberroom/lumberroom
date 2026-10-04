@@ -1295,6 +1295,44 @@ const LIVE_EMBEDDED_COUNTS_SQL: &str = concat!(
       ORDER BY n DESC"
 );
 
+/// One row's conflict scan, in a statement of its own. The scan lives in `memory_conflict_record`
+/// (migration `20261004000026`) so a deployment can swap in a `SECURITY DEFINER` version without
+/// editing this file.
+///
+/// TRAP: run it only on the pool, outside any transaction, after the anchor row committed. Inside
+/// the inserting transaction two concurrent writes in one namespace miss each other, and inside a
+/// batch transaction the tenant's shared advisory key holds until the whole batch commits.
+const RECORD_CONFLICTS_SQL: &str = "SELECT memory_conflict_record($1, $2, $3)";
+
+/// The next live rows without a current mark, oldest first. A `SETOF uuid` function names its
+/// output column after itself, so `SELECT id` resolves only through the alias, and the limit casts
+/// to `int4` because the function takes `integer` and an `i64` binds as `int8`.
+const NEXT_CONFLICT_SCANS_SQL: &str = "SELECT id FROM memory_conflict_next($1, $2, $3::int4) AS id";
+
+/// Every live row in the tenant still without a mark, whoever may read it. Background passes only:
+/// a request handler that returned this would tell a caller how many rows sit outside their grant.
+const CONFLICT_BACKLOG_SQL: &str = "SELECT memory_conflict_backlog($1, $2)";
+
+/// The reader-scoped pending count. The same row set as `memory_conflict_backlog` with the grant
+/// and its ceiling inside the query. No embedding test: the scan marks a row that has no vector, so
+/// filtering on it here would make this count and the backlog disagree.
+const CONFLICTS_PENDING_SQL: &str = concat!(
+    "SELECT count(*) FROM memory m
+      WHERE m.tenant_id = $1
+        AND ",
+    live!(),
+    "
+        AND NOT EXISTS (SELECT 1 FROM memory_conflict_scan s
+                         WHERE s.memory_id = m.id AND s.floor <= $2)
+        AND EXISTS (
+              SELECT 1
+                FROM unnest($3::text[], $4::bool[], $5::text[]) AS g(prefix, exact, max)
+               WHERE CASE WHEN g.exact THEN m.namespace = g.prefix
+                          ELSE left(m.namespace, length(g.prefix)) = g.prefix END
+                 AND sensitivity_rank(g.max) >= sensitivity_rank(m.sensitivity)
+            )"
+);
+
 /// Retire one row in favour of another, and end its validity in the same statement.
 ///
 /// One constant for both supersession paths: the write that carries `supersedes` and the standalone
@@ -1599,6 +1637,73 @@ const UNRECOGNISED_ALG: &str = "unrecognised";
 
 #[async_trait]
 impl MemoryRepository for PgMemoryRepository {
+    /// One batch of the conflict sweep: the ids, one autocommitted scan per id, then the backlog.
+    ///
+    /// Each record runs on the pool so it commits alone. Two single-row scans share at most one
+    /// pair key and cannot deadlock each other; a batch in one transaction deadlocked with a writer
+    /// on a scratch copy and held the tenant's advisory key for the whole batch (spec 4.3).
+    ///
+    /// A failed record is logged and skipped rather than returned. The row keeps no mark, so the
+    /// next sweep retries it, and `scanned` leaves it out so a batch that fails every row ends the
+    /// sweep instead of spinning on it until the budget runs out.
+    async fn sweep_conflicts(
+        &self,
+        tenant: &str,
+        floor: f64,
+        limit: i64,
+    ) -> Result<crate::ports::ConflictSweep> {
+        let ids: Vec<uuid::Uuid> = sqlx::query_scalar(NEXT_CONFLICT_SCANS_SQL)
+            .bind(tenant)
+            .bind(floor)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let mut scanned = 0i64;
+        for id in ids {
+            match sqlx::query(RECORD_CONFLICTS_SQL)
+                .bind(tenant)
+                .bind(id)
+                .bind(floor)
+                .execute(&self.pool)
+                .await
+            {
+                Ok(_) => scanned += 1,
+                Err(e) => tracing::warn!(memory_id = %id, error = %e, "conflict scan failed"),
+            }
+        }
+
+        let pending: i64 = sqlx::query_scalar(CONFLICT_BACKLOG_SQL)
+            .bind(tenant)
+            .bind(floor)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(crate::ports::ConflictSweep { scanned, pending })
+    }
+
+    /// Live rows this reader may see with no mark at or below `floor`. An empty grant reads
+    /// nothing, the same short cut `conflicts` takes.
+    async fn conflicts_pending(
+        &self,
+        tenant: &str,
+        floor: f64,
+        reader: &[NamespaceGrant],
+    ) -> Result<i64> {
+        if reader.is_empty() {
+            return Ok(0);
+        }
+        let (g_prefix, g_exact, g_max) = super::grant_arrays(reader);
+        let pending: i64 = sqlx::query_scalar(CONFLICTS_PENDING_SQL)
+            .bind(tenant)
+            .bind(floor)
+            .bind(&g_prefix)
+            .bind(&g_exact)
+            .bind(&g_max)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(pending)
+    }
+
     /// The ciphertext columns for rows the caller already holds, so the service can decrypt them.
     ///
     /// Kept apart from every other read rather than folded into one: `Memory` has no ciphertext
@@ -4004,6 +4109,54 @@ mod tests {
     fn the_namespace_count_reads_live_embedded_rows_and_groups_by_namespace() {
         assert!(LIVE_EMBEDDED_COUNTS_SQL.contains("embedding IS NOT NULL"));
         assert!(LIVE_EMBEDDED_COUNTS_SQL.contains("GROUP BY m.namespace"));
+    }
+
+    #[test]
+    fn the_sweep_statements_call_the_three_conflict_functions_with_their_binds() {
+        assert_eq!(RECORD_CONFLICTS_SQL, "SELECT memory_conflict_record($1, $2, $3)");
+        assert_eq!(CONFLICT_BACKLOG_SQL, "SELECT memory_conflict_backlog($1, $2)");
+        // A SETOF uuid function names its output column after itself, so `SELECT id` resolves only
+        // through the alias, and the limit binds as int4 to match the function's integer argument.
+        assert!(NEXT_CONFLICT_SCANS_SQL.contains("memory_conflict_next($1, $2, $3::int4) AS id"));
+        assert!(NEXT_CONFLICT_SCANS_SQL.starts_with("SELECT id FROM"));
+    }
+
+    #[test]
+    fn the_pending_count_reads_live_rows_without_a_mark_at_or_below_the_floor() {
+        assert_eq!(CONFLICTS_PENDING_SQL.matches(live!()).count(), 1);
+        assert!(CONFLICTS_PENDING_SQL.contains("NOT EXISTS (SELECT 1 FROM memory_conflict_scan s"));
+        assert!(CONFLICTS_PENDING_SQL.contains("s.floor <= $2"));
+        // The scan marks a row it skipped for want of a vector, so the count must not filter on the
+        // embedding: a filter here would disagree with memory_conflict_backlog.
+        assert!(!CONFLICTS_PENDING_SQL.contains("embedding"));
+    }
+
+    #[test]
+    fn the_pending_count_applies_the_grant_and_its_ceiling_inside_the_query() {
+        assert_eq!(
+            CONFLICTS_PENDING_SQL.matches("unnest($3::text[], $4::bool[], $5::text[])").count(),
+            1
+        );
+        assert!(CONFLICTS_PENDING_SQL
+            .contains("sensitivity_rank(g.max) >= sensitivity_rank(m.sensitivity)"));
+        assert!(!CONFLICTS_PENDING_SQL.contains("$6"));
+    }
+
+    /// The sweep commits each scan on its own. A transaction around the loop would hold the
+    /// tenant's shared advisory key across the whole batch, and one failing row would roll back the
+    /// rest (spec section 4.3).
+    #[test]
+    fn the_sweep_runs_each_record_on_the_pool_and_never_opens_a_transaction() {
+        let source = include_str!("memory.rs");
+        let head = source.split("#[cfg(test)]").next().unwrap();
+        let start = head.find("async fn sweep_conflicts(").expect("sweep_conflicts is defined");
+        let end = head[start..].find("async fn conflicts_pending(").expect("followed by pending");
+        let body = &head[start..start + end];
+        assert!(body.contains("RECORD_CONFLICTS_SQL"));
+        assert!(body.contains("NEXT_CONFLICT_SCANS_SQL"));
+        assert!(body.contains("CONFLICT_BACKLOG_SQL"));
+        assert!(!body.contains(".begin("), "a scan inside a transaction holds the key per batch");
+        assert!(!body.contains("Transaction"));
     }
 
     /// Every statement in the adapter that reads or writes the supersession link, classified.

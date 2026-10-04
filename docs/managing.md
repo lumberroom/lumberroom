@@ -239,6 +239,22 @@ the self-join that finds a namespace's conflicting pairs runs per namespace, so 
 that ceiling would cost tens of seconds rather than answer a page. The default came from a
 dev-container probe; recalibrate it against a timed run on the deployment's own hardware.
 
+### Conflict recording
+
+The server records conflicting pairs as rows commit. A sweeper scans each new row against its
+namespace after the row commits and stores the pairs at or above `CONFLICT_THRESHOLD`. It runs on a
+Postgres `LISTEN` wake and on a timer, and the same loop backfills rows that predate it. The review
+queue still reads pairs the old way in this release, so recording changes nothing a reader sees.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CONFLICT_SWEEP_SECS` | `60` | Seconds between timer sweeps. The timer covers a wake the listener lost. `0` stops all pair recording: no listener, no sweeps, and every new row stays pending. Above `0`, the listener holds one pooled connection for the life of the process, so boot refuses `DB_MAX_CONNECTIONS` below 2. |
+| `CONFLICT_SWEEP_BUDGET_MS` | `5000` | Time one sweep may spend on the tenant before it yields. Boot refuses a value below 100 or above 25000. |
+
+Behind a connection pooler in transaction mode `LISTEN` does not hold and every wake goes missing.
+The timer still records every pair, up to `CONFLICT_SWEEP_SECS` late. Point the server at a direct
+connection if that delay matters.
+
 `arity` and `graph` are the two worth reading about before use, because both decide what the store
 hides. Declaring a tag `single` lets the cleanup pass propose that one dated fact ended another, so
 `arity preview <tag>` shows what a declaration would end before anything is written. Approving those

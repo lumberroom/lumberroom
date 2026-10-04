@@ -9,6 +9,7 @@ pub mod alias;
 pub mod archive;
 pub mod bootstrap;
 pub mod cleanup;
+pub mod conflicts;
 pub mod currency;
 pub mod eval;
 pub mod export;
