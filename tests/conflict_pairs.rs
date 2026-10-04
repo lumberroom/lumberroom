@@ -1,9 +1,11 @@
-//! Write-time conflict pairs, plan E1-T4: the triggers, the sweep and the scan against a real
-//! Postgres, skipped when none is reachable, in the shape `tests/review_queue.rs` uses.
+//! Write-time conflict pairs, plan tasks E1-T4 and E2-T4: the triggers, the sweep, the scan and the
+//! stored-pair read against a real Postgres, skipped when none is reachable, in the shape
+//! `tests/review_queue.rs` uses.
 //!
-//! Every event test ends in `assert_parity`: one sweep, then the stored-pair read must return the
-//! rows the self-join returns today, bit for bit and in the same order. The stored read is spec 4.9
-//! and stays a test constant until E2 moves it into the adapter.
+//! Every event test ends in `assert_parity`: one sweep, then the adapter's `conflicts` must return
+//! the rows the old self-join returns, in the same order, and every stored similarity must equal
+//! the self-join's to the bit. Going through the adapter means the parity checks the statement the
+//! server ships rather than a copy of it.
 //!
 //! Rows that need an exact similarity go in through SQL with hand-built vectors. Rows that test the
 //! write path go through `write::run`, whose hash embedder scores the fixture wording at about 0.91,
@@ -44,8 +46,8 @@ const DIM: usize = 768;
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Today's `CONFLICTS_SQL` (`src/adapters/postgres/memory.rs`, before E2), kept here as the oracle.
-/// E2 replaces the adapter's body with the stored read; this copy must not follow it.
+/// `CONFLICTS_SQL` as it stood before E2 (`src/adapters/postgres/memory.rs` at 47d7a55), kept here
+/// as the oracle. The adapter now reads stored pairs; this copy must not follow it.
 const SELF_JOIN_SQL: &str = "SELECT a.id AS older_id, b.id AS newer_id,
                     (1 - (a.embedding <=> b.embedding))::float8 AS similarity
                FROM memory a
@@ -82,41 +84,6 @@ const SELF_JOIN_SQL: &str = "SELECT a.id AS older_id, b.id AS newer_id,
                     )
               ORDER BY similarity DESC, a.created_at, a.id, b.id
               LIMIT $3 OFFSET $4";
-
-/// Spec 4.9, the read E2 ships, cut to the three columns parity compares.
-const STORED_SQL: &str = "SELECT a.id AS older_id, b.id AS newer_id, c.similarity
-  FROM memory_conflict c
-  JOIN memory a ON a.tenant_id = c.tenant_id AND a.id = c.older_id
-  JOIN memory b ON b.tenant_id = c.tenant_id AND b.id = c.newer_id
- WHERE c.tenant_id = $1
-   AND c.similarity >= $2
-   AND a.namespace = b.namespace
-   AND a.superseded_by IS NULL
-   AND (a.occurred_until IS NULL OR a.occurred_until > now())
-   AND b.superseded_by IS NULL
-   AND (b.occurred_until IS NULL OR b.occurred_until > now())
-   AND EXISTS (
-         SELECT 1
-           FROM unnest($5::text[], $6::bool[], $7::text[]) AS g(prefix, exact, max)
-          WHERE CASE WHEN g.exact THEN a.namespace = g.prefix
-                     ELSE left(a.namespace, length(g.prefix)) = g.prefix END
-            AND sensitivity_rank(g.max) >= sensitivity_rank(a.sensitivity)
-       )
-   AND EXISTS (
-         SELECT 1
-           FROM unnest($5::text[], $6::bool[], $7::text[]) AS g(prefix, exact, max)
-          WHERE CASE WHEN g.exact THEN b.namespace = g.prefix
-                     ELSE left(b.namespace, length(g.prefix)) = g.prefix END
-            AND sensitivity_rank(g.max) >= sensitivity_rank(b.sensitivity)
-       )
-   AND NOT EXISTS (
-         SELECT 1 FROM memory_pair_dismissed d
-          WHERE d.tenant_id = c.tenant_id
-            AND d.lo_id = least(a.id, b.id)
-            AND d.hi_id = greatest(a.id, b.id)
-       )
- ORDER BY c.similarity DESC, a.created_at, a.id, b.id
- LIMIT $3 OFFSET $4";
 
 /// The pattern test 15 runs in SQL. `\y` and never `\b`: a Postgres regex reads `\b` as a backspace,
 /// and with it the pattern matched no function at all.
@@ -307,8 +274,13 @@ fn noise(seed: u64) -> Vec<f32> {
 
 /// `base` nudged by a little noise. Two of these from one base score about 0.96.
 fn near(base: &[f32], seed: u64) -> Vec<f32> {
+    nudged(base, seed, 0.2)
+}
+
+/// `base` plus `eps` of noise. Two rows at `eps` from one base score about `1 / (1 + eps^2)`.
+fn nudged(base: &[f32], seed: u64, eps: f32) -> Vec<f32> {
     let n = noise(seed);
-    normalise(base.iter().zip(&n).map(|(b, e)| b + 0.2 * e).collect())
+    normalise(base.iter().zip(&n).map(|(b, e)| b + eps * e).collect())
 }
 
 /// One live open row, inserted the way a direct `psql` insert would be: the wake trigger fires and
@@ -317,11 +289,27 @@ async fn insert_row<'e, E>(exec: E, tenant: &str, ns: &str, emb: &[f32], age_sec
 where
     E: sqlx::PgExecutor<'e>,
 {
+    insert_row_at(exec, tenant, ns, emb, age_secs, Sensitivity::Open).await
+}
+
+/// `insert_row` at a chosen level. The content stays plaintext: the read tests the stored level,
+/// and the table's representation check admits a plaintext row at any level.
+async fn insert_row_at<'e, E>(
+    exec: E,
+    tenant: &str,
+    ns: &str,
+    emb: &[f32],
+    age_secs: i64,
+    level: Sensitivity,
+) -> Uuid
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO memory (id, tenant_id, namespace, content, embedding, source_client,
                              embedding_model, sensitivity, created_at)
-         VALUES ($1, $2, $3, $4, $5, 'test', 'hash', 'open',
+         VALUES ($1, $2, $3, $4, $5, 'test', 'hash', $7,
                  now() - make_interval(secs => $6::float8))",
     )
     .bind(id)
@@ -330,6 +318,7 @@ where
     .bind(format!("fixture row {id}"))
     .bind(pgvector::Vector::from(emb.to_vec()))
     .bind(age_secs as f64)
+    .bind(level.as_str())
     .execute(exec)
     .await
     .unwrap();
@@ -360,18 +349,35 @@ async fn write_at(ctx: &Ctx, content: &str, ns: &str) -> Uuid {
 // Reads
 // ---------------------------------------------------------------------------------------------
 
-fn full_grant() -> (Vec<String>, Vec<bool>, Vec<String>) {
-    (vec![String::new()], vec![false], vec!["sealed".to_string()])
+/// The adapter's `grant_arrays` is `pub(crate)`, so the self-join oracle builds its binds here. The
+/// stored side goes through the adapter, so a drift between the two shows as a parity failure.
+fn grant_binds(grants: &[NamespaceGrant]) -> (Vec<String>, Vec<bool>, Vec<String>) {
+    let mut out = (Vec::new(), Vec::new(), Vec::new());
+    for g in grants {
+        let pattern = g.namespace.trim().to_ascii_lowercase();
+        match pattern.strip_suffix('*') {
+            Some(prefix) => {
+                out.0.push(prefix.to_string());
+                out.1.push(false);
+            }
+            None => {
+                out.0.push(pattern);
+                out.1.push(true);
+            }
+        }
+        out.2.push(g.max.as_str().to_string());
+    }
+    out
 }
 
-async fn pairs_by(
+async fn self_join(
     pool: &PgPool,
-    sql: &'static str,
     tenant: &str,
     floor: f64,
+    grants: &[NamespaceGrant],
 ) -> Vec<(Uuid, Uuid, f64)> {
-    let (prefix, exact, max) = full_grant();
-    sqlx::query_as(sql)
+    let (prefix, exact, max) = grant_binds(grants);
+    sqlx::query_as(SELF_JOIN_SQL)
         .bind(tenant)
         .bind(floor)
         .bind(1_000_000i64)
@@ -384,16 +390,58 @@ async fn pairs_by(
         .unwrap()
 }
 
-/// One sweep, then the stored read must equal the self-join row for row, similarity included to
-/// the bit. A sweep that leaves rows pending would make the comparison prove nothing, so that fails
-/// first.
+/// The shipped read, through the port.
+async fn stored(
+    h: &Harness,
+    tenant: &str,
+    floor: f64,
+    grants: &[NamespaceGrant],
+) -> Vec<(Uuid, Uuid, f64)> {
+    h.repo()
+        .conflicts(tenant, floor, 1_000_000, 0, grants)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| {
+            let id = |s: &str| Uuid::parse_str(s).unwrap();
+            (id(&p.older.id), id(&p.newer.id), p.similarity)
+        })
+        .collect()
+}
+
+/// The adapter rounds to four places as it maps rows; this is the same arithmetic.
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
+}
+
+/// One sweep, then parity under the whole grant.
 async fn assert_parity(h: &Harness, tenant: &str, floor: f64) {
+    assert_parity_under(h, tenant, floor, &NamespaceGrant::everything()).await;
+}
+
+/// One sweep, then the adapter's read must list the self-join's pairs in its order, and every pair
+/// the self-join finds must be stored at the self-join's similarity to the bit. The adapter rounds
+/// what it returns, so the bit comparison reads `memory_conflict` itself. A sweep that leaves rows
+/// pending would make the comparison prove nothing, so that fails first. Returns the pairs so a
+/// caller can check the fixture was not empty.
+async fn assert_parity_under(
+    h: &Harness,
+    tenant: &str,
+    floor: f64,
+    grants: &[NamespaceGrant],
+) -> Vec<(Uuid, Uuid, f64)> {
     let report =
         conflicts::sweep(h.repo().as_ref(), tenant, floor, Duration::from_secs(10)).await.unwrap();
     assert_eq!(report.pending, 0, "the parity sweep left rows pending: {report:?}");
-    let stored = pairs_by(&h.pool, STORED_SQL, tenant, floor).await;
-    let joined = pairs_by(&h.pool, SELF_JOIN_SQL, tenant, floor).await;
-    assert_eq!(stored, joined, "stored pairs differ from the self-join at floor {floor}");
+    let joined = self_join(&h.pool, tenant, floor, grants).await;
+    let read = stored(h, tenant, floor, grants).await;
+    let joined_rounded: Vec<_> = joined.iter().map(|(a, b, s)| (*a, *b, round4(*s))).collect();
+    assert_eq!(read, joined_rounded, "the stored read differs from the self-join at floor {floor}");
+    for (a, b, sim) in &joined {
+        let kept = pair_stored(&h.pool, *a, *b).await;
+        assert_eq!(kept.map(f64::to_bits), Some(sim.to_bits()), "pair {a} {b} at floor {floor}");
+    }
+    joined
 }
 
 async fn pair_stored(pool: &PgPool, a: Uuid, b: Uuid) -> Option<f64> {
@@ -706,6 +754,209 @@ async fn forgetting_a_row_cascades_its_pairs_and_mark() {
     assert!(!marked(&h.pool, a).await);
     assert!(marked(&h.pool, b).await, "the surviving row lost its mark");
     assert_parity(&h, h.tenant(), FLOOR).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// 9. Parity across grants and floors
+// ---------------------------------------------------------------------------------------------
+
+type Grants = [(&'static str, Vec<NamespaceGrant>); 3];
+
+/// Parity at both floors under each grant, as `(floor, grant name, pairs read)`.
+async fn parity_at_every_grant(h: &Harness, grants: &Grants) -> Vec<(f64, &'static str, usize)> {
+    let mut seen = Vec::new();
+    for floor in [FLOOR, 0.95] {
+        for (name, grant) in grants {
+            let pairs = assert_parity_under(h, h.tenant(), floor, grant).await;
+            assert!(!pairs.is_empty(), "{name} at {floor} read no pair, so parity proved nothing");
+            seen.push((floor, *name, pairs.len()));
+        }
+    }
+    seen
+}
+
+fn pairs_read(seen: &[(f64, &str, usize)], floor: f64, name: &str) -> usize {
+    seen.iter().find(|(f, n, _)| *f == floor && *n == name).map(|(_, _, c)| *c).unwrap()
+}
+
+/// The stored read tests liveness, the grant and the dismissed ledger itself, because none of them
+/// writes to the pair table. Three grants that cut the fixture differently and two floors that
+/// split its pairs show the grant holds on both halves. Ending rows with `occurred_until`, then
+/// superseding a newer half and an older half, shows liveness holds on both halves under both
+/// retirement clocks.
+#[tokio::test]
+async fn parity_with_the_self_join_at_three_grants_and_two_floors() {
+    let h = harness_or_skip!();
+    let levels = [Sensitivity::Open, Sensitivity::Private, Sensitivity::Sealed];
+    let namespaces = ["project:alpha", "project:beta", "personal:gamma"];
+    let mut age = 10_000i64;
+    let mut ids = Vec::new();
+    for (n, ns) in namespaces.iter().enumerate() {
+        // Two clusters a namespace. Rows at 0.2 of noise pair at about 0.96, rows at 0.3 at about
+        // 0.92, and a 0.2 row with a 0.3 row at about 0.94, so both floors cut through the pairs.
+        for cluster in 0..2u64 {
+            let base = noise(70_000 + 10 * n as u64 + cluster);
+            for i in 0..10u64 {
+                let eps = if i % 2 == 0 { 0.2 } else { 0.3 };
+                let seed = 71_000 + 100 * n as u64 + 20 * cluster + i;
+                let level = levels[(i as usize + n) % levels.len()];
+                let emb = nudged(&base, seed, eps);
+                ids.push(insert_row_at(&h.pool, h.tenant(), ns, &emb, age, level).await);
+                age -= 1;
+            }
+        }
+    }
+    assert_eq!(ids.len(), 60);
+
+    let grants: Grants = [
+        ("everything at sealed", NamespaceGrant::everything()),
+        ("project:* at open", vec![NamespaceGrant::open("project:*")]),
+        (
+            "personal:gamma at private",
+            vec![NamespaceGrant::new("personal:gamma", Sensitivity::Private)],
+        ),
+    ];
+    let seen = parity_at_every_grant(&h, &grants).await;
+    // Each grant and each floor has to change the answer, or one of them tested nothing.
+    for (name, _) in &grants {
+        let (low, high) = (pairs_read(&seen, FLOOR, name), pairs_read(&seen, 0.95, name));
+        assert!(high < low, "{name}: the floors read alike: {seen:?}");
+    }
+    for floor in [FLOOR, 0.95] {
+        let all = pairs_read(&seen, floor, "everything at sealed");
+        assert!(pairs_read(&seen, floor, "project:* at open") < all, "{seen:?}");
+        assert!(pairs_read(&seen, floor, "personal:gamma at private") < all, "{seen:?}");
+    }
+
+    // Retirement writes nothing to the pair table, so these rows keep their stored pairs and only
+    // the read's liveness test keeps them out. Index 0 is project:alpha's oldest row, the older
+    // half of every pair it has; index 18 sits late in that namespace's second cluster, mostly a
+    // newer half; index 29 is the newest row of project:beta's first cluster, a newer half only.
+    sqlx::query("UPDATE memory SET occurred_until = now() - interval '1 hour' WHERE id = ANY($1)")
+        .bind(vec![ids[0], ids[18]])
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE memory SET superseded_by = $2, superseded_at = now() WHERE id = $1")
+        .bind(ids[29])
+        .bind(ids[28])
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM memory_conflict WHERE older_id = ANY($1) OR newer_id = ANY($1)",
+    )
+    .bind(vec![ids[0], ids[18], ids[29]])
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(kept > 0, "the retired rows held no stored pair, so the liveness check tests nothing");
+
+    let after = parity_at_every_grant(&h, &grants).await;
+    let everything = |s: &[(f64, &str, usize)]| pairs_read(s, FLOOR, "everything at sealed");
+    assert!(everything(&after) < everything(&seen), "retirement removed no pair: {after:?}");
+
+    // Supersession is the usual way an older half retires, and the steps above end both older
+    // halves with occurred_until, so only this step reaches `a.superseded_by`. Index 20 is the
+    // oldest row of project:beta's first cluster, the older half of every pair it holds there, and
+    // keeps occurred_until NULL so the link test alone has to drop its pairs.
+    let as_older: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM memory_conflict WHERE older_id = $1")
+            .bind(ids[20])
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(
+        as_older > 0,
+        "index 20 is the older half of no stored pair, so this step tests nothing"
+    );
+    sqlx::query("UPDATE memory SET superseded_by = $2, superseded_at = now() WHERE id = $1")
+        .bind(ids[20])
+        .bind(ids[21])
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let superseded = parity_at_every_grant(&h, &grants).await;
+    assert!(
+        everything(&superseded) < everything(&after),
+        "superseding an older half removed no pair: {superseded:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 10. Dismissal
+// ---------------------------------------------------------------------------------------------
+
+/// Dismissal writes the ledger and leaves the stored pair alone, so the read's anti-join is the
+/// only thing that keeps a kept pair out of the queue.
+#[tokio::test]
+async fn a_dismissed_pair_stays_out_of_the_stored_read() {
+    let h = harness_or_skip!();
+    let a = insert_row(&h.pool, h.tenant(), "global", &axis(&[(0, 1.0)]), 30).await;
+    let b = insert_row(&h.pool, h.tenant(), "global", &axis(&[(0, 0.95), (1, 0.3122)]), 20).await;
+    let c = insert_row(&h.pool, h.tenant(), "global", &axis(&[(0, 0.97), (2, 0.2431)]), 10).await;
+    let everything = NamespaceGrant::everything();
+    assert_eq!(assert_parity_under(&h, h.tenant(), FLOOR, &everything).await.len(), 3);
+
+    // Newer id first: the ledger keeps uuid order whichever way round the caller names the pair.
+    assert!(h.repo().dismiss_pair(h.tenant(), b, a, "mac", "test").await.unwrap());
+    assert!(pair_stored(&h.pool, a, b).await.is_some(), "dismissal deleted the stored pair");
+    let read = stored(&h, h.tenant(), FLOOR, &everything).await;
+    assert_eq!(read.len(), 2, "{read:?}");
+    assert!(read.iter().all(|(x, y, _)| !(*x == a && *y == b)), "the dismissed pair was read");
+    assert!(read.iter().any(|(x, y, _)| *x == a && *y == c));
+    assert!(read.iter().any(|(x, y, _)| *x == b && *y == c));
+    assert_parity(&h, h.tenant(), FLOOR).await;
+
+    assert!(h.repo().undismiss_pair(h.tenant(), a, b).await.unwrap());
+    assert_eq!(stored(&h, h.tenant(), FLOOR, &everything).await.len(), 3, "undismiss lost it");
+}
+
+// ---------------------------------------------------------------------------------------------
+// 11. Pending and the pair under a partial grant
+// ---------------------------------------------------------------------------------------------
+
+/// A reader learns nothing from a count of rows it may not see, and a pair is a finding only for a
+/// reader who may see both halves. Both tests run inside the statements, so a reader at open never
+/// receives the private half to drop.
+#[tokio::test]
+async fn pending_counts_only_rows_the_reader_may_see() {
+    let h = harness_or_skip!();
+    let ns = "project:levels";
+    let open_reader = vec![NamespaceGrant::open("project:*")];
+    let private_reader = vec![NamespaceGrant::new("project:*", Sensitivity::Private)];
+    let a = insert_row_at(&h.pool, h.tenant(), ns, &axis(&[(0, 1.0)]), 30, Sensitivity::Open).await;
+    let b = insert_row_at(
+        &h.pool,
+        h.tenant(),
+        ns,
+        &axis(&[(0, 0.95), (1, 0.3122)]),
+        20,
+        Sensitivity::Private,
+    )
+    .await;
+
+    let pending = |grant: Vec<NamespaceGrant>| {
+        let repo = h.repo();
+        let tenant = h.tenant().to_string();
+        async move { repo.conflicts_pending(&tenant, FLOOR, &grant).await.unwrap() }
+    };
+    assert_eq!(pending(private_reader.clone()).await, 2);
+    assert_eq!(pending(open_reader.clone()).await, 1, "an open reader counted the private row");
+
+    // The pair is stored, one half open and one private.
+    assert_eq!(assert_parity_under(&h, h.tenant(), FLOOR, &private_reader).await.len(), 1);
+    assert!(pair_stored(&h.pool, a, b).await.is_some());
+    assert!(
+        stored(&h, h.tenant(), FLOOR, &open_reader).await.is_empty(),
+        "an open reader read a pair with a private half"
+    );
+    assert!(assert_parity_under(&h, h.tenant(), FLOOR, &open_reader).await.is_empty());
+
+    // An unmarked private row: pending for the reader who may see it, invisible to the other.
+    insert_row_at(&h.pool, h.tenant(), ns, &noise(80_000), 10, Sensitivity::Private).await;
+    assert_eq!(pending(private_reader.clone()).await, 1);
+    assert_eq!(pending(open_reader.clone()).await, 0, "an open reader counted the private row");
 }
 
 // ---------------------------------------------------------------------------------------------

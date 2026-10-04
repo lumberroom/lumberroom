@@ -785,12 +785,14 @@ pub trait MemoryRepository: Send + Sync {
 
     async fn staleness(&self, tenant: &str) -> Result<Staleness>;
 
-    /// Near-duplicate live pairs, for `lumberroom review`. Computed on demand rather than recorded at
-    /// write time: a stored queue drifts out of step with the store it describes, and this runs by
-    /// hand rather than on the hot path.
+    /// Near-duplicate live pairs, for `lumberroom review`, read from the pairs the sweeper stored.
+    /// A row the sweeper has not scanned yet contributes no pair, so the list can be short;
+    /// `conflicts_pending` says by how much. Liveness, the grant on both halves at their stored
+    /// level and the dismissed ledger all apply inside the query, because retirement and dismissal
+    /// write nothing to the stored pairs.
     ///
     /// `offset` is bound into the statement. Reading a page and discarding its head in Rust makes
-    /// a deep page cost the whole scan, and this join has no index to lean on.
+    /// a deep page cost every row before it.
     async fn conflicts(
         &self,
         tenant: &str,
@@ -823,14 +825,6 @@ pub trait MemoryRepository: Send + Sync {
 
     /// For the envelope's `dismissed`. Counted in the query, so it never names an id to say how many.
     async fn dismissed_count(&self, tenant: &str, reader: &[NamespaceGrant]) -> Result<i64>;
-
-    /// Live embedded rows per readable namespace, highest first. The conflicts self-join runs per
-    /// namespace, so the largest one bounds the work and the whole-tenant total does not.
-    async fn live_embedded_counts(
-        &self,
-        tenant: &str,
-        reader: &[NamespaceGrant],
-    ) -> Result<Vec<(String, i64)>>;
 
     /// The ciphertext columns for rows the caller already holds, so the service can decrypt them.
     ///

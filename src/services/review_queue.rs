@@ -26,7 +26,6 @@ pub mod codes {
     pub const UNKNOWN_ORIGIN: &str = "unknown_origin";
     pub const NOT_A_QUEUE_KEY: &str = "not_a_queue_key";
     pub const UNKNOWN_SOURCE: &str = "unknown_source";
-    pub const NAMESPACE_TOO_LARGE: &str = "namespace_too_large";
     pub const PAGE_TOO_DEEP: &str = "page_too_deep";
     pub const ROW_NOT_OPENED: &str = "row_not_opened";
     pub const REASON_REQUIRED: &str = "reason_required";
@@ -188,6 +187,7 @@ pub struct Queue {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub refused: std::collections::BTreeMap<String, &'static str>,
     pub dismissed: i64,
+    pub conflicts_pending: i64,
     pub stale_days: i32,
     pub min_similarity: f64,
     pub limit: i64,
@@ -437,26 +437,20 @@ fn row_writable(ctx: &Ctx, row: &Memory, failed: &[String]) -> bool {
     !failed.contains(&row.id) && can_write(&ctx.principal, &row.namespace, row.sensitivity)
 }
 
-/// Bounded before it runs: `live_embedded_counts` answers in milliseconds and a namespace past
-/// `conflict_scan_max` gets no conflicts review rather than a query the probe in spec §0 timed
-/// out to tens of seconds.
+/// Reads stored pairs, so no namespace is too large to answer. A row the sweeper has not scanned
+/// yet has no pairs to read, so the page can be short; the third value says by how many readable
+/// rows.
 async fn conflict_items(
     ctx: &Ctx,
     min_similarity: f64,
     limit: i64,
     offset: i64,
-) -> Result<(Vec<QueueItem>, bool)> {
-    let counts = ctx.repos.memories.live_embedded_counts(ctx.tenant(), &ctx.principal.read).await?;
-    if let Some((_, top)) = counts.first() {
-        if *top > ctx.cfg.quality.conflict_scan_max {
-            return Err(DomainError::validation(
-                "the largest readable namespace holds more live embedded rows than this server \
-                 scans for conflicts",
-            )
-            .with_code(codes::NAMESPACE_TOO_LARGE));
-        }
-    }
-
+) -> Result<(Vec<QueueItem>, bool, i64)> {
+    let pending = ctx
+        .repos
+        .memories
+        .conflicts_pending(ctx.tenant(), min_similarity, &ctx.principal.read)
+        .await?;
     let mut pairs = ctx
         .repos
         .memories
@@ -500,7 +494,7 @@ async fn conflict_items(
             verdicts: verdicts_for(Source::Conflict, writable, ctx.principal.may_delete),
         });
     }
-    Ok((items, has_more))
+    Ok((items, has_more, pending))
 }
 
 async fn stale_items(
@@ -608,18 +602,21 @@ pub async fn queue(
     let mut items = Vec::new();
     let mut refused: BTreeMap<String, &'static str> = BTreeMap::new();
     let mut has_more = false;
+    // Stays 0 when the conflict source was not asked for or refused.
+    let mut conflicts_pending = 0;
     let mut attempted = 0u32;
     let mut failed = 0u32;
     // Kept whole, not just its code: a single-source request that refuses has to answer with the
-    // refusal's own `Kind` (e.g. `namespace_too_large` is a 400, not a 500) end to end.
+    // refusal's own `Kind` (a validation refusal is a 400, not a 500) end to end.
     let mut first_error: Option<DomainError> = None;
 
     if wants(Source::Conflict) {
         attempted += 1;
         match conflict_items(ctx, min_similarity, limit, offset).await {
-            Ok((mut out, more)) => {
+            Ok((mut out, more, pending)) => {
                 has_more |= more;
                 items.append(&mut out);
+                conflicts_pending = pending;
             }
             Err(e) => {
                 failed += 1;
@@ -666,8 +663,8 @@ pub async fn queue(
 
     // One source refusing leaves the others in the envelope; every requested source refusing
     // means the caller asked for something and got nothing. Answer with the first refusal's own
-    // `Kind` and code rather than flattening it to an internal 500: a single-source
-    // `namespace_too_large` (spec, docs/managing.md) has to reach the caller as the 400 it is.
+    // `Kind` and code rather than flattening it to an internal 500: a single-source validation
+    // refusal has to reach the caller as the 400 it is.
     if attempted > 0 && failed == attempted {
         return Err(
             first_error.expect("failed == attempted > 0 means at least one error was recorded")
@@ -685,6 +682,7 @@ pub async fn queue(
         },
         refused,
         dismissed,
+        conflicts_pending,
         stale_days: days,
         min_similarity,
         limit,
@@ -1162,6 +1160,15 @@ fn render_key(key: &str) -> &str {
 
 pub fn render(q: &Queue) -> String {
     let mut out = String::new();
+    // First, so a model reading the page knows a short conflict list may grow before it concludes
+    // there is nothing to review.
+    if q.conflicts_pending > 0 {
+        out.push_str(&format!(
+            "{} readable memories have not been checked for conflicts yet, so this list may be \
+             short.\n",
+            q.conflicts_pending
+        ));
+    }
     for item in &q.items {
         out.push_str(render_key(&item.key));
         out.push('\n');
@@ -1288,6 +1295,7 @@ mod tests {
             sources: Sources { conflict: true, stale: true, proposal: vec!["cleanup".into()] },
             refused: BTreeMap::new(),
             dismissed: 0,
+            conflicts_pending: 0,
             stale_days: 365,
             min_similarity: 0.9,
             limit: 50,
@@ -1328,6 +1336,7 @@ mod tests {
             sources: Sources { conflict: true, stale: true, proposal: vec![] },
             refused: BTreeMap::new(),
             dismissed: 0,
+            conflicts_pending: 0,
             stale_days: 365,
             min_similarity: 0.9,
             limit: 50,
@@ -1367,6 +1376,7 @@ mod tests {
             sources: Sources { conflict: true, stale: true, proposal: vec!["canned".into()] },
             refused: BTreeMap::new(),
             dismissed: 0,
+            conflicts_pending: 0,
             stale_days: 365,
             min_similarity: 0.9,
             limit: 50,
@@ -1435,6 +1445,18 @@ mod tests {
         let long = "x".repeat(REASON_MAX_CHARS + 1);
         let d = proposal_decision(Verdict::Dismiss, None, Some(&long), Some("v1"), Via::Mcp);
         assert_eq!(check_proposal_decision(&d).unwrap_err().code(), Some(codes::REASON_TOO_LONG));
+    }
+
+    #[test]
+    fn render_says_the_list_may_be_short_only_while_rows_are_pending() {
+        let line =
+            "3 readable memories have not been checked for conflicts yet, so this list may be \
+                    short.";
+        let mut q = queue_with_row("a fact");
+        q.conflicts_pending = 3;
+        assert_eq!(render(&q).lines().filter(|l| *l == line).count(), 1, "{}", render(&q));
+        q.conflicts_pending = 0;
+        assert!(!render(&q).contains("checked for conflicts"), "{}", render(&q));
     }
 
     #[test]

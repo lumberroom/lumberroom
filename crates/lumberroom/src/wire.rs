@@ -425,6 +425,10 @@ pub struct ReviewQueue {
     #[serde(default)]
     pub refused: std::collections::BTreeMap<String, String>,
     pub dismissed: i64,
+    /// Live rows the conflict sweeper has not scanned yet. An older server omits it, which reads
+    /// as nothing pending.
+    #[serde(default)]
+    pub conflicts_pending: i64,
     pub stale_days: i32,
     pub min_similarity: f64,
     pub limit: i64,

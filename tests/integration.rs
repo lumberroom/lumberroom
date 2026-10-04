@@ -15,8 +15,8 @@ use lumberroom_server::domain::types::{Invocation, Principal, Sensitivity, ToolC
 use lumberroom_server::ports::registry::RegistryUpsert;
 use lumberroom_server::ports::RegistryWrite;
 use lumberroom_server::services::{
-    bootstrap, currency, export, forget, graph, recall, registry, review, review_queue, search,
-    write, Ctx, Repos,
+    bootstrap, conflicts, currency, export, forget, graph, recall, registry, review, review_queue,
+    search, write, Ctx, Repos,
 };
 use sqlx::{PgPool, Row};
 
@@ -501,6 +501,17 @@ async fn a_supersedes_retry_reuses_the_row_the_first_call_stored() {
             .unwrap();
     assert_eq!(mirror.map(|u| u.to_string()).as_deref(), Some(old.id.as_str()));
 
+    // The queue reads stored pairs and this harness starts no sweeper. Without the sweep a twin
+    // would go unpaired and the check below could never fail.
+    let swept = conflicts::sweep(
+        ctx.repos.memories.as_ref(),
+        ctx.tenant(),
+        ctx.cfg.quality.conflict_threshold,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(swept.pending, 0, "the sweep left rows unscanned: {swept:?}");
     let queue = review_queue::queue(
         &ctx,
         &[],

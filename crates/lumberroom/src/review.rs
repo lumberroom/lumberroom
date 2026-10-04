@@ -58,6 +58,7 @@ async fn run_loop(
     let mut offset: i64 = args.int("offset", 0).max(0);
     let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut running = Tally::default();
+    let mut told_pending = false;
 
     'paging: loop {
         // A run of skips can carry `offset` past the server's `page_too_deep` ceiling; that
@@ -67,6 +68,9 @@ async fn run_loop(
             break 'paging;
         };
         running.dismissed_in_ledger = queue.dismissed;
+        if let Some(line) = pending_notice_once(&mut told_pending, &queue) {
+            out(&line);
+        }
 
         if queue.items.iter().all(|it| skipped.contains(&it.key)) {
             if queue.has_more && !queue.items.is_empty() {
@@ -231,6 +235,26 @@ fn bump(t: &mut Tally, verdict: wire::Verdict) {
         wire::Verdict::Apply => t.applied += 1,
         wire::Verdict::Dismiss => t.dismissed += 1,
     }
+}
+
+/// Once per run: each refetch after a decision would repeat the same warning. The first queue
+/// spends the once even when nothing is pending, so a count that appears later stays quiet.
+fn pending_notice_once(told: &mut bool, queue: &wire::ReviewQueue) -> Option<String> {
+    if std::mem::replace(told, true) {
+        return None;
+    }
+    conflicts_pending_line(queue)
+}
+
+/// The server's own wording from the spec: rows the sweeper has not scanned cannot show a pair,
+/// so the list can be short until it catches up.
+fn conflicts_pending_line(queue: &wire::ReviewQueue) -> Option<String> {
+    (queue.conflicts_pending > 0).then(|| {
+        format!(
+            "{} readable memories have not been checked for conflicts yet, so this list may be short.",
+            queue.conflicts_pending
+        )
+    })
 }
 
 fn print_header(queue: &wire::ReviewQueue, item: &wire::ReviewItem, pos: usize, total: usize) {
@@ -1081,6 +1105,51 @@ mod tests {
             proposal_state: None,
         };
         assert_eq!(one_line(&d), "wrote 2b7c and retired 1; unfinished: b");
+    }
+
+    fn queue_with_pending(n: i64) -> wire::ReviewQueue {
+        serde_json::from_value(serde_json::json!({
+            "items": [],
+            "sources": { "conflict": true, "stale": true, "proposal": [] },
+            "dismissed": 0,
+            "conflicts_pending": n,
+            "stale_days": 180,
+            "min_similarity": 0.85,
+            "limit": 50,
+            "offset": 0,
+            "has_more": false,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn pending_conflicts_print_one_line_that_says_the_list_may_be_short() {
+        assert_eq!(
+            conflicts_pending_line(&queue_with_pending(12)).as_deref(),
+            Some(
+                "12 readable memories have not been checked for conflicts yet, so this list may be short."
+            )
+        );
+    }
+
+    #[test]
+    fn the_pending_line_comes_out_once_per_run_however_many_refetches() {
+        let queue = queue_with_pending(12);
+        let mut told = false;
+        assert!(pending_notice_once(&mut told, &queue).is_some());
+        assert_eq!(pending_notice_once(&mut told, &queue), None);
+    }
+
+    #[test]
+    fn a_first_queue_with_nothing_pending_still_spends_the_once() {
+        let mut told = false;
+        assert_eq!(pending_notice_once(&mut told, &queue_with_pending(0)), None);
+        assert_eq!(pending_notice_once(&mut told, &queue_with_pending(5)), None);
+    }
+
+    #[test]
+    fn no_pending_conflicts_print_nothing() {
+        assert_eq!(conflicts_pending_line(&queue_with_pending(0)), None);
     }
 
     #[test]

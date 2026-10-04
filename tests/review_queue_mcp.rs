@@ -20,7 +20,7 @@ use lumberroom_server::ports::OauthStore;
 use lumberroom_server::services::review_queue::{
     ProposalDecided, ProposalDecision, ProposalItem, ProposalSource, Verdict, Via,
 };
-use lumberroom_server::services::{write, Ctx, Repos};
+use lumberroom_server::services::{conflicts, write, Ctx, Repos};
 use sqlx::PgPool;
 
 mod common;
@@ -391,7 +391,23 @@ async fn conflict_pair(ctx: &Ctx, pool: &PgPool, namespace: &str, tag: &str) -> 
         namespace,
     )
     .await;
+    sweep_pairs(ctx).await;
     (older, newer)
+}
+
+/// The conflict source reads stored pairs and this harness starts no sweeper, so a test records its
+/// pairs here before it reads them. Run it after any `created_at` backdate: a scan fixes which half
+/// of a pair is the older one.
+async fn sweep_pairs(ctx: &Ctx) {
+    let report = conflicts::sweep(
+        ctx.repos.memories.as_ref(),
+        ctx.tenant(),
+        ctx.cfg.quality.conflict_threshold,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.pending, 0, "the sweep left rows unscanned: {report:?}");
 }
 
 async fn make_stale(pool: &PgPool, id: &str) {
@@ -585,6 +601,28 @@ async fn a_verdict_the_item_never_offered_is_refused_by_its_own_code() {
         h.call("review_decide", serde_json::json!({ "key": key, "verdict": "apply" })).await;
     assert!(refused(&result), "{result:?}");
     assert!(text(&result).contains("verdict_not_for_source"), "{}", text(&result));
+}
+
+/// The legacy conflicts route lists stored pairs only, so it carries the same `conflicts_pending`
+/// the queue answers with: a row the sweeper has not scanned yet is the gap a short list hides.
+#[tokio::test]
+async fn the_legacy_conflicts_route_carries_conflicts_pending() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    conflict_pair(&h.ctx, &h.pool, "global", "lg1").await;
+    write_at(&h.ctx, &format!("a fact waiting for its scan {}", nonce("lg2")), "global").await;
+
+    let res = reqwest::Client::new()
+        .get(format!("{}/admin/review/conflicts?min_similarity=0", h.base))
+        .bearer_auth(OWNER_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = res.text().await.unwrap();
+    assert!(status.is_success(), "the route answered {status}: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["conflicts_pending"], 1, "one row written after the sweep: {v}");
+    assert!(!v["pairs"].as_array().unwrap().is_empty(), "the swept pair is listed: {v}");
 }
 
 #[tokio::test]

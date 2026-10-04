@@ -444,9 +444,9 @@ pub struct QualityConfig {
     pub conflict_threshold: f64,
     /// How many conflict candidates a write returns.
     pub conflict_limit: i64,
-    /// Largest readable namespace, in live embedded rows, that the conflicts self-join will scan.
-    /// The join is O(n squared) per namespace: a dev-container probe timed 2.48s at 1,400 rows,
-    /// 13.33s at 3,000 and 34.96s at 5,000, so past this the queue refuses instead of hanging.
+    /// Deprecated and ignored. It bounded the conflicts self-join, and conflicts now come from
+    /// stored pairs. Still parsed for one release so a deployment that sets it boots, with one
+    /// warning from `log_effective_policy`; the release after removes the field and the variable.
     pub conflict_scan_max: i64,
     /// Seconds between timer sweeps of unscanned rows. The timer is the fallback for a wake the
     /// listener lost, which a pooler in transaction mode does to every wake. Zero turns the sweeper
@@ -1241,16 +1241,6 @@ fn validate(cfg: &Config) -> Result<()> {
         ));
     }
 
-    // Under a hundred rows a namespace the self-join answers in milliseconds, so a bound below
-    // that only refuses stores that were never at risk.
-    if cfg.quality.conflict_scan_max < 100 {
-        return Err(DomainError::validation(
-            "CONFLICT_SCAN_MAX must be at least 100. Below that the bound refuses namespaces the \
-             conflicts query answers in milliseconds, which removes the review queue's conflict \
-             source on a store that never needed protecting.",
-        ));
-    }
-
     // Zero here reads as "no limit" to somebody skimming and means "refuse every archive" to the
     // reader, which turns a bomb defence into an outage of its own.
     if cfg.quality.archive_max_decompressed_bytes == 0 {
@@ -1316,7 +1306,8 @@ fn validate(cfg: &Config) -> Result<()> {
 }
 
 /// The one line an operator needs to know what their store classifies as private, and the warning
-/// that follows from it.
+/// that follows from it. Deprecated settings warn here too, since boot calls this after tracing
+/// starts and `load` runs before it, when a warning would go nowhere.
 ///
 /// Called after the effective table is settled, not from `validate`: at load time the only rules in
 /// hand are whatever the environment supplied, which on a default install is nothing, so the check
@@ -1340,11 +1331,66 @@ pub fn log_effective_policy(cfg: &Config, source: &str) {
              refused rather than stored unencrypted"
         );
     }
+
+    // Here rather than in `load`: `load` runs before the subscriber exists, so a warning from it
+    // goes nowhere, and boot calls this function once after tracing starts.
+    warn_deprecated_settings(std::env::var("CONFLICT_SCAN_MAX").ok().as_deref());
+}
+
+/// Spec 4.8 fixes this wording.
+const CONFLICT_SCAN_MAX_DEPRECATED: &str = "CONFLICT_SCAN_MAX is ignored since conflicts are read \
+     from stored pairs, and the next release removes it";
+
+/// Takes the raw value so a test does not have to touch the process environment. Set means
+/// non-empty, which is how `env_num` reads the same variable.
+fn warn_deprecated_settings(conflict_scan_max: Option<&str>) {
+    if conflict_scan_max.is_some_and(|v| !v.is_empty()) {
+        tracing::warn!("{CONFLICT_SCAN_MAX_DEPRECATED}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything `f` logs, as text. `with_default` scopes the subscriber to this thread, so tests
+    /// running beside it neither add lines nor lose them.
+    fn logged_by(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber =
+            tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn a_set_conflict_scan_max_logs_one_deprecation_warning() {
+        let out = logged_by(|| warn_deprecated_settings(Some("2000")));
+        assert_eq!(out.matches(CONFLICT_SCAN_MAX_DEPRECATED).count(), 1, "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn an_absent_or_empty_conflict_scan_max_logs_nothing() {
+        // Empty reads as unset everywhere else in this file, so it must not warn either.
+        for raw in [None, Some("")] {
+            let out = logged_by(|| warn_deprecated_settings(raw));
+            assert!(out.is_empty(), "{raw:?} logged {out}");
+        }
+    }
 
     /// Cleanup settings that pass, so each test below changes exactly one thing.
     fn valid() -> CleanupConfig {

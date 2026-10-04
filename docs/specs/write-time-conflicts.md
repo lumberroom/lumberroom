@@ -1,10 +1,18 @@
 # Write-time conflict pairs
 
-> **Draft.** PR E1 (the pair tables, triggers and sweeper) is built on branch `feat/write-time-conflicts`. Readers (PR E2) are not built yet, and this document changes as the build proceeds.
+> **Draft.** PR E1 (the pair tables, triggers and sweeper) merged as #106 (47d7a55). PR E2 (the readers) is built on branch `feat/write-time-readers` and not merged. This document changes as the build proceeds.
 
-3 October 2026. Status: design, nothing built. Revised the same day: a trigger on `memory` now
-wakes the sweeper, and the write path no longer calls the scan (section 11 records the shapes that
-lost). Decision record:
+3 October 2026. Design. Revised the same day: a trigger on `memory` now wakes the sweeper, and the
+write path no longer calls the scan (section 11 records the shapes that lost).
+
+4 October 2026. Status: E1 merged; E2 implemented and not merged. What ran on the E2 branch, on a
+throwaway Postgres 16 with pgvector: `./scripts/cargo.sh test -j 1 --test conflict_pairs` reported
+19 passed, 0 failed, with no `skipping:` line. That covers gate E2-G1's fixture half (plan tests 9
+to 11), and six mutations of the read and the pending count each turned at least one of those
+tests red. Nothing else is recorded here as run: the full suite is the lead's gate. E2-G1's
+real-store half, E1-G3 and E2-G2 need the owner and a copy of a real store. E2-G2 has not run, and
+no record here says E1-G3 or the real-store parity has; until E2-G2 runs, the read's cost in
+section 7 stays a scratch figure. Decision record:
 [0022](../decisions/0022-conflict-pairs-are-recorded-when-a-row-is-written.md). Plan:
 [`write-time-conflicts-plan.md`](write-time-conflicts-plan.md).
 
