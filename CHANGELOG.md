@@ -6,6 +6,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The memory rules for connector clients.** The server's descriptions stopped giving orders in #92,
+  so a client that only connects the server, such as claude.ai or Cowork, no longer learns to
+  bootstrap, search before assuming, or write without asking. `client/connector-instructions.md.snippet`
+  carries those rules in under 1,000 characters for project instructions, profile preferences or
+  ChatGPT custom instructions, and `client/skills/lumberroom-memory/` carries them as a skill.
+  `docs/connect-claude-ai.md` covers both routes.
 - **The owner names a client.** An OAuth client gains `owner_label`, a name the owner chose, kept
   beside the `client_name` it registered with (decision 0023, issue #89). The consent page offers
   "Name this connection", prefilled with the cleaned registered name, and stores nothing when the
