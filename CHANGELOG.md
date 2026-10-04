@@ -21,6 +21,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   only text the consent warnings read. In a group of approved clients whose printed names collide, a
   single named client prints bare and the others keep their `(added ...)` stamp. Implemented and
   covered by the gates named in decision 0023; no hosted MCP client has seen it.
+- **A sweeper records conflicting pairs as rows commit.** Migration `20261004000026` adds the
+  `memory_conflict` pair table, the `memory_conflict_scan` ledger and triggers on `memory`. A
+  change to a row's vector, model, namespace or tenant clears its pairs and queues a fresh scan,
+  and a retired row that turns live again rescans. The sweeper
+  scans each new row against its namespace after commit, wakes on Postgres `LISTEN` and on a
+  timer, and backfills rows that predate it (spec `write-time-conflicts.md`, decision 0022). Two
+  settings: `CONFLICT_SWEEP_SECS` (default 60) spaces the timer sweeps, and `0` turns recording
+  off; `CONFLICT_SWEEP_BUDGET_MS` (default 5000) bounds one sweep, and boot refuses a value outside
+  100 to 25000. With the sweeper on, the listener holds one pooled connection for the life of the
+  process, so **boot now refuses `DB_MAX_CONNECTIONS` below 2** unless `CONFLICT_SWEEP_SECS=0`.
+  Behind a transaction-mode pooler `LISTEN` does not hold and the timer alone records pairs. See
+  "Conflict recording" in `docs/managing.md`.
 - **A fact can stop being true without being replaced.** A row gains a second clock,
   `occurred_until`, and the live-row predicate reads both: `superseded_by IS NULL AND
   (occurred_until IS NULL OR occurred_until > now())`, defined once as `live!()`. A consolidation
@@ -90,6 +102,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The review queue lists conflicts from stored pairs.** A sweeper records each row's pairs after
+  the row commits, and `conflicts` now joins those pairs to their two rows with no vector
+  arithmetic, testing liveness, the grant on both halves and the dismissed ledger inside the
+  statement (spec `write-time-conflicts.md`, decision 0022). No namespace is too large to answer,
+  so the `namespace_too_large` refusal is gone. A row the sweeper has not scanned has no pairs yet:
+  `GET /admin/review/queue`, `GET /admin/review/conflicts` and the MCP queue envelope gain
+  `conflicts_pending`, the readable rows still waiting, and the MCP render and `lumberroom review`
+  print one line when it is above zero.
+  The CLI reads the field with a default of 0, so it still talks to an older server.
+  `CONFLICT_SCAN_MAX` is deprecated: boot still parses it, ignores it, and logs one warning when it
+  is set, and the next release removes it. After an upgrade the list stays short until the backfill
+  drains. The read's cost on a real store (gate E2-G2) is not measured.
 - **Registration refuses a `client_name` that ends in `(added ...)` or `(not approved)`.** Dynamic
   registration answers 400 `invalid_client_metadata`, and trailing whitespace does not hide the
   suffix. This is a behaviour change: a client that sent such a name used to register and now
@@ -147,9 +171,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **The conflicts query took the caller's read grant and an offset.** `conflicts` ran over the
   whole tenant and filtered each pair after the fact; the grant runs inside the query, as `stale`
   already does, and paging is by `offset` rather than a client-side skip.
-- **A namespace past `CONFLICT_SCAN_MAX` refuses the conflict source rather than running the
-  self-join against it.** The setting defaults to 2000 live rows per namespace, validated at boot
-  like every other setting, and a refusal carries `namespace_too_large` instead of a slow answer.
+- **`CONFLICT_SCAN_MAX` and the `namespace_too_large` refusal shipped in 0.4.1-rc.1 only.** That
+  candidate refused the conflict source for a namespace past 2000 live rows rather than running the
+  self-join against it. This release reads stored pairs, drops the refusal and deprecates the
+  setting, as the stored-pairs entry above says. A deployment that skipped the candidate never
+  meets either.
 - **`GET /admin/review/stale` publishes a narrower row.** Both old review routes read through the
   one queue now, so a stale row carries `opened`, `access_count`, `last_accessed_at` and
   `last_confirmed_at`, and no longer carries `tags`, `source_client`, `embedding_model`,

@@ -341,9 +341,25 @@ fn a_review_queue_parses_and_keeps_the_proposal_origins() {
     let q: ReviewQueue = serde_json::from_value(fixture("review_queue.json")).unwrap();
     assert_eq!(q.items.len(), 3);
     assert_eq!(q.sources.proposal, vec!["canned".to_string()]);
-    assert_eq!(q.refused.get("conflict").map(String::as_str), Some("namespace_too_large"));
+    assert_eq!(q.refused.get("stale").map(String::as_str), Some("review_queue_failed"));
     assert_eq!(q.dismissed, 12);
     assert!(!q.has_more);
+}
+
+/// The fixture carries the count of live rows the conflict sweeper has not scanned yet.
+#[test]
+fn a_review_queue_reads_the_pending_conflict_count() {
+    let q: ReviewQueue = serde_json::from_value(fixture("review_queue.json")).unwrap();
+    assert_eq!(q.conflicts_pending, 3);
+}
+
+/// An older server omits the field. The client must read that as nothing pending.
+#[test]
+fn a_review_queue_without_the_pending_count_parses_to_zero() {
+    let mut raw = fixture("review_queue.json");
+    raw.as_object_mut().unwrap().remove("conflicts_pending");
+    let q: ReviewQueue = serde_json::from_value(raw).unwrap();
+    assert_eq!(q.conflicts_pending, 0);
 }
 
 /// A server that adds a field to the envelope or to an item must not break an installed client.

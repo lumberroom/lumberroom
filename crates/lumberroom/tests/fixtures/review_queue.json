@@ -77,8 +77,9 @@
     }
   ],
   "sources": { "conflict": true, "stale": true, "proposal": ["canned"] },
-  "refused": { "conflict": "namespace_too_large" },
+  "refused": { "stale": "review_queue_failed" },
   "dismissed": 12,
+  "conflicts_pending": 3,
   "stale_days": 365,
   "min_similarity": 0.9,
   "limit": 50,

@@ -1,6 +1,12 @@
 # 0018. One review queue, one decide path
 
-22 September 2026. Accepted, implemented.
+22 September 2026. Accepted, implemented. Partly superseded by
+[0022](0022-conflict-pairs-are-recorded-when-a-row-is-written.md) on 4 October 2026, in PR E2 of
+[`write-time-conflicts.md`](../specs/write-time-conflicts.md), in two places: the
+`CONFLICT_SCAN_MAX` refusal, in "The decision" and "Costs accepted", and "a stored queue table for
+conflicts" in "What lost". The conflicts read now lists pairs a sweeper stored. `CONFLICT_SCAN_MAX`
+is still parsed for one release, ignored, and logs a deprecation warning at boot when set. The rest
+of this record stands.
 
 What was run, and where: on 22 September 2026, `./scripts/cargo.sh check --all-targets` ran clean,
 then the library suite, the `review_queue` acceptance suite and the full suite. `test -j 1` reported
@@ -29,6 +35,10 @@ from, so a client never offers a key the server will refuse on a grant or on a s
 fingerprint. The conflicts statement anti-joins it, so a pair somebody has read and kept leaves the
 queue and the queue shrinks as it is worked.
 
+> **Superseded on 4 October 2026 by
+> [0022](0022-conflict-pairs-are-recorded-when-a-row-is-written.md).** The conflicts read lists
+> stored pairs, no namespace is refused, and `CONFLICT_SCAN_MAX` is ignored.
+
 `CONFLICT_SCAN_MAX` bounds the conflict source. The self-join is O(n squared) in the rows of one
 namespace with no index able to help it, and the queue now answers requests rather than running by
 hand, so a namespace count runs first and the source refuses past the ceiling instead of hanging.
@@ -47,6 +57,10 @@ decision 0017 owns that verb and its own surface. Folding the `cleanup` proposal
 engine's first source, which would double-list every pair the cleanup pass already holds at 0.97 and
 above while the conflict source reads from 0.90 with no anti-join between them.
 
+> **Reversed in part by [0022](0022-conflict-pairs-are-recorded-when-a-row-is-written.md).** The
+> stored conflict table no longer drifts: triggers clear a row's pairs when its vector, namespace,
+> tenant or model changes, and the read applies liveness, the grant and the dismissed ledger itself.
+
 ## Costs accepted
 
 Two round trips per pair, since each half is re-fetched by id for its own ceiling check. An offset
@@ -54,6 +68,9 @@ cursor rather than a keyset one, bounded at 2,000. A verdict list computed per i
 namespace count before every conflicts read. A conflict source that refuses a large namespace
 rather than answering slowly. A confirmed stale row returning after one window rather than never.
 A trait with no implementation in this repository, exercised by a test double.
+
+> **Superseded in part by [0022](0022-conflict-pairs-are-recorded-when-a-row-is-written.md).** The
+> namespace count and the refusal of a large namespace are gone.
 
 ## Not for
 

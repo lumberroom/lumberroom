@@ -233,23 +233,25 @@ lumberroom graph walk "<question>" | lumberroom graph rebuild
 Without `--json` it walks the queue one item at a time: full row text, then a key line drawn from
 what that item allows (`s` supersede keep newer, `o` keep older, `m` merge, `k` keep both, `d`
 delete, `c` confirm, `a` apply, `x` dismiss, `n` skip, `q` quit). `--json` prints the page as JSON
-and exits instead of walking it. The conflict source answers `namespace_too_large` and sits out of
-the page when a readable namespace holds more live rows than `CONFLICT_SCAN_MAX` (default 2000):
-the self-join that finds a namespace's conflicting pairs runs per namespace, so a namespace past
-that ceiling would cost tens of seconds rather than answer a page. The default came from a
-dev-container probe; recalibrate it against a timed run on the deployment's own hardware.
+and exits instead of walking it. The conflict source lists the pairs the sweeper below has stored,
+so it answers for a namespace of any size. A row written since the last sweep has no pairs yet.
+Every page carries `conflicts_pending`, the readable rows still waiting for their scan. When it is
+above zero, `review` prints the count once, before the first item, so a short list does not pass
+for the whole answer.
 
 ### Conflict recording
 
 The server records conflicting pairs as rows commit. A sweeper scans each new row against its
 namespace after the row commits and stores the pairs at or above `CONFLICT_THRESHOLD`. It runs on a
 Postgres `LISTEN` wake and on a timer, and the same loop backfills rows that predate it. The review
-queue still reads pairs the old way in this release, so recording changes nothing a reader sees.
+queue reads the stored pairs. Until the backfill finishes, `conflicts_pending` stays above zero and
+the conflict list is short by those rows.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `CONFLICT_SWEEP_SECS` | `60` | Seconds between timer sweeps. The timer covers a wake the listener lost. `0` stops all pair recording: no listener, no sweeps, and every new row stays pending. Above `0`, the listener holds one pooled connection for the life of the process, so boot refuses `DB_MAX_CONNECTIONS` below 2. |
 | `CONFLICT_SWEEP_BUDGET_MS` | `5000` | Time one sweep may spend on the tenant before it yields. Boot refuses a value below 100 or above 25000. |
+| `CONFLICT_SCAN_MAX` | `2000`, unused | Deprecated and ignored. It bounded the old self-join, which refused a namespace past it with `namespace_too_large`; stored pairs need no bound, and nothing refuses now. Boot still parses it, so a value that is not a number still refuses boot, and logs one deprecation warning when it is set. The next release removes it, so drop it from the environment. |
 
 Behind a connection pooler in transaction mode `LISTEN` does not hold and every wake goes missing.
 The timer still records every pair, up to `CONFLICT_SWEEP_SECS` late. Point the server at a direct

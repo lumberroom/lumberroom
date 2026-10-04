@@ -1,6 +1,6 @@
 # 0022. Conflict pairs are recorded when a row is written
 
-> **Draft.** PR E1 (the pair tables, triggers and sweeper) is built on branch `feat/write-time-conflicts`. Readers (PR E2) are not built yet, and this document changes as the build proceeds.
+> **Draft.** PR E1 (the pair tables, triggers and sweeper) merged as #106 (47d7a55). PR E2 (the readers) is implemented on branch `feat/write-time-readers` and not merged. Gate E2-G2 (the read's cost on real data) has not run. This document changes as the build proceeds.
 
 3 October 2026. Proposed, design; nothing built, nothing run. Revised the same day (revision 1,
 below): a trigger on `memory` wakes the sweeper, and the write path's call to the scan is withdrawn.
@@ -8,6 +8,10 @@ Spec: [`docs/specs/write-time-conflicts.md`](../specs/write-time-conflicts.md). 
 record supersedes two parts of [0018](0018-one-review-queue.md): "a stored queue table for
 conflicts" in its "What lost", and the `CONFLICT_SCAN_MAX` refusal. The setting itself is read,
 ignored and warned about for one release, then removed (owner ruling, 3 October 2026).
+
+4 October 2026. Status: proposed; E1 merged in #106, E2 implemented and not merged. The readers
+list and count stored pairs on the E2 branch. Gate E2-G2 (the read's cost on a real store) has not
+run; until it does, the read's 17.6 ms under "Costs accepted" stays a scratch-copy figure.
 
 ## The decision
 
