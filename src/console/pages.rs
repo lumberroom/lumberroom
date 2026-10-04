@@ -1046,7 +1046,7 @@ autocomplete=\"off\" spellcheck=\"false\">\
 <p class=\"hint\">When the fact started holding in the world, as 2026-03-01 or a full instant. \
 Leave it empty for a fact that has always held. A date inside the last {fence} is refused unless \
 the fact itself names that day: this notebook already stamps the moment it learned a thing, and \
-today's date would otherwise write that clock twice.</p></div></div>\
+today's date would otherwise write that clock twice. A future date is refused.</p></div></div>\
 <div class=\"send\"><button type=\"submit\">{submit}</button>\
 <a href=\"/console/reading\">Back to reading</a></div></form>",
         csrf = escape(csrf),
@@ -1824,6 +1824,7 @@ mod tests {
         assert!(compose(&Draft::default(), &contents(), &health(), "tok", 604_800, None)
             .contains("inside the last 7 days is refused"));
         assert!(html.contains("Leave it empty for a fact that has always held."));
+        assert!(html.contains("A future date is refused."), "the store refuses one: {html}");
     }
 
     /// A refused write comes back with the paragraph still in the box. The reader typed it and the

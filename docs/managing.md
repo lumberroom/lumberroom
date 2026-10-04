@@ -164,6 +164,7 @@ has never seen.
 started holding; a model reads one out of context and invents it. A date inside the near-now fence,
 one day by default (`WRITE_MIN_OCCURRED_AGE_SECS`), is refused, because the store already stamps the
 moment it learned a thing and today's date would write that clock twice.
+A future date is refused too.
 
 To correct a fact, open it from the arrivals list and use **Replace this fact** underneath it. That
 retires the old row, links the two, and keeps the old wording readable with the date it stopped
