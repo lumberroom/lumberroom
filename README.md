@@ -46,7 +46,8 @@ sudo ./deploy/install.sh
 ```
 
 That is token mode on loopback: the server binds `127.0.0.1:8787`, opens no public port, and prints
-the client token with the command to run on your Mac. Add `--domain` and `--auth-mode oauth` when a
+the command to run on your Mac. The client token is the first `"token"` field in the `.env` the
+installer writes (mode 600) in the clone. Add `--domain` and `--auth-mode oauth` when a
 browser has to reach it. The installer pulls
 `ghcr.io/lumberroom/lumberroom-server:0.4.0` and falls back to building from this tree when the
 pull fails; `--build-local` skips the pull. It pins a version rather than tracking `latest`, because
@@ -109,7 +110,7 @@ To wire a Mac into Claude Code, which installs the MCP server, the session hook 
 rule in one pass:
 
 ```bash
-./client/wire-mac.sh --url http://127.0.0.1:8787 --token <token>
+LUMBERROOM_TOKEN=<token> ./client/wire-mac.sh --url http://127.0.0.1:8787
 ```
 
 For Hermes Agent, [`lumberroom-hermes`](https://github.com/lumberroom/lumberroom-hermes) is a memory
