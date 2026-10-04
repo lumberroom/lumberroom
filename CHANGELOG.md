@@ -21,6 +21,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   only text the consent warnings read. In a group of approved clients whose printed names collide, a
   single named client prints bare and the others keep their `(added ...)` stamp. Implemented and
   covered by the gates named in decision 0023; no hosted MCP client has seen it.
+- **Two scripts for testing against realistic stores.** `scripts/seed/seed.py` asks a model
+  (through `claude -p`, or the Messages API when `ANTHROPIC_API_KEY` is set) for a fictional owner,
+  their projects and a few hundred facts in a set namespace mix and length spread, with
+  dated rows, near-duplicate restatements and supersession chains. It then loads them through the
+  server's MCP tools, so the server embeds, dedupes and records conflicts as it would for any
+  client. `scripts/measure-conflicts.sh` runs gates E1-G3 and E2-G2 of the write-time conflicts
+  spec on a scratch copy of a store. It drains the backlog one committed scan at a time and times
+  `memory_conflict_record`, `memory_conflict_next`, `memory_conflict_backlog`, the conflicts read
+  and the pending count, then writes a report with p50 and p95 and the plans. The server's code
+  does not change.
 - **A sweeper records conflicting pairs as rows commit.** Migration `20261004000026` adds the
   `memory_conflict` pair table, the `memory_conflict_scan` ledger and triggers on `memory`. A
   change to a row's vector, model, namespace or tenant clears its pairs and queues a fresh scan,
