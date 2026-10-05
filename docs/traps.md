@@ -61,6 +61,15 @@ a wake reaches it once Postgres releases the notification, and a timer sweep rea
 `memory_conflict_record` or inserts into `memory_conflict`. The argument is in
 [`specs/write-time-conflicts.md`](specs/write-time-conflicts.md) section 6.
 
+**`IS DISTINCT FROM` on an extension type does not survive `pg_dump`.** The dump prints it with no
+schema on the operator it hides, and `pg_restore` runs with `search_path` empty, so a trigger WHEN
+clause comparing two vectors that way fails to restore: `operator does not exist: public.vector =
+public.vector`. 0.5.0 shipped `memory_conflict_moved` like this, and every dump of it stopped
+`pg_restore --exit-on-error`. Any stored expression has the same exposure: a CHECK, an index
+predicate, a default. Write a plain operator, which `pg_dump` prints as `OPERATOR(public.<>)`, plus
+an explicit NULL test where NULL matters. `tests/trigger_restore.rs` replays every trigger as
+`pg_dump` prints it; nothing yet checks the other expression kinds.
+
 **A pooler in transaction mode drops conflict wakes.** `LISTEN` binds to one server session, and
 transaction pooling hands that session to other clients, so the listener hears nothing and raises no
 error. Rows stay pending until the next timer sweep, up to `CONFLICT_SWEEP_SECS` (default 60), and

@@ -288,7 +288,11 @@ CREATE TRIGGER memory_conflict_moved
   FOR EACH ROW
   WHEN (OLD.tenant_id IS DISTINCT FROM NEW.tenant_id
      OR OLD.namespace IS DISTINCT FROM NEW.namespace
-     OR OLD.embedding IS DISTINCT FROM NEW.embedding
+     -- Not IS DISTINCT FROM on the vectors: pg_dump writes that back with no schema on the
+     -- operator, and a restore runs with an empty search_path, so it fails at this trigger.
+     -- `<>` is stored resolved and dumps as OPERATOR(public.<>). Migration 20261005000028.
+     OR (OLD.embedding IS NULL) <> (NEW.embedding IS NULL)
+     OR OLD.embedding <> NEW.embedding
      OR OLD.embedding_model IS DISTINCT FROM NEW.embedding_model)
   EXECUTE FUNCTION memory_conflict_forget_row();
 
