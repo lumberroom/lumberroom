@@ -10,8 +10,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `memory_conflict_moved` with `operator does not exist: public.vector = public.vector`, and a
   restore without the flag finished with the trigger missing. Migration `20261005000028` recreates
   the trigger with a WHEN clause `pg_dump` can write back. To restore a dump taken before this fix,
-  run `pg_restore` without `--exit-on-error`, then start this version: the migration runs and the
-  trigger returns. `tests/trigger_restore.rs` replays every trigger as `pg_dump` prints it.
+  run `pg_restore` without `--exit-on-error`, which reports one ignored error and exits 1, then
+  start this version: the migration runs and the trigger returns. `tests/trigger_restore.rs` replays every trigger as `pg_dump` prints it.
 
 ## [0.5.0] - 2026-10-04
 
