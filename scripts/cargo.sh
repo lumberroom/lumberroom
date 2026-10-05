@@ -7,18 +7,24 @@
 #
 # The builder image carries g++ (ONNX Runtime links libstdc++) and the OpenSSL headers; a bare
 # rust:slim does not. Build it once with:  docker build -t lumberroom-builder -f Dockerfile.builder .
-# The integration suite needs the compose database, which is why the container joins its network.
+# The integration suite needs a Postgres on the compose network, which is why the container joins
+# it: the `testdb` service for `test` and `test-fast`, the `db` service for everything else.
+# scripts/cargo-sh-test.sh checks both choices below against a fake docker.
 set -e
 cd "$(dirname "$0")/.."
 [ -f .env ] && { set -a; . ./.env; set +a; }
 
-# `test` links the lib-test and integration binaries in one step. Doing that concurrently gets the
-# linker OOM-killed in the container (`collect2: fatal error: ld terminated with signal 9`), which
-# reads like a compile error and is a memory ceiling: Docker Desktop here is handing the
-# container 6.2GB of the host's 16GB. The real fix is raising that allocation; until someone does,
-# force `-j 1` by default so nobody has to rediscover this. Only for `test`, and only when the
-# caller has not already picked a `-j`: `check` gets real parallelism because it never links two
-# binaries at once.
+# `test` links the lib-test and integration binaries in one step. Doing that concurrently got the
+# linker OOM-killed in a Docker VM holding 6 GB (`collect2: fatal error: ld terminated with signal
+# 9`), which reads like a compile error and is a memory ceiling. So `test` and `test-fast` pick their
+# own `-j` when the caller passes none, from the memory Docker reports: 12 GiB or more gets `-j 4`,
+# anything less, or a read that fails, gets `-j 1`. `check` keeps cargo's default because it never
+# links two binaries at once, and an explicit `-j` from the caller always wins.
+#
+# The parallelism pays at link time. On a 12-CPU Linux build host with 15 GB, a cold suite build took
+# 14m35s at `-j 1` and 11m07s at `-j 4`, and linking the integration-test binaries one after another
+# was about half of the `-j 1` figure. 12 GiB is a chosen threshold between those two hosts. Nobody
+# has measured where between 6 and 15 GB `-j 4` starts to OOM the linker.
 #
 # `test-fast` builds like `test`, so it takes the same default, and then runs the built binaries N at
 # a time through scripts/lib/test-fast.sh.
@@ -26,7 +32,11 @@ FAST=
 if [ "${1:-}" = "test-fast" ]; then
   FAST=1
 fi
+TESTING=
 if [ "${1:-}" = "test" ] || [ "$FAST" = 1 ]; then
+  TESTING=1
+fi
+if [ "$TESTING" = 1 ]; then
   has_j=0
   for arg in "$@"; do
     case "$arg" in
@@ -34,9 +44,67 @@ if [ "${1:-}" = "test" ] || [ "$FAST" = 1 ]; then
     esac
   done
   if [ "$has_j" = 0 ]; then
+    jobs=1
+    mem="$(docker info --format '{{.MemTotal}}' 2>/dev/null || true)"
+    case "$mem" in
+      '' | *[!0-9]*) ;;
+      *) [ "$mem" -ge $((12 * 1024 * 1024 * 1024)) ] && jobs=4 ;;
+    esac
     sub="$1"
     shift
-    set -- "$sub" -j 1 "$@"
+    set -- "$sub" -j "$jobs" "$@"
+  fi
+fi
+
+# ── which Postgres the suite gets ────────────────────────────────────────────────────────────────
+#
+# The test binaries create and truncate databases on whatever DATABASE_URL names, so `test` and
+# `test-fast` never get the developer's store. They get the `testdb` compose service, a throwaway
+# cluster with durability off (docker-compose.yml says why), started here when it is not already
+# healthy. LUMBERROOM_TEST_DATABASE_URL points them somewhere else instead, and is refused when its
+# database is the store's own name or missing, since a missing name connects to a database named
+# after the user, which on the compose cluster is the store again.
+#
+# On a shared cluster `max_connections` is the next trap: the old setup ran the suite on `db` at 50
+# and a parallel run failed binaries with "too many clients" (SQLSTATE 53300). testdb allows 200.
+#
+# Compose interpolates every service in the file whatever profile is active, and `caddy` requires
+# LUMBERROOM_DOMAIN with `:?`. A development .env usually leaves it unset, and compose then refuses
+# to start testdb over a variable testdb never reads, so these calls fill in a placeholder.
+compose_test() {
+  LUMBERROOM_DOMAIN="${LUMBERROOM_DOMAIN:-unused.invalid}" docker compose --profile test "$@"
+}
+DB_URL="postgres://${POSTGRES_USER:-lumberroom}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-lumberroom}"
+if [ "$TESTING" = 1 ]; then
+  if [ -n "${LUMBERROOM_TEST_DATABASE_URL:-}" ]; then
+    rest="${LUMBERROOM_TEST_DATABASE_URL#*://}"
+    rest="${rest%%\?*}"
+    case "$rest" in
+      */*) test_db="${rest##*/}" ;;
+      *) test_db= ;;
+    esac
+    if [ -z "$test_db" ] || [ "$test_db" = "${POSTGRES_DB:-lumberroom}" ]; then
+      echo "cargo.sh: refusing LUMBERROOM_TEST_DATABASE_URL: its database is '${test_db}'." >&2
+      echo "  The suites truncate what they are handed. Name a scratch database other than '${POSTGRES_DB:-lumberroom}'." >&2
+      exit 1
+    fi
+    DB_URL="$LUMBERROOM_TEST_DATABASE_URL"
+  else
+    testdb_id="$(compose_test ps -q testdb 2>/dev/null || true)"
+    testdb_health=
+    if [ -n "$testdb_id" ]; then
+      testdb_health="$(docker inspect -f '{{.State.Health.Status}}' "$testdb_id" 2>/dev/null || true)"
+    fi
+    if [ "$testdb_health" != healthy ]; then
+      echo "cargo.sh: starting the testdb service" >&2
+      if ! compose_test up -d --wait testdb >&2; then
+        echo "cargo.sh: the testdb service did not start or never reported healthy." >&2
+        echo "  Run 'docker compose --profile test up -d --wait testdb' to see why, or set" >&2
+        echo "  LUMBERROOM_TEST_DATABASE_URL to another scratch Postgres." >&2
+        exit 1
+      fi
+    fi
+    DB_URL="postgres://${POSTGRES_USER:-lumberroom}:${POSTGRES_PASSWORD}@testdb:5432/lumberroom_test"
   fi
 fi
 
@@ -151,7 +219,7 @@ docker run --rm --name "$NAME" \
   -v "$PWD:/app" \
   -v lumberroom-target:/app/target \
   -v lumberroom-cargo:/usr/local/cargo/registry \
-  -e DATABASE_URL="postgres://${POSTGRES_USER:-lumberroom}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-lumberroom}" \
+  -e DATABASE_URL="$DB_URL" \
   -e CARGO_TERM_COLOR=never \
   -e XDG_CACHE_HOME=/app/target/.cache \
   -e RUST_BACKTRACE=1 \

@@ -66,6 +66,52 @@ services:
       - -c
       - maintenance_work_mem=512MB
 
+  # The integration suite's own cluster. `./scripts/cargo.sh test` and `test-fast` start it and point
+  # DATABASE_URL here. It holds disposable test data and nothing else: every test binary creates the
+  # databases it needs and truncates them as it goes, so a crash that loses the lot costs one rerun.
+  # That is why fsync, synchronous_commit and full_page_writes are off. The suite spends its time
+  # committing, and durability buys a throwaway cluster nothing.
+  #
+  # A service of its own rather than a database on `db`, for two reasons. On `db` the suite shared a
+  # cluster with the developer's own store, and at max_connections=50 a parallel run failed binaries
+  # with "too many clients" (SQLSTATE 53300). And a stray truncate here cannot reach that store.
+  #
+  # Under the `test` profile, so a plain `docker compose up` never starts it. No published port: the
+  # builder container reaches it as `testdb` on the compose network. No restart policy either, since
+  # cargo.sh starts it on demand. CONTRIBUTING.md has the command that resets it, which removes
+  # `testdata` and leaves `pgdata` alone.
+  testdb:
+    image: pgvector/pgvector:pg16
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lumberroom}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: lumberroom_test
+    volumes:
+      - testdata:/var/lib/postgresql/data
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lumberroom} -d lumberroom_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    command:
+      - postgres
+      - -c
+      - fsync=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=512MB
+
   server:
     build:
       context: .
@@ -389,6 +435,7 @@ services:
 
 volumes:
   pgdata:
+  testdata:
   caddy_data:
   caddy_config:
   target:
