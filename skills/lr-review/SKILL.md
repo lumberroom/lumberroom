@@ -54,15 +54,6 @@ A `stale:` item is one row nobody has read or confirmed for a long time. Its ver
 - It describes a passing state ("in progress", "uncommitted", "currently failing") and nothing newer
   resolves it: leave it, and list it in the report as stale and unresolved. Do not ask about it.
 
-## Undated rows
-
-A row with no `occurred_at` reads as true from the moment the store heard it. When a row you touch
-has none and its own text names the day the fact became true, carry that day: as `occurred_at` on a
-merge, or by `memory_write` of the same text with `occurred_at` set and `supersedes` set to the row.
-Never infer a day the text does not state, and never move a date already set. Where the lumberroom
-CLI is available, `lumberroom review --dates` lists undated rows whose text names a day and
-`lumberroom fill-date <id> <date>` fills one in place.
-
 ## Dreaming proposals
 
 A server that runs a dreaming pass adds `proposal:` items. Each carries a `version`, a `verdicts`
@@ -91,6 +82,6 @@ merges create new pairs, and the new pairs need the same treatment.
 ## Finish
 
 End with one message:
-- Counts by verdict, plus stale rows left unresolved and undated rows given a date.
+- Counts by verdict, plus stale rows left unresolved.
 - Questions: only the contradictions nothing could order, each with both values and both row ids.
 - Anything the tools refused, with the error.
