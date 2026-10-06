@@ -6,6 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `skills/lr-review`, an agent skill for working the review queue, synced into client plugins.
 - **A memory provider for Hermes Agent, in its own repository.**
   [`lumberroom/lumberroom-hermes`](https://github.com/lumberroom/lumberroom-hermes) makes lumberroom
   Hermes's memory through the existing `/mcp` endpoint and needed no engine change. Decision 0021
