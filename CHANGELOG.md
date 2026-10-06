@@ -12,6 +12,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the trigger with a WHEN clause `pg_dump` can write back. To restore a dump taken before this fix,
   run `pg_restore` without `--exit-on-error`, which reports one ignored error and exits 1, then
   start this version: the migration runs and the trigger returns. `tests/trigger_restore.rs` replays every trigger as `pg_dump` prints it.
+- **The digest prints whole entries.** `context_bootstrap` used to cut its markdown at
+  `BOOTSTRAP_MAX_CHARS` inside a bullet. It now gives profile, project, recent and registry 40, 25,
+  20 and 15 percent of what the header and the tail leave, passes unused budget on, leaves out an
+  entry that does not fit and counts the left-out entries per section in a footer that stays under
+  the ceiling. An overflowing digest caps the namespace and sealed lists at 20 percent and ends them
+  with "and N more namespaces". A memory longer than its whole section prints shortened at a
+  sentence, a word or a grapheme, with an ellipsis. The OpenWebUI filter cuts at whole lines (#109).
 
 ## [0.5.0] - 2026-10-04
 
