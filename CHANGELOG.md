@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A per-call recall log, off by default.** `RECALL_EVENT_LOG=true` records one `recall_event` row
+  per memory that a `memory_search` or `context_bootstrap` call returned, with the call id, rank,
+  digest section and active project, and no content. The cleanup pass deletes rows older than
+  `RECALL_EVENT_RETENTION_DAYS` (default 30), and forgetting a memory deletes its rows. Migration
+  `20261006000029`; see `docs/recall-event-log.md` and decision 0024.
 - `client/skills/lr-review`, an agent skill for working the review queue, synced into client plugins.
 
 ### Fixed

@@ -307,11 +307,21 @@ pub async fn run_tagged(
     let emissions =
         emissions_for(ctx, out.iter().map(|h| (h.id.as_str(), h.content.as_str(), h.sensitivity)))
             .await;
+    // The per-call log, from the same `out` and in the order the caller sees it.
+    let project_ns = project
+        .filter(|p| !p.trim().is_empty())
+        .and_then(|p| namespaces::project_namespace(p).ok());
+    let call = super::recall_events::call(
+        ctx,
+        project_ns.as_deref(),
+        [(None, out.iter().map(|h| (h.id.as_str(), h.namespace.as_str())))],
+    );
     ctx.repos.memories.record_emissions(
         ctx.tenant(),
         SEARCH_TOOL,
         ctx.session_id.clone(),
         emissions,
+        call,
     );
 
     let writers: Vec<String> = out.iter().map(|h| h.source_client.clone()).collect();

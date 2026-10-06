@@ -28,6 +28,8 @@ and `CONTRIBUTING.md` at the repository root, then `docs/decisions/README.md`.
   model, and which of its settings are measured rather than assumed.
 - [`importing.md`](importing.md): bringing a memory out of ChatGPT or claude.ai, the two routes it
   arrives by, and the dump prompt `lumberroom import prompt` prints.
+- [`recall-event-log.md`](recall-event-log.md): the per-call recall log behind `RECALL_EVENT_LOG`,
+  what a row holds, and what it is not for.
 - [`cleanup-schedule.md`](cleanup-schedule.md): the two processes and no cron daemon behind the
   cleanup pass.
 - [`benchmarks.md`](benchmarks.md): every retrieval number the project has, with the configuration
