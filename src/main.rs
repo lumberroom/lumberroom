@@ -150,7 +150,7 @@ async fn run() -> Result<()> {
     if cfg.auth.mode == config::AuthMode::Oauth {
         spawn_oauth_purge(Arc::clone(&oauth));
     }
-    spawn_cleanup(Arc::clone(&cfg), Arc::clone(&cleanup));
+    spawn_cleanup(Arc::clone(&cfg), Arc::clone(&cleanup), Arc::clone(&state.repos.memories));
     spawn_conflict_sweep(Arc::clone(&cfg), Arc::clone(&state.repos.memories), pool.clone());
 
     let app = http::router(Arc::clone(&state), auth)
@@ -345,7 +345,11 @@ async fn verify_kek_at_boot(
 /// `run` takes a tenant rather than a `Ctx` for the same reason: a background pass has no caller,
 /// and a synthetic principal invented to satisfy a signature is one somebody later reuses where it
 /// decides an answer.
-fn spawn_cleanup(cfg: Arc<config::Config>, repo: Arc<dyn ports::CleanupRepository>) {
+fn spawn_cleanup(
+    cfg: Arc<config::Config>,
+    repo: Arc<dyn ports::CleanupRepository>,
+    memories: Arc<dyn ports::MemoryRepository>,
+) {
     let interval = cfg.cleanup.interval_secs;
     if interval == 0 {
         tracing::info!("scheduled cleanup is off (CLEANUP_INTERVAL_SECS=0)");
@@ -384,6 +388,21 @@ fn spawn_cleanup(cfg: Arc<config::Config>, repo: Arc<dyn ports::CleanupRepositor
                     }
                 }
                 Err(e) => tracing::warn!(error = %e.log_message(), "cleanup pass failed"),
+            }
+            // The recall log's retention rides on this timer rather than a scheduler of its own,
+            // which is why config refuses RECALL_EVENT_LOG with this pass off. It runs with the log
+            // off too, so rows written before the owner turned it off still age out.
+            match services::recall_events::purge(
+                memories.as_ref(),
+                &cfg.tenant_id,
+                cfg.recall_events.retention_days,
+                services::recall_events::PURGE_BATCH,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(rows = n, "deleted recall events past their retention"),
+                Err(e) => tracing::warn!(error = %e.log_message(), "recall event purge failed"),
             }
         }
     });

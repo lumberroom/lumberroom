@@ -173,6 +173,14 @@ services:
       # reaches the container however the operator sets it. Empty parses as linear.
       SEARCH_FUSION: ${SEARCH_FUSION:-}
       SEARCH_RRF_K: ${SEARCH_RRF_K:-}
+      # The in-server cleanup pass, which also enforces the recall log's retention. Empty means
+      # the config.rs default: every 3600 s, 500 rows, every namespace.
+      CLEANUP_INTERVAL_SECS: ${CLEANUP_INTERVAL_SECS:-}
+      CLEANUP_LIMIT: ${CLEANUP_LIMIT:-}
+      CLEANUP_NAMESPACE: ${CLEANUP_NAMESPACE:-}
+      # The per-call recall log, docs/recall-event-log.md. Empty means off and 30 days.
+      RECALL_EVENT_LOG: ${RECALL_EVENT_LOG:-}
+      RECALL_EVENT_RETENTION_DAYS: ${RECALL_EVENT_RETENTION_DAYS:-}
     ports:
       # Localhost only: Caddy terminates TLS and proxies in. Nothing else needs this port.
       - "127.0.0.1:${SERVER_PORT:-8787}:8787"

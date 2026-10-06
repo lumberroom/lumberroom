@@ -51,6 +51,29 @@ pub struct Emission {
     pub memory_id: uuid::Uuid,
 }
 
+/// One call's result set, on its way to `recall_event`. Ids, positions and names only: the log
+/// stores no content, so nothing here carries any.
+#[derive(Debug, Clone)]
+pub struct RecallCall {
+    pub call_id: uuid::Uuid,
+    /// `Principal::client`, the same name `tool_calls.client` records.
+    pub client: String,
+    /// The active project namespace, such as `project:alpha`, when the call named a project.
+    pub project: Option<String>,
+    pub events: Vec<RecallEvent>,
+}
+
+/// One returned row inside a [`RecallCall`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallEvent {
+    pub memory_id: uuid::Uuid,
+    pub namespace: String,
+    /// The digest section, `profile`, `project` or `recent`. `None` for a search.
+    pub section: Option<&'static str>,
+    /// From 1, within the search result or within the digest section.
+    pub rank: i32,
+}
+
 /// A row on the supersession chain next to one about to be deleted: enough to apply the grant and
 /// nothing a caller could read content out of. The caller may not be able to read the row at all,
 /// which is the reason this is not a `Memory`.
@@ -739,13 +762,29 @@ pub trait MemoryRepository: Send + Sync {
     /// check a hash that can never meet a proposal's, which is how the earlier version of this
     /// layer was built unreachable. The service also decides which rows are recorded at all:
     /// encrypted rows are not, and a repository never sees their plaintext to hash.
+    ///
+    /// `call` carries the per-call log when `RECALL_EVENT_LOG` is on, and the store writes it in the
+    /// same statement as the emissions, so the log costs no round trip of its own. `rows` may be
+    /// empty while `call` is not: a digest served from the cache records no emission and still
+    /// logs its call.
     fn record_emissions(
         &self,
         tenant: &str,
         tool: &'static str,
         session_id: Option<String>,
         rows: Vec<Emission>,
+        call: Option<RecallCall>,
     );
+
+    /// Delete up to `batch` of this tenant's `recall_event` rows older than `older_than_days`, and
+    /// return how many went. One batch per call so a large backlog never holds one long delete;
+    /// `services::recall_events::purge` loops until a batch comes back short.
+    async fn purge_recall_events(
+        &self,
+        tenant: &str,
+        older_than_days: u32,
+        batch: i64,
+    ) -> Result<u64>;
 
     /// Repetition is confirmation. Set when a write restates a fact rather than contradicting it.
     async fn confirm(&self, tenant: &str, id: uuid::Uuid) -> Result<()>;

@@ -18,6 +18,7 @@ pub mod graph;
 pub mod history;
 pub mod ingest;
 pub mod recall;
+pub mod recall_events;
 pub mod registry;
 pub mod review;
 pub mod review_queue;

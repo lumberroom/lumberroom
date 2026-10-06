@@ -5,7 +5,9 @@ Two halves, two processes, no cron anywhere.
 **The deterministic pass runs inside the server**, on a timer set by `CLEANUP_INTERVAL_SECS`
 (default 3600, `0` turns it off). Exact duplicates and near-certain pairs, written straight into the
 queue. It opens no connection to anyone. Nothing to install: it starts with the server and stops
-with it, and one task cannot overlap itself, so it needs no lock.
+with it, and one task cannot overlap itself, so it needs no lock. The same pass deletes
+`recall_event` rows older than `RECALL_EVENT_RETENTION_DAYS`; see
+[recall-event-log.md](recall-event-log.md).
 
 **The model pass runs as its own container**, `lumberroom cleanup daemon`, under the `cleanup` compose
 profile:

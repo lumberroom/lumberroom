@@ -120,6 +120,17 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
             if entry.at.elapsed().as_millis() < ctx.cfg.bootstrap.cache_ms as u128 {
                 let mut hit = entry.digest.clone();
                 hit.cached = true;
+                // A cached digest still reached a caller, so it logs as a call of its own. It
+                // records no emission, for the reason given where the build path records one.
+                if let Some(call) = super::recall_events::digest_call(ctx, &hit) {
+                    ctx.repos.memories.record_emissions(
+                        ctx.tenant(),
+                        BOOTSTRAP_TOOL,
+                        ctx.session_id.clone(),
+                        vec![],
+                        Some(call),
+                    );
+                }
                 return Ok(hit);
             }
         }
@@ -222,6 +233,7 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
         BOOTSTRAP_TOOL,
         ctx.session_id.clone(),
         emissions,
+        super::recall_events::digest_call(ctx, &digest),
     );
 
     if let Ok(mut c) = cache().lock() {
