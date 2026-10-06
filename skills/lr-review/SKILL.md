@@ -41,6 +41,28 @@ the repetition, and comes out shorter than the sources combined.
 makes those older rows live again. Prefer `supersede`. Before any delete, check `memory_history`
 for predecessors and retire each one that comes back.
 
+## Stale items
+
+A `stale:` item is one row nobody has read or confirmed for a long time. Its verdicts are
+`confirm`, `merge` and `delete`. Search for newer rows on the same subject first.
+
+- A newer live row holds every claim of the stale row: `delete` it, after the predecessor check.
+- A newer row holds part of it: `merge` with `content` carrying the stale row's remaining claims,
+  dated as history where the newer row changed them.
+- Nothing newer touches it and it states a lasting fact (a rule, preference, convention, host,
+  decision): `confirm`.
+- It describes a passing state ("in progress", "uncommitted", "currently failing") and nothing newer
+  resolves it: leave it, and list it in the report as stale and unresolved. Do not ask about it.
+
+## Undated rows
+
+A row with no `occurred_at` reads as true from the moment the store heard it. When a row you touch
+has none and its own text names the day the fact became true, carry that day: as `occurred_at` on a
+merge, or by `memory_write` of the same text with `occurred_at` set and `supersedes` set to the row.
+Never infer a day the text does not state, and never move a date already set. Where the lumberroom
+CLI is available, `lumberroom review --dates` lists undated rows whose text names a day and
+`lumberroom fill-date <id> <date>` fills one in place.
+
 ## Dreaming proposals
 
 A server that runs a dreaming pass adds `proposal:` items. Each carries a `version`, a `verdicts`
@@ -69,6 +91,6 @@ merges create new pairs, and the new pairs need the same treatment.
 ## Finish
 
 End with one message:
-- Counts by verdict.
+- Counts by verdict, plus stale rows left unresolved and undated rows given a date.
 - Questions: only the contradictions nothing could order, each with both values and both row ids.
 - Anything the tools refused, with the error.
