@@ -230,6 +230,9 @@ lumberroom graph walk "<question>" | lumberroom graph rebuild
 
 `review` opens one queue over conflicts, stale rows and, on a server that fills them, proposals.
 `--stale` and `--conflicts` still work, as aliases for `--source stale` and `--source conflict`.
+Over MCP the same pass as `review --dates` is a queue source: `review_queue` with
+`source: ["undated"]` lists the rows, and `review_decide` with `fill_date` fills one. It appears only
+when named.
 Without `--json` it walks the queue one item at a time: full row text, then a key line drawn from
 what that item allows (`s` supersede keep newer, `o` keep older, `m` merge, `k` keep both, `d`
 delete, `c` confirm, `a` apply, `x` dismiss, `n` skip, `q` quit). `--json` prints the page as JSON

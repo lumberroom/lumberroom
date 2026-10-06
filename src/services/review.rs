@@ -108,6 +108,44 @@ pub struct DateCandidate {
 /// review, it is the store.
 pub async fn date_candidates(ctx: &Ctx, limit: Option<i64>) -> Result<Vec<DateCandidate>> {
     let limit = limit.unwrap_or(50).clamp(1, 500);
+    let (rows, _) = dated_in_text(ctx, limit, 0).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(row, days)| {
+            let (proposed, ambiguous) = if days.len() == 1 {
+                (Some(days[0].to_string()), vec![])
+            } else {
+                (None, days.iter().map(|d| d.to_string()).collect())
+            };
+            DateCandidate {
+                id: row.id,
+                namespace: row.namespace,
+                content: row.content,
+                created_at: row.created_at.to_rfc3339(),
+                proposed,
+                ambiguous,
+            }
+        })
+        .collect())
+}
+
+/// Most undated rows name no day, so the scan reads this many rows per answer it wants.
+const DATE_SCAN_FACTOR: i64 = 20;
+/// The scan's ceiling, whatever page was asked for. A deep page on a store of timeless facts would
+/// otherwise decrypt tens of thousands of rows to find nothing.
+const DATE_SCAN_MAX: i64 = 20_000;
+
+/// Undated live rows whose own text names a past day, each with every such day, newest row first.
+/// The second value says whether a further page exists inside the scan.
+///
+/// Shared by the admin date review and the queue's `undated` source, so the two can never list
+/// different rows. The offset counts answers, not scanned rows: a caller paging past rows it chose
+/// to leave undated has to land on the next candidate, not on the next block of timeless facts.
+pub(super) async fn dated_in_text(
+    ctx: &Ctx,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<(Memory, Vec<chrono::NaiveDate>)>, bool)> {
     // Every namespace this caller may read, resolved from their grants the way `search` resolves a
     // requested list. The store supplies the names; the grant decides which survive and at what
     // ceiling, and the ceiling then runs inside the query.
@@ -116,7 +154,8 @@ pub async fn date_candidates(ctx: &Ctx, limit: Option<i64>) -> Result<Vec<DateCa
     let readable = policy::resolve(&ctx.principal.read, &names);
     // Scan wider than the answer. Undated rows are the common case and only a few name a day, so a
     // page sized to the answer would return almost nothing.
-    let mut rows = ctx.repos.memories.undated(ctx.tenant(), &readable, limit * 20).await?;
+    let scan = ((offset + limit + 1) * DATE_SCAN_FACTOR).min(DATE_SCAN_MAX);
+    let mut rows = ctx.repos.memories.undated(ctx.tenant(), &readable, scan).await?;
 
     // A private row arrives with empty content, because the repository will not render ciphertext
     // as text. Without this the scan reads those rows as naming no day and drops them in silence,
@@ -126,6 +165,7 @@ pub async fn date_candidates(ctx: &Ctx, limit: Option<i64>) -> Result<Vec<DateCa
 
     let today = Utc::now().date_naive();
     let mut out = Vec::new();
+    let mut skipped = 0;
     for row in rows {
         let mut days = crate::domain::dates::extract(&row.content);
         // A day still ahead is a plan, not a record, and `fill_date` would refuse it anyway.
@@ -133,24 +173,16 @@ pub async fn date_candidates(ctx: &Ctx, limit: Option<i64>) -> Result<Vec<DateCa
         if days.is_empty() {
             continue;
         }
-        let (proposed, ambiguous) = if days.len() == 1 {
-            (Some(days[0].to_string()), vec![])
-        } else {
-            (None, days.iter().map(|d| d.to_string()).collect())
-        };
-        out.push(DateCandidate {
-            id: row.id,
-            namespace: row.namespace,
-            content: row.content,
-            created_at: row.created_at.to_rfc3339(),
-            proposed,
-            ambiguous,
-        });
-        if out.len() as i64 >= limit {
-            break;
+        if skipped < offset {
+            skipped += 1;
+            continue;
         }
+        if out.len() as i64 == limit {
+            return Ok((out, true));
+        }
+        out.push((row, days));
     }
-    Ok(out)
+    Ok((out, false))
 }
 
 /// "This fact described a situation, and the situation has passed."
@@ -219,7 +251,14 @@ pub async fn unexpire(ctx: &Ctx, id: &str, until: DateTime<Utc>) -> Result<bool>
 /// **Nothing in the future.** A future start reads live and never reads as-of, so the row would
 /// answer one query and not the other.
 pub async fn fill_date(ctx: &Ctx, id: &str, when: DateTime<Utc>) -> Result<Resolved> {
-    let (uuid, row) = writable_row(ctx, id).await?;
+    let (uuid, mut row) = writable_row(ctx, id).await?;
+    // A private row reads back with empty content, and empty content names no day, so without
+    // opening it first every private row would fail the check below with a misleading answer.
+    if !super::decrypt(ctx, vec![&mut row]).await.is_empty() {
+        return Err(DomainError::validation(format!(
+            "memory {id} did not open for this caller, so its text cannot be checked for the date"
+        )));
+    }
     if when > Utc::now() {
         return Err(DomainError::validation(
             "occurred_at cannot be in the future: a fact does not become true later than now",
