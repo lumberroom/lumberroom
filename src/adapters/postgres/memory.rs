@@ -30,6 +30,7 @@ use crate::ports::memory::{
     ChainEdits, ChainLink, ChainNeighbours, DeleteOutcome, DeletePlan, GraphEdge, PairCounts,
     RestoreRow, Retired, Superseded, Timeline, WalkBounds,
 };
+use crate::ports::RecallCall;
 use crate::ports::{
     ConflictPair, DigestData, DigestQuery, Emission, MemoryRepository, NamespaceRows,
     NamespaceSummary, NeighbourQuery, NewMemory, RecentQuery, RegistrySummary, SearchQuery,
@@ -2775,14 +2776,26 @@ impl MemoryRepository for PgMemoryRepository {
     /// `recall_emission` also has a writer in `ingest.rs`, for the one-row path the ingest service
     /// uses. The batched one lives here because this is where the rows being emitted are, and
     /// because the spec puts it beside the touch it rides along with.
+    ///
+    /// With `call` set, the `recall_event` rows ride in a data-modifying CTE on the same statement.
+    /// Postgres runs that insert to completion whether or not the outer statement reads it, so the
+    /// log adds rows to this round trip and no round trip of its own. The cost is shared fate: a
+    /// statement that fails loses both records for that call, which a log line reports.
+    ///
+    /// The event list names rows the emission list leaves out, private rows among them, so an
+    /// event for a row a forget deleted after the read would fail the foreign key and take the
+    /// emissions down with it. The EXISTS drops those events first. A delete that commits inside
+    /// the statement itself can still race it, which is the window the emission insert already had.
     fn record_emissions(
         &self,
         tenant: &str,
         tool: &'static str,
         session_id: Option<String>,
         rows: Vec<Emission>,
+        call: Option<RecallCall>,
     ) {
-        if rows.is_empty() {
+        let call = call.filter(|c| !c.events.is_empty());
+        if rows.is_empty() && call.is_none() {
             return;
         }
         let pool = self.pool.clone();
@@ -2790,6 +2803,53 @@ impl MemoryRepository for PgMemoryRepository {
         tokio::spawn(async move {
             let hashes: Vec<String> = rows.iter().map(|r| r.content_sha256.clone()).collect();
             let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.memory_id).collect();
+            if let Some(call) = call {
+                let events = call.events.len();
+                let memory: Vec<uuid::Uuid> = call.events.iter().map(|e| e.memory_id).collect();
+                let namespace: Vec<&str> =
+                    call.events.iter().map(|e| e.namespace.as_str()).collect();
+                let section: Vec<Option<&str>> = call.events.iter().map(|e| e.section).collect();
+                let rank: Vec<i32> = call.events.iter().map(|e| e.rank).collect();
+                let result = sqlx::query(
+                    "WITH logged AS (
+                         INSERT INTO recall_event
+                             (tenant_id, call_id, tool, client, session_id, project,
+                              memory_id, namespace, section, rank)
+                         SELECT $1, $6, $4, $7, $5, $8, e.m, e.ns, e.s, e.r
+                           FROM unnest($9::uuid[], $10::text[], $11::text[], $12::int4[])
+                                AS e(m, ns, s, r)
+                          WHERE EXISTS (SELECT 1 FROM memory
+                                         WHERE id = e.m AND tenant_id = $1)
+                     )
+                     INSERT INTO recall_emission
+                         (tenant_id, content_sha256, memory_id, tool, session_id)
+                     SELECT DISTINCT $1, h, m, $4, $5
+                       FROM unnest($2::text[], $3::uuid[]) AS t(h, m)
+                     ON CONFLICT (tenant_id, content_sha256, memory_id, tool) DO UPDATE
+                        SET last_emitted_at = now(),
+                            emit_count      = recall_emission.emit_count + 1,
+                            session_id      = COALESCE(EXCLUDED.session_id,
+                                                       recall_emission.session_id)",
+                )
+                .bind(&tenant)
+                .bind(&hashes)
+                .bind(&ids)
+                .bind(tool)
+                .bind(session_id)
+                .bind(call.call_id)
+                .bind(&call.client)
+                .bind(&call.project)
+                .bind(&memory)
+                .bind(&namespace)
+                .bind(&section)
+                .bind(&rank)
+                .execute(&pool)
+                .await;
+                if let Err(e) = result {
+                    tracing::warn!(rows = ids.len(), events, tool, error = %e, "record_emissions failed");
+                }
+                return;
+            }
             // Two parallel arrays into one `unnest`, which is what makes a ten-row digest one
             // round trip. DISTINCT because two rows in one result set can carry the same content,
             // and Postgres refuses a statement that touches the same key twice.
@@ -2814,6 +2874,30 @@ impl MemoryRepository for PgMemoryRepository {
                 tracing::warn!(rows = ids.len(), tool, error = %e, "record_emissions failed");
             }
         });
+    }
+
+    async fn purge_recall_events(
+        &self,
+        tenant: &str,
+        older_than_days: u32,
+        batch: i64,
+    ) -> Result<u64> {
+        // By the identity key, in emission order, so each batch is a short index range on
+        // `recall_event_tenant_emitted` and the oldest rows go first if the loop is cut short.
+        let deleted = sqlx::query(
+            "DELETE FROM recall_event
+              WHERE id IN (SELECT id FROM recall_event
+                            WHERE tenant_id = $1
+                              AND emitted_at < now() - make_interval(days => $2)
+                            ORDER BY emitted_at
+                            LIMIT $3)",
+        )
+        .bind(tenant)
+        .bind(i32::try_from(older_than_days).unwrap_or(i32::MAX))
+        .bind(batch)
+        .execute(&self.pool)
+        .await?;
+        Ok(deleted.rows_affected())
     }
 
     async fn confirm(&self, tenant: &str, id: uuid::Uuid) -> Result<()> {

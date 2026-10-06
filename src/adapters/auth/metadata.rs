@@ -119,6 +119,7 @@ mod tests {
         use crate::config::*;
         Config {
             cleanup: crate::config::CleanupConfig { interval_secs: 0, namespace: None, limit: 500 },
+            recall_events: crate::config::RecallEventConfig { enabled: false, retention_days: 30 },
             port: 8787,
             host: "0.0.0.0".into(),
             tenant_id: "me".into(),

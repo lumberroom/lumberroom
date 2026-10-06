@@ -247,6 +247,7 @@ pub struct Config {
     pub quality: QualityConfig,
     pub ingest: IngestConfig,
     pub cleanup: CleanupConfig,
+    pub recall_events: RecallEventConfig,
 }
 
 /// The scheduled cleanup pass, which runs inside this process.
@@ -268,6 +269,17 @@ pub struct CleanupConfig {
     /// How many rows one pass considers. A run that hits this holds its watermark where the
     /// findings stopped and says so in the log, so the next pass picks up the remainder.
     pub limit: i64,
+}
+
+/// The per-call recall log, `recall_event`. See `docs/recall-event-log.md` and decision 0024.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallEventConfig {
+    /// Off in the engine. A self-hoster who never runs a ranking evaluation gains nothing from a
+    /// table that records which facts each client used and when.
+    pub enabled: bool,
+    /// Days an event is kept. The cleanup pass enforces it, which is why turning the log on with
+    /// that pass off is refused at boot.
+    pub retention_days: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -948,6 +960,10 @@ pub fn load() -> Result<Config> {
             namespace: env_opt("CLEANUP_NAMESPACE"),
             limit: env_num("CLEANUP_LIMIT", 500i64)?,
         },
+        recall_events: parse_recall_events(
+            std::env::var("RECALL_EVENT_LOG").ok().as_deref(),
+            std::env::var("RECALL_EVENT_RETENTION_DAYS").ok().as_deref(),
+        )?,
         quality: QualityConfig {
             dedupe_threshold: env_num("DEDUPE_THRESHOLD", 0.97f64)?,
             conflict_threshold: env_num("CONFLICT_THRESHOLD", 0.90f64)?,
@@ -1069,6 +1085,56 @@ fn validate_cleanup(c: &CleanupConfig) -> Result<()> {
     Ok(())
 }
 
+/// Empty and absent both mean the default, as in `env_num` and `env_bool`. Takes the raw strings so
+/// a test does not have to touch the process environment.
+fn parse_recall_events(
+    log: Option<&str>,
+    retention_days: Option<&str>,
+) -> Result<RecallEventConfig> {
+    let enabled = match log.map(str::trim) {
+        Some(v) if !v.is_empty() => {
+            matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        }
+        _ => false,
+    };
+    let retention_days = match retention_days.map(str::trim) {
+        Some(v) if !v.is_empty() => v.parse().map_err(|_| {
+            DomainError::validation(format!(
+                "RECALL_EVENT_RETENTION_DAYS is not a valid whole number of days: {v:?}"
+            ))
+        })?,
+        _ => 30,
+    };
+    Ok(RecallEventConfig { enabled, retention_days })
+}
+
+/// Split out of `validate` so a test can reach it without building a whole `Config`.
+fn validate_recall_events(r: &RecallEventConfig, cleanup: &CleanupConfig) -> Result<()> {
+    // Zero would delete every event on the next pass, including the ones the evaluation is waiting
+    // for, and reads as "keep nothing" to one owner and "keep forever" to the next.
+    if r.retention_days < 1 {
+        return Err(DomainError::validation(
+            "RECALL_EVENT_RETENTION_DAYS must be at least 1. To keep no events, leave \
+             RECALL_EVENT_LOG off.",
+        ));
+    }
+    // Postgres refuses a timestamp a few million years back, so a window that wide would fail
+    // every purge with "timestamp out of range" instead of keeping everything.
+    if r.retention_days > 36_500 {
+        return Err(DomainError::validation("RECALL_EVENT_RETENTION_DAYS must be at most 36500."));
+    }
+    // The cleanup pass is the only thing that enforces the window. A log written with that pass
+    // off grows forever and keeps every row past the retention the owner was promised.
+    if r.enabled && cleanup.interval_secs == 0 {
+        return Err(DomainError::validation(
+            "RECALL_EVENT_LOG=true needs the cleanup pass, which deletes events past \
+             RECALL_EVENT_RETENTION_DAYS, and CLEANUP_INTERVAL_SECS=0 turns that pass off. Set \
+             CLEANUP_INTERVAL_SECS to at least 60, or turn the log off.",
+        ));
+    }
+    Ok(())
+}
+
 /// Split out of `validate` so a test can reach it without building a whole `Config`.
 fn validate_bootstrap(b: &BootstrapConfig) -> Result<()> {
     // Zero or below calls every pair of rows that points the same general way a duplicate, so each
@@ -1182,6 +1248,7 @@ fn validate_static_token(client: &str, token: &str) -> Result<()> {
 fn validate(cfg: &Config) -> Result<()> {
     validate_cleanup(&cfg.cleanup)?;
     validate_bootstrap(&cfg.bootstrap)?;
+    validate_recall_events(&cfg.recall_events, &cfg.cleanup)?;
     validate_db(&cfg.db)?;
     validate_conflict_sweep(&cfg.quality)?;
     validate_listener_pool(&cfg.db, &cfg.quality)?;
@@ -1419,6 +1486,53 @@ mod tests {
     /// Cleanup settings that pass, so each test below changes exactly one thing.
     fn valid() -> CleanupConfig {
         CleanupConfig { interval_secs: 3600, namespace: None, limit: 500 }
+    }
+
+    #[test]
+    fn absent_recall_event_settings_mean_off_and_thirty_days() {
+        for raw in [None, Some("")] {
+            let c = parse_recall_events(raw, raw).unwrap();
+            assert_eq!(c, RecallEventConfig { enabled: false, retention_days: 30 }, "{raw:?}");
+        }
+        let c = parse_recall_events(Some("true"), Some("7")).unwrap();
+        assert_eq!(c, RecallEventConfig { enabled: true, retention_days: 7 });
+    }
+
+    #[test]
+    fn a_recall_event_retention_that_is_not_a_number_names_its_variable() {
+        let e = parse_recall_events(None, Some("a month")).unwrap_err();
+        assert!(
+            e.client_message().contains("RECALL_EVENT_RETENTION_DAYS"),
+            "{}",
+            e.client_message()
+        );
+    }
+
+    #[test]
+    fn a_recall_event_retention_of_zero_days_is_refused() {
+        let c = RecallEventConfig { enabled: false, retention_days: 0 };
+        let e = validate_recall_events(&c, &valid()).unwrap_err();
+        assert!(
+            e.client_message().contains("RECALL_EVENT_RETENTION_DAYS"),
+            "{}",
+            e.client_message()
+        );
+        let one = RecallEventConfig { enabled: true, retention_days: 1 };
+        assert!(validate_recall_events(&one, &valid()).is_ok());
+        let ages = RecallEventConfig { enabled: true, retention_days: 36_501 };
+        assert!(validate_recall_events(&ages, &valid()).is_err());
+    }
+
+    #[test]
+    fn the_recall_event_log_needs_the_cleanup_pass_that_enforces_its_window() {
+        let mut off = valid();
+        off.interval_secs = 0;
+        let on = RecallEventConfig { enabled: true, retention_days: 30 };
+        let e = validate_recall_events(&on, &off).unwrap_err();
+        assert!(e.client_message().contains("CLEANUP_INTERVAL_SECS"), "{}", e.client_message());
+        // With the log off nothing new is written, so a deployment that runs no cleanup pass boots.
+        let quiet = RecallEventConfig { enabled: false, retention_days: 30 };
+        assert!(validate_recall_events(&quiet, &off).is_ok());
     }
 
     #[test]

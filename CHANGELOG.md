@@ -4,14 +4,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **A per-call recall log, off by default.** `RECALL_EVENT_LOG=true` records one `recall_event` row
+  per memory that a `memory_search` or `context_bootstrap` call returned, with the call id, rank,
+  digest section and active project, and no content. The cleanup pass deletes rows older than
+  `RECALL_EVENT_RETENTION_DAYS` (default 30), and forgetting a memory deletes its rows. Migration
+  `20261006000029`; see `docs/recall-event-log.md` and decision 0024.
+- `client/skills/lr-review`, an agent skill for working the review queue, synced into client plugins.
+
 ### Changed
 
 - **The digest ranks by recency, and a restatement gives up its slot.** Profile shows the 10 newest
   rows from `user:me` and `global` with no tag sorting first, and project the 5 newest. Recent no
   longer repeats a row either of them chose. Of two candidate rows at cosine 0.90 or more, the
   older is dropped from every section, so a correction hides the fact it corrects, and the next row
-  fills the slot. `BOOTSTRAP_DEDUP_COSINE` sets the threshold and 1 turns it off. Defaults for `BOOTSTRAP_PROFILE_LIMIT` and `BOOTSTRAP_PROJECT_LIMIT` move from 12
-  and 10 to 10 and 5. Decision 0025 has the reasoning (#109).
+  fills the slot. `BOOTSTRAP_DEDUP_COSINE` sets the threshold and 1 turns it off.
+  `BOOTSTRAP_PROFILE_LIMIT` and `BOOTSTRAP_PROJECT_LIMIT` now default to 10 and 5, down from 12 and
+  10. Decision 0025 has the reasoning (#109).
 
 ### Fixed
 
