@@ -8,17 +8,18 @@ module.
 
 You can run cargo directly if you have a Rust toolchain. The maintainer's machine has none, so
 everything below goes through a builder image that carries `g++` (ONNX Runtime links libstdc++ and
-`rust:slim` ships gcc without it) and the OpenSSL headers. Either way the `-j 1` rule applies on any
-machine tight on memory.
+`rust:slim` ships gcc without it) and the OpenSSL headers. Either way the `-j` rule below applies on
+any machine tight on memory.
 
 ```bash
 docker build -t lumberroom-builder -f Dockerfile.builder .   # once, and again after any change to
                                                        # Dockerfile.builder or scripts/lib/builder-entrypoint.sh
-docker compose up -d db                                # Postgres 16 + pgvector on 127.0.0.1:5432
+docker compose up -d db                                # Postgres 16 + pgvector on 127.0.0.1:5432, your store
 
 ./scripts/cargo.sh check --all-targets
-./scripts/cargo.sh test-fast                           # the suite, six binaries at a time
-./scripts/cargo.sh test -j 1                           # the suite, one binary at a time
+./scripts/cargo.sh test-fast                           # the suite on testdb, six binaries at a time
+./scripts/cargo.sh test                                # the suite on testdb, one binary at a time
+./scripts/cargo.sh test -j 1                           # the same, linking one binary at a time
 ./scripts/cargo.sh test -j 1 -p lumberroom
 ```
 
@@ -54,12 +55,44 @@ cache mount. Later builds copy from that mount, and the release image carries th
 `/models`, which is where `MODEL_CACHE_DIR` points.
 
 `-j 1` is not optional under memory pressure. Linking the lib-test and integration binaries at the
-same time gets the linker OOM-killed in the container: `collect2: fatal error: ld terminated with
-signal 9`. It reads as a compile error and it is a memory limit.
+same time got the linker OOM-killed in a Docker VM holding 6 GB: `collect2: fatal error: ld terminated
+with signal 9`. It reads as a compile error and it is a memory limit. So `test` and `test-fast` pick
+their own `-j` when you pass none: `-j 4` when `docker info` reports 12 GiB or more, `-j 1` below that
+or when the read fails. On a 12-CPU Linux build host with 15 GB, a cold suite build took 14m35s at
+`-j 1` and 11m07s at `-j 4`. Pass `-j` yourself to override either default.
 
-The integration suite runs against a real Postgres in its own `lumberroom_rust_test` database with the hash
-embedder, so it downloads nothing. It **skips rather than fails** when no database is reachable, so a
-run reporting 0 tests is not a pass. Check the count. Tests serialise themselves on a Postgres
+The suite runs on `testdb`, a Postgres service of its own in `docker-compose.yml` under the `test`
+profile, never on `db` where your store lives. `scripts/cargo.sh test` and `test-fast` start it when
+it is not healthy and hand the container
+`DATABASE_URL=postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@testdb:5432/lumberroom_test`, an admin
+connection each test binary creates its own databases from. The cluster runs with fsync,
+synchronous_commit and full_page_writes off and `max_connections=200`, because it holds nothing worth
+keeping and a parallel run at `db`'s 50 connections failed binaries with "too many clients". In one
+measured run of the hosted fork of [lumberroom](https://github.com/lumberroom/lumberroom) on a 12-CPU
+Linux build host, the move took the test phase from about 22 minutes to 11. This repository's suite
+has not been timed on both clusters.
+
+`LUMBERROOM_TEST_DATABASE_URL` sends the suite to another Postgres instead. `cargo.sh` refuses it when
+its database name is empty or equals `POSTGRES_DB`, because the suites truncate what they are handed.
+`scripts/cargo-sh-test.sh` checks that refusal and the `-j` default against a fake `docker`, with no
+Docker needed.
+
+Reset the test cluster by removing its container and its one volume. `cargo.sh` recreates both on the
+next run:
+
+```bash
+docker rm -f lumberroom-testdb-1
+docker volume rm lumberroom_testdata
+```
+
+Not `docker compose --profile test down -v`. That removes every named volume the file declares,
+`pgdata` included, which is your store. Plain `docker` also sidesteps compose's interpolation, which
+refuses every command while `LUMBERROOM_DOMAIN` is unset; `cargo.sh` fills in a placeholder for its
+own calls.
+
+The integration suite runs against that real Postgres in its own `lumberroom_rust_test` database with
+the hash embedder, so it downloads nothing. It **skips rather than fails** when no database is
+reachable, so a run reporting 0 tests is not a pass. Check the count. Tests serialise themselves on a Postgres
 advisory lock, because each one truncates that database and six test binaries are six processes. A
 mutex serialises threads and would not do.
 

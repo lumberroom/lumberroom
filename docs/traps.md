@@ -248,6 +248,12 @@ another binary's suite lock beside it and it failed with "left 2 advisory lock(s
 cluster break the unfiltered form the same way. The probe database carries the pid for the same
 reason: a fixed name lets one run's `DROP ... WITH (FORCE)` kill the other's connection.
 
+**`docker compose down -v` takes your store with the test cluster.** `-v` removes every named volume
+`docker-compose.yml` declares, so resetting `testdb` that way also deletes `pgdata`. A dry run against
+two throwaway volumes listed both for removal. Remove the container and the one volume by name, as
+CONTRIBUTING.md shows. The suite moved off `db` for the same reason in the other direction: it
+truncates whatever `DATABASE_URL` names, and on `db` that sat one database name away from the store.
+
 **The integration suite skips rather than fails with no database reachable**, so a run reporting a low
 count is not a pass. Check the split, not the exit code.
 
