@@ -14,6 +14,12 @@
 //! convenience surface rather than the obvious one, so the digest is where the grant has to be
 //! checked hardest.
 //!
+//! Ranking is recency (decision 0025). Each memory section reads a pool of candidates three times
+//! its limit, newest first. Across all three pools, the older row of every pair at or above
+//! `BOOTSTRAP_DEDUP_COSINE` is dropped, and each section then fills from what is left: profile,
+//! project, recent, with recent skipping every row the first two chose. The database compares the
+//! stored vectors and returns pairs of ids, so there is still no embedding call on this path.
+//!
 //! The structured payload is authoritative. Ceilings on the rendered text differ by surface and at
 //! least one is undocumented, so a client that truncates the markdown block still has the data.
 
@@ -24,10 +30,11 @@ use std::time::Instant;
 
 use super::Ctx;
 use crate::adapters::auth::filter_readable;
+use crate::domain::digest_dedup::Selection;
 use crate::domain::errors::Result;
 use crate::domain::namespaces;
 use crate::domain::policy::NamespaceCeiling;
-use crate::domain::types::Sensitivity;
+use crate::domain::types::{Memory, Sensitivity};
 use crate::ports::{DigestQuery, RegistrySummary};
 
 /// The name this tool records its emissions under, and the same string `recall_emission.tool`
@@ -145,11 +152,14 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
             user_namespace: namespaces::user_namespace(),
             project_namespace: project_ns.clone(),
             readable: readable.clone(),
-            profile_limit: b.profile_limit,
-            project_limit: b.project_limit,
-            recent_limit: b.recent_limit,
+            profile_limit: pool(b.profile_limit, 0),
+            project_limit: pool(b.project_limit, 0),
+            // Recent spans every namespace, so its newest rows are often the ones profile and
+            // project already took. The pool carries room for all of those on top of its own.
+            recent_limit: pool(b.recent_limit, b.profile_limit.max(0) + b.project_limit.max(0)),
             registry_limit: b.registry_limit,
             recent_days: b.recent_days,
+            dedup_cosine: b.dedup_cosine,
         })
         .await?;
 
@@ -168,6 +178,24 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
         for section in [&mut data.profile, &mut data.project_context, &mut data.recent] {
             section.retain(|m| !unopened.contains(&m.id));
         }
+    }
+
+    // After the unopened rows are gone, so a row this client cannot read never takes a slot or
+    // pushes its readable twin out.
+    let mut selection = Selection::new(
+        data.profile
+            .iter()
+            .chain(data.project_context.iter())
+            .chain(data.recent.iter())
+            .map(|m| (m.id.as_str(), m.created_at)),
+        &data.near_duplicates,
+    );
+    data.profile = choose(&mut selection, std::mem::take(&mut data.profile), b.profile_limit);
+    data.project_context =
+        choose(&mut selection, std::mem::take(&mut data.project_context), b.project_limit);
+    data.recent = choose(&mut selection, std::mem::take(&mut data.recent), b.recent_limit);
+    if selection.dropped() > 0 {
+        tracing::debug!(dropped = selection.dropped(), "digest collapsed near-duplicate rows");
     }
 
     // The digest's own count, which carries the namespace and the ceiling into the query. Built
@@ -240,6 +268,22 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
         c.insert(cache_key, CacheEntry { at: Instant::now(), digest: digest.clone() });
     }
     Ok(digest)
+}
+
+/// How many candidates a section reads for each slot it fills. Dropped twins and rows an earlier
+/// section took both come out of the pool, and three to one leaves room for both.
+const POOL_FACTOR: i64 = 3;
+
+fn pool(limit: i64, extra: i64) -> i64 {
+    limit.max(0).saturating_mul(POOL_FACTOR).saturating_add(extra)
+}
+
+/// One section's rows, newest first, cut to `limit` by the shared selection.
+fn choose(selection: &mut Selection, pool: Vec<Memory>, limit: i64) -> Vec<Memory> {
+    let ids: Vec<&str> = pool.iter().map(|m| m.id.as_str()).collect();
+    let keep = selection.pick(&ids, usize::try_from(limit).unwrap_or(0));
+    let mut pool: Vec<Option<Memory>> = pool.into_iter().map(Some).collect();
+    keep.into_iter().filter_map(|i| pool[i].take()).collect()
 }
 
 /// The cache key is a policy boundary, not an optimisation detail.

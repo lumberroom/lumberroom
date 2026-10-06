@@ -105,6 +105,10 @@ impl ResourceAudience {
 /// value an operator overrides are one number.
 pub const DEFAULT_RRF_K: f64 = 60.0;
 
+/// The cosine at which two digest rows count as near-duplicates, and the value
+/// `CONFLICT_THRESHOLD` defaults to.
+pub const DEFAULT_BOOTSTRAP_DEDUP_COSINE: f64 = 0.90;
+
 /// How old an `occurred_at` must be before `memory_write` accepts it. One day.
 ///
 /// Named so the write path's refusal and the boot-time check read one number, and so a test can
@@ -365,6 +369,9 @@ pub struct BootstrapConfig {
     /// boundary at a size nobody has published. The structured payload stays authoritative so a
     /// client that truncates the text block still has the data.
     pub max_chars_by_client: HashMap<String, usize>,
+    /// At or above this cosine, a digest candidate restates a row already chosen and gives up its
+    /// slot to the next one. 1.0 turns the pass off. Decision 0025 has the reasoning.
+    pub dedup_cosine: f64,
 }
 
 impl BootstrapConfig {
@@ -895,13 +902,14 @@ pub fn load() -> Result<Config> {
         },
         bootstrap: BootstrapConfig {
             cache_ms: env_num("BOOTSTRAP_CACHE_MS", 30_000u64)?,
-            profile_limit: env_num("BOOTSTRAP_PROFILE_LIMIT", 12i64)?,
-            project_limit: env_num("BOOTSTRAP_PROJECT_LIMIT", 10i64)?,
+            profile_limit: env_num("BOOTSTRAP_PROFILE_LIMIT", 10i64)?,
+            project_limit: env_num("BOOTSTRAP_PROJECT_LIMIT", 5i64)?,
             recent_limit: env_num("BOOTSTRAP_RECENT_LIMIT", 8i64)?,
             recent_days: env_num("BOOTSTRAP_RECENT_DAYS", 14i32)?,
             registry_limit: env_num("BOOTSTRAP_REGISTRY_LIMIT", 25i64)?,
             max_chars: env_num("BOOTSTRAP_MAX_CHARS", 6000usize)?,
             max_chars_by_client: parse_client_budgets(&env("BOOTSTRAP_MAX_CHARS_BY_CLIENT", ""))?,
+            dedup_cosine: env_num("BOOTSTRAP_DEDUP_COSINE", DEFAULT_BOOTSTRAP_DEDUP_COSINE)?,
         },
         search: SearchConfig {
             default_limit: env_num("SEARCH_DEFAULT_LIMIT", 8i64)?,
@@ -1128,6 +1136,21 @@ fn validate_recall_events(r: &RecallEventConfig, cleanup: &CleanupConfig) -> Res
 }
 
 /// Split out of `validate` so a test can reach it without building a whole `Config`.
+fn validate_bootstrap(b: &BootstrapConfig) -> Result<()> {
+    // Zero or below calls every pair of rows that points the same general way a duplicate, so each
+    // section prints one row and says nothing about why. NaN parses and then loses every
+    // comparison, which reads as "dedup on" while doing nothing.
+    if !(b.dedup_cosine.is_finite() && b.dedup_cosine > 0.0 && b.dedup_cosine <= 1.0) {
+        return Err(DomainError::validation(format!(
+            "BOOTSTRAP_DEDUP_COSINE must be above 0 and at most 1, got {}. It is a cosine; 1 turns \
+             near-duplicate collapse off and {DEFAULT_BOOTSTRAP_DEDUP_COSINE} is the default.",
+            b.dedup_cosine
+        )));
+    }
+    Ok(())
+}
+
+/// Split out of `validate` so a test can reach it without building a whole `Config`.
 fn validate_conflict_sweep(q: &QualityConfig) -> Result<()> {
     // One scan took 10 to 19 ms on a scratch copy at 1,691 rows a namespace, so 100 ms buys a
     // handful of rows a pass and less turns a backfill into a crawl. Past 25 seconds one sweep
@@ -1224,6 +1247,7 @@ fn validate_static_token(client: &str, token: &str) -> Result<()> {
 
 fn validate(cfg: &Config) -> Result<()> {
     validate_cleanup(&cfg.cleanup)?;
+    validate_bootstrap(&cfg.bootstrap)?;
     validate_recall_events(&cfg.recall_events, &cfg.cleanup)?;
     validate_db(&cfg.db)?;
     validate_conflict_sweep(&cfg.quality)?;
@@ -1826,9 +1850,41 @@ mod tests {
             registry_limit: 1,
             max_chars: 6000,
             max_chars_by_client: parse_client_budgets("chatgpt=3000").unwrap(),
+            dedup_cosine: DEFAULT_BOOTSTRAP_DEDUP_COSINE,
         };
         assert_eq!(cfg.budget_for("chatgpt"), 3000);
         assert_eq!(cfg.budget_for("hermes"), 6000);
+    }
+
+    fn bootstrap_with_dedup(dedup_cosine: f64) -> BootstrapConfig {
+        BootstrapConfig {
+            cache_ms: 0,
+            profile_limit: 10,
+            project_limit: 5,
+            recent_limit: 8,
+            recent_days: 14,
+            registry_limit: 25,
+            max_chars: 6000,
+            max_chars_by_client: HashMap::new(),
+            dedup_cosine,
+        }
+    }
+
+    #[test]
+    fn the_dedup_cosine_accepts_zero_to_one_with_one_meaning_off() {
+        for ok in [DEFAULT_BOOTSTRAP_DEDUP_COSINE, 0.01, 0.5, 1.0] {
+            assert!(validate_bootstrap(&bootstrap_with_dedup(ok)).is_ok(), "{ok} refused");
+        }
+    }
+
+    #[test]
+    fn the_dedup_cosine_refuses_zero_negatives_above_one_and_nan() {
+        // Zero would call every pair with a non-negative cosine a duplicate and print one row per
+        // section; NaN parses as a number and then loses every comparison.
+        for bad in [0.0, -0.5, 1.01, f64::NAN, f64::INFINITY] {
+            let e = validate_bootstrap(&bootstrap_with_dedup(bad)).unwrap_err();
+            assert!(e.client_message().contains("BOOTSTRAP_DEDUP_COSINE"), "{bad}");
+        }
     }
 
     #[test]

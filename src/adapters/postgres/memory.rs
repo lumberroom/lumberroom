@@ -877,7 +877,28 @@ const SAMPLE_CONTENT_SQL: &str = r#"
      ORDER BY random() LIMIT $4
 "#;
 
-/// The digest, as one statement with seven subqueries.
+/// The vector the digest compares, as one SQL expression over `memory m`.
+///
+/// One place on purpose: a store that keeps its current embedding in another column swaps it here
+/// and nowhere else. Both sides of every comparison read the same expression, so the widths match.
+macro_rules! digest_vector {
+    () => {
+        "m.embedding"
+    };
+}
+
+/// The digest, as one statement with seven filtered subqueries.
+///
+/// The three memory arms are candidate pools, newest first, which the service trims to its
+/// section limits (decision 0025). Profile has no tag preference: recency alone ranks it.
+///
+/// `near_duplicates` names the pairs of pooled rows whose cosine is at or above `$11`, and sends
+/// ids rather than vectors. A vector in a pool's select list cost twice over: under a generic plan
+/// Postgres detoasted and cast every candidate row before the LIMIT, and the JSON payload grew by
+/// more than thirty times on a synthetic store of 4,500 rows. The pairs come only from rows the three pools already admitted, so the grant and the
+/// ceiling bound them the same way they bound the pools. A zero vector gives a NaN distance, and
+/// NaN fails `<=`, so it pairs with nothing. `$11 < 1` gates the comparison, which is how 1.0
+/// turns the pass off without a second statement.
 ///
 /// Deliberately not decomposed: the bootstrap latency budget depends on this staying a single round
 /// trip. Every one of the seven joins `reachable` and compares `sensitivity_rank`, including the
@@ -891,61 +912,85 @@ const DIGEST_SQL: &str = concat!(
         SELECT namespace, min(sensitivity_rank(max)) AS max_rank
           FROM unnest($6::text[], $7::text[]) AS g(namespace, max)
          GROUP BY namespace
+    ),
+    profile_pool AS (
+        SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
+               m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
+               m.access_count, m.last_accessed_at, m.last_confirmed_at, m.created_at,
+               m.occurred_at, m.occurred_until
+          FROM memory m
+          JOIN reachable rg ON rg.namespace = m.namespace
+         WHERE m.tenant_id = $1
+           AND sensitivity_rank(m.sensitivity) <= rg.max_rank
+           AND "#,
+    live!(),
+    r#"
+           -- 'global' is a namespace like any other and has to be granted. The join is what
+           -- enforces that; this line only narrows which granted namespaces are profile.
+           AND m.namespace IN ($2, 'global')
+         ORDER BY m.created_at DESC
+         LIMIT $3
+    ),
+    project_pool AS (
+        SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
+               m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
+               m.access_count, m.last_accessed_at, m.last_confirmed_at, m.created_at,
+               m.occurred_at, m.occurred_until
+          FROM memory m
+          JOIN reachable rg ON rg.namespace = m.namespace
+         WHERE m.tenant_id = $1
+           AND sensitivity_rank(m.sensitivity) <= rg.max_rank
+           AND "#,
+    live!(),
+    r#"
+           AND $4::text IS NOT NULL AND m.namespace = $4
+         ORDER BY m.created_at DESC
+         LIMIT $5
+    ),
+    recent_pool AS (
+        SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
+               m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
+               m.access_count, m.last_accessed_at, m.last_confirmed_at, m.created_at,
+               m.occurred_at, m.occurred_until
+          FROM memory m
+          JOIN reachable rg ON rg.namespace = m.namespace
+         WHERE m.tenant_id = $1
+           AND sensitivity_rank(m.sensitivity) <= rg.max_rank
+           AND "#,
+    live!(),
+    r#"
+           AND m.created_at > now() - ($8 || ' days')::interval
+         ORDER BY m.created_at DESC
+         LIMIT $9
+    ),
+    pooled_vectors AS MATERIALIZED (
+        -- The cast round trip is a copy on purpose. A stored vector is a TOAST pointer, and the
+        -- materialized CTE kept the pointer, so every one of the n-squared comparisons below read
+        -- the vector again: 11,532 buffer hits at 20,000 rows on a synthetic store, against 372
+        -- with one in-memory copy per pooled row.
+        SELECT p.id, ("#,
+    digest_vector!(),
+    r#")::real[]::vector AS v
+          FROM (SELECT id FROM profile_pool
+                UNION SELECT id FROM project_pool
+                UNION SELECT id FROM recent_pool) p
+          JOIN memory m ON m.id = p.id AND m.tenant_id = $1
+         WHERE $11::float8 < 1 AND "#,
+    digest_vector!(),
+    r#" IS NOT NULL
     )
     SELECT json_build_object(
         'profile', COALESCE((
-            SELECT json_agg(f) FROM (
-              SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
-                     m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
-                     m.access_count, m.last_accessed_at, m.last_confirmed_at, m.created_at,
-                     m.occurred_at, m.occurred_until
-                FROM memory m
-                JOIN reachable rg ON rg.namespace = m.namespace
-               WHERE m.tenant_id = $1
-                 AND sensitivity_rank(m.sensitivity) <= rg.max_rank
-                 AND "#,
-    live!(),
-    r#"
-                 -- 'global' is a namespace like any other and has to be granted. The join is what
-                 -- enforces that; this line only narrows which granted namespaces are profile.
-                 AND m.namespace IN ($2, 'global')
-               ORDER BY (m.tags && ARRAY['profile','preference','identity']) DESC, m.created_at DESC
-               LIMIT $3
-            ) f), '[]'::json),
+            SELECT json_agg(f ORDER BY f.created_at DESC) FROM profile_pool f), '[]'::json),
         'project_context', COALESCE((
-            SELECT json_agg(f) FROM (
-              SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
-                     m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
-                     m.access_count, m.last_accessed_at, m.last_confirmed_at, m.created_at,
-                     m.occurred_at, m.occurred_until
-                FROM memory m
-                JOIN reachable rg ON rg.namespace = m.namespace
-               WHERE m.tenant_id = $1
-                 AND sensitivity_rank(m.sensitivity) <= rg.max_rank
-                 AND "#,
-    live!(),
-    r#"
-                 AND $4::text IS NOT NULL AND m.namespace = $4
-               ORDER BY m.created_at DESC
-               LIMIT $5
-            ) f), '[]'::json),
+            SELECT json_agg(f ORDER BY f.created_at DESC) FROM project_pool f), '[]'::json),
         'recent', COALESCE((
-            SELECT json_agg(f) FROM (
-              SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
-                     m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
-                     m.access_count, m.last_accessed_at, m.last_confirmed_at, m.created_at,
-                     m.occurred_at, m.occurred_until
-                FROM memory m
-                JOIN reachable rg ON rg.namespace = m.namespace
-               WHERE m.tenant_id = $1
-                 AND sensitivity_rank(m.sensitivity) <= rg.max_rank
-                 AND "#,
-    live!(),
-    r#"
-                 AND m.created_at > now() - ($8 || ' days')::interval
-               ORDER BY m.created_at DESC
-               LIMIT $9
-            ) f), '[]'::json),
+            SELECT json_agg(f ORDER BY f.created_at DESC) FROM recent_pool f), '[]'::json),
+        'near_duplicates', COALESCE((
+            SELECT json_agg(json_build_array(a.id, b.id))
+              FROM pooled_vectors a
+              JOIN pooled_vectors b ON a.id < b.id
+             WHERE (a.v <=> b.v) <= 1 - $11::float8), '[]'::json),
         'registry', COALESCE((
             SELECT json_agg(r) FROM (
               -- The registry carries its own sensitivity column and holds credential locations.
@@ -2002,6 +2047,7 @@ impl MemoryRepository for PgMemoryRepository {
             .bind(q.recent_days.to_string())
             .bind(q.recent_limit)
             .bind(q.registry_limit)
+            .bind(q.dedup_cosine)
             .fetch_one(&self.pool)
             .await?;
 
@@ -2014,11 +2060,21 @@ impl MemoryRepository for PgMemoryRepository {
                 .map(Into::into)
                 .collect()
         };
+        // A pair list that fails to parse costs the dedup pass and nothing else, so it reads as
+        // empty rather than failing the digest.
+        let near_duplicates = payload
+            .get("near_duplicates")
+            .and_then(|v| serde_json::from_value::<Vec<(uuid::Uuid, uuid::Uuid)>>(v.clone()).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
 
         Ok(DigestData {
             profile: parse("profile"),
             project_context: parse("project_context"),
             recent: parse("recent"),
+            near_duplicates,
             registry: payload
                 .get("registry")
                 .and_then(|v| serde_json::from_value::<Vec<RegistrySummary>>(v.clone()).ok())
@@ -4368,6 +4424,25 @@ mod tests {
         for sql in AS_OF_SQL {
             assert!(!sql.contains("occurred_until > now()"), "as-of reads an instant, not now");
         }
+    }
+
+    /// Decision 0025. No pool carries a vector, profile orders by recency alone, and the pairs
+    /// compare one vector expression on both sides, gated by the threshold.
+    #[test]
+    fn the_digest_pools_send_ids_not_vectors_and_profile_orders_by_recency_alone() {
+        // One cast, in the pair CTE. A vector in a pool's select list is detoasted before LIMIT.
+        assert_eq!(DIGEST_SQL.matches("::real[]").count(), 1);
+        let pools = &DIGEST_SQL[..DIGEST_SQL.find("pooled_vectors AS").unwrap()];
+        assert!(!pools.contains("embedding AS") && !pools.contains("::vector"));
+        assert!(!DIGEST_SQL.contains("m.tags &&"), "no tag sorts a row above a newer one");
+        assert_eq!(DIGEST_SQL.matches("ORDER BY m.created_at DESC").count(), 3);
+        assert_eq!(
+            DIGEST_SQL.matches(concat!("(", digest_vector!(), ")::real[]::vector AS v")).count(),
+            1
+        );
+        assert_eq!(DIGEST_SQL.matches(concat!(digest_vector!(), " IS NOT NULL")).count(), 1);
+        assert!(DIGEST_SQL.contains("WHERE $11::float8 < 1 AND"));
+        assert!(DIGEST_SQL.contains("(a.v <=> b.v) <= 1 - $11::float8"));
     }
 
     /// Three digest select lists gained two columns each. The join count is what says no arm lost

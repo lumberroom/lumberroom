@@ -13,6 +13,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `20261006000029`; see `docs/recall-event-log.md` and decision 0024.
 - `client/skills/lr-review`, an agent skill for working the review queue, synced into client plugins.
 
+### Changed
+
+- **The digest ranks by recency, and a restatement gives up its slot.** Profile shows the 10 newest
+  rows from `user:me` and `global` with no tag sorting first, and project the 5 newest. Recent no
+  longer repeats a row either of them chose. Of two candidate rows at cosine 0.90 or more, the
+  older is dropped from every section, so a correction hides the fact it corrects, and the next row
+  fills the slot. `BOOTSTRAP_DEDUP_COSINE` sets the threshold and 1 turns it off.
+  `BOOTSTRAP_PROFILE_LIMIT` and `BOOTSTRAP_PROJECT_LIMIT` now default to 10 and 5, down from 12 and
+  10. Decision 0025 has the reasoning (#109).
+
 ### Fixed
 
 - **A 0.5.0 dump restores again.** `pg_restore --exit-on-error` stopped every 0.5.0 dump at trigger

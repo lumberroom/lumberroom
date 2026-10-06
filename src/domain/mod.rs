@@ -1,6 +1,7 @@
 pub mod canonical;
 pub mod cleanup;
 pub mod dates;
+pub mod digest_dedup;
 pub mod errors;
 pub mod namespaces;
 pub mod oauth;

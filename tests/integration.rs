@@ -1286,16 +1286,19 @@ async fn a_private_row_reaches_every_digest_section_it_belongs_to_and_no_further
     .await
     .unwrap();
 
-    // A fresh row in the user namespace lands in profile and in recent at once. The digest decrypts
-    // all three sections in one pass, so a decryptor that spent the ciphertext on the first copy
-    // reported the second as data loss and the row vanished from both.
+    // A fresh row in the user namespace lands in the profile pool and the recent pool at once. The
+    // digest decrypts every pool in one pass, so a decryptor that spent the ciphertext on the first
+    // copy reported the second as data loss and the row vanished from both. Since decision 0025
+    // recent skips what profile chose, so the row prints in profile alone. The end of this test
+    // pushes it out of profile, so recent prints the copy from the second pool.
     bootstrap::clear_cache();
     let high = restricted_at(&ctx, &at(&[("user:me", Sensitivity::Private)]), &[]);
     let d = bootstrap::run(&high, None).await.unwrap();
     assert!(d.profile.iter().any(|f| f.content.contains(&secret)), "profile holds the private row");
-    assert!(d.recent.iter().any(|f| f.content.contains(&secret)), "recent holds the same row");
-    // The rendered text prints a fact once across sections by design, so the payload is what carries
-    // the claim above.
+    assert!(
+        !d.recent.iter().any(|f| f.content.contains(&secret)),
+        "recent skips what profile chose"
+    );
     assert_eq!(d.text.matches(&secret).count(), 1, "the markdown prints it once");
 
     // Search reads the same row through the same decryptor.
@@ -1319,6 +1322,37 @@ async fn a_private_row_reaches_every_digest_section_it_belongs_to_and_no_further
     assert!(
         hits.hits.iter().all(|h| !h.content.contains(&secret)),
         "search must not serve it at open"
+    );
+
+    // Newer rows fill profile, so the private row prints from the recent pool, the later of its
+    // two copies. A decryptor that opened only the first copy leaves this one empty. Sentences
+    // with no word in common, so the dedup pass leaves every one of them standing.
+    let fillers = [
+        "Mornings start with black coffee",
+        "Invoices go out on the first Monday",
+        "The cat is called Biscuit",
+        "Prefers vim keybindings everywhere",
+        "Runs every Saturday along the canal",
+        "Allergic to peanuts",
+        "Keeps receipts in a shoebox",
+        "Reads science fiction before sleeping",
+        "Calls grandmother on Sunday evenings",
+        "Uses metric units when cooking",
+    ];
+    assert!(fillers.len() as i64 >= ctx.cfg.bootstrap.profile_limit);
+    for line in fillers {
+        write::run(&ctx, line, "user:me", None, None, None, None).await.unwrap();
+    }
+    bootstrap::clear_cache();
+    let d = bootstrap::run(&high, None).await.unwrap();
+    assert!(
+        !d.profile.iter().any(|f| f.content.contains(&secret)),
+        "profile is full of newer rows"
+    );
+    assert!(
+        d.recent.iter().any(|f| f.content == format!("the private note says {secret}")),
+        "recent prints the second copy, decrypted: {:?}",
+        d.recent.iter().map(|f| &f.content).collect::<Vec<_>>()
     );
 }
 
