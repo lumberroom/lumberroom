@@ -4,6 +4,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The digest ranks by recency, and a restatement gives up its slot.** Profile shows the 10 newest
+  rows from `user:me` and `global` with no tag sorting first, and project the 5 newest. Recent no
+  longer repeats a row either of them chose. Of two candidate rows at cosine 0.90 or more, the
+  older is dropped from every section, so a correction hides the fact it corrects, and the next row
+  fills the slot. `BOOTSTRAP_DEDUP_COSINE` sets the threshold and 1 turns it off. Defaults for `BOOTSTRAP_PROFILE_LIMIT` and `BOOTSTRAP_PROJECT_LIMIT` move from 12
+  and 10 to 10 and 5. Decision 0025 has the reasoning (#109).
+
 ### Fixed
 
 - **A 0.5.0 dump restores again.** `pg_restore --exit-on-error` stopped every 0.5.0 dump at trigger

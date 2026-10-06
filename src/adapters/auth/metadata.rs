@@ -167,6 +167,7 @@ mod tests {
                 registry_limit: 1,
                 max_chars: 100,
                 max_chars_by_client: std::collections::HashMap::new(),
+                dedup_cosine: crate::config::DEFAULT_BOOTSTRAP_DEDUP_COSINE,
             },
             search: SearchConfig {
                 graph_route: crate::domain::routing::Thresholds::default(),

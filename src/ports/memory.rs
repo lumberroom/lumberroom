@@ -402,11 +402,17 @@ pub struct DigestQuery {
     /// Phase 1 shipped a bug where the profile and project subqueries skipped the namespace filter,
     /// and the leak path in a memory system is the convenience surface, not the obvious one.
     pub readable: Vec<NamespaceCeiling>,
+    /// The three memory limits size candidate pools, newest first, and the service trims each pool
+    /// to its section after collapsing near-duplicates. An adapter returns up to this many rows
+    /// and applies no limit of its own.
     pub profile_limit: i64,
     pub project_limit: i64,
     pub recent_limit: i64,
     pub registry_limit: i64,
     pub recent_days: i32,
+    /// Pooled rows at or above this cosine come back as a pair in `near_duplicates`. At 1.0 or
+    /// above the adapter compares nothing.
+    pub dedup_cosine: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -418,6 +424,9 @@ pub struct DigestData {
     pub memories_count: i64,
     pub registry_count: i64,
     pub by_namespace: HashMap<String, i64>,
+    /// Pairs of pooled row ids whose stored vectors sit at or above `dedup_cosine`, each pair once
+    /// and in no set order. A row without a vector is in no pair.
+    pub near_duplicates: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
