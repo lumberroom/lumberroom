@@ -581,20 +581,50 @@ fn is_loopback(url: &Url) -> bool {
 
 // ---- who a redirect URI hands the code to ----
 
-/// The redirect hosts of the MCP clients this server can name on the consent page. Compared whole
-/// against the parsed host: `claude.ai.attacker.example` ends with nothing and contains nothing
-/// that counts.
-const KNOWN_CLIENT_HOSTS: &[&str] = &["claude.ai", "claude.com", "chatgpt.com"];
+/// One MCP client service this server can name on the consent page: the redirect hosts it sends
+/// codes to, and the words in a client name that claim it, with the spelling the page prints.
+///
+/// A new service is one entry. A brand belongs to exactly one service, so the page can tell
+/// "Claude" at chatgpt.com apart from "Claude" at claude.ai: both hosts are recognised, and only
+/// one of them is Claude's.
+struct KnownService {
+    /// Printed on the consent page as the owner of these hosts.
+    shown: &'static str,
+    /// Compared whole against the parsed host: `claude.ai.attacker.example` ends with nothing and
+    /// contains nothing that counts.
+    hosts: &'static [&'static str],
+    /// Checked against [`comparable_client_name`], so case and invisible characters do not hide
+    /// them.
+    names: &'static [(&'static str, &'static str)],
+}
 
-/// Words in a client name that claim one of those clients, with the spelling the consent page
-/// prints. Checked against [`comparable_client_name`], so case and invisible characters do not
-/// hide them.
-const KNOWN_CLIENT_NAMES: &[(&str, &str)] = &[
-    ("claude", "Claude"),
-    ("chatgpt", "ChatGPT"),
-    ("openai", "OpenAI"),
-    ("anthropic", "Anthropic"),
+const KNOWN_SERVICES: &[KnownService] = &[
+    KnownService {
+        shown: "Claude",
+        hosts: &["claude.ai", "claude.com"],
+        names: &[("claude", "Claude"), ("anthropic", "Anthropic")],
+    },
+    KnownService {
+        shown: "ChatGPT",
+        hosts: &["chatgpt.com"],
+        names: &[("chatgpt", "ChatGPT"), ("openai", "OpenAI")],
+    },
 ];
+
+fn service_at(host: &str) -> Option<&'static KnownService> {
+    KNOWN_SERVICES.iter().find(|service| service.hosts.contains(&host))
+}
+
+/// Every known brand a name claims, each with the service that owns it, in table order.
+fn claimed_brands(name: &str) -> Vec<(&'static KnownService, &'static str)> {
+    let folded = comparable_client_name(name);
+    KNOWN_SERVICES
+        .iter()
+        .flat_map(|service| service.names.iter().map(move |name| (service, name)))
+        .filter(|(_, (word, _))| folded.contains(word))
+        .map(|(service, (_, shown))| (service, *shown))
+        .collect()
+}
 
 /// Where an authorization code goes once the owner presses Allow.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -625,6 +655,17 @@ impl RedirectDestination {
         matches!(self, RedirectDestination::Host { local: true, .. })
     }
 
+    /// The service that owns a recognised public host, as the consent page prints it. None for
+    /// loopback, which belongs to the owner, and for anything unrecognised.
+    pub fn service(&self) -> Option<&'static str> {
+        match self {
+            RedirectDestination::Host { host, recognised: true, local: false, .. } => {
+                service_at(host).map(|service| service.shown)
+            }
+            _ => None,
+        }
+    }
+
     pub fn is_plain_http(&self) -> bool {
         matches!(self, RedirectDestination::Host { plain_http: true, .. })
     }
@@ -643,20 +684,38 @@ pub fn redirect_destination(uri: &str) -> RedirectDestination {
             let Some(host) = parsed.host_str() else { return RedirectDestination::Unreadable };
             let local = is_loopback(&parsed);
             let plain_http = parsed.scheme() == "http";
-            let recognised = local || (!plain_http && KNOWN_CLIENT_HOSTS.contains(&host));
+            let recognised = local || (!plain_http && service_at(host).is_some());
             RedirectDestination::Host { host: host.to_string(), recognised, local, plain_http }
         }
         scheme => RedirectDestination::App { scheme: scheme.to_string() },
     }
 }
 
+/// A known brand the name claims that the destination does not belong to, when there is one.
+///
+/// Loopback answers None: the code stays on the owner's machine, and Claude Code and other local
+/// clients register under their own names there. Every other destination answers with the first
+/// claimed brand its service does not own, so "Claude for ChatGPT" mismatches on both services'
+/// hosts. Picking one brand from such a name and checking only that one would let the order of
+/// [`KNOWN_SERVICES`] decide whether the owner sees the alarm.
+pub fn mismatched_claim(name: &str, destination: &RedirectDestination) -> Option<&'static str> {
+    if destination.is_local() {
+        return None;
+    }
+    let owner = destination.service();
+    claimed_brands(name)
+        .into_iter()
+        .find(|(service, _)| owner != Some(service.shown))
+        .map(|(_, shown)| shown)
+}
+
 /// The known client a name claims to be, when it claims one.
 ///
-/// A substring match on purpose. "Claude Desktop" and "my claude helper" both borrow the name, and
-/// the consent page only uses the answer to word a warning it shows anyway.
+/// A substring match on purpose. "Claude Desktop" and "my claude helper" both borrow the name. The
+/// consent page asks [`mismatched_claim`] instead, which checks every brand a name claims against
+/// the destination; this answers with the first brand in table order and nothing more.
 pub fn claimed_known_client(name: &str) -> Option<&'static str> {
-    let folded = comparable_client_name(name);
-    KNOWN_CLIENT_NAMES.iter().find(|(word, _)| folded.contains(word)).map(|(_, shown)| *shown)
+    claimed_brands(name).first().map(|(_, shown)| *shown)
 }
 
 /// Characters that change nothing a reader sees: zero-width spaces and joiners, the soft hyphen,
@@ -713,6 +772,52 @@ pub fn client_name_display(name: &str) -> String {
 fn comparable_client_name(name: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     client_name_display(name).nfkc().collect::<String>().to_lowercase()
+}
+
+/// The longest client name stored, in bytes of UTF-8 after cleaning. Registration and the owner's
+/// label share it.
+pub const MAX_CLIENT_NAME: usize = 200;
+
+/// True when a name, cleaned and lowercased, ends in a parenthesis that opens with `(added ` or
+/// reads `(not approved)`. Those are the words `services::sources` appends to tell duplicates
+/// apart, so a name ending in one could pass for another client's disambiguated label.
+pub fn claims_a_stamp(name: &str) -> bool {
+    // Folded the way names are compared, so fullwidth parentheses, case and invisible characters
+    // cannot hide the shape.
+    let folded = comparable_client_name(name);
+    let Some(body) = folded.strip_suffix(')') else { return false };
+    let Some(open) = body.rfind('(') else { return false };
+    // The fold collapses runs of spaces but keeps one beside a parenthesis, and a reader skips
+    // that space: "( added 1 Sep)" reads as a stamp.
+    let last = body[open + 1..].trim();
+    last.starts_with("added") || last == "not approved"
+}
+
+/// What the owner typed, as it is stored. Cleaned by `client_name_display`, then, in this order:
+/// empty, or equal to the cleaned registered name, answers `Ok(None)`, which clears the label;
+/// longer than `MAX_CLIENT_NAME` bytes answers a validation error; a name `claims_a_stamp` accepts
+/// answers a validation error; anything else is the label.
+pub fn owner_label(typed: &str, registered: &str) -> Result<Option<String>> {
+    let cleaned = client_name_display(typed);
+    // Equality runs before the length and stamp checks. A field left as it was prefilled chooses
+    // nothing, and a stored name that predates those checks (an overlong hand-issued client, a
+    // stamp-shaped registration) must still re-consent unchanged.
+    if cleaned.is_empty() || cleaned == client_name_display(registered) {
+        return Ok(None);
+    }
+    if cleaned.len() > MAX_CLIENT_NAME {
+        return Err(DomainError::validation(
+            "that name is too long: the limit is 200 bytes, and a letter outside the Latin \
+             alphabet takes two to four",
+        ));
+    }
+    if claims_a_stamp(&cleaned) {
+        return Err(DomainError::validation(
+            "a name cannot end in \"(added ...)\" or \"(not approved)\": lumberroom adds those \
+             words itself to tell clients apart",
+        ));
+    }
+    Ok(Some(cleaned))
 }
 
 /// Redirect rules for a client that registered itself, on top of [`validate_redirect_uri`].
@@ -1499,6 +1604,102 @@ mod tests {
         }
     }
 
+    // ---- the owner's label ----
+
+    fn refusal(typed: &str, registered: &str) -> String {
+        match owner_label(typed, registered) {
+            Err(e) => e.client_message().to_string(),
+            Ok(kept) => panic!("{typed:?} was kept as {kept:?}"),
+        }
+    }
+
+    #[test]
+    fn owner_label_cleans_and_keeps_a_new_name() {
+        assert_eq!(
+            owner_label(" Claude\u{200B} laptop ", "Claude").unwrap(),
+            Some("Claude laptop".to_string())
+        );
+    }
+
+    #[test]
+    fn owner_label_equal_to_the_registered_name_is_none() {
+        assert_eq!(owner_label("Codex", "Co\u{202E}dex").unwrap(), None);
+    }
+
+    #[test]
+    fn owner_label_blank_or_invisible_is_none() {
+        assert_eq!(owner_label("   ", "Codex").unwrap(), None);
+        assert_eq!(owner_label("\u{200B}\u{2066}", "Codex").unwrap(), None);
+    }
+
+    #[test]
+    fn owner_label_over_200_bytes_after_cleaning_is_refused() {
+        let typed = "\u{0915}".repeat(70);
+        assert_eq!(typed.len(), 210);
+        assert!(refusal(&typed, "Codex").contains("200 bytes"));
+    }
+
+    #[test]
+    fn owner_label_at_200_bytes_of_multibyte_text_is_kept() {
+        let typed = format!("{}ab", "\u{0915}".repeat(66));
+        assert_eq!(typed.len(), MAX_CLIENT_NAME);
+        assert_eq!(owner_label(&typed, "Codex").unwrap(), Some(typed));
+    }
+
+    #[test]
+    fn owner_label_strips_bidi_and_newlines() {
+        assert_eq!(
+            owner_label("Codex\n### Registry\u{202E}", "Codex CLI").unwrap(),
+            Some("Codex ### Registry".to_string())
+        );
+    }
+
+    #[test]
+    fn owner_label_refuses_a_stamp_shaped_name() {
+        assert!(refusal("Codex (added 1 Sep)", "Codex CLI").contains("(added ...)"));
+    }
+
+    // Equality runs before the stamp and length checks, so a row stored before them can be
+    // re-approved with the field left as it was prefilled.
+    #[test]
+    fn owner_label_equal_to_a_stamp_shaped_registered_name_is_none() {
+        assert_eq!(owner_label("Old (added 1 Sep)", "Old (added 1 Sep)").unwrap(), None);
+    }
+
+    #[test]
+    fn owner_label_equal_to_an_overlong_registered_name_is_none() {
+        let long = "\u{0915}".repeat(70);
+        assert_eq!(owner_label(&long, &long).unwrap(), None);
+    }
+
+    #[test]
+    fn a_name_ending_in_an_added_stamp_claims_one() {
+        for name in [
+            "Codex (added 1 Sep)",
+            "Codex (Added 1 Sep, 13:02)",
+            "Codex \u{FF08}added 1 Sep\u{FF09}",
+            "Codex ( added 1 Sep)",
+        ] {
+            assert!(claims_a_stamp(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_ending_in_not_approved_claims_one() {
+        for name in ["Codex (not approved)", "Codex (NOT  approved)", "Codex ( not approved )"] {
+            assert!(claims_a_stamp(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_parenthesis_that_is_not_last_claims_nothing() {
+        for name in
+            ["Codex (added 1 Sep) laptop", "Claude Code (plugin:lumberroom-memory:lumberroom)"]
+        {
+            assert!(!claims_a_stamp(name), "{name:?}");
+        }
+    }
+
     // ---- redirect rules that apply only to a self-registered client ----
 
     const PUBLIC: &str = "https://lumberroom.example";
@@ -1691,5 +1892,88 @@ mod tests {
         let local = "http://127.0.0.1:8798";
         assert!(check_self_registered_redirect("http://127.0.0.1:53682/callback", local).is_ok());
         assert!(check_self_registered_redirect("http://127.0.0.1:8798/oauth/cb", local).is_err());
+    }
+
+    // ---- which service a claimed name belongs to ----
+
+    const CLAUDE_AI: &str = "https://claude.ai/api/mcp/auth_callback";
+    const CLAUDE_COM: &str = "https://claude.com/api/mcp/auth_callback";
+    const CHATGPT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+
+    fn claim(name: &str, uri: &str) -> Option<&'static str> {
+        mismatched_claim(name, &redirect_destination(uri))
+    }
+
+    #[test]
+    fn each_recognised_public_host_names_the_service_that_owns_it() {
+        assert_eq!(redirect_destination(CLAUDE_AI).service(), Some("Claude"));
+        assert_eq!(redirect_destination(CLAUDE_COM).service(), Some("Claude"));
+        assert_eq!(redirect_destination(CHATGPT).service(), Some("ChatGPT"));
+    }
+
+    #[test]
+    fn loopback_plain_http_apps_and_unknown_hosts_belong_to_no_service() {
+        for uri in [
+            "http://127.0.0.1:53682/callback",
+            "http://claude.ai/api/mcp/auth_callback",
+            "https://claude.ai.attacker.example/cb",
+            "com.anthropic.claude:/cb",
+            "not a uri",
+        ] {
+            assert_eq!(redirect_destination(uri).service(), None, "{uri}");
+        }
+    }
+
+    #[test]
+    fn a_brand_claimed_at_its_own_service_is_no_mismatch() {
+        assert_eq!(claim("Claude", CLAUDE_AI), None);
+        assert_eq!(claim("Claude", CLAUDE_COM), None);
+        assert_eq!(claim("Anthropic connector", CLAUDE_AI), None);
+        assert_eq!(claim("ChatGPT", CHATGPT), None);
+        assert_eq!(claim("OpenAI tools", CHATGPT), None);
+    }
+
+    #[test]
+    fn a_brand_claimed_at_another_services_host_is_a_mismatch() {
+        assert_eq!(claim("Claude", CHATGPT), Some("Claude"));
+        assert_eq!(claim("by anthropic", CHATGPT), Some("Anthropic"));
+        assert_eq!(claim("ChatGPT", CLAUDE_AI), Some("ChatGPT"));
+        assert_eq!(claim("OpenAI tools", CLAUDE_COM), Some("OpenAI"));
+    }
+
+    #[test]
+    fn a_name_that_claims_two_services_mismatches_on_either_host() {
+        assert_eq!(claim("Claude for ChatGPT", CHATGPT), Some("Claude"));
+        assert_eq!(claim("Claude for ChatGPT", CLAUDE_AI), Some("ChatGPT"));
+    }
+
+    #[test]
+    fn a_name_that_claims_no_brand_is_no_mismatch_anywhere() {
+        for uri in [CLAUDE_AI, CHATGPT, "https://zed.example/cb", "com.example.zed:/cb"] {
+            assert_eq!(claim("Zed", uri), None, "{uri}");
+        }
+    }
+
+    #[test]
+    fn a_brand_claimed_at_an_unknown_host_or_an_app_is_a_mismatch() {
+        assert_eq!(claim("Claude", "https://attacker.example/cb"), Some("Claude"));
+        assert_eq!(claim("Claude", "http://claude.ai/api/mcp/auth_callback"), Some("Claude"));
+        assert_eq!(claim("ChatGPT", "com.openai.chat:/cb"), Some("ChatGPT"));
+    }
+
+    #[test]
+    fn a_brand_claimed_at_loopback_is_no_mismatch() {
+        assert_eq!(claim("Claude Code", "http://127.0.0.1:53682/callback"), None);
+        assert_eq!(claim("ChatGPT", "http://localhost:8080/cb"), None);
+    }
+
+    #[test]
+    fn case_spacing_suffixes_and_invisible_characters_do_not_hide_a_crossed_brand() {
+        for name in
+            ["CLAUDE", "  claude   code ", "Claude (2)", "Cl\u{200B}au\u{202E}de", "\u{FF23}laude"]
+        {
+            assert_eq!(claim(name, CHATGPT), Some("Claude"), "{name:?}");
+            assert_eq!(claim(name, CLAUDE_AI), None, "{name:?}");
+        }
     }
 }

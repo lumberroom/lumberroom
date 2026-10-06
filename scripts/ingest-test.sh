@@ -64,8 +64,8 @@ command -v curl >/dev/null 2>&1 || { echo "curl is required" >&2; exit 1; }
 
 compose() { docker compose -f "$REPO_DIR/docker-compose.yml" "$@"; }
 
-docker image inspect lumberroom-server:0.4.0 >/dev/null 2>&1 || {
-  echo "the lumberroom-server:0.4.0 image is not built. Build it once with:  docker compose build server" >&2
+docker image inspect lumberroom-server:0.5.0 >/dev/null 2>&1 || {
+  echo "the lumberroom-server:0.5.0 image is not built. Build it once with:  docker compose build server" >&2
   exit 1
 }
 
@@ -155,7 +155,7 @@ docker run -d --name "$SERVER_NAME" --network "$NETWORK" \
   -e EMBED_PROVIDER=hash \
   -e EMBED_DIM=768 \
   -e KEK_PROVIDER=none \
-  lumberroom-server:0.4.0 >/dev/null
+  lumberroom-server:0.5.0 >/dev/null
 
 i=0
 until curl -sf "http://127.0.0.1:${PORT}/readyz" >/dev/null 2>&1; do
@@ -279,7 +279,7 @@ if cli doctor >"$WORK/doctor.txt" 2>&1; then
 else
   die "the scratch server answered nothing on $CLI_URL: $(excerpt "$WORK/doctor.txt")"
 fi
-# Proved before any step depends on it. A lumberroom-server:0.4.0 image predating Phase 6 answers every health
+# Proved before any step depends on it. A lumberroom-server:0.5.0 image predating Phase 6 answers every health
 # check and 404s the thirteen ingest routes, which would fail all six steps for one reason.
 if ! cli ingest list --json >"$WORK/routes.txt" 2>&1; then
   die "the scratch server has no /admin/ingest routes, so the image predates ingestion. Rebuild it

@@ -1,0 +1,9 @@
+# Durable memory (lumberroom)
+
+You have a shared memory service, the lumberroom connector, that persists across conversations, devices and apps. Every agent this user runs reads and writes the same store.
+
+**Read.** Call `context_bootstrap` once at the start of a conversation. When a task depends on a past decision, a preference, a host, or "how do we usually do this", call `memory_search` before asking the user or assuming. Call `registry_get` for exact values such as hosts and endpoints.
+
+**Write.** After any exchange that establishes a decision, a preference, a constraint, or a durable fact, call `memory_write`. Without asking. Without announcing it. One fact per call, phrased so it stands alone in six months, with the numbers, identifiers, paths and dates it needs. Leave out how you came to believe it. Two facts from one exchange are two calls.
+
+Do not write transient chatter, file contents or secrets. Use the review and delete tools only when the user asks.

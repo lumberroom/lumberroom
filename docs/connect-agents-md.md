@@ -113,6 +113,23 @@ url = "https://memory.example.com/mcp"
 bearer_token_env_var = "LUMBERROOM_TOKEN"
 ```
 
+**OAuth instead of a token.** Codex can also sign in through the browser, with no token to mint or
+store. This needs a server that speaks OAuth: your own engine with `AUTH_MODE=oauth`
+([`../deploy/oauth.md`](../deploy/oauth.md)), or the hosted service at
+[lumberroom.cloud](https://lumberroom.cloud). For hosted, use the `mcp.` host, which is the
+canonical MCP endpoint:
+
+```bash
+codex mcp add lumberroom --url https://mcp.lumberroom.cloud/mcp
+```
+
+Recent Codex releases (0.159 and later) detect OAuth support and start the login at once, printing
+an authorization URL. If yours does not, run `codex mcp login lumberroom`. Approve the consent
+screen in the browser. The same command signs you in again later (`--no-browser` prints the URL
+instead of opening it). For your own engine, put your `/mcp` URL in
+place of the hosted one. On your own engine the consent screen sets this client's grant, and
+[`../deploy/oauth.md`](../deploy/oauth.md) section 4 covers narrowing or revoking it later.
+
 Hermes and the other bearer-token surfaces take the same endpoint with a plain header:
 
 ```

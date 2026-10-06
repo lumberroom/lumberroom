@@ -6,7 +6,83 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- `skills/lr-review`, an agent skill for working the review queue, synced into client plugins.
+- `client/skills/lr-review`, an agent skill for working the review queue, synced into client plugins.
+
+### Fixed
+
+- **A 0.5.0 dump restores again.** `pg_restore --exit-on-error` stopped every 0.5.0 dump at trigger
+  `memory_conflict_moved` with `operator does not exist: public.vector = public.vector`, and a
+  restore without the flag finished with the trigger missing. Migration `20261005000028` recreates
+  the trigger with a WHEN clause `pg_dump` can write back. To restore a dump taken before this fix,
+  run `pg_restore` without `--exit-on-error`, which reports one ignored error and exits 1, then
+  start this version: the migration runs and the trigger returns. `tests/trigger_restore.rs` replays every trigger as `pg_dump` prints it.
+- **The digest prints whole entries.** `context_bootstrap` used to cut its markdown at
+  `BOOTSTRAP_MAX_CHARS` inside a bullet. It now gives profile, project, recent and registry 40, 25,
+  20 and 15 percent of what the header and the tail leave, passes unused budget on, leaves out an
+  entry that does not fit and counts the left-out entries per section in a footer that stays under
+  the ceiling. An overflowing digest caps the namespace and sealed lists at 20 percent and ends them
+  with "and N more namespaces". A memory longer than its whole section prints shortened at a
+  sentence, a word or a grapheme, with an ellipsis. The OpenWebUI filter cuts at whole lines (#109).
+
+## [0.5.0] - 2026-10-04
+
+### Added
+
+- **The memory rules for connector clients.** The server's descriptions stopped giving orders in #92,
+  so a client that only connects the server, such as claude.ai or Cowork, no longer learns to
+  bootstrap, search before assuming, or write without asking. `client/connector-instructions.md.snippet`
+  carries those rules in under 1,000 characters for project instructions, profile preferences or
+  ChatGPT custom instructions, and `client/skills/lumberroom-memory/` carries them as a skill.
+  `docs/connect-claude-ai.md` covers both routes.
+- **The owner names a client.** An OAuth client gains `owner_label`, a name the owner chose, kept
+  beside the `client_name` it registered with (decision 0023, issue #89). The consent page offers
+  "Name this connection", prefilled with the cleaned registered name, and stores nothing when the
+  field comes back unchanged. Each client card in the console carries a rename form, and
+  `lumberroom clients rename <client_id> <name...>` (or `--clear`) calls the new
+  `POST /oauth/clients/{client_id}/label`. Clearing the label falls back to the registered name. Every
+  MCP `source`, the digest, the console and `lumberroom clients` print the label on their next read,
+  and a rename clears the digest cache so `context_bootstrap` follows at once. MCP prints the label
+  alone. A rename writes one column, so no grant, token or audit field changes, and the server logs
+  one info line with the client id and no label text. Migration `20261004000027` adds the column and
+  a CHECK that refuses a label on a client nobody approved, or setting `consented_at` back to NULL
+  on a row that holds one. Registration never writes the label, and the registered name stays the
+  only text the consent warnings read. In a group of approved clients whose printed names collide, a
+  single named client prints bare and the others keep their `(added ...)` stamp. Implemented and
+  covered by the gates named in decision 0023; no hosted MCP client has seen it.
+- **Two scripts for testing against realistic stores.** `scripts/seed/seed.py` asks a model
+  (through `claude -p`, or the Messages API when `ANTHROPIC_API_KEY` is set) for a fictional owner,
+  their projects and a few hundred facts in a set namespace mix and length spread, with
+  dated rows, near-duplicate restatements and supersession chains. It then loads them through the
+  server's MCP tools, so the server embeds, dedupes and records conflicts as it would for any
+  client. `scripts/measure-conflicts.sh` runs gates E1-G3 and E2-G2 of the write-time conflicts
+  spec on a scratch copy of a store. It drains the backlog one committed scan at a time and times
+  `memory_conflict_record`, `memory_conflict_next`, `memory_conflict_backlog`, the conflicts read
+  and the pending count, then writes a report with p50 and p95 and the plans. The server's code
+  does not change.
+- **A sweeper records conflicting pairs as rows commit.** Migration `20261004000026` adds the
+  `memory_conflict` pair table, the `memory_conflict_scan` ledger and triggers on `memory`. A
+  change to a row's vector, model, namespace or tenant clears its pairs and queues a fresh scan,
+  and a retired row that turns live again rescans. The sweeper
+  scans each new row against its namespace after commit, wakes on Postgres `LISTEN` and on a
+  timer, and backfills rows that predate it (spec `write-time-conflicts.md`, decision 0022). Two
+  settings: `CONFLICT_SWEEP_SECS` (default 60) spaces the timer sweeps, and `0` turns recording
+  off; `CONFLICT_SWEEP_BUDGET_MS` (default 5000) bounds one sweep, and boot refuses a value outside
+  100 to 25000. With the sweeper on, the listener holds one pooled connection for the life of the
+  process, so **boot now refuses `DB_MAX_CONNECTIONS` below 2** unless `CONFLICT_SWEEP_SECS=0`.
+  Behind a transaction-mode pooler `LISTEN` does not hold and the timer alone records pairs. See
+  "Conflict recording" in `docs/managing.md`.
+- **A fact can stop being true without being replaced.** A row gains a second clock,
+  `occurred_until`, and the live-row predicate reads both: `superseded_by IS NULL AND
+  (occurred_until IS NULL OR occurred_until > now())`, defined once as `live!()`. A consolidation
+  pass can now close a fact whose state has passed, reversibly, where before it could only delete
+  it. An expired row takes no successor and is not one, and the console marks it "expired". History
+  readers (all and as-of search, the retired feed, chain walks) keep the link test alone. No
+  migration, no new tool or route (#67).
+- **`DB_MAX_CONNECTIONS` and `DB_ACQUIRE_TIMEOUT_SECS`** set the Postgres pool, defaulting to
+  the 10 connections and 5 seconds the server used before (#73). At boot the server compares the
+  pool with the database's `max_connections`, less the superuser reserve and 3 spare. An explicit
+  size that does not fit refuses boot with every number named; the default size logs a warning
+  and boots, so an upgrade never stops a small server.
 - **A memory provider for Hermes Agent, in its own repository.**
   [`lumberroom/lumberroom-hermes`](https://github.com/lumberroom/lumberroom-hermes) makes lumberroom
   Hermes's memory through the existing `/mcp` endpoint and needed no engine change. Decision 0021
@@ -64,6 +140,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The review queue lists conflicts from stored pairs.** A sweeper records each row's pairs after
+  the row commits, and `conflicts` now joins those pairs to their two rows with no vector
+  arithmetic, testing liveness, the grant on both halves and the dismissed ledger inside the
+  statement (spec `write-time-conflicts.md`, decision 0022). No namespace is too large to answer,
+  so the `namespace_too_large` refusal is gone. A row the sweeper has not scanned has no pairs yet:
+  `GET /admin/review/queue`, `GET /admin/review/conflicts` and the MCP queue envelope gain
+  `conflicts_pending`, the readable rows still waiting, and the MCP render and `lumberroom review`
+  print one line when it is above zero.
+  The CLI reads the field with a default of 0, so it still talks to an older server.
+  `CONFLICT_SCAN_MAX` is deprecated: boot still parses it, ignores it, and logs one warning when it
+  is set, and the next release removes it. After an upgrade the list stays short until the backfill
+  drains. The read's cost on a real store (gate E2-G2) is not measured.
+- **Registration refuses a `client_name` that ends in `(added ...)` or `(not approved)`.** Dynamic
+  registration answers 400 `invalid_client_metadata`, and trailing whitespace does not hide the
+  suffix. This is a behaviour change: a client that sent such a name used to register and now
+  fails to. `services::sources` appends those words to tell duplicates apart, so a registered name
+  ending in one could pass for another client's disambiguated label. The same refusal applies to an
+  owner label. Rows already stored keep their names and print as before.
+- **Tool arguments describe what they do instead of telling the model what to do.** Every
+  argument description on the 12 tools now states what a value means, what the server does with
+  it and what it refuses. "Pass it whenever you know it", "Omit it unless" and "Never infer a
+  date" became the facts behind them: a tag the fact was never filed under makes the search report
+  nothing known, a wrong `as_of` can hide a current fact or return a retired one, and a date within
+  the last day fails the write unless the fact states it. Six arguments that had no description
+  gained one. `registry_history`'s `namespace` no longer claims a project lookup the tool never
+  makes, and `alias_set` declares `destructiveHint`, since it overwrites an alias row in place.
+  `tests/mcp_tool_annotations.rs` walks every argument schema and fails on an order or a missing
+  description.
+- **Dependencies.** argon2 0.6 (#41): `lumberroom-server hash-password` passes its 16-byte OS
+  salt to `hash_password_with_salt`, and hashes from 0.5 and 0.6 verify under both, so an existing
+  `OWNER_PASSWORD_HASH` keeps working. tower-http 0.7 (#66), where the server uses only
+  `RequestBodyLimitLayer`, which did not change. rmcp 3.4.1, jsonwebtoken 11.1, uuid 1.26.1 and
+  thiserror 2.0.21 (#86). The release workflows moved to `actions/upload-artifact` v7 and
+  `actions/download-artifact` v8 (#44, #43).
+- **Contributor tooling.** `./scripts/cargo.sh test-fast` builds the test binaries once and runs
+  them six at a time, the builder links with mold, and `migration_lock` counts only its own probe
+  database's advisory locks (#90). The builder image pins the Rust toolchain from
+  `rust-toolchain.toml` and keeps ort's ONNX Runtime download inside the target volume (#88).
+- **`memory_write` says what a memory is.** The tool description and the `content` argument's doc
+  ask for one fact per call, stated so it stands alone in six months, with the numbers,
+  identifiers, paths and dates it needs, and the cause or reversal condition when the fact turns on
+  one (#69).
+- **Every MCP tool carries a title and annotations.** Reads declare `readOnlyHint`,
+  `memory_forget` and `review_decide` declare `destructiveHint`, and every tool declares
+  `openWorldHint: false`, so a client can decide what to approve without a prompt (#92).
+  `tests/mcp_tool_annotations.rs` fails when a new tool ships without them. The server instructions
+  and tool descriptions now say what each tool does and drop orders about how the model should
+  behave; the owner's own agent rules carry those.
 - **The cleanup pass writes its rationales as sentences.** A near-duplicate reads "These two say
   the same thing." in place of "these two say the same thing at a cosine of 0.971."; the score
   stays in the proposal's `similarity` field. The exact and stale rationales now start with a
@@ -85,9 +209,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **The conflicts query took the caller's read grant and an offset.** `conflicts` ran over the
   whole tenant and filtered each pair after the fact; the grant runs inside the query, as `stale`
   already does, and paging is by `offset` rather than a client-side skip.
-- **A namespace past `CONFLICT_SCAN_MAX` refuses the conflict source rather than running the
-  self-join against it.** The setting defaults to 2000 live rows per namespace, validated at boot
-  like every other setting, and a refusal carries `namespace_too_large` instead of a slow answer.
+- **`CONFLICT_SCAN_MAX` and the `namespace_too_large` refusal never reached a release.** Between
+  0.4.0 and this release, `main` refused the conflict source for a namespace past 2000 live rows
+  rather than running the self-join against it. This release reads stored pairs instead, so the
+  refusal is gone and the setting is parsed, ignored and warned about, as the stored-pairs entry
+  above says. A deployment built from a tagged release never meets either.
 - **`GET /admin/review/stale` publishes a narrower row.** Both old review routes read through the
   one queue now, so a stale row carries `opened`, `access_count`, `last_accessed_at` and
   `last_confirmed_at`, and no longer carries `tags`, `source_client`, `embedding_model`,
@@ -123,6 +249,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A future `occurred_at` is refused for being in the future.** `memory_write`, a review merge
+  and the console used to refuse `2027-01-01` with "is inside the last 86400 seconds", the
+  near-now message, which named a window the date was nowhere near. The fence now checks the
+  future first and says `occurred_at <instant> is in the future`. A date inside the window keeps
+  the near-now message, and both still ask the caller to omit the field. The console's date hint
+  says a future date is refused. Gate: `./scripts/cargo.sh test -j 1 --lib services::write::tests`
+  and `./scripts/cargo.sh test -j 1 --test review_queue_mcp future`.
+- **A supersession that retired nothing is refused.** `review::supersede` reads `rows_affected` on
+  the retire statement and rolls back when the predecessor stayed live, as the write path already
+  did. Since #67 the statement carries a guard that can match no row, and a review call could
+  write the `supersedes` link and report success with the old row still live (#68).
+  `domain::types::expired` defines the expired state once.
+- **The consent page catches a client that claims one service and sends codes to another.** A
+  self-registered client named Claude that redirected to chatgpt.com used to draw only the
+  shared-account reminder, because every recognised host shared one allowlist. Each known service
+  now owns its hosts, and a claimed brand at another service's host raises the mismatch alarm
+  naming both (#91).
+- **A search no longer rewrites every index on `memory`.** The touch after each search changed
+  `last_accessed_at`, which the partial index `memory_never_accessed` named in its predicate, so
+  Postgres could never apply it in place and wrote a new entry into every index, the HNSW graph
+  included (#72). Migration `20261003000026` drops that index and sets `fillfactor = 90` on
+  `memory`. Pages written before the migration keep their old fill until `VACUUM FULL` or
+  `pg_repack` rewrites them.
+- **`SEARCH_LEXICAL_WEIGHT=0` skips the text-search scan.** The lexical arm now carries
+  `$10::float8 > 0`, so a store written in Chinese, Japanese or Thai, where Postgres text search
+  matches nothing, can turn the arm off and stop paying for it (#75). Compose now passes the
+  setting through.
 - **A search no longer deadlocks a write on the rows it returned.** The access bump after every
   search locked its rows in scan order and held them until the statement ended, while a
   supersession locks its two rows in id order, so a search that returned both could hold one while
@@ -136,6 +289,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   spaces, so a crafted callback URL cannot send an escape sequence to the terminal. Without a
   description the line reads as before. Gate: `./scripts/cargo.sh test -j 1 -p lumberroom --lib
   oauth::`.
+- **Replacing a fact through `supersedes` leaves one live row.** The documented `memory_write`
+  flow stores the correction, reads the old row back from `possible_conflicts`, and repeats the
+  write with `supersedes` set. The repeat used to skip the exact-duplicate check and insert a
+  second copy of the correction, and the review queue then paired the two copies as a conflict.
+  It now retires the target in favour of the live row that already holds the content, confirms
+  that row, and answers with its id, `deduplicated: true` and `superseded` set. The write still
+  stores its own row when the content is the target's own, when the caller may write the
+  namespace but not read it, when it sends a tag the existing row lacks, or when its
+  `occurred_at` differs from the existing row's at microsecond precision. A review queue merge
+  into one source's own text leaves one live row and reports nothing unfinished. Gate:
+  `./scripts/cargo.sh test -j 1 --test integration supersedes_` and `./scripts/cargo.sh test -j 1
+  --test review_queue a_merge_`.
+
+### Security
+
+- **The consent page names where codes go, and registration refuses risky redirects.** Anyone can
+  self-register a client called "Claude" that sends codes to their own host. The consent page now
+  puts "Codes go to <host>" under the headline, warns for a host that is not a known MCP client,
+  and raises an alarm when the name claims a known service (#87; #95 extends the alarm to a known
+  service's host that belongs to another service). Dynamic registration refuses a public IP-literal
+  redirect and a redirect to this server's own origin. Plain http reaches only loopback, private,
+  link-local and LAN-only names, and the page says the code travels unencrypted there. Auth pages
+  send `X-Frame-Options: DENY` and `frame-ancestors 'none'`, and client names lose control, bidi,
+  zero-width and filler characters at registration and at render. A refresh-token rotation now
+  authenticates the caller before spending the token, so another client's token or a wrong secret
+  no longer burns it.
 
 ## [0.4.0] - 2026-09-07
 
@@ -584,6 +763,7 @@ softened for a release note.
 - `submit` collapses exact duplicate proposals on a content hash and misses near-duplicates, so
   overlapping chunks queue the same fact more than once.
 
+[0.5.0]: https://github.com/lumberroom/lumberroom/releases/tag/v0.5.0
 [0.4.0]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.4.0
 [0.3.1]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.3.1
 [0.3.0]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.3.0

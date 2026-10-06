@@ -39,6 +39,44 @@ against every live row. `similar_pairs` does, and a test asserts the `OR` that m
 a quiet run advances nothing, so every later run re-reads the same rows forever. `newest_in_scope`
 exists for that.
 
+**A column named in a partial index predicate counts as indexed, and that turns off HOT.** The
+`memory_never_accessed` index carried `WHERE last_accessed_at IS NULL`, so the touch after every
+search wrote a new entry into every index on `memory`, the HNSW graph included. On a 5,000-row
+scratch store, 2,400 touches ran 0 HOT with the index and 2,027 HOT after migration 026 dropped it.
+Never name `last_accessed_at` or `access_count` in an index on `memory`, key or predicate;
+`tests/search_touch_hot.rs` reads the catalog for it, and that covers indexes a fork adds.
+
+**A bare parameter takes its type from the first place it appears.** `PREPARE p AS SELECT 1 WHERE
+$1 > 0 AND $1 * 1.0::float8 > 0` gives `$1` the type `integer` on Postgres 17, the later float
+use notwithstanding. A guard added ahead of a parameter's existing uses can retype it. Cast it where
+it first appears, as the lexical arm's `$10::float8 > 0` does.
+
+**A conflict scan inside a trigger on `memory`, or inside the inserting transaction, loses pairs.**
+Under `READ COMMITTED` a scan sees only rows committed before its statement starts. Two writes into
+one namespace that overlap each scan before the other commits, both rows get marked scanned, and the
+pair between them is never found or retried. The same holds for an `AFTER INSERT` trigger and for a
+deferred constraint trigger. Only the sweeper calls `memory_conflict_record`, and it runs after commit:
+a wake reaches it once Postgres releases the notification, and a timer sweep reads committed rows.
+`tests/conflict_pairs.rs` reads `pg_proc` and fails if any trigger function on `memory` calls
+`memory_conflict_record` or inserts into `memory_conflict`. The argument is in
+[`specs/write-time-conflicts.md`](specs/write-time-conflicts.md) section 6.
+
+**`IS DISTINCT FROM` on an extension type does not survive `pg_dump`.** The dump prints it with no
+schema on the operator it hides, and `pg_restore` runs with `search_path` empty, so a trigger WHEN
+clause comparing two vectors that way fails to restore: `operator does not exist: public.vector =
+public.vector`. 0.5.0 shipped `memory_conflict_moved` like this, and every dump of it stopped
+`pg_restore --exit-on-error`. Any stored expression has the same exposure: a CHECK, an index
+predicate, a default. Write a plain operator, which `pg_dump` prints as `OPERATOR(public.<>)`, plus
+an explicit NULL test where NULL matters. `tests/trigger_restore.rs` replays every trigger as
+`pg_dump` prints it; nothing yet checks the other expression kinds.
+
+**A pooler in transaction mode drops conflict wakes.** `LISTEN` binds to one server session, and
+transaction pooling hands that session to other clients, so the listener hears nothing and raises no
+error. Rows stay pending until the next timer sweep, up to `CONFLICT_SWEEP_SECS` (default 60), and
+then record normally. Nothing is lost and nothing warns. Set `CONFLICT_SWEEP_SECS=0` and the same
+deployment records no pairs at all, which looks identical to a quiet store until the pending count
+stops falling. Spec section 5 lists the wake failure path.
+
 ## Policy and disclosure
 
 **Four disclosures shipped, and no gate could have caught them.** Each published a value computed
@@ -166,6 +204,15 @@ exists can still pick different uids and chown in turn; that settles after one c
 sees `Permission denied` on a crate source only if it is fetching at that moment. Landed 8
 September 2026.
 
+**lumberroom-cloud rebuilds the same builder image.** Both repositories tag their
+`Dockerfile.builder` as `lumberroom-builder`, so the image holds whatever the last checkout to build
+it put there. On 30 September 2026 the image on the maintainer's machine dated from 8 September. It
+carried no clippy, although both Dockerfiles install it, so every run downloaded clippy. And
+lumberroom-cloud's lld setting had never reached it, so every build there linked with GNU ld. The two
+Dockerfiles now install the same packages and carry the same `lumberroom.linker=mold` label, and
+`scripts/cargo.sh` reads the label and refuses to start without mold, naming the rebuild command.
+`docker image inspect lumberroom-builder -f '{{.Created}} {{.Config.Labels}}'` shows what is there.
+
 **A root process writing into a claimed build volume leaves files no later run can replace.** The
 ownership marker `.builder-owner` records which uid claimed `lumberroom-target` or
 `lumberroom-cargo`, and the entrypoint reads the marker rather than walking 41,000 inodes on every
@@ -191,6 +238,15 @@ passed alone and two failed in a full run, with assertions that read like logic 
 `tests/common/mod.rs` takes a Postgres advisory lock, which the session holds and every process sees.
 The guard has to be carried out of `setup`; an unused-variable warning was the only tell when it was
 not.
+
+**A catalog view in a test sees every database on the cluster.** `pg_locks`, `pg_stat_activity` and
+`pg_db_role_setting` are cluster-wide. `tests/migration_lock.rs` counted every advisory lock on the
+cluster to prove a failed migration released its own, and passed because `cargo test` runs one binary
+at a time. In lumberroom-cloud's copy of the test, the first run of `scripts/cargo.sh test-fast` put
+another binary's suite lock beside it and it failed with "left 2 advisory lock(s) held". Filter on
+`current_database()`, or on the role or pid the test owns. Two suites from two worktrees sharing the
+cluster break the unfiltered form the same way. The probe database carries the pid for the same
+reason: a fixed name lets one run's `DROP ... WITH (FORCE)` kill the other's connection.
 
 **The integration suite skips rather than fails with no database reachable**, so a run reporting a low
 count is not a pass. Check the split, not the exit code.

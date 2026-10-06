@@ -30,6 +30,16 @@ impl PgOauthStore {
     }
 }
 
+/// The owner's rename, one column and nothing else (decision 0023). A rename that moved
+/// `consented_at`, a grant or a token would turn a cosmetic edit into an authorization event.
+/// `consented_at IS NOT NULL` keeps an unapproved client unnamed, so a stranger's registration
+/// never carries a name the owner seems to have chosen; the migration's CHECK refuses the same row
+/// as a backstop. `revoked_at` stays out of the predicate on purpose: a revoked client keeps the
+/// memories it wrote, and the owner still has to tell it apart from the others.
+const SET_CLIENT_LABEL: &str = "UPDATE oauth_client SET owner_label = $2
+ WHERE client_id = $1 AND consented_at IS NOT NULL
+RETURNING client_id";
+
 fn grants(value: serde_json::Value) -> Vec<NamespaceGrant> {
     // A grant column that will not parse must not read as "everything". It reads as nothing, which
     // fails the client closed and shows up as a refused request rather than a widened one.
@@ -57,6 +67,7 @@ fn client_from_row(r: &sqlx::postgres::PgRow) -> OauthClientRecord {
         created_at: r.get("created_at"),
         last_used_at: r.get("last_used_at"),
         revoked_at: r.get("revoked_at"),
+        owner_label: r.get("owner_label"),
     }
 }
 
@@ -93,7 +104,7 @@ impl OauthStore for PgOauthStore {
             "SELECT client_id, secret_hash, client_name, redirect_uris, grant_types,
                     software_id, software_version, registered_via, grant_read, grant_write,
                     registry_write, sealed_capable, may_delete, may_ingest, may_read_history, consented_at, profile,
-                    created_at, last_used_at, revoked_at
+                    created_at, last_used_at, revoked_at, owner_label
                FROM oauth_client
               WHERE client_id = $1",
         )
@@ -111,7 +122,7 @@ impl OauthStore for PgOauthStore {
                 "SELECT client_id, secret_hash, client_name, redirect_uris, grant_types,
                         software_id, software_version, registered_via, grant_read, grant_write,
                         registry_write, sealed_capable, may_delete, may_ingest, may_read_history, consented_at, profile,
-                        created_at, last_used_at, revoked_at
+                        created_at, last_used_at, revoked_at, owner_label
                    FROM oauth_client
                   ORDER BY created_at DESC",
             )
@@ -122,7 +133,7 @@ impl OauthStore for PgOauthStore {
                 "SELECT client_id, secret_hash, client_name, redirect_uris, grant_types,
                         software_id, software_version, registered_via, grant_read, grant_write,
                         registry_write, sealed_capable, may_delete, may_ingest, may_read_history, consented_at, profile,
-                        created_at, last_used_at, revoked_at
+                        created_at, last_used_at, revoked_at, owner_label
                    FROM oauth_client
                   WHERE revoked_at IS NULL
                   ORDER BY created_at DESC",
@@ -161,6 +172,15 @@ impl OauthStore for PgOauthStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn set_client_label(&self, client_id: &str, label: Option<&str>) -> Result<bool> {
+        let row = sqlx::query(SET_CLIENT_LABEL)
+            .bind(client_id)
+            .bind(label)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
     }
 
     async fn revoke_client(&self, client_id: &str) -> Result<bool> {

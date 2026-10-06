@@ -78,6 +78,41 @@ client's grant lives in `AUTH_TOKENS`, which is read once at boot, so changing o
 `.env` and restarting. And a grant change leaves no audit row, so the console shows what a client
 holds now and never what it used to hold.
 
+### Naming a client
+
+A client's name is the one it sent at registration, and an agent sometimes sends a long one such as
+`Claude Code (plugin:lumberroom-memory:lumberroom)`. You can give a client your own name. The
+registered name stays on record beside it.
+
+Three places set it:
+
+- **The consent page.** "Name this connection" opens prefilled with the registered name, cleaned of
+  control characters. Leave it as it is and the server stores nothing. Type something else and that
+  becomes the name.
+- **The console.** An approved card, a revoked one included, carries a rename form. **Save name**
+  stores what you typed. **Use the registered name** clears it.
+- **The CLI.** `lumberroom clients rename <client_id> <name...>` sets it and `lumberroom clients
+  rename <client_id> --clear` clears it. It answers with the name the client now reads as. A client
+  you have not approved answers `no approved client has id <client_id>`, because only an approved
+  client can hold a name.
+
+Every MCP answer that names a memory's source prints your name alone, never the registered one, and
+the digest, the console and `lumberroom clients` follow on their next read. A rename also clears the
+cached digest, so a session that starts right after reads the new name. The listing shows the
+registered name beside yours.
+
+When two approved clients print the same name, `source` adds `(added 1 Sep)` to tell them apart.
+Name one of them and it prints bare, while the other keeps its date. Name both and both keep it.
+
+A name cannot end in `(added ...)` or `(not approved)`, because the server appends those words and a
+name ending in one could pass for another client's.
+
+A rename changes the name and nothing else. The grant, the tokens and every stored row stay as they
+were, and no audit row is written; the server logs one line with the client id. The consent page
+keeps judging a client on the name it registered and the host its codes go to, so renaming a client
+never softens a warning. Implemented and covered by `tests/client_label.rs` and the unit tests in `src/console/clients.rs`;
+not yet run against a live server.
+
 ### Approving a client that registered itself
 
 A client that runs dynamic registration exists and holds nothing. Its card shows **awaiting
@@ -164,6 +199,7 @@ has never seen.
 started holding; a model reads one out of context and invents it. A date inside the near-now fence,
 one day by default (`WRITE_MIN_OCCURRED_AGE_SECS`), is refused, because the store already stamps the
 moment it learned a thing and today's date would write that clock twice.
+A future date is refused too.
 
 To correct a fact, open it from the arrivals list and use **Replace this fact** underneath it. That
 retires the old row, links the two, and keeps the old wording readable with the date it stopped
@@ -197,11 +233,29 @@ lumberroom graph walk "<question>" | lumberroom graph rebuild
 Without `--json` it walks the queue one item at a time: full row text, then a key line drawn from
 what that item allows (`s` supersede keep newer, `o` keep older, `m` merge, `k` keep both, `d`
 delete, `c` confirm, `a` apply, `x` dismiss, `n` skip, `q` quit). `--json` prints the page as JSON
-and exits instead of walking it. The conflict source answers `namespace_too_large` and sits out of
-the page when a readable namespace holds more live rows than `CONFLICT_SCAN_MAX` (default 2000):
-the self-join that finds a namespace's conflicting pairs runs per namespace, so a namespace past
-that ceiling would cost tens of seconds rather than answer a page. The default came from a
-dev-container probe; recalibrate it against a timed run on the deployment's own hardware.
+and exits instead of walking it. The conflict source lists the pairs the sweeper below has stored,
+so it answers for a namespace of any size. A row written since the last sweep has no pairs yet.
+Every page carries `conflicts_pending`, the readable rows still waiting for their scan. When it is
+above zero, `review` prints the count once, before the first item, so a short list does not pass
+for the whole answer.
+
+### Conflict recording
+
+The server records conflicting pairs as rows commit. A sweeper scans each new row against its
+namespace after the row commits and stores the pairs at or above `CONFLICT_THRESHOLD`. It runs on a
+Postgres `LISTEN` wake and on a timer, and the same loop backfills rows that predate it. The review
+queue reads the stored pairs. Until the backfill finishes, `conflicts_pending` stays above zero and
+the conflict list is short by those rows.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CONFLICT_SWEEP_SECS` | `60` | Seconds between timer sweeps. The timer covers a wake the listener lost. `0` stops all pair recording: no listener, no sweeps, and every new row stays pending. Above `0`, the listener holds one pooled connection for the life of the process, so boot refuses `DB_MAX_CONNECTIONS` below 2. |
+| `CONFLICT_SWEEP_BUDGET_MS` | `5000` | Time one sweep may spend on the tenant before it yields. Boot refuses a value below 100 or above 25000. |
+| `CONFLICT_SCAN_MAX` | `2000`, unused | Deprecated and ignored. It bounded the old self-join, which refused a namespace past it with `namespace_too_large`; stored pairs need no bound, and nothing refuses now. Boot still parses it, so a value that is not a number still refuses boot, and logs one deprecation warning when it is set. The next release removes it, so drop it from the environment. |
+
+Behind a connection pooler in transaction mode `LISTEN` does not hold and every wake goes missing.
+The timer still records every pair, up to `CONFLICT_SWEEP_SECS` late. Point the server at a direct
+connection if that delay matters.
 
 `arity` and `graph` are the two worth reading about before use, because both decide what the store
 hides. Declaring a tag `single` lets the cleanup pass propose that one dated fact ended another, so

@@ -30,8 +30,10 @@ src/domain/     types, errors, namespace rules, the two-axis policy model, canon
 src/ports/      one file per port: memory, registry, alias, cleanup, embedder, ingest, oauth,
                 sealed, tool_calls. The contract adapters implement and services consume.
 src/services/   the use cases: bootstrap, search, write, registry, forget, review, export, recall,
-                alias, cleanup, history, ingest, eval.
-src/adapters/   postgres (the only module containing SQL), embedding, auth.
+                alias, cleanup, history, ingest, eval, conflicts (the sweeper that records
+                conflict pairs after a row commits).
+src/adapters/   postgres (the only module containing SQL; `conflict_wake` holds the LISTEN
+                connection the sweeper wakes on), embedding, auth.
 src/authserver/ the built-in OAuth 2.1 authorization server: routes, consent pages, session, limiter.
 src/crypto/     envelope encryption and the KEK provider.
 src/mcp/        tool registration and the tool descriptions.

@@ -21,10 +21,10 @@ use lumberroom_server::domain::types::{Invocation, Memory, Principal, Sensitivit
 use lumberroom_server::mcp::AppState;
 use lumberroom_server::ports::OauthStore;
 use lumberroom_server::services::review_queue::{
-    self, Decision, ProposalDecided, ProposalDecision, ProposalField, ProposalItem, ProposalSource,
-    QueueQuery, Source, Verdict, Via,
+    self, Decided, Decision, ProposalDecided, ProposalDecision, ProposalField, ProposalItem,
+    ProposalSource, QueueQuery, Source, Verdict, Via,
 };
-use lumberroom_server::services::{review, write, Ctx, Repos};
+use lumberroom_server::services::{conflicts, review, write, Ctx, Repos};
 use sqlx::PgPool;
 
 mod common;
@@ -323,7 +323,23 @@ async fn conflict_pair(ctx: &Ctx, pool: &PgPool, namespace: &str, tag: &str) -> 
         namespace,
     )
     .await;
+    sweep_pairs(ctx).await;
     (older, newer)
+}
+
+/// The conflict source reads stored pairs, and this harness starts no sweeper, so a test records
+/// its pairs here before it reads them. Run it after every `created_at` backdate: a scan fixes which
+/// half of a pair is the older one, and moving `created_at` later does not reorder a stored pair.
+async fn sweep_pairs(ctx: &Ctx) {
+    let report = conflicts::sweep(
+        ctx.repos.memories.as_ref(),
+        ctx.tenant(),
+        ctx.cfg.quality.conflict_threshold,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.pending, 0, "the sweep left rows unscanned: {report:?}");
 }
 
 /// A private row that will never open again: written and sealed properly, then its ciphertext is
@@ -568,6 +584,7 @@ async fn conflict_pair_at(
     .await
     .unwrap()
     .id;
+    sweep_pairs(ctx).await;
     (older, newer)
 }
 
@@ -799,6 +816,7 @@ async fn a_narrow_grant_sees_a_full_page_of_its_own_conflict_pairs_and_none_of_t
     set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
     let newer = write_at(&h.ctx, "the rota tie aa bb dd", "global").await;
     let key = format!("conflict:{older}:{newer}");
+    sweep_pairs(&h.ctx).await;
 
     let narrow =
         restricted_at(&h.ctx, &[("global", Sensitivity::Open)], &[("global", Sensitivity::Open)]);
@@ -912,6 +930,7 @@ async fn two_pairs_at_one_similarity_page_once_each() {
     let older_b = write_at(&h.ctx, "the rota tie aa bb cc", "project:tieb").await;
     set_created_at(&h.pool, &older_b, Utc::now() - Duration::hours(2)).await;
     let _newer_b = write_at(&h.ctx, "the rota tie aa bb dd", "project:tieb").await;
+    sweep_pairs(&h.ctx).await;
 
     let query = |offset: i64| QueueQuery {
         sources: Some(vec![Source::Conflict]),
@@ -960,36 +979,88 @@ async fn an_offset_past_the_ceiling_is_refused_rather_than_clamped() {
     assert_eq!(err.code(), Some(review_queue::codes::PAGE_TOO_DEEP));
 }
 
+/// Before stored pairs, a namespace past `CONFLICT_SCAN_MAX` (2,000 by default) got
+/// `namespace_too_large` in place of its conflicts. The 2,001 fillers carry centred random vectors,
+/// so none of them pairs with anything at 0.5, and none is scanned: the read answers from the one
+/// stored pair, and `conflicts_pending` counts the fillers.
 #[tokio::test]
-async fn a_namespace_over_the_scan_ceiling_refuses_conflicts_and_still_answers_stale() {
-    let h = ctx_or_skip!(|c: &mut Config| {
-        c.quality.conflict_scan_max = 100;
-    });
-    let stale_id = write_at(&h.ctx, &format!("a stale fact {}", nonce("ceiling")), "global").await;
-    make_stale(&h.pool, &stale_id).await;
-    for i in 0..101 {
-        write_at(&h.ctx, &format!("filler row {i} {}", nonce("ceiling")), "global").await;
-    }
+async fn a_namespace_past_two_thousand_rows_gets_its_conflicts() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.5);
+    let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "ceiling").await;
+    // `WHERE g > 0` correlates the subquery, so Postgres draws a fresh vector per row rather than
+    // evaluating it once and handing every filler the same one.
+    sqlx::query(
+        "INSERT INTO memory (id, tenant_id, namespace, content, embedding, source_client, sensitivity)
+         SELECT gen_random_uuid(), $1, 'global', 'filler row ' || g,
+                (SELECT array_agg(random() - 0.5) FROM generate_series(1, 768) AS d WHERE g > 0)::vector,
+                'review-queue-test', 'open'
+           FROM generate_series(1, 2001) AS g",
+    )
+    .bind(h.ctx.tenant())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let embedded: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM memory
+          WHERE tenant_id = $1 AND namespace = 'global' AND embedding IS NOT NULL
+            AND superseded_by IS NULL",
+    )
+    .bind(h.ctx.tenant())
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(embedded > 2_000, "the namespace has to sit past the old ceiling: {embedded}");
 
     let q = review_queue::queue(
         &h.ctx,
         &no_sources(),
         QueueQuery {
-            sources: Some(vec![Source::Conflict, Source::Stale]),
+            sources: Some(vec![Source::Conflict]),
             limit: None,
             offset: None,
-            days: Some(0),
+            days: None,
             min_similarity: None,
         },
     )
     .await
     .unwrap();
+    assert!(q.refused.is_empty(), "the conflict source answered: {:?}", q.refused);
     assert_eq!(
-        q.refused.get("conflict"),
-        Some(&review_queue::codes::NAMESPACE_TOO_LARGE),
-        "the namespace crossed conflict_scan_max"
+        q.items.iter().map(|i| i.key.clone()).collect::<Vec<_>>(),
+        vec![format!("conflict:{older}:{newer}")],
+        "the stored pair and nothing from the unscanned fillers"
     );
-    assert!(q.items.iter().any(|i| i.source == Source::Stale), "stale still answers");
+    assert_eq!(q.conflicts_pending, 2_001, "every filler is still waiting for its scan");
+}
+
+/// Two rows written and not yet swept: both count as pending in the struct and in the route's
+/// JSON. One sweep later both count 0.
+#[tokio::test]
+async fn the_envelope_carries_conflicts_pending() {
+    let h = ctx_or_skip!();
+    write_at(&h.ctx, &format!("a fact waiting for its scan {}", nonce("pending1")), "global").await;
+    write_at(&h.ctx, &format!("another fact waiting {}", nonce("pending2")), "global").await;
+    let conflicts_only = || QueueQuery {
+        sources: Some(vec![Source::Conflict]),
+        limit: None,
+        offset: None,
+        days: None,
+        min_similarity: None,
+    };
+
+    let q = review_queue::queue(&h.ctx, &no_sources(), conflicts_only()).await.unwrap();
+    assert_eq!(q.conflicts_pending, 2, "both rows are unscanned");
+    let (status, body) = h.get("/admin/review/queue?source=conflict").await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["conflicts_pending"], 2, "the route carries the count: {v}");
+
+    sweep_pairs(&h.ctx).await;
+    let q = review_queue::queue(&h.ctx, &no_sources(), conflicts_only()).await.unwrap();
+    assert_eq!(q.conflicts_pending, 0, "the sweep scanned both rows");
+    let (_, body) = h.get("/admin/review/queue?source=conflict").await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["conflicts_pending"], 0, "the field stays present at 0: {v}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1153,6 +1224,100 @@ async fn a_merge_whose_second_retirement_fails_reports_the_leftover_in_unfinishe
         "the expired row is reported rather than silently dropped: {:?}",
         decided.unfinished
     );
+}
+
+/// Merges a conflict pair into `content` and returns what the queue answered.
+async fn merge_into(h: &Harness, older: &str, newer: &str, content: &str) -> Decided {
+    review_queue::decide(
+        &h.ctx,
+        &no_sources(),
+        Decision {
+            key: format!("conflict:{older}:{newer}"),
+            verdict: Verdict::Merge,
+            keep: None,
+            id: None,
+            content: Some(content.into()),
+            tags: None,
+            occurred_at: None,
+            reason: None,
+            version: None,
+            via: Via::Http,
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn live_holding(pool: &PgPool, content: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM memory WHERE content = $1 AND superseded_by IS NULL",
+    )
+    .bind(content)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|u| u.to_string())
+    .collect()
+}
+
+/// A reviewer who keeps the newer source's wording merges into text that row already holds.
+#[tokio::test]
+async fn a_merge_whose_content_is_the_newer_source_retires_both_sources() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let older =
+        write_at(&h.ctx, &format!("the gate code is 4411 {}", nonce("mnew")), "global").await;
+    set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
+    let text = format!("the gate code is 4412 {}", nonce("mnew"));
+    let newer = write_at(&h.ctx, &text, "global").await;
+
+    let decided = merge_into(&h, &older, &newer, &text).await;
+    let written = decided.written.expect("the merge names the row holding the fact");
+    assert!(decided.unfinished.is_empty(), "{:?}", decided.unfinished);
+    assert!(!live(&h.pool, &older).await.1 && !live(&h.pool, &newer).await.1);
+    assert_eq!(live_holding(&h.pool, &text).await, vec![written]);
+}
+
+/// A reviewer who keeps the older source's wording merges into text that row already holds. The
+/// written row must not come back as a retirement the merge failed to make.
+#[tokio::test]
+async fn a_merge_whose_content_is_the_older_source_reports_nothing_unfinished() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let text = format!("the gate code is 5511 {}", nonce("mold"));
+    let older = write_at(&h.ctx, &text, "global").await;
+    set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
+    let newer =
+        write_at(&h.ctx, &format!("the gate code is 5512 {}", nonce("mold")), "global").await;
+
+    let decided = merge_into(&h, &older, &newer, &text).await;
+    let written = decided.written.expect("the merge names the row holding the fact");
+    assert!(decided.unfinished.is_empty(), "{:?}", decided.unfinished);
+    assert!(!live(&h.pool, &newer).await.1, "the newer source retired");
+    assert_eq!(live_holding(&h.pool, &text).await, vec![written]);
+}
+
+/// Two live rows with the same content, the shape repeated supersedes writes left in older
+/// stores. Merging them into that content leaves one live row.
+#[tokio::test]
+async fn a_merge_of_an_identical_pair_leaves_one_live_row() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let text = format!("the gate code is 6611 {}", nonce("mpair"));
+    let older = write_at(&h.ctx, &text, "global").await;
+    set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
+    let newer =
+        write_at(&h.ctx, &format!("the gate code is 6612 {}", nonce("mpair")), "global").await;
+    sqlx::query("UPDATE memory SET content = $2 WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&newer).unwrap())
+        .bind(&text)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let decided = merge_into(&h, &older, &newer, &text).await;
+    let written = decided.written.expect("the merge names the row holding the fact");
+    assert!(decided.unfinished.is_empty(), "{:?}", decided.unfinished);
+    assert!(!live(&h.pool, &older).await.1 && !live(&h.pool, &newer).await.1);
+    assert_eq!(live_holding(&h.pool, &text).await, vec![written]);
 }
 
 #[tokio::test]

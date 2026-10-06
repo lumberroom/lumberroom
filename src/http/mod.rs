@@ -1174,6 +1174,9 @@ struct ConflictQuery {
 ///
 /// Reads `review_queue::queue` filtered to one source. `min_similarity` and `limit` clamp inside
 /// that call now; each pair still prints the same five fields `conflict_side` used to.
+///
+/// The list holds stored pairs only, so a row the sweeper has not scanned yet is missing from it.
+/// `conflicts_pending` counts those rows, the same number `/admin/review/queue` carries.
 async fn admin_review_conflicts(
     State(http): State<Http>,
     headers: HeaderMap,
@@ -1221,8 +1224,12 @@ async fn admin_review_conflicts(
             }))
         })
         .collect();
-    Json(serde_json::json!({ "min_similarity": envelope.min_similarity, "pairs": pairs }))
-        .into_response()
+    Json(serde_json::json!({
+        "min_similarity": envelope.min_similarity,
+        "pairs": pairs,
+        "conflicts_pending": envelope.conflicts_pending,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]

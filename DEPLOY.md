@@ -81,8 +81,8 @@ throwaways, and copying it skips the fresh secret generation the installer does.
 
 ## 3. Install
 
-`docker-compose.yml` pins `server` and `cleanup` to `ghcr.io/lumberroom/lumberroom-server:0.4.0`
-and `ghcr.io/lumberroom/lumberroom:0.4.0`, the images `.github/workflows/publish-docker.yml`
+`docker-compose.yml` pins `server` and `cleanup` to `ghcr.io/lumberroom/lumberroom-server:0.5.0`
+and `ghcr.io/lumberroom/lumberroom:0.5.0`, the images `.github/workflows/publish-docker.yml`
 pushes on every `v*` tag. `install.sh` pulls those by default, a few seconds to a minute, and falls
 back to building from this checkout when the pull fails: no network, `ghcr.io` unreachable, no
 manifest for this architecture, or a working tree ahead of the last tagged release. Either path,
@@ -104,12 +104,12 @@ To move to a different version, set `LUMBERROOM_SERVER_IMAGE` and `LUMBERROOM_CL
 running the installer, or edit them in `.env`:
 
 ```bash
-LUMBERROOM_SERVER_IMAGE=ghcr.io/lumberroom/lumberroom-server:0.4.0 \
-LUMBERROOM_CLIENT_IMAGE=ghcr.io/lumberroom/lumberroom:0.4.0 \
+LUMBERROOM_SERVER_IMAGE=ghcr.io/lumberroom/lumberroom-server:0.5.0 \
+LUMBERROOM_CLIENT_IMAGE=ghcr.io/lumberroom/lumberroom:0.5.0 \
   sudo -E ./deploy/install.sh
 ```
 
-Both variables are read by `docker-compose.yml` and default to `0.4.0`. Neither tracks `latest`: a
+Both variables are read by `docker-compose.yml` and default to `0.5.0`. Neither tracks `latest`: a
 memory store should not upgrade itself on a routine restart, so the version in `.env` or the shell
 is the version that runs until you change it by hand.
 
@@ -297,7 +297,7 @@ From a clone of this repo on the Mac:
 
 ```bash
 # token mode
-./client/wire-mac.sh --url https://memory.example.com --token <token from the installer>
+LUMBERROOM_TOKEN=<token from .env> ./client/wire-mac.sh --url https://memory.example.com
 
 # oauth mode: no token here, Claude Code runs its own flow on first use
 ./client/wire-mac.sh --url https://memory.example.com --oauth-mode
@@ -453,13 +453,13 @@ start. The safe order is back up, then get the new image, then recreate:
 ```bash
 ./deploy/backup.sh
 git pull
-LUMBERROOM_SERVER_IMAGE=ghcr.io/lumberroom/lumberroom-server:0.4.0 \
-LUMBERROOM_CLIENT_IMAGE=ghcr.io/lumberroom/lumberroom:0.4.0 \
+LUMBERROOM_SERVER_IMAGE=ghcr.io/lumberroom/lumberroom-server:0.5.0 \
+LUMBERROOM_CLIENT_IMAGE=ghcr.io/lumberroom/lumberroom:0.5.0 \
   docker compose pull server cleanup
 docker compose up -d
 ```
 
-Pin the new version in `.env` too, or the next `up -d` with no override falls back to `0.4.0`.
+Pin the new version in `.env` too, or the next `up -d` with no override falls back to `0.5.0`.
 Building from source instead is `docker compose build server cleanup && docker compose up -d`, or
 re-run the installer with `--build-local`.
 

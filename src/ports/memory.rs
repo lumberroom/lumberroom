@@ -436,6 +436,15 @@ pub struct ConflictPair {
     pub similarity: f64,
 }
 
+/// What one sweep call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflictSweep {
+    /// Rows whose scan committed in this call. A record call that failed does not count.
+    pub scanned: i64,
+    /// Live rows in the tenant still without a mark at or below the floor.
+    pub pending: i64,
+}
+
 /// One dismissed pair, as the ledger holds it. Both columns name the caller because one cannot: a
 /// deployment putting several people behind one client writes the same `dismissed_by` for all.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -776,12 +785,14 @@ pub trait MemoryRepository: Send + Sync {
 
     async fn staleness(&self, tenant: &str) -> Result<Staleness>;
 
-    /// Near-duplicate live pairs, for `lumberroom review`. Computed on demand rather than recorded at
-    /// write time: a stored queue drifts out of step with the store it describes, and this runs by
-    /// hand rather than on the hot path.
+    /// Near-duplicate live pairs, for `lumberroom review`, read from the pairs the sweeper stored.
+    /// A row the sweeper has not scanned yet contributes no pair, so the list can be short;
+    /// `conflicts_pending` says by how much. Liveness, the grant on both halves at their stored
+    /// level and the dismissed ledger all apply inside the query, because retirement and dismissal
+    /// write nothing to the stored pairs.
     ///
     /// `offset` is bound into the statement. Reading a page and discarding its head in Rust makes
-    /// a deep page cost the whole scan, and this join has no index to lean on.
+    /// a deep page cost every row before it.
     async fn conflicts(
         &self,
         tenant: &str,
@@ -814,14 +825,6 @@ pub trait MemoryRepository: Send + Sync {
 
     /// For the envelope's `dismissed`. Counted in the query, so it never names an id to say how many.
     async fn dismissed_count(&self, tenant: &str, reader: &[NamespaceGrant]) -> Result<i64>;
-
-    /// Live embedded rows per readable namespace, highest first. The conflicts self-join runs per
-    /// namespace, so the largest one bounds the work and the whole-tenant total does not.
-    async fn live_embedded_counts(
-        &self,
-        tenant: &str,
-        reader: &[NamespaceGrant],
-    ) -> Result<Vec<(String, i64)>>;
 
     /// The ciphertext columns for rows the caller already holds, so the service can decrypt them.
     ///
@@ -893,4 +896,23 @@ pub trait MemoryRepository: Send + Sync {
         supersedes: Option<uuid::Uuid>,
         superseded_by: Option<uuid::Uuid>,
     ) -> Result<()>;
+
+    /// Scan up to `limit` live rows with no current mark, oldest first, one autocommitted statement
+    /// per row. `pending` counts every live row in the tenant, whoever may read it, so only a
+    /// background pass calls this; a request handler that returned it would tell a caller how many
+    /// rows sit outside their grant.
+    ///
+    /// The port has no single-row `record_conflicts` on purpose. Only the sweep scans, and a method
+    /// that recorded one row on demand would invite a caller to run it inside a write's
+    /// transaction, where two concurrent writes miss each other (spec section 6).
+    async fn sweep_conflicts(&self, tenant: &str, floor: f64, limit: i64) -> Result<ConflictSweep>;
+
+    /// Live rows this reader may see that carry no mark at or below `floor`. Grant applied inside
+    /// the query on the row's namespace and stored level.
+    async fn conflicts_pending(
+        &self,
+        tenant: &str,
+        floor: f64,
+        reader: &[NamespaceGrant],
+    ) -> Result<i64>;
 }

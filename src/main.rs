@@ -78,7 +78,7 @@ async fn run() -> Result<()> {
         "starting"
     );
 
-    let pool = pg::connect(&cfg.database_url).await?;
+    let pool = pg::connect_with(&cfg.database_url, &cfg.db).await?;
 
     if cfg.run_migrations_on_boot {
         pg::migrate(&pool).await?;
@@ -151,6 +151,7 @@ async fn run() -> Result<()> {
         spawn_oauth_purge(Arc::clone(&oauth));
     }
     spawn_cleanup(Arc::clone(&cfg), Arc::clone(&cleanup));
+    spawn_conflict_sweep(Arc::clone(&cfg), Arc::clone(&state.repos.memories), pool.clone());
 
     let app = http::router(Arc::clone(&state), auth)
         // The digest is a few KB; anything much larger is a mistake or an attack.
@@ -388,6 +389,50 @@ fn spawn_cleanup(cfg: Arc<config::Config>, repo: Arc<dyn ports::CleanupRepositor
     });
 }
 
+/// The conflict sweeper: the only caller of `memory_conflict_record`, and the backfill.
+///
+/// Two wakes drive one loop. The listener hears the `memory_conflict` notification a writer's
+/// commit sends; the timer covers every notification Postgres dropped while nobody listened, and
+/// the rows that existed before this process started. A listener that fails at boot costs latency
+/// and nothing else, so its error is a warning and boot goes on.
+///
+/// The listener holds one pooled connection for the life of the process. The default pool of 10
+/// leaves nine for requests; an owner who sets `DB_MAX_CONNECTIONS` low should count it.
+///
+/// `CONFLICT_SWEEP_SECS=0` turns off the timer and the listener together. Nothing else records a
+/// pair, so the log line says so.
+fn spawn_conflict_sweep(
+    cfg: Arc<config::Config>,
+    repo: Arc<dyn ports::MemoryRepository>,
+    pool: sqlx::PgPool,
+) {
+    let secs = cfg.quality.conflict_sweep_secs;
+    if secs == 0 {
+        tracing::info!(
+            "conflict sweeper is off (CONFLICT_SWEEP_SECS=0): no conflict pairs will be recorded"
+        );
+        return;
+    }
+    let wakes = Arc::new(services::conflicts::Wakes::default());
+    let on_wake = Arc::clone(&wakes);
+    tokio::spawn(async move {
+        if let Err(e) = pg::conflict_wake::listen(&pool, move |t| on_wake.wake(t)).await {
+            tracing::warn!(
+                error = %e.log_message(),
+                "conflict wake listener did not start; pairs wait for the timer sweep"
+            );
+        }
+    });
+    tokio::spawn(services::conflicts::run_loop(
+        repo,
+        cfg.tenant_id.clone(),
+        cfg.quality.conflict_threshold,
+        std::time::Duration::from_millis(cfg.quality.conflict_sweep_budget_ms),
+        std::time::Duration::from_secs(secs),
+        wakes,
+    ));
+}
+
 fn spawn_oauth_purge(store: Arc<dyn ports::OauthStore>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -408,7 +453,7 @@ fn spawn_oauth_purge(store: Arc<dyn ports::OauthStore>) {
 /// in a shell history. `install.sh` pipes it in with no TTY, so this reads stdin either way and only
 /// bothers with the prompt and the echo dance when a person is typing.
 fn hash_password() -> Result<()> {
-    use argon2::password_hash::{PasswordHasher, SaltString};
+    use argon2::password_hash::PasswordHasher;
     use argon2::Argon2;
 
     let password = read_password()?;
@@ -422,16 +467,14 @@ fn hash_password() -> Result<()> {
         ));
     }
 
-    // 16 bytes from the OS. `SaltString::generate` would work too and would pull in a second RNG
-    // path; this is the same CSPRNG every key in `crypto` comes from.
+    // 16 bytes from the OS. `hash_password` would generate a salt too, through password-hash's own
+    // getrandom path; this keeps the salt on the same CSPRNG every key in `crypto` comes from.
     let mut salt = [0u8; 16];
     getrandom::fill(&mut salt)
         .map_err(|e| DomainError::internal(format!("os rng failure: {e}")))?;
-    let salt = SaltString::encode_b64(&salt)
-        .map_err(|e| DomainError::internal(format!("cannot encode a salt: {e}")))?;
 
     let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), &salt)
         .map_err(|e| DomainError::internal(format!("argon2 failed: {e}")))?
         .to_string();
 
@@ -508,7 +551,7 @@ async fn verify_kek_command() -> Result<()> {
     println!("kek_id:       {}", keys.kek_id());
     println!("fingerprint:  {fingerprint}");
 
-    let pool = pg::connect(&cfg.database_url).await?;
+    let pool = pg::connect_with(&cfg.database_url, &cfg.db).await?;
     let check =
         pg::verify_kek(&pool, &cfg.tenant_id, &keys.kek_id(), &fingerprint, keys.provider())
             .await?;

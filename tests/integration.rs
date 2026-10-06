@@ -15,7 +15,8 @@ use lumberroom_server::domain::types::{Invocation, Principal, Sensitivity, ToolC
 use lumberroom_server::ports::registry::RegistryUpsert;
 use lumberroom_server::ports::RegistryWrite;
 use lumberroom_server::services::{
-    bootstrap, currency, export, forget, graph, recall, registry, review, search, write, Ctx, Repos,
+    bootstrap, conflicts, currency, export, forget, graph, recall, registry, review, review_queue,
+    search, write, Ctx, Repos,
 };
 use sqlx::{PgPool, Row};
 
@@ -441,6 +442,225 @@ async fn refuses_to_supersede_a_row_the_client_cannot_write() {
     assert!(msg.contains("does not exist or is not writable"));
     // Naming the namespace would tell the client that a namespace it cannot write exists.
     assert!(!msg.contains("user:me"));
+}
+
+/// Live rows in `namespace` holding exactly `content`. Read straight from the table so the count
+/// does not depend on the search path that the bug would also have fed.
+async fn live_copies(pool: &PgPool, namespace: &str, content: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM memory
+          WHERE namespace = $1 AND content = $2 AND superseded_by IS NULL",
+    )
+    .bind(namespace)
+    .bind(content)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn superseded_by(pool: &PgPool, id: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<uuid::Uuid>>("SELECT superseded_by FROM memory WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(id).unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .map(|u| u.to_string())
+}
+
+/// The flow the memory_write description teaches: the first call stores the corrected fact and
+/// names the old row as a possible conflict, and the second call repeats the content with
+/// `supersedes` set to that row. Before the fix the second call stored a copy of the first, and
+/// the review queue then paired the two copies as a conflict.
+#[tokio::test]
+async fn a_supersedes_retry_reuses_the_row_the_first_call_stored() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let old_text = "The demo API runs on port 8443 behind Caddy on host bree.";
+    let new_text = "The demo API runs on port 9443 behind Caddy on host bree.";
+    let old = write::run(&ctx, old_text, "global", None, None, None, None).await.unwrap();
+
+    let first = write::run(&ctx, new_text, "global", None, None, None, None).await.unwrap();
+    assert!(!first.deduplicated, "a changed port must not collapse into the old row");
+    assert!(
+        first.possible_conflicts.iter().any(|c| c.id == old.id),
+        "the first call names the old row, which is what sends the caller back with supersedes"
+    );
+
+    let second =
+        write::run(&ctx, new_text, "global", None, Some(&old.id), None, None).await.unwrap();
+    assert_eq!(second.id, first.id, "the retry answers with the row the first call stored");
+    assert!(second.deduplicated);
+    assert_eq!(second.superseded.as_deref(), Some(old.id.as_str()));
+
+    assert_eq!(live_copies(&pool, "global", new_text).await, 1, "one live row for one fact");
+    assert_eq!(superseded_by(&pool, &old.id).await.as_deref(), Some(first.id.as_str()));
+    let mirror: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT supersedes FROM memory WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&first.id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(mirror.map(|u| u.to_string()).as_deref(), Some(old.id.as_str()));
+
+    // The queue reads stored pairs and this harness starts no sweeper. Without the sweep a twin
+    // would go unpaired and the check below could never fail.
+    let swept = conflicts::sweep(
+        ctx.repos.memories.as_ref(),
+        ctx.tenant(),
+        ctx.cfg.quality.conflict_threshold,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(swept.pending, 0, "the sweep left rows unscanned: {swept:?}");
+    let queue = review_queue::queue(
+        &ctx,
+        &[],
+        review_queue::QueueQuery {
+            sources: Some(vec![review_queue::Source::Conflict]),
+            limit: None,
+            offset: None,
+            days: None,
+            min_similarity: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        queue.items.iter().all(|i| !i.key.contains(&first.id)),
+        "the corrected fact has no twin to conflict with: {:?}",
+        queue.items.iter().map(|i| &i.key).collect::<Vec<_>>()
+    );
+}
+
+/// A write whose content is its own target's carries nothing to reuse. It stores a new row and
+/// retires the target into it, as it did before reuse existed, so a merge of an identical pair and
+/// a dated restatement both still land.
+#[tokio::test]
+async fn a_supersedes_write_whose_content_is_the_target_itself_stores_a_new_row() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let text = "The staging database lives on host anduin.";
+    let row = write::run(&ctx, text, "global", None, None, None, None).await.unwrap();
+
+    let written = write::run(&ctx, text, "global", None, Some(&row.id), None, None).await.unwrap();
+    assert_ne!(written.id, row.id);
+    assert_eq!(superseded_by(&pool, &row.id).await.as_deref(), Some(written.id.as_str()));
+    assert_eq!(live_copies(&pool, "global", text).await, 1, "one live row for one fact");
+}
+
+/// Restating the target's own content with a valid time and a new tag records something the
+/// target lacks. The write stores a dated row and retires the undated one into it.
+#[tokio::test]
+async fn a_dated_supersedes_write_of_the_target_content_stores_a_dated_row() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let text = "The office moved to the third floor.";
+    let row = write::run(&ctx, text, "global", None, None, None, None).await.unwrap();
+    let at = chrono::Utc::now() - chrono::Duration::days(30);
+
+    let written =
+        write::run(&ctx, text, "global", Some(vec!["moved".into()]), Some(&row.id), None, Some(at))
+            .await
+            .unwrap();
+    assert_ne!(written.id, row.id);
+    assert_eq!(superseded_by(&pool, &row.id).await.as_deref(), Some(written.id.as_str()));
+    let dated: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT occurred_at FROM memory WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&written.id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(dated.map(|d| d.date_naive()), Some(at.date_naive()));
+}
+
+/// Reusing a row that lacks a tag the caller sent would drop the tag, so a retry that adds one
+/// stores its own row carrying it.
+#[tokio::test]
+async fn a_supersedes_retry_with_a_new_tag_stores_its_own_row() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let target =
+        write::run(&ctx, "The nightly backup runs at 02:00.", "global", None, None, None, None)
+            .await
+            .unwrap();
+    let text = "The nightly backup runs at 03:00.";
+    let first = write::run(&ctx, text, "global", None, None, None, None).await.unwrap();
+
+    let written =
+        write::run(&ctx, text, "global", Some(vec!["backup".into()]), Some(&target.id), None, None)
+            .await
+            .unwrap();
+    assert_ne!(written.id, first.id, "the caller's tag would have been dropped");
+    let tags: Vec<String> = sqlx::query_scalar("SELECT tags FROM memory WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&written.id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tags, vec!["backup".to_string()]);
+}
+
+/// Postgres keeps `occurred_at` to the microsecond while an RFC 3339 date can carry nanoseconds.
+/// A retry that sends the same date as the first call must still match the stored row.
+#[tokio::test]
+async fn a_supersedes_retry_with_a_sub_microsecond_date_reuses_the_row() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let target =
+        write::run(&ctx, "The release freeze starts on the 1st.", "global", None, None, None, None)
+            .await
+            .unwrap();
+    let text = "The release freeze starts on the 5th.";
+    let at = chrono::DateTime::parse_from_rfc3339("2026-06-01T09:30:00.123456789Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let first = write::run(&ctx, text, "global", None, None, None, Some(at)).await.unwrap();
+
+    let second =
+        write::run(&ctx, text, "global", None, Some(&target.id), None, Some(at)).await.unwrap();
+    assert_eq!(second.id, first.id, "the same date names the same row");
+    assert_eq!(live_copies(&pool, "global", text).await, 1);
+}
+
+/// A caller that may write a namespace but not read it never learns that its sentence is already
+/// stored there, the rule step (e) keeps for plain writes. Its supersedes write stores a copy.
+#[tokio::test]
+async fn a_supersedes_write_into_a_write_only_namespace_stores_its_own_row() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let target =
+        write::run(&ctx, "The build cache sits on host moria.", "global", None, None, None, None)
+            .await
+            .unwrap();
+    let text = format!("The build cache sits on host erebor {}.", nonce("writeonly"));
+    let existing = write::run(&ctx, &text, "project:secret", None, None, None, None).await.unwrap();
+
+    let writer = restricted(&ctx, &["global"], &["global", "project:secret"]);
+    let written = write::run(&writer, &text, "project:secret", None, Some(&target.id), None, None)
+        .await
+        .unwrap();
+    assert!(!written.deduplicated, "deduplicated:true is a yes to an exact-content guess");
+    assert_ne!(written.id, existing.id);
+    assert_eq!(superseded_by(&pool, &target.id).await.as_deref(), Some(written.id.as_str()));
+    assert_eq!(live_copies(&pool, "project:secret", &text).await, 2);
+}
+
+/// The retired row's end comes from its successor's `occurred_at`. Reusing a row whose valid time
+/// disagrees with the one the caller sent would drop the caller's date and close the old period
+/// on the wrong day, so a dated retry that disagrees stores its own row.
+#[tokio::test]
+async fn a_supersedes_write_with_a_different_occurred_at_does_not_reuse_the_row() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let target =
+        write::run(&ctx, "The release train leaves on Mondays.", "global", None, None, None, None)
+            .await
+            .unwrap();
+    let text = "The release train leaves on Thursdays.";
+    let stored_at = chrono::Utc::now() - chrono::Duration::days(30);
+    let sent_at = chrono::Utc::now() - chrono::Duration::days(20);
+    let existing =
+        write::run(&ctx, text, "global", None, None, None, Some(stored_at)).await.unwrap();
+
+    let written = write::run(&ctx, text, "global", None, Some(&target.id), None, Some(sent_at))
+        .await
+        .unwrap();
+    assert_ne!(written.id, existing.id, "the caller's date would have been dropped");
+    assert!(!written.deduplicated);
+    assert_eq!(superseded_by(&pool, &target.id).await.as_deref(), Some(written.id.as_str()));
 }
 
 #[tokio::test]

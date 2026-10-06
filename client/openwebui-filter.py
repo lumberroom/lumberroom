@@ -67,6 +67,29 @@ WRITE_RULE = (
     "fact, call `memory_write`. Without asking."
 )
 
+def fit_digest(digest: str, max_chars: int) -> str:
+    """Cut the digest to max_chars at whole lines, marker included. A slice landed mid-bullet and
+    left the model half a fact. The server's own footer, the last line when it starts with "_(",
+    says what the server left out, so it stays while it fits."""
+    marker = "\n\n[digest truncated by the OpenWebUI filter]"
+    if len(digest) <= max_chars:
+        return digest
+    lines = digest.split("\n")
+    footer = [lines.pop()] if lines and lines[-1].startswith("_(") else []
+    for tail in (footer, []):
+        kept = list(lines)
+        while kept:
+            # A cut must not end on a blank line or on a ### heading whose bullets all went.
+            while kept and (not kept[-1].strip() or kept[-1].startswith("###")):
+                kept.pop()
+            if not kept:
+                break
+            text = "\n".join(kept + ([""] + tail if tail else [])) + marker
+            if len(text) <= max_chars:
+                return text
+            kept.pop()
+    return ""
+
 
 class Filter:
     class Valves(BaseModel):
@@ -185,8 +208,7 @@ class Filter:
             # locked out of recall for the whole cache window because one request hiccuped.
             return cached[1] if cached else None
 
-        if len(digest) > self.valves.max_chars:
-            digest = digest[: self.valves.max_chars] + "\n\n[digest truncated by the OpenWebUI filter]"
+        digest = fit_digest(digest, self.valves.max_chars)
 
         self._cache[cache_key] = (now, digest)
         return digest

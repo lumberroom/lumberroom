@@ -124,6 +124,8 @@ later pages; §6.1 says how the loop copes.
 }
 ```
 
+> Superseded by [0022](../decisions/0022-conflict-pairs-are-recorded-when-a-row-is-written.md) on 4 October 2026: the conflicts read lists stored pairs, the service no longer raises `namespace_too_large`, and the envelope carries `conflicts_pending` in its place.
+
 `sources.proposal` lists the origins this server fills; the engine answers `[]`. A client that asks
 for `source=proposal` on a server answering `[]` gets `400 source_not_filled`, never an empty list:
 an empty list reads as "nothing to review" and that is a different fact.
@@ -366,6 +368,8 @@ site; `src/http/review.rs` publishes `e.code()` and falls back to `review_decide
 transport matches on message text. Refusals on state (a proposal already decided, a supersede
 target already retired) carry the code the underlying service already raises.
 
+> Superseded by [0022](../decisions/0022-conflict-pairs-are-recorded-when-a-row-is-written.md) on 4 October 2026: `namespace_too_large` is gone from the codes the service raises.
+
 ## 3. The dismissed-pair ledger
 
 ### 3.1 The table
@@ -494,6 +498,8 @@ refuses the conflict source with `namespace_too_large` when the largest count ex
 `QUALITY.conflict_scan_max`. `CONFLICT_SCAN_MAX` defaults to 2000, validated at boot like every
 other setting, from the dev-container probe in §0 where one namespace of 3,000 rows cost 13.33 s.
 Recalibrate it from §10's timed run before trusting it on server hardware.
+
+> Superseded by [0022](../decisions/0022-conflict-pairs-are-recorded-when-a-row-is-written.md) on 4 October 2026: the conflicts read lists stored pairs and no longer refuses a large namespace. `CONFLICT_SCAN_MAX` is read, ignored and warned about for one release, then removed.
 
 A small `limit` is no substitute, since the probe measured `LIMIT 51` and `LIMIT 2201` at the same
 34.96 s, so the refusal is the honest version of what a slow caller was going to get anyway. Two
@@ -827,6 +833,9 @@ against a live deployment. Discovery on production is reads only.
    `--source conflict` and print the seconds, then seed one row past the ceiling and confirm the
    refusal reads `namespace_too_large` in milliseconds. The archive copy cannot show this: its
    largest namespace is well under the ceiling, the shape where the query is fast.
+
+   > Superseded by [0022](../decisions/0022-conflict-pairs-are-recorded-when-a-row-is-written.md) on 4 October 2026: no ceiling and no refusal remain to time. Gate
+   > E2-G2 in the write-time conflicts plan measures the stored read instead.
 
 Every count above is a design target until the run prints it. §0's two figures are measurements and
 say where they came from.

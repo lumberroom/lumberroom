@@ -123,6 +123,7 @@ mod tests {
             host: "0.0.0.0".into(),
             tenant_id: "me".into(),
             database_url: String::new(),
+            db: Default::default(),
             run_migrations_on_boot: false,
             public_url: "https://lumberroom.example.com".into(),
             auth: AuthConfig {
@@ -199,6 +200,8 @@ mod tests {
                 conflict_threshold: 0.90,
                 conflict_limit: 3,
                 conflict_scan_max: 2_000,
+                conflict_sweep_secs: 60,
+                conflict_sweep_budget_ms: 5_000,
                 stale_days: 365,
                 export_max_sensitivity: crate::domain::types::Sensitivity::Open,
                 archive_max_decompressed_bytes: 2 * 1024 * 1024 * 1024,

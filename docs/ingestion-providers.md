@@ -46,6 +46,40 @@ interactive shell writes the command into its history file, so a key passed that
 places the owner did not pick and stays there. The key never enters a log line, an error message or
 the working directory; a failure prints the provider name and the HTTP status.
 
+## LiteLLM, Ollama and other OpenAI-compatible servers
+
+`custom` reaches any server that speaks `chat/completions`. The CLI posts to
+`{base_url}/chat/completions` and sends the key as a bearer only when one is set, so a local server
+with no auth needs no key.
+
+A [LiteLLM](https://docs.litellm.ai/) proxy, with its virtual key or master key:
+
+```
+cat litellm-key.txt | lumberroom ingest keys set custom
+lumberroom ingest extract --run <id> --provider custom \
+  --base-url http://localhost:4000 --model <model_name from the LiteLLM config>
+```
+
+`LUMBERROOM_INGEST_KEY_CUSTOM` overrides the stored key, which suits CI. Save the settings so
+`--provider custom` is the only flag:
+
+```json
+{"ingest": {"providers": {"custom": {"base_url": "http://localhost:4000", "model": "my-extractor", "json_mode": true}}}}
+```
+
+`json_mode` is off by default for `custom`. Turn it on only when the model behind the server accepts
+`response_format: json_object`; some answer HTTP 400 to it (see `json_mode` below).
+
+LiteLLM fronts Anthropic, Bedrock, Vertex, Ollama and many more and translates them to the OpenAI
+shape, so Claude or any other model it routes to works through `custom` without the `anthropic`
+provider.
+
+Ollama, vLLM and LM Studio work the same way. Ollama's base URL is `http://localhost:11434/v1`.
+
+There is one `custom` entry. For a second OpenAI-compatible endpoint, point another entry elsewhere:
+`ingest.providers.openai.base_url` replaces the OpenAI default. Set `model` and `json_mode` in the
+same entry to match that server, since the `openai` defaults (`gpt-4o-mini`, JSON mode on) still apply.
+
 ## `reasoning`, off by default
 
 ```json

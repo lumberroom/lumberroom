@@ -39,7 +39,7 @@ BIN_DIR="${LUMBERROOM_BIN_DIR:-$HOME/.local/bin}"
 CONFIG_DIR="${LUMBERROOM_CONFIG_DIR:-$HOME/.config/lumberroom}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_REPO="${LUMBERROOM_RELEASE_REPO:-https://github.com/lumberroom/lumberroom}"
-RELEASE_VERSION="${LUMBERROOM_RELEASE_VERSION:-0.4.0}"
+RELEASE_VERSION="${LUMBERROOM_RELEASE_VERSION:-0.5.0}"
 
 usage() {
   sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'

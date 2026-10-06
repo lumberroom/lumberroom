@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Copies the agent skills under skills/ into the client plugins that ship them, or with --check
-# reports any copy that has drifted. The plugins live in their own repositories; point at their
+# Copies the agent skills listed in SKILLS from client/skills/ into the client plugins that ship
+# them, or with --check reports any copy that has drifted. lumberroom-memory is not listed: each
+# plugin carries its own version of it. The plugins live in their own repositories; point at their
 # checkouts with PLUGIN_ROOTS (space-separated), which defaults to siblings of this checkout.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 roots="${PLUGIN_ROOTS:-$here/../lumberroom-claude-code $here/../lumberroom-openclaw $here/../lumberroom-hermes}"
+skills="${SKILLS:-lr-review}"
 check=0; [ "${1:-}" = "--check" ] && check=1
 status=0
-for skill in "$here"/skills/*/; do
-  name="$(basename "$skill")"
+for name in $skills; do
+  skill="$here/client/skills/$name"
   for root in $roots; do
     [ -d "$root" ] || { echo "skip: $root not found" >&2; continue; }
     dest="$root/skills/$name/SKILL.md"

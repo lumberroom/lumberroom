@@ -293,6 +293,18 @@ button[disabled]{opacity:.45;cursor:not-allowed}
    below it, so the form is never squeezed into half a card. */
 .cli-acts{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
 .cli-acts>form{margin-left:auto}
+/* The name form owns the first row of the card: the generic `.cli-acts>form` rule above pushes
+   Revoke right with an auto margin, and the rename form inherited it and floated mid-row. */
+.cli-acts>.cli-name-form{flex:1 1 100%;margin-left:0;display:flex;gap:8px;flex-wrap:wrap;align-items:stretch}
+/* Chrome floors an input's text box at 16px, which made it 3px taller than the buttons it sits
+   beside; the explicit height is the button's own 13px line, 16px padding and 2px border. */
+.cli-name-form input[type=text]{flex:1 1 24ch;min-width:0;max-width:48ch;padding:0 8px;height:calc(var(--t-sm) + 18px);box-sizing:border-box;
+ border:1px solid var(--rule-3);background:var(--paper-2);color:var(--ink);
+ font:400 var(--t-sm)/var(--lh-flat) var(--sans)}
+@media (max-width:600px){
+ .cli-name-form input[type=text]{flex-basis:100%;max-width:none}
+ .cli-name-form button{flex:1 1 auto}
+}
 .cli-edit{flex:0 1 auto}
 .cli-edit[open]{flex:1 1 100%}
 .cli-edit>summary,.confirm>summary{display:inline-block;font:600 var(--t-sm)/var(--lh-flat) var(--sans);color:var(--ink-2);

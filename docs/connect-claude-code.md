@@ -197,7 +197,7 @@ Against the stack on `127.0.0.1:8787` in token mode, 19 August 2026:
 
 ```
 endpoint: http://127.0.0.1:8787/mcp
-healthz:  200 {"name":"lumberroom","ok":true,"version":"0.4.0"}
+healthz:  200 {"name":"lumberroom","ok":true,"version":"0.5.0"}
 readyz:   200 {"auth_mode":"token","db_ms":2,"embedder":"Xenova/bge-base-en-v1.5@q8","embedder_degraded":false,"embedding_dim":768,"kek_provider":"none","kek_verified":false,"ok":true}
 credential: static token
 whoami:   200 {"client":"claude-code-mac","embedder":"Xenova/bge-base-en-v1.5@q8","may_delete":false,"mode":"token","read":[{"max":"open","namespace":"*"}],"registry_write":true,"scopes":[],"sealed_capable":false,"tenant":"me","token_fingerprint":"aee1bc266593","write":[{"max":"open","namespace":"*"}]}

@@ -20,7 +20,7 @@ use lumberroom_server::ports::OauthStore;
 use lumberroom_server::services::review_queue::{
     ProposalDecided, ProposalDecision, ProposalItem, ProposalSource, Verdict, Via,
 };
-use lumberroom_server::services::{write, Ctx, Repos};
+use lumberroom_server::services::{conflicts, write, Ctx, Repos};
 use sqlx::PgPool;
 
 mod common;
@@ -391,7 +391,23 @@ async fn conflict_pair(ctx: &Ctx, pool: &PgPool, namespace: &str, tag: &str) -> 
         namespace,
     )
     .await;
+    sweep_pairs(ctx).await;
     (older, newer)
+}
+
+/// The conflict source reads stored pairs and this harness starts no sweeper, so a test records its
+/// pairs here before it reads them. Run it after any `created_at` backdate: a scan fixes which half
+/// of a pair is the older one.
+async fn sweep_pairs(ctx: &Ctx) {
+    let report = conflicts::sweep(
+        ctx.repos.memories.as_ref(),
+        ctx.tenant(),
+        ctx.cfg.quality.conflict_threshold,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.pending, 0, "the sweep left rows unscanned: {report:?}");
 }
 
 async fn make_stale(pool: &PgPool, id: &str) {
@@ -587,6 +603,28 @@ async fn a_verdict_the_item_never_offered_is_refused_by_its_own_code() {
     assert!(text(&result).contains("verdict_not_for_source"), "{}", text(&result));
 }
 
+/// The legacy conflicts route lists stored pairs only, so it carries the same `conflicts_pending`
+/// the queue answers with: a row the sweeper has not scanned yet is the gap a short list hides.
+#[tokio::test]
+async fn the_legacy_conflicts_route_carries_conflicts_pending() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    conflict_pair(&h.ctx, &h.pool, "global", "lg1").await;
+    write_at(&h.ctx, &format!("a fact waiting for its scan {}", nonce("lg2")), "global").await;
+
+    let res = reqwest::Client::new()
+        .get(format!("{}/admin/review/conflicts?min_similarity=0", h.base))
+        .bearer_auth(OWNER_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    let status = res.status();
+    let body = res.text().await.unwrap();
+    assert!(status.is_success(), "the route answered {status}: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["conflicts_pending"], 1, "one row written after the sweep: {v}");
+    assert!(!v["pairs"].as_array().unwrap().is_empty(), "the swept pair is listed: {v}");
+}
+
 #[tokio::test]
 async fn a_malformed_key_is_refused_not_a_queue_key() {
     let h = ctx_or_skip!(|_| {});
@@ -618,6 +656,58 @@ async fn a_bare_date_on_occurred_at_is_refused_because_the_tool_takes_rfc_3339_o
         .await;
     assert!(refused(&result), "{result:?}");
     assert!(text(&result).contains("occurred_at"), "{}", text(&result));
+}
+
+/// A future `occurred_at` is refused for being in the future. The refusal used to say the date was
+/// inside the last 86400 seconds, which a caller sending next year's date cannot act on.
+#[tokio::test]
+async fn memory_write_refuses_a_future_date_by_naming_the_future() {
+    let h = ctx_or_skip!(|_| {});
+    let ahead = (Utc::now() + Duration::days(400)).date_naive().format("%Y-%m-%d").to_string();
+
+    let result = h
+        .call(
+            "memory_write",
+            serde_json::json!({
+                "content": format!("the rota changes {}", nonce("f1")),
+                "namespace": "global",
+                "occurred_at": ahead,
+            }),
+        )
+        .await;
+    assert!(refused(&result), "{result:?}");
+    let message = text(&result);
+    assert!(
+        message.contains(&format!("occurred_at {ahead}T00:00:00+00:00 is in the future")),
+        "{message}"
+    );
+    assert!(!message.contains("inside the last"), "{message}");
+}
+
+/// The merge path writes through the same fence, so it draws the same message.
+#[tokio::test]
+async fn a_merge_with_a_future_date_is_refused_by_naming_the_future() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
+    let id =
+        write_at(&h.ctx, &format!("the merge target still holds {}", nonce("f2")), "global").await;
+    make_stale(&h.pool, &id).await;
+    let ahead = (Utc::now() + Duration::days(400)).to_rfc3339();
+
+    let result = h
+        .call(
+            "review_decide",
+            serde_json::json!({
+                "key": format!("stale:{id}"),
+                "verdict": "merge",
+                "content": "the merged fact",
+                "occurred_at": ahead,
+            }),
+        )
+        .await;
+    assert!(refused(&result), "{result:?}");
+    let message = text(&result);
+    assert!(message.contains("is in the future"), "{message}");
+    assert!(!message.contains("inside the last"), "{message}");
 }
 
 #[tokio::test]

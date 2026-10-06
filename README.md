@@ -5,6 +5,10 @@
 One memory that every AI tool you use can read from and write to, with you deciding what each one is
 allowed to see.
 
+[![Introducing Lumberroom: one shared memory for AI agents](https://i.ytimg.com/vi/W1a7X3Oee2M/maxresdefault.jpg)](https://youtu.be/W1a7X3Oee2M)
+
+More videos: [Lumberroom playlist](https://www.youtube.com/playlist?list=PLICXFDm9bubU) · [lumberroom.cloud/videos](https://lumberroom.cloud/videos)
+
 You run seven AI surfaces. Each keeps its own memory. None of them share. You re-explain your setup
 to ChatGPT, then again to Claude, then again to your coding agent, and when you correct one of them
 the others never find out. Lumberroom holds the facts once, on infrastructure you own, and every tool
@@ -46,11 +50,14 @@ sudo ./deploy/install.sh
 ```
 
 That is token mode on loopback: the server binds `127.0.0.1:8787`, opens no public port, and prints
-the client token with the command to run on your Mac. Add `--domain` and `--auth-mode oauth` when a
+the command to run on your Mac. The client token is the first `"token"` field in the `.env` the
+installer writes (mode 600) in the clone. Add `--domain` and `--auth-mode oauth` when a
 browser has to reach it. The installer pulls
-`ghcr.io/lumberroom/lumberroom-server:0.4.0` and falls back to building from this tree when the
+`ghcr.io/lumberroom/lumberroom-server:0.5.0` and falls back to building from this tree when the
 pull fails; `--build-local` skips the pull. It pins a version rather than tracking `latest`, because
 a memory store that upgrades itself while you sleep is not a feature.
+
+Watch the self-host walkthrough: [youtu.be/Km7CcmcsS2w](https://youtu.be/Km7CcmcsS2w).
 
 Moved: the engine used to publish as `ghcr.io/the-cybersapien/lumberroom-server`. That image stays
 public, frozen at 0.4.0, and takes no new versions; pull `ghcr.io/lumberroom/lumberroom-server`
@@ -76,7 +83,7 @@ cargo install lumberroom
 A binary, with no package manager. Four targets, macOS and Linux on arm64 and x86_64:
 
 ```bash
-tag=v0.4.0; target=aarch64-apple-darwin      # or x86_64-apple-darwin,
+tag=v0.5.0; target=aarch64-apple-darwin      # or x86_64-apple-darwin,
                                              # aarch64-unknown-linux-musl, x86_64-unknown-linux-musl
 base=https://github.com/lumberroom/lumberroom/releases/download/$tag
 curl -fsSLO "$base/lumberroom-${tag#v}-$target.tar.gz"
@@ -92,8 +99,8 @@ On a machine where `apt` or `dnf` is how software arrives, the release also carr
 dependency:
 
 ```bash
-sudo dpkg -i lumberroom_0.4.0-1_amd64.deb     # or lumberroom_0.4.0-1_arm64.deb
-sudo rpm -i lumberroom-0.4.0-1.x86_64.rpm     # or lumberroom-0.4.0-1.aarch64.rpm
+sudo dpkg -i lumberroom_0.5.0-1_amd64.deb     # or lumberroom_0.5.0-1_arm64.deb
+sudo rpm -i lumberroom-0.5.0-1.x86_64.rpm     # or lumberroom-0.5.0-1.aarch64.rpm
 ```
 
 Then point it at your server:
@@ -109,7 +116,7 @@ To wire a Mac into Claude Code, which installs the MCP server, the session hook 
 rule in one pass:
 
 ```bash
-./client/wire-mac.sh --url http://127.0.0.1:8787 --token <token>
+LUMBERROOM_TOKEN=<token> ./client/wire-mac.sh --url http://127.0.0.1:8787
 ```
 
 For Hermes Agent, [`lumberroom-hermes`](https://github.com/lumberroom/lumberroom-hermes) is a memory
@@ -135,6 +142,7 @@ unreadable, in the database and in every backup.
 | [deploy/oauth.md](deploy/oauth.md) | The OAuth production path, per surface, with the consent screen |
 | [docs/permissions.md](docs/permissions.md) | Every grant field, both axes, and which tools each capability opens |
 | [docs/connect-claude-code.md](docs/connect-claude-code.md) | Wiring Claude Code on a Mac, end to end |
+| [docs/connect-claude-ai.md](docs/connect-claude-ai.md) | The memory rules for claude.ai, Cowork and other connector clients: instructions to paste, or a skill |
 | [docs/architecture.md](docs/architecture.md) | The ports-and-adapters shape and where each part lives |
 | [docs/decisions/](docs/decisions/) | Why each part is shaped the way it is, one record per choice |
 | [docs/traps.md](docs/traps.md) | Findings that cost real time, and what to do instead |

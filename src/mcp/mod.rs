@@ -1,14 +1,16 @@
-//! MCP surface: the four tools from PRD §5, plus five behind a capability each.
+//! MCP surface: twelve tools, seven open to every client and five behind a capability each.
 //!
 //! `src/mcp/capability.rs` holds which grant opens which tool, and `list_tools` filters on it so a
 //! client never sees a tool it cannot call. The filter shapes what a model tries; every service
 //! checks the grant again on the call, which is what refuses a client that names a tool anyway.
 //!
-//! Descriptions are written as instructions rather than blurbs. They are the only lever that makes
-//! a model read memory before working and write memory after learning something (PRD §6.4), and on
-//! every surface except OpenWebUI they are the only lever at all. Signatures extend and never
-//! rename: a client pinned to an older argument list keeps working, and a renamed tool is a tool the
-//! model has to be told about again.
+//! Descriptions say what a tool does, what comes back and when it applies. They give no orders
+//! about behaviour: when to read or write memory is the owner's rule, kept in the owner's own agent
+//! configuration (docs/connect-*.md carries the snippets), and a server that issues those orders
+//! itself fails connector directory review. Every tool also carries a title and the hints a
+//! client reads to decide what runs without a prompt; `tests/mcp_tool_annotations.rs` fails a tool
+//! that lacks them. Signatures extend and never rename: a client pinned to an older argument list
+//! keeps working, and a renamed tool is a tool the model has to be told about again.
 
 pub mod tools;
 
@@ -37,6 +39,20 @@ pub mod views;
 
 pub const SERVER_NAME: &str = "lumberroom";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What a client reads at `initialize`. Facts about the server and its tools, with no orders.
+pub const SERVER_INSTRUCTIONS: &str = "Durable memory for this user, shared across the agents and \
+machines they use. context_bootstrap returns what is already known: the user's preferences, the \
+active project and the infrastructure registry. memory_search finds facts by meaning, and \
+registry_get looks up an exact operational value. memory_write records one durable fact per call: \
+a decision, preference, constraint or convention, with its numbers and identifiers. Which tools \
+appear depends on what the client's credential grants.";
+
+/// Every tool the server registers, as `tools/list` would show it to a credential that holds every
+/// grant. Exists so a test can read the annotations without a database or a request.
+pub fn tool_definitions() -> Vec<rmcp::model::Tool> {
+    (Lumberroom::tool_router() + Lumberroom::extra_tool_router()).list_all()
+}
 
 /// Registered only for a principal whose grant carries `may_delete`, so it does not appear in
 /// `tools/list` for anyone else. Named here because both the filter and the guard read it.
@@ -96,40 +112,50 @@ pub struct SearchArgs {
     // `as_of` asks for one it was given, and two guesses compound.
     /// What you want to know, in natural language. Full sentences retrieve better than keywords.
     pub query: String,
-    /// Restrict the search to exactly these namespaces. Omit it unless you have a reason.
+    /// The namespaces to search. When absent, the search covers the user namespace, global and the
+    /// project's namespace when project is set, as primary hits, then every other namespace the
+    /// credential can read at a lower rank unless the operator turned that wider reach off. A
+    /// non-empty list searches only the listed namespaces and their aliases, so it narrows the
+    /// search. Namespaces the credential cannot read are left out either way.
     #[serde(default)]
     pub namespaces: Option<Vec<String>>,
     /// Maximum rows. Default 8.
     #[serde(default)]
     pub limit: Option<i64>,
-    /// Slug or path of the project you are in. Pass it whenever you know it.
+    /// Slug or path of the current project. Its namespace joins the user namespace and global in
+    /// the default set, so its facts rank as primary hits. When the operator turned off the wider
+    /// reach, a project not named here or in namespaces is not searched at all. It has no effect
+    /// when namespaces is set.
     #[serde(default)]
     pub project: Option<String>,
-    /// Include facts that a later correction replaced. Off by default, because a superseded fact
-    /// read as current is worse than a missing one. Pass true only to answer "what did we believe
-    /// before".
+    /// true includes facts that a later correction replaced, which answers "what did we believe
+    /// before". Off by default, because a superseded fact read as current is worse than a missing
+    /// one. It needs a credential that may read history, and it cannot be set beside as_of.
     #[serde(default)]
     pub include_superseded: Option<bool>,
     /// What the store held at this instant, as a date, `2026-03-01`, read as midnight UTC, or a
-    /// full RFC 3339 instant. Pass it only when the person named a time. Working one out from the
-    /// question is a guess, and a guess here is worse than no argument at all: the filter drops
-    /// every fact that started after the instant you chose, so a date that is too early answers
-    /// "nothing is known" about facts the store holds. Omit it and the search answers as of now,
-    /// which is what almost every question wants.
+    /// full RFC 3339 instant. The filter drops every fact that started after the instant, so an
+    /// instant earlier than a fact's start hides that fact and the search answers "nothing is
+    /// known" about something the store holds. An instant the person named reflects what they
+    /// asked; one worked out from the question is a guess. A wrong guess can hide a fact that holds
+    /// now or return one a later correction retired, and leaving as_of absent risks neither. When
+    /// absent, the search answers as of now, which is what almost every question wants. It needs a credential that may read history, and it cannot be set
+    /// beside include_superseded.
     #[serde(default)]
     pub as_of: Option<String>,
-    /// Keep only facts carrying every one of these tags. Omit it unless the person asked for a tag
-    /// or you know the tag the fact was filed under: a fact filed without the tag is dropped, and
-    /// the search then reports nothing known about something the store holds.
+    /// Keeps only facts carrying every one of these tags. A fact filed without one of them is
+    /// dropped, so a tag the fact was never filed under makes the search report nothing known about
+    /// something the store holds. Absent or empty, no tag filter applies.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WriteArgs {
-    /// The durable fact, self-contained, still making sense in six months with no surrounding
-    /// conversation. Name the subject. Keep the numbers, identifiers, paths and dates, and the
-    /// cause or reversal condition the fact turns on; drop the trail of how you came to believe it.
+    /// The durable fact, self-contained, so it still makes sense in six months with no surrounding
+    /// conversation. A fact that names its subject and keeps its numbers, identifiers, paths, dates
+    /// and the cause or reversal condition it turns on stays usable; the trail of how it came to be
+    /// believed adds nothing a later reader needs.
     pub content: String,
     /// 'user:me' for facts about the person, 'project:<slug>' for one codebase, 'global' for facts
     /// true everywhere, 'personal:<slug>' such as 'personal:finance' for a private area of life.
@@ -147,12 +173,14 @@ pub struct WriteArgs {
     pub sensitivity: Option<String>,
     /// When this fact became true in the world. Two forms are accepted: a date, `2026-03-01`, read
     /// as midnight UTC, or a full RFC 3339 instant, `2026-03-01T09:30:00Z`. A bare month or year
-    /// has no form here, so "since March" is omitted rather than turned into a day you chose. Set
-    /// it whenever the time is stated rather than worked out: by the user, as in "we moved to
-    /// Postgres 16 on 4 June 2026", or by the fact itself naming the day an event happened, as in
-    /// "the regulator approved it on 19 August 2026". Never infer a date from context, and never
-    /// pass today's date because today is when you heard it: the store already records that
-    /// separately.
+    /// has no form here, so "since March" leaves the argument absent rather than carrying a day
+    /// nobody stated. The argument holds a time that was stated rather than worked out: by the
+    /// user, as in "we moved to Postgres 16 on 4 June 2026", or by the fact itself naming the day
+    /// an event happened, as in "the regulator approved it on 19 August 2026". A date inferred from
+    /// context is a guess the store then reports as fact. A stated time left out is lost: the row
+    /// then reads as true since the store heard it. By default a date within the last day is
+    /// refused unless the fact's text states it, because the store already records when it heard
+    /// the fact, so today's date alone fails the write. A future date is refused.
     pub occurred_at: Option<String>,
 }
 
@@ -162,9 +190,12 @@ pub struct RegistryArgs {
     pub kind: String,
     /// Exact key. This lookup does not guess or fuzzy-match.
     pub key: String,
-    /// Where to look. Omit to check the project, then the user namespace, then global.
+    /// Where to look. When absent, the lookup checks the project's namespace, then the user
+    /// namespace, then global, and the first match answers.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Slug or path of the current project. When namespace is absent, its namespace is checked
+    /// first, so a project override beats a global default.
     #[serde(default)]
     pub project: Option<String>,
 }
@@ -176,8 +207,9 @@ pub struct ForgetArgs {
     /// Why it is being deleted, recorded with the deletion. Required: a delete with no reason is
     /// indistinguishable from a mistake a month later.
     pub reason: String,
-    /// List what would go without deleting anything. Use it first whenever the user's instruction
-    /// was not explicit about this exact memory.
+    /// true lists what would go and deletes nothing, so the person can see the exact memory before
+    /// a delete removes it. A delete on an instruction that did not name this exact memory can
+    /// remove the wrong one, and nothing restores it.
     #[serde(default)]
     pub dry_run: Option<bool>,
 }
@@ -190,11 +222,16 @@ impl Lumberroom {
 
     #[tool(
         name = "context_bootstrap",
-        description = "Run this once at the start of a session, before any substantive work, and \
-before asking the user a question they may have already answered in an earlier session. It returns \
-everything already known about this user, their standing preferences, the active project, and the \
-infrastructure registry. One call, one round trip, typically under 200ms. If you skip it you will \
-re-ask questions that were answered weeks ago."
+        title = "Load session context",
+        description = "Returns what is already known about this user: standing preferences, the \
+active project's memory and the infrastructure registry, in one call. It suits the start of a \
+session, or the moment before asking a question an earlier session may have answered. project, a \
+path or slug, promotes that project's memory.",
+        annotations(
+            title = "Load session context",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn context_bootstrap(
         &self,
@@ -211,11 +248,13 @@ re-ask questions that were answered weeks ago."
 
     #[tool(
         name = "memory_search",
-        description = "Search durable memory for what is already known before answering from \
-assumption or asking the user. Use it whenever a task depends on a past decision, a preference, a \
-host, a credential location, or \"how do we usually do this\". Semantic, so ask in full sentences. \
-Superseded facts are excluded: every hit is what is believed now. Each hit's source is the name \
-of the app that wrote it. Pass tags to keep only facts carrying all of them."
+        title = "Search memory",
+        description = "Semantic search over durable memory. It applies when a task depends on a \
+past decision, a preference, a host, a credential location, or how something is usually done. \
+Queries retrieve best as full sentences. Superseded facts are excluded, so each hit is what is \
+believed now; include_superseded and as_of change that. Each hit's source is the name of the app \
+that wrote it. tags keeps only facts carrying all of them.",
+        annotations(title = "Search memory", read_only_hint = true, open_world_hint = false)
     )]
     async fn memory_search(
         &self,
@@ -258,20 +297,23 @@ of the app that wrote it. Pass tags to keep only facts carrying all of them."
     // nothing acts on them, and the store accumulates two versions of one fact (Phase 4 §1).
     #[tool(
         name = "memory_write",
-        description = "Record a durable fact the moment it appears: a decision, a stated \
-preference, a constraint, a host or service detail, a convention. Call this without asking \
-permission and without announcing it. Write one fact per call, phrased so it stands alone in six \
-months, carrying the numbers, identifiers, paths and dates the fact needs, and the cause, scope \
-qualifier and reversal condition whenever the fact turns on them. Leave out the trail of how you \
-came to believe it: the search you ran, the file you read on the way, the argument for the claim. \
-No hedges, no evaluative words, no restated context, no inventory of what you did not change. \
-Long is right when the fact is long, a list or a timeline; long prose about a short fact is not. \
-When a second fact turns up in the same exchange, write it in a second call. Do not \
-record transient chatter, file contents, or anything you would not want repeated back next month. \
-If the response comes back with possible_conflicts, read them: when one of them states the OLD \
-version of the fact you just wrote, call memory_write again with the same content and supersedes \
-set to that memory's id, which retires it. When it is a different fact that merely sounds \
-similar, leave it alone."
+        title = "Save a memory",
+        description = "Records one durable fact: a decision, a stated preference, a constraint, a \
+host or service detail, a convention. Content that names its subject and keeps the numbers, \
+identifiers, paths, dates and the cause or reversal condition stays usable in six months, when a \
+reader sees only the row. Each call stores one row; transient chatter or a file's contents stored \
+here come back in every later search. The response can carry possible_conflicts, older facts close \
+to the new one, and the new row is already stored either way. When one of them states the old \
+version of the fact just written, a second call with the same content and supersedes set to that \
+memory's id retires it in favour of the row the first call stored, which leaves one live row for \
+the fact. The old row stays readable in memory_history. \
+possible_conflicts can also list a different fact that only sounds similar.",
+        annotations(
+            title = "Save a memory",
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn memory_write(
         &self,
@@ -304,10 +346,16 @@ similar, leave it alone."
 
     #[tool(
         name = "registry_get",
+        title = "Look up a registry value",
         description = "Exact lookup of a known operational value: a host, a service endpoint, \
-where a credential lives, a model route, a dataset. Use this instead of guessing an address or \
-asking the user to repeat it. Returns found:false when nothing is recorded, so then ask and write \
-the answer with memory_write. source is the name of the app that wrote the value."
+where a credential lives, a model route, a dataset. It does not guess or fuzzy-match, which suits a \
+value where a wrong address would break something. Returns found:false when nothing is recorded. \
+source is the name of the app that wrote the value.",
+        annotations(
+            title = "Look up a registry value",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn registry_get(
         &self,
@@ -333,11 +381,18 @@ the answer with memory_write. source is the name of the app that wrote the value
 
     #[tool(
         name = "memory_forget",
-        description = "Delete one memory permanently, by id. Only for a fact the user has told you \
-to remove, or one they have just contradicted and asked you to drop. This cannot be undone and \
-there is no copy: for a private memory the key that opens it goes with the row. Prefer memory_write \
-with supersedes for a fact that CHANGED, which keeps the history and is almost always what is \
-wanted. Call it with dry_run true first unless the user named this exact memory."
+        title = "Delete a memory",
+        description = "Deletes one memory permanently, by id. The delete cannot be undone and \
+leaves no copy: for a private memory the key that opens it goes with the row. For a fact that \
+changed, memory_write with supersedes keeps the history instead. reason is recorded with the \
+deletion. dry_run true lists what would go and deletes nothing. The tool appears only for a \
+credential granted mayDelete.",
+        annotations(
+            title = "Delete a memory",
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn memory_forget(
         &self,
@@ -464,13 +519,8 @@ fn tool_error(tool: &str, e: &DomainError) -> CallToolResult {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Lumberroom {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Durable memory for this user, shared across every agent and machine they use. Call \
-             context_bootstrap before substantive work. Call memory_write whenever an exchange \
-             establishes a decision, preference, or durable fact, silently, without asking. Write \
-             the fact with its numbers and identifiers, one fact per call, and leave out the case \
-             for it.",
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 
     /// The tool list is per client, because `memory_forget` is per grant.

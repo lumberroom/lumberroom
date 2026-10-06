@@ -17,7 +17,7 @@ Without `--domain` the server binds `127.0.0.1:8787`, opens no public port, and 
 SSH tunnel.
 
 **How do I connect a client?**
-`./client/wire-mac.sh --url <url> --token <token>` registers the MCP server with Claude Code,
+`LUMBERROOM_TOKEN=<token> ./client/wire-mac.sh --url <url>` registers the MCP server with Claude Code,
 installs the session hook and appends the write rule. For the OAuth surfaces, the client registers
 itself and waits at the consent screen. [connect-claude-code.md](connect-claude-code.md) walks the
 Mac path end to end.
@@ -107,7 +107,7 @@ citations.
 **Why was my write refused?**
 Four common reasons. The content tripped the credential tripwire, which refuses anything shaped like
 a secret. The namespace classifies `private` and no key is configured, so the server refuses rather
-than storing it in the clear. `occurred_at` fell inside the near-now fence. Or the write asked for a
+than storing it in the clear. `occurred_at` fell inside the near-now fence or lay in the future. Or the write asked for a
 sensitivity the credential's ceiling does not reach. The refusal names which.
 
 **How do I delete something for good?**

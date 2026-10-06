@@ -203,12 +203,30 @@ impl ClientGrant {
     }
 }
 
+/// Size and patience of the Postgres pool. The defaults are the values `connect()` hard-coded
+/// before these settings existed, so an unset environment changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbConfig {
+    pub max_connections: u32,
+    /// True when the owner set `DB_MAX_CONNECTIONS`. A default must never fail boot on a small
+    /// server, so only an explicit size is refused when it does not fit.
+    pub max_connections_explicit: bool,
+    pub acquire_timeout_secs: u64,
+}
+
+impl Default for DbConfig {
+    fn default() -> Self {
+        Self { max_connections: 10, max_connections_explicit: false, acquire_timeout_secs: 5 }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
     pub host: String,
     pub tenant_id: String,
     pub database_url: String,
+    pub db: DbConfig,
     pub run_migrations_on_boot: bool,
     /// The public origin this server is reached at, with no trailing slash. Every externally
     /// visible URL is derived from it: the MCP endpoint, the OAuth issuer, the metadata documents
@@ -426,10 +444,16 @@ pub struct QualityConfig {
     pub conflict_threshold: f64,
     /// How many conflict candidates a write returns.
     pub conflict_limit: i64,
-    /// Largest readable namespace, in live embedded rows, that the conflicts self-join will scan.
-    /// The join is O(n squared) per namespace: a dev-container probe timed 2.48s at 1,400 rows,
-    /// 13.33s at 3,000 and 34.96s at 5,000, so past this the queue refuses instead of hanging.
+    /// Deprecated and ignored. It bounded the conflicts self-join, and conflicts now come from
+    /// stored pairs. Still parsed for one release so a deployment that sets it boots, with one
+    /// warning from `log_effective_policy`; the release after removes the field and the variable.
     pub conflict_scan_max: i64,
+    /// Seconds between timer sweeps of unscanned rows. The timer is the fallback for a wake the
+    /// listener lost, which a pooler in transaction mode does to every wake. Zero turns the sweeper
+    /// and its listener off, so no pair is recorded and every new row stays pending.
+    pub conflict_sweep_secs: u64,
+    /// Time one sweep may spend on a tenant before it yields until the next tick or wake.
+    pub conflict_sweep_budget_ms: u64,
     /// A live row never retrieved and older than this appears in `lumberroom review --stale`.
     pub stale_days: i32,
     /// Highest sensitivity the Obsidian export may include. Private content in a vault synced to a
@@ -820,6 +844,10 @@ pub fn load() -> Result<Config> {
             "DATABASE_URL",
             "postgres://lumberroom:lumberroom@127.0.0.1:5432/lumberroom",
         ),
+        db: parse_db(
+            std::env::var("DB_MAX_CONNECTIONS").ok().as_deref(),
+            std::env::var("DB_ACQUIRE_TIMEOUT_SECS").ok().as_deref(),
+        )?,
         run_migrations_on_boot: env_bool("RUN_MIGRATIONS_ON_BOOT", true),
         auth: AuthConfig {
             mode,
@@ -917,6 +945,8 @@ pub fn load() -> Result<Config> {
             conflict_threshold: env_num("CONFLICT_THRESHOLD", 0.90f64)?,
             conflict_limit: env_num("CONFLICT_LIMIT", 3i64)?,
             conflict_scan_max: env_num("CONFLICT_SCAN_MAX", 2_000i64)?,
+            conflict_sweep_secs: env_num("CONFLICT_SWEEP_SECS", 60u64)?,
+            conflict_sweep_budget_ms: env_num("CONFLICT_SWEEP_BUDGET_MS", 5_000u64)?,
             stale_days: env_num("STALE_DAYS", 365i32)?,
             export_max_sensitivity: env_sensitivity("EXPORT_MAX_SENSITIVITY", Sensitivity::Open)?,
             archive_max_decompressed_bytes: env_num(
@@ -932,6 +962,83 @@ pub fn load() -> Result<Config> {
 
     validate(&cfg)?;
     Ok(cfg)
+}
+
+/// Connections kept free beyond `superuser_reserved_connections`: one for an operator's `psql`, one
+/// for the detached connection `migrate` holds while the pool is up, one for `verify-kek` or a
+/// second replica starting. Small on purpose. A bigger reserve refuses pools the server can carry.
+const POOL_SPARE_CONNECTIONS: i64 = 3;
+
+/// Empty and absent both mean "use the default", as in `env_num`. Takes the raw strings so a test
+/// does not have to touch the process environment.
+fn parse_db(max_connections: Option<&str>, acquire_timeout_secs: Option<&str>) -> Result<DbConfig> {
+    fn num<T: std::str::FromStr>(key: &str, raw: Option<&str>, fallback: T) -> Result<T> {
+        match raw {
+            Some(v) if !v.trim().is_empty() => v.trim().parse().map_err(|_| {
+                DomainError::validation(format!(
+                    "{key} is not a valid whole number of at least 1: {v:?}"
+                ))
+            }),
+            _ => Ok(fallback),
+        }
+    }
+    let d = DbConfig::default();
+    Ok(DbConfig {
+        max_connections_explicit: max_connections.is_some_and(|v| !v.trim().is_empty()),
+        max_connections: num("DB_MAX_CONNECTIONS", max_connections, d.max_connections)?,
+        acquire_timeout_secs: num(
+            "DB_ACQUIRE_TIMEOUT_SECS",
+            acquire_timeout_secs,
+            d.acquire_timeout_secs,
+        )?,
+    })
+}
+
+fn validate_db(c: &DbConfig) -> Result<()> {
+    // sqlx panics on a pool of zero, and a zero acquire timeout fails every request that finds the
+    // pool busy, which is the opposite of waiting for a free connection.
+    if c.max_connections < 1 {
+        return Err(DomainError::validation("DB_MAX_CONNECTIONS must be at least 1."));
+    }
+    if c.acquire_timeout_secs < 1 {
+        return Err(DomainError::validation(
+            "DB_ACQUIRE_TIMEOUT_SECS must be at least 1. Zero fails every request that finds the \
+             pool busy instead of waiting for a connection.",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a pool the server cannot hold. Postgres enforces `max_connections` only when a new
+/// connection arrives, so an oversized pool boots clean and fails under load, which is when the
+/// cause is hardest to find. `server_max` and `superuser_reserved` come from the live server.
+pub fn check_pool_fits(pool_max: u32, server_max: i64, superuser_reserved: i64) -> Result<()> {
+    let usable = (server_max - superuser_reserved - POOL_SPARE_CONNECTIONS).max(0);
+    if i64::from(pool_max) > usable {
+        return Err(DomainError::validation(format!(
+            "DB_MAX_CONNECTIONS is {pool_max}, but the database allows {server_max} connections \
+             and reserves {superuser_reserved} for superusers, which leaves {usable} after \
+             {POOL_SPARE_CONNECTIONS} spare. Lower DB_MAX_CONNECTIONS or raise max_connections \
+             on the server."
+        )));
+    }
+    Ok(())
+}
+
+/// What boot does with the answer from `check_pool_fits`. `Ok(None)` means the pool fits.
+/// `Ok(Some(e))` means it does not fit but the size is the built-in default, so the caller logs `e`
+/// and keeps booting: an upgrade onto a small server must not start failing. `Err` is an explicit
+/// size that does not fit.
+pub fn enforce_pool_fit(
+    db: &DbConfig,
+    server_max: i64,
+    superuser_reserved: i64,
+) -> Result<Option<DomainError>> {
+    match check_pool_fits(db.max_connections, server_max, superuser_reserved) {
+        Ok(()) => Ok(None),
+        Err(e) if db.max_connections_explicit => Err(e),
+        Err(e) => Ok(Some(e)),
+    }
 }
 
 /// Split out of `validate` so a test can reach it without building a whole `Config`.
@@ -950,6 +1057,36 @@ fn validate_cleanup(c: &CleanupConfig) -> Result<()> {
         return Err(DomainError::validation(
             "CLEANUP_LIMIT must be at least 1. Zero reads nothing and reports a clean store.",
         ));
+    }
+    Ok(())
+}
+
+/// Split out of `validate` so a test can reach it without building a whole `Config`.
+fn validate_conflict_sweep(q: &QualityConfig) -> Result<()> {
+    // One scan took 10 to 19 ms on a scratch copy at 1,691 rows a namespace, so 100 ms buys a
+    // handful of rows a pass and less turns a backfill into a crawl. Past 25 seconds one sweep
+    // holds the loop for most of the default 60-second interval, and wakes queue behind it.
+    if !(100..=25_000).contains(&q.conflict_sweep_budget_ms) {
+        return Err(DomainError::validation(format!(
+            "CONFLICT_SWEEP_BUDGET_MS is {}, outside 100 to 25000. Below 100 a sweep scans almost \
+             nothing per pass; above 25000 one sweep holds the loop while wakes queue behind it.",
+            q.conflict_sweep_budget_ms
+        )));
+    }
+    Ok(())
+}
+
+/// The conflict wake listener opens its `PgListener` from the shared pool and keeps that
+/// connection for the life of the process. With a pool of one, every request then waits
+/// `DB_ACQUIRE_TIMEOUT_SECS` and fails, and nothing at boot shows it.
+fn validate_listener_pool(db: &DbConfig, q: &QualityConfig) -> Result<()> {
+    if q.conflict_sweep_secs > 0 && db.max_connections < 2 {
+        return Err(DomainError::validation(format!(
+            "DB_MAX_CONNECTIONS is {}, but CONFLICT_SWEEP_SECS={} starts a listener that holds one \
+             pooled connection for the life of the process, which leaves none for requests. Set \
+             DB_MAX_CONNECTIONS to at least 2, or set CONFLICT_SWEEP_SECS=0 to turn the sweeper off.",
+            db.max_connections, q.conflict_sweep_secs
+        )));
     }
     Ok(())
 }
@@ -1021,6 +1158,9 @@ fn validate_static_token(client: &str, token: &str) -> Result<()> {
 
 fn validate(cfg: &Config) -> Result<()> {
     validate_cleanup(&cfg.cleanup)?;
+    validate_db(&cfg.db)?;
+    validate_conflict_sweep(&cfg.quality)?;
+    validate_listener_pool(&cfg.db, &cfg.quality)?;
 
     // Every mode honours static tokens, so a deployment with no token and no other credential
     // source can authenticate nobody. That is a configuration error rather than a lockout to
@@ -1101,16 +1241,6 @@ fn validate(cfg: &Config) -> Result<()> {
         ));
     }
 
-    // Under a hundred rows a namespace the self-join answers in milliseconds, so a bound below
-    // that only refuses stores that were never at risk.
-    if cfg.quality.conflict_scan_max < 100 {
-        return Err(DomainError::validation(
-            "CONFLICT_SCAN_MAX must be at least 100. Below that the bound refuses namespaces the \
-             conflicts query answers in milliseconds, which removes the review queue's conflict \
-             source on a store that never needed protecting.",
-        ));
-    }
-
     // Zero here reads as "no limit" to somebody skimming and means "refuse every archive" to the
     // reader, which turns a bomb defence into an outage of its own.
     if cfg.quality.archive_max_decompressed_bytes == 0 {
@@ -1176,7 +1306,8 @@ fn validate(cfg: &Config) -> Result<()> {
 }
 
 /// The one line an operator needs to know what their store classifies as private, and the warning
-/// that follows from it.
+/// that follows from it. Deprecated settings warn here too, since boot calls this after tracing
+/// starts and `load` runs before it, when a warning would go nowhere.
 ///
 /// Called after the effective table is settled, not from `validate`: at load time the only rules in
 /// hand are whatever the environment supplied, which on a default install is nothing, so the check
@@ -1200,15 +1331,146 @@ pub fn log_effective_policy(cfg: &Config, source: &str) {
              refused rather than stored unencrypted"
         );
     }
+
+    // Here rather than in `load`: `load` runs before the subscriber exists, so a warning from it
+    // goes nowhere, and boot calls this function once after tracing starts.
+    warn_deprecated_settings(std::env::var("CONFLICT_SCAN_MAX").ok().as_deref());
+}
+
+/// Spec 4.8 fixes this wording.
+const CONFLICT_SCAN_MAX_DEPRECATED: &str = "CONFLICT_SCAN_MAX is ignored since conflicts are read \
+     from stored pairs, and the next release removes it";
+
+/// Takes the raw value so a test does not have to touch the process environment. Set means
+/// non-empty, which is how `env_num` reads the same variable.
+fn warn_deprecated_settings(conflict_scan_max: Option<&str>) {
+    if conflict_scan_max.is_some_and(|v| !v.is_empty()) {
+        tracing::warn!("{CONFLICT_SCAN_MAX_DEPRECATED}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Everything `f` logs, as text. `with_default` scopes the subscriber to this thread, so tests
+    /// running beside it neither add lines nor lose them.
+    fn logged_by(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber =
+            tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn a_set_conflict_scan_max_logs_one_deprecation_warning() {
+        let out = logged_by(|| warn_deprecated_settings(Some("2000")));
+        assert_eq!(out.matches(CONFLICT_SCAN_MAX_DEPRECATED).count(), 1, "{out}");
+        assert!(out.contains("WARN"), "{out}");
+    }
+
+    #[test]
+    fn an_absent_or_empty_conflict_scan_max_logs_nothing() {
+        // Empty reads as unset everywhere else in this file, so it must not warn either.
+        for raw in [None, Some("")] {
+            let out = logged_by(|| warn_deprecated_settings(raw));
+            assert!(out.is_empty(), "{raw:?} logged {out}");
+        }
+    }
+
     /// Cleanup settings that pass, so each test below changes exactly one thing.
     fn valid() -> CleanupConfig {
         CleanupConfig { interval_secs: 3600, namespace: None, limit: 500 }
+    }
+
+    #[test]
+    fn absent_db_settings_reproduce_the_old_hardcoded_pool() {
+        let c = parse_db(None, None).unwrap();
+        assert_eq!((c.max_connections, c.acquire_timeout_secs), (10, 5));
+        assert_eq!(c, DbConfig::default());
+        assert_eq!(parse_db(Some(""), Some("")).unwrap(), c);
+        assert!(validate_db(&c).is_ok());
+    }
+
+    #[test]
+    fn explicit_db_settings_are_read() {
+        let c = parse_db(Some("40"), Some("15")).unwrap();
+        assert_eq!((c.max_connections, c.acquire_timeout_secs), (40, 15));
+    }
+
+    #[test]
+    fn a_db_setting_that_is_not_a_number_names_its_variable() {
+        let e = parse_db(Some("ten"), None).unwrap_err();
+        assert!(e.client_message().contains("DB_MAX_CONNECTIONS"), "{}", e.client_message());
+        let e = parse_db(None, Some("-1")).unwrap_err();
+        assert!(e.client_message().contains("DB_ACQUIRE_TIMEOUT_SECS"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn zero_connections_is_refused() {
+        let c = DbConfig { max_connections: 0, acquire_timeout_secs: 5, ..DbConfig::default() };
+        let e = validate_db(&c).unwrap_err();
+        assert!(e.client_message().contains("DB_MAX_CONNECTIONS"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn a_zero_acquire_timeout_is_refused() {
+        let c = DbConfig { max_connections: 10, acquire_timeout_secs: 0, ..DbConfig::default() };
+        let e = validate_db(&c).unwrap_err();
+        assert!(e.client_message().contains("DB_ACQUIRE_TIMEOUT_SECS"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn the_default_pool_fits_a_default_server() {
+        assert!(check_pool_fits(10, 100, 3).is_ok());
+    }
+
+    #[test]
+    fn a_pool_one_over_what_the_server_can_carry_is_refused_with_both_numbers() {
+        // 100 allowed, 3 superuser, 3 spare: 94 usable.
+        assert!(check_pool_fits(94, 100, 3).is_ok());
+        let e = check_pool_fits(95, 100, 3).unwrap_err();
+        let m = e.client_message();
+        assert!(m.contains("95") && m.contains("100") && m.contains("94"), "{m}");
+        assert!(m.contains("DB_MAX_CONNECTIONS"), "{m}");
+    }
+
+    #[test]
+    fn an_explicit_pool_size_that_does_not_fit_refuses_boot() {
+        let db = parse_db(Some("95"), None).unwrap();
+        assert!(db.max_connections_explicit);
+        assert!(enforce_pool_fit(&db, 100, 3).is_err());
+        assert!(enforce_pool_fit(&parse_db(Some("94"), None).unwrap(), 100, 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_default_pool_size_that_does_not_fit_warns_and_boots() {
+        let db = parse_db(None, None).unwrap();
+        assert!(!db.max_connections_explicit);
+        // 16 allowed, 3 superuser, 3 spare: 10 usable fits; 15 allowed leaves 9 and does not.
+        assert!(enforce_pool_fit(&db, 16, 3).unwrap().is_none());
+        let w = enforce_pool_fit(&db, 15, 3).unwrap().expect("a warning, not a refusal");
+        assert!(w.client_message().contains("15"), "{}", w.client_message());
+        assert!(!parse_db(Some(""), None).unwrap().max_connections_explicit);
+    }
+
+    #[test]
+    fn a_server_smaller_than_the_reserve_refuses_every_pool() {
+        assert!(check_pool_fits(1, 5, 3).is_err());
     }
 
     #[test]
@@ -1240,6 +1502,77 @@ mod tests {
             c.interval_secs = secs;
             assert!(validate_cleanup(&c).is_ok(), "{secs} should be accepted");
         }
+    }
+
+    /// Quality settings that pass, so each sweep test below changes exactly one thing.
+    fn valid_quality() -> QualityConfig {
+        QualityConfig {
+            dedupe_threshold: 0.97,
+            conflict_threshold: 0.90,
+            conflict_limit: 3,
+            conflict_scan_max: 2_000,
+            conflict_sweep_secs: 60,
+            conflict_sweep_budget_ms: 5_000,
+            stale_days: 365,
+            export_max_sensitivity: Sensitivity::Open,
+            archive_max_decompressed_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn a_sweep_budget_under_a_hundred_milliseconds_is_refused() {
+        let mut q = valid_quality();
+        q.conflict_sweep_budget_ms = 99;
+        let e = validate_conflict_sweep(&q).unwrap_err();
+        assert!(e.client_message().contains("CONFLICT_SWEEP_BUDGET_MS"), "{}", e.client_message());
+        assert!(e.client_message().contains("99"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn a_sweep_budget_over_twenty_five_seconds_is_refused() {
+        let mut q = valid_quality();
+        q.conflict_sweep_budget_ms = 25_001;
+        let e = validate_conflict_sweep(&q).unwrap_err();
+        assert!(e.client_message().contains("CONFLICT_SWEEP_BUDGET_MS"), "{}", e.client_message());
+        assert!(e.client_message().contains("25001"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn both_sweep_budget_bounds_and_the_default_are_accepted() {
+        for ms in [100u64, 5_000, 25_000] {
+            let mut q = valid_quality();
+            q.conflict_sweep_budget_ms = ms;
+            assert!(validate_conflict_sweep(&q).is_ok(), "{ms} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_sweep_interval_of_zero_turns_the_sweeper_off_and_is_not_an_error() {
+        let mut q = valid_quality();
+        q.conflict_sweep_secs = 0;
+        assert!(validate_conflict_sweep(&q).is_ok());
+    }
+
+    #[test]
+    fn one_connection_with_the_sweeper_on_is_refused() {
+        let db = DbConfig { max_connections: 1, ..DbConfig::default() };
+        let e = validate_listener_pool(&db, &valid_quality()).unwrap_err();
+        assert!(e.client_message().contains("DB_MAX_CONNECTIONS"), "{}", e.client_message());
+        assert!(e.client_message().contains("CONFLICT_SWEEP_SECS"), "{}", e.client_message());
+    }
+
+    #[test]
+    fn one_connection_with_the_sweeper_off_is_accepted() {
+        let db = DbConfig { max_connections: 1, ..DbConfig::default() };
+        let mut q = valid_quality();
+        q.conflict_sweep_secs = 0;
+        assert!(validate_listener_pool(&db, &q).is_ok());
+    }
+
+    #[test]
+    fn two_connections_with_the_sweeper_on_are_accepted() {
+        let db = DbConfig { max_connections: 2, ..DbConfig::default() };
+        assert!(validate_listener_pool(&db, &valid_quality()).is_ok());
     }
 
     #[test]
