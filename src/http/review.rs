@@ -37,8 +37,9 @@ struct QueueParams {
     min_similarity: Option<f64>,
 }
 
-/// A comma list of `conflict`, `stale`, `proposal`. Absent or empty means every source the server
-/// fills, which the service reads as `None` rather than an explicit empty list.
+/// A comma list of `conflict`, `stale`, `proposal`, `undated`. Absent or empty means every source
+/// the server fills but `undated`, which the service reads as `None` rather than an explicit empty
+/// list.
 fn parse_sources(raw: &str) -> Result<Option<Vec<Source>>, Response> {
     let words: Vec<&str> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
     if words.is_empty() {
@@ -50,6 +51,7 @@ fn parse_sources(raw: &str) -> Result<Option<Vec<Source>>, Response> {
             "conflict" => Source::Conflict,
             "stale" => Source::Stale,
             "proposal" => Source::Proposal,
+            "undated" => Source::Undated,
             other => {
                 return Err((
                     StatusCode::BAD_REQUEST,

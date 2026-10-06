@@ -12,6 +12,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `RECALL_EVENT_RETENTION_DAYS` (default 30), and forgetting a memory deletes its rows. Migration
   `20261006000029`; see `docs/recall-event-log.md` and decision 0024.
 - `client/skills/lr-review`, an agent skill for working the review queue, synced into client plugins.
+- **Undated facts on the MCP review queue.** `review_queue` with `source: ["undated"]` lists live rows
+  with no start date whose own text names a past day, each with its `dates`. `review_decide` takes
+  `fill_date` with `occurred_at` set to one of them, under the checks `lumberroom fill-date` already
+  ran. The source is opt-in, so the default queue is unchanged. Decision 0026.
 
 ### Changed
 
@@ -25,6 +29,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `fill_date` opens a private row before checking its text, so a private row can take a date.
 - **A 0.5.0 dump restores again.** `pg_restore --exit-on-error` stopped every 0.5.0 dump at trigger
   `memory_conflict_moved` with `operator does not exist: public.vector = public.vector`, and a
   restore without the flag finished with the trigger missing. Migration `20261005000028` recreates

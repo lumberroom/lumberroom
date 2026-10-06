@@ -774,3 +774,38 @@ async fn a_proposal_decided_through_the_tool_reaches_the_source_marked_mcp_with_
         "the tool always marks a decision mcp and forwards the version it read"
     );
 }
+
+/// The date review on the MCP surface: `undated` is a source word, the item carries its dates
+/// outside the data fence, and `fill_date` takes the bare day the merge path refuses.
+#[tokio::test]
+async fn fill_date_through_the_mcp_tool_takes_a_bare_day_and_clears_the_undated_item() {
+    let h = ctx_or_skip!(|_c: &mut Config| {});
+    let id = write_at(
+        &h.ctx,
+        &format!("the archive moved to cold storage on 2026-02-17 {}", nonce("u1")),
+        "global",
+    )
+    .await;
+    let key = format!("undated:{id}");
+
+    let before = h.call("review_queue", serde_json::json!({ "source": ["undated"] })).await;
+    assert!(!refused(&before), "{before:?}");
+    let items = structured(&before)["items"].as_array().cloned().unwrap_or_default();
+    let item = items.iter().find(|i| i["key"] == key).expect("the undated row is listed");
+    assert_eq!(item["dates"], serde_json::json!(["2026-02-17"]));
+    assert_eq!(item["verdicts"], serde_json::json!(["fill_date"]));
+    assert!(text(&before).contains("dates: 2026-02-17; verdicts: fill_date"));
+
+    let decided = h
+        .call(
+            "review_decide",
+            serde_json::json!({ "key": key, "verdict": "fill_date", "occurred_at": "2026-02-17" }),
+        )
+        .await;
+    assert!(!refused(&decided), "{decided:?}");
+    assert_eq!(structured(&decided)["verdict"], "fill_date");
+
+    let after = h.call("review_queue", serde_json::json!({ "source": ["undated"] })).await;
+    let items = structured(&after)["items"].as_array().cloned().unwrap_or_default();
+    assert!(!items.iter().any(|i| i["key"] == key), "a filled row leaves the undated page");
+}

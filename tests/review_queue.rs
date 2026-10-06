@@ -2352,3 +2352,175 @@ async fn a_confirmed_stale_row_leaves_the_list_for_one_window() {
         "the row comes back once the window passes"
     );
 }
+
+/// One namespace per test and a grant on that namespace alone, so the tenant-wide undated scan
+/// sees only this test's rows.
+fn undated_ctx(h: &Harness, namespace: &str) -> Ctx {
+    restricted_at(
+        &h.ctx,
+        &[(namespace, Sensitivity::Private)],
+        &[(namespace, Sensitivity::Private)],
+    )
+}
+
+fn undated_query(limit: Option<i64>, offset: Option<i64>) -> QueueQuery {
+    QueueQuery {
+        sources: Some(vec![Source::Undated]),
+        limit,
+        offset,
+        days: None,
+        min_similarity: None,
+    }
+}
+
+fn fill(key: &str, occurred_at: Option<DateTime<Utc>>) -> Decision {
+    Decision {
+        key: key.to_string(),
+        verdict: Verdict::FillDate,
+        keep: None,
+        id: None,
+        content: None,
+        tags: None,
+        occurred_at,
+        reason: None,
+        version: None,
+        via: Via::Mcp,
+    }
+}
+
+fn day(raw: &str) -> DateTime<Utc> {
+    format!("{raw}T00:00:00Z").parse().unwrap()
+}
+
+#[tokio::test]
+async fn an_undated_row_naming_a_day_is_listed_only_when_asked_for_and_fill_date_dates_it() {
+    let h = ctx_or_skip!();
+    let ns = format!("project:undated-{}", uuid::Uuid::new_v4().simple());
+    let ctx = undated_ctx(&h, &ns);
+    let named = write_at(&ctx, "The team moved the build host to Colima on 2026-03-04.", &ns).await;
+    write_at(&ctx, "The owner prefers tabs over spaces in shell scripts.", &ns).await;
+    write_dated(&ctx, "The release froze on 2026-02-10.", &ns, day("2026-02-10")).await;
+
+    let mut everything = undated_query(None, None);
+    everything.sources = None;
+    let all = review_queue::queue(&ctx, &no_sources(), everything).await.unwrap();
+    assert!(all.items.iter().all(|i| i.source != Source::Undated), "undated is opt-in");
+
+    let q = review_queue::queue(&ctx, &no_sources(), undated_query(None, None)).await.unwrap();
+    assert_eq!(q.items.len(), 1, "only the undated row whose text names a day");
+    let item = &q.items[0];
+    assert_eq!(item.key, format!("undated:{named}"));
+    assert_eq!(item.dates, vec!["2026-03-04".to_string()]);
+    assert_eq!(item.verdicts, vec![Verdict::FillDate]);
+    assert!(review_queue::render(&q).contains("dates: 2026-03-04; verdicts: fill_date"));
+
+    let decided =
+        review_queue::decide(&ctx, &no_sources(), fill(&item.key, Some(day("2026-03-04"))))
+            .await
+            .unwrap();
+    assert_eq!(decided.verdict, Verdict::FillDate);
+    let after = review_queue::queue(&ctx, &no_sources(), undated_query(None, None)).await.unwrap();
+    assert!(after.items.is_empty(), "a dated row leaves the undated source");
+    let stored: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT occurred_at FROM memory WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&named).unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, Some(day("2026-03-04")));
+}
+
+#[tokio::test]
+async fn fill_date_refuses_a_day_the_text_does_not_name_a_missing_date_and_another_source() {
+    let h = ctx_or_skip!();
+    let ns = format!("project:undated-{}", uuid::Uuid::new_v4().simple());
+    let ctx = undated_ctx(&h, &ns);
+    let id = write_at(&ctx, "The office lease was signed on 2026-01-15.", &ns).await;
+    let key = format!("undated:{id}");
+
+    let wrong_day = review_queue::decide(&ctx, &no_sources(), fill(&key, Some(day("2026-01-16"))))
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_day.kind, Kind::Validation);
+
+    let no_day = review_queue::decide(&ctx, &no_sources(), fill(&key, None)).await.unwrap_err();
+    assert_eq!(no_day.kind, Kind::Validation);
+
+    let on_stale = review_queue::decide(
+        &ctx,
+        &no_sources(),
+        fill(&format!("stale:{id}"), Some(day("2026-01-15"))),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(on_stale.code(), Some(review_queue::codes::VERDICT_NOT_FOR_SOURCE));
+
+    let mut confirm = fill(&key, None);
+    confirm.verdict = Verdict::Confirm;
+    let refused = review_queue::decide(&ctx, &no_sources(), confirm).await.unwrap_err();
+    assert_eq!(refused.code(), Some(review_queue::codes::VERDICT_NOT_FOR_SOURCE));
+}
+
+/// A private row reads back with empty content until it is opened. Before the queue source, the
+/// fill path checked that empty text and refused every private row.
+#[tokio::test]
+async fn a_private_row_is_listed_with_its_day_and_takes_fill_date() {
+    let h = ctx_or_skip!();
+    let ns = format!("project:undated-{}", uuid::Uuid::new_v4().simple());
+    let ctx = undated_ctx(&h, &ns);
+    let id = write::run(
+        &ctx,
+        "The clinic appointment took place on 2026-05-20.",
+        &ns,
+        None,
+        None,
+        Some("private"),
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
+
+    let q = review_queue::queue(&ctx, &no_sources(), undated_query(None, None)).await.unwrap();
+    assert_eq!(q.items.len(), 1);
+    assert_eq!(q.items[0].dates, vec!["2026-05-20".to_string()]);
+
+    review_queue::decide(
+        &ctx,
+        &no_sources(),
+        fill(&format!("undated:{id}"), Some(day("2026-05-20"))),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn undated_pages_by_candidate_and_lists_every_day_a_row_names() {
+    let h = ctx_or_skip!();
+    let ns = format!("project:undated-{}", uuid::Uuid::new_v4().simple());
+    let ctx = undated_ctx(&h, &ns);
+    let older = write_at(
+        &ctx,
+        "The grant was approved on 2026-04-04 after the panel met on 2026-01-09.",
+        &ns,
+    )
+    .await;
+    set_created_at(&h.pool, &older, Utc::now() - Duration::days(2)).await;
+    for n in 0..5 {
+        write_at(&ctx, &format!("Timeless preference number {n} with no day in it."), &ns).await;
+    }
+    let newer = write_at(&ctx, "The domain renewed on 2026-06-30.", &ns).await;
+
+    let first =
+        review_queue::queue(&ctx, &no_sources(), undated_query(Some(1), None)).await.unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(first.items[0].key, format!("undated:{newer}"));
+    assert!(first.has_more);
+
+    let second =
+        review_queue::queue(&ctx, &no_sources(), undated_query(Some(1), Some(1))).await.unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].key, format!("undated:{older}"));
+    assert_eq!(second.items[0].dates, vec!["2026-04-04".to_string(), "2026-01-09".to_string()]);
+    assert!(!second.has_more);
+}

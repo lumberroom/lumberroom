@@ -78,6 +78,10 @@ pub enum Source {
     Conflict,
     Stale,
     Proposal,
+    /// Live rows with no start date whose own text names a past day. Read only when asked for by
+    /// name: a client built before this source existed parses `source` as a closed set, and an
+    /// unknown word in the default queue would break it.
+    Undated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +94,7 @@ pub enum Verdict {
     Confirm,
     Apply,
     Dismiss,
+    FillDate,
 }
 
 /// One row as the queue shows it. Whole content, because the person deciding has to read it.
@@ -155,7 +160,8 @@ pub struct ProposalItem {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueItem {
-    /// `conflict:<id>:<id>` in either order, `stale:<id>`, `proposal:<origin>:<id>`.
+    /// `conflict:<id>:<id>` in either order, `stale:<id>`, `proposal:<origin>:<id>`,
+    /// `undated:<id>`.
     pub key: String,
     pub source: Source,
     pub namespace: String,
@@ -167,6 +173,10 @@ pub struct QueueItem {
     pub age_days: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposal: Option<ProposalItem>,
+    /// undated: every past day the row's text names, in the order the text names them. The engine
+    /// reads these out of the text, so `fill_date` admits exactly these and nothing else.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dates: Vec<String>,
     /// What this item takes for this caller. The CLI draws its key line from this and nothing
     /// else. Empty when the caller may not change the rows or a row did not open.
     pub verdicts: Vec<Verdict>,
@@ -177,6 +187,7 @@ pub struct Sources {
     pub conflict: bool,
     pub stale: bool,
     pub proposal: Vec<String>,
+    pub undated: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -220,7 +231,7 @@ pub struct Decision {
     pub content: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
-    /// merge: the period of the merged fact.
+    /// merge: the period of the merged fact. fill_date: the start to fill, one of the item's dates.
     #[serde(default)]
     pub occurred_at: Option<DateTime<Utc>>,
     /// delete: recorded on the deletion. proposal: handed to the source to record with the act,
@@ -314,6 +325,7 @@ pub enum Key {
     Conflict(uuid::Uuid, uuid::Uuid),
     Stale(uuid::Uuid),
     Proposal { origin: String, id: String },
+    Undated(uuid::Uuid),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -351,6 +363,10 @@ pub fn parse_key(raw: &str) -> Result<Key> {
             let id = Uuid::parse_str(rest).map_err(|_| not_a_key())?;
             Ok(Key::Stale(id))
         }
+        "undated" => {
+            let id = Uuid::parse_str(rest).map_err(|_| not_a_key())?;
+            Ok(Key::Undated(id))
+        }
         "proposal" => {
             let mut rest_parts = rest.splitn(2, ':');
             let origin = rest_parts.next().ok_or_else(not_a_key)?;
@@ -364,7 +380,7 @@ pub fn parse_key(raw: &str) -> Result<Key> {
     }
 }
 
-/// Conflict and stale only. `writable` is every row at its stored level, and every row opened.
+/// Conflict, stale and undated. `writable` is every row at its stored level, and every row opened.
 pub fn verdicts_for(source: Source, writable: bool, may_delete: bool) -> Vec<Verdict> {
     if !writable {
         return vec![];
@@ -384,6 +400,7 @@ pub fn verdicts_for(source: Source, writable: bool, may_delete: bool) -> Vec<Ver
             }
             v
         }
+        Source::Undated => vec![Verdict::FillDate],
         // Never called for a proposal: the item copies `proposal.verdicts` instead.
         Source::Proposal => vec![],
     }
@@ -400,6 +417,7 @@ fn verdict_shaped_for(source: Source, verdict: Verdict) -> bool {
         ),
         Source::Stale => matches!(verdict, Verdict::Confirm | Verdict::Merge | Verdict::Delete),
         Source::Proposal => matches!(verdict, Verdict::Apply | Verdict::Dismiss),
+        Source::Undated => matches!(verdict, Verdict::FillDate),
     }
 }
 
@@ -491,6 +509,7 @@ async fn conflict_items(
             similarity: Some(pair.similarity),
             age_days: None,
             proposal: None,
+            dates: vec![],
             verdicts: verdicts_for(Source::Conflict, writable, ctx.principal.may_delete),
         });
     }
@@ -527,6 +546,7 @@ async fn stale_items(
             similarity: None,
             age_days: Some(age_days),
             proposal: None,
+            dates: vec![],
             verdicts: verdicts_for(Source::Stale, writable, ctx.principal.may_delete),
         });
     }
@@ -569,9 +589,34 @@ async fn proposal_items(
             similarity: None,
             age_days: None,
             proposal: Some(proposal),
+            dates: vec![],
             verdicts,
         });
     }
+    Ok((items, has_more))
+}
+
+/// The date review's rows, as queue items. `review::dated_in_text` reads the grant inside the query
+/// and opens each row, so a row that did not open never reaches this list.
+async fn undated_items(ctx: &Ctx, limit: i64, offset: i64) -> Result<(Vec<QueueItem>, bool)> {
+    let (rows, has_more) = super::review::dated_in_text(ctx, limit, offset).await?;
+    let items = rows
+        .into_iter()
+        .map(|(row, days)| {
+            let writable = can_write(&ctx.principal, &row.namespace, row.sensitivity);
+            QueueItem {
+                key: format!("undated:{}", row.id),
+                source: Source::Undated,
+                namespace: row.namespace.clone(),
+                rows: vec![queue_row(&row, true)],
+                similarity: None,
+                age_days: None,
+                proposal: None,
+                dates: days.iter().map(|d| d.to_string()).collect(),
+                verdicts: verdicts_for(Source::Undated, writable, ctx.principal.may_delete),
+            }
+        })
+        .collect();
     Ok((items, has_more))
 }
 
@@ -589,12 +634,11 @@ pub async fn queue(
         .max(ctx.cfg.quality.conflict_threshold)
         .min(1.0);
     let wants = |s: Source| q.sources.as_ref().is_none_or(|list| list.contains(&s));
+    let asked_for = |s: Source| q.sources.as_ref().is_some_and(|list| list.contains(&s));
 
     // Asking for everything (no `source` param) reads as "review what this server has"; only an
     // explicit `source=proposal` on an engine that fills none is refused.
-    let asked_for_proposal =
-        q.sources.as_ref().is_some_and(|list| list.contains(&Source::Proposal));
-    if asked_for_proposal && sources.is_empty() {
+    if asked_for(Source::Proposal) && sources.is_empty() {
         return Err(DomainError::validation("this server fills no proposal source")
             .with_code(codes::SOURCE_NOT_FILLED));
     }
@@ -641,6 +685,21 @@ pub async fn queue(
         }
     }
 
+    if asked_for(Source::Undated) {
+        attempted += 1;
+        match undated_items(ctx, limit, offset).await {
+            Ok((mut out, more)) => {
+                has_more |= more;
+                items.append(&mut out);
+            }
+            Err(e) => {
+                failed += 1;
+                refused.insert("undated".to_string(), e.code().unwrap_or("review_queue_failed"));
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+
     if wants(Source::Proposal) {
         for source in sources {
             attempted += 1;
@@ -679,6 +738,7 @@ pub async fn queue(
             conflict: true,
             stale: true,
             proposal: sources.iter().map(|s| s.origin().to_string()).collect(),
+            undated: true,
         },
         refused,
         dismissed,
@@ -700,6 +760,7 @@ fn verdict_name(v: Verdict) -> &'static str {
         Verdict::Confirm => "confirm",
         Verdict::Apply => "apply",
         Verdict::Dismiss => "dismiss",
+        Verdict::FillDate => "fill_date",
     }
 }
 
@@ -708,6 +769,7 @@ fn source_name(s: Source) -> &'static str {
         Source::Conflict => "conflict",
         Source::Stale => "stale",
         Source::Proposal => "proposal",
+        Source::Undated => "undated",
     }
 }
 
@@ -972,6 +1034,34 @@ async fn decide_stale(ctx: &Ctx, d: &Decision, id: Uuid) -> Result<Decided> {
     }
 }
 
+/// `review::fill_date` runs every check that matters: the day has to be one the text names, the
+/// row must not carry a start already, and nothing in the future. This only shapes the request.
+async fn decide_undated(ctx: &Ctx, d: &Decision, id: Uuid) -> Result<Decided> {
+    if !verdict_shaped_for(Source::Undated, d.verdict) {
+        return Err(verdict_not_for_source(Source::Undated, d.verdict, &[Verdict::FillDate]));
+    }
+    let when = d.occurred_at.ok_or_else(|| {
+        DomainError::validation(
+            "fill_date needs occurred_at: one of the dates the item lists, the day the fact is about",
+        )
+    })?;
+    // The row keeps its id and gains a start; nothing new is written, so `written` stays empty.
+    super::review::fill_date(ctx, &id.to_string(), when).await?;
+    Ok(Decided {
+        key: d.key.clone(),
+        verdict: d.verdict,
+        written: None,
+        superseded: vec![],
+        deleted: vec![],
+        end_left_open: false,
+        unfinished: vec![],
+        already_dismissed: false,
+        proposal_state: None,
+        content_written: None,
+        overrode: None,
+    })
+}
+
 /// The engine's half of a proposal decision. The source runs every check on the text itself.
 fn check_proposal_decision(d: &Decision) -> Result<()> {
     if let Some(content) = d.content.as_deref() {
@@ -1076,6 +1166,7 @@ pub async fn decide(
         Key::Conflict(a, b) => decide_conflict(ctx, &d, a, b).await,
         Key::Stale(id) => decide_stale(ctx, &d, id).await,
         Key::Proposal { origin, id } => decide_proposal(ctx, sources, &d, &origin, &id).await,
+        Key::Undated(id) => decide_undated(ctx, &d, id).await,
     }
 }
 
@@ -1179,6 +1270,14 @@ pub fn render(q: &Queue) -> String {
             out.push_str(&as_data(&row.content, &nonce));
             out.push('\n');
         }
+        // The engine read these days out of the text, so they print outside the fence.
+        if !item.dates.is_empty() {
+            out.push_str(&format!(
+                "dates: {}; verdicts: {}\n",
+                item.dates.join(", "),
+                item.verdicts.iter().copied().map(verdict_name).collect::<Vec<_>>().join(", "),
+            ));
+        }
         if let Some(p) = &item.proposal {
             out.push_str(&format!(
                 "verdicts: {}; repairable: {}; held_by: {}; version: {}\n",
@@ -1279,6 +1378,7 @@ mod tests {
                     similarity: None,
                     age_days: Some(400),
                     proposal: None,
+                    dates: vec![],
                     verdicts: vec![],
                 },
                 QueueItem {
@@ -1289,10 +1389,16 @@ mod tests {
                     similarity: None,
                     age_days: None,
                     proposal: Some(proposal),
+                    dates: vec![],
                     verdicts: vec![],
                 },
             ],
-            sources: Sources { conflict: true, stale: true, proposal: vec!["cleanup".into()] },
+            sources: Sources {
+                conflict: true,
+                stale: true,
+                proposal: vec!["cleanup".into()],
+                undated: false,
+            },
             refused: BTreeMap::new(),
             dismissed: 0,
             conflicts_pending: 0,
@@ -1331,9 +1437,10 @@ mod tests {
                 similarity: None,
                 age_days: Some(400),
                 proposal: None,
+                dates: vec![],
                 verdicts: vec![],
             }],
-            sources: Sources { conflict: true, stale: true, proposal: vec![] },
+            sources: Sources { conflict: true, stale: true, proposal: vec![], undated: false },
             refused: BTreeMap::new(),
             dismissed: 0,
             conflicts_pending: 0,
@@ -1371,9 +1478,15 @@ mod tests {
                 similarity: None,
                 age_days: None,
                 proposal: Some(proposal),
+                dates: vec![],
                 verdicts: vec![Verdict::Apply],
             }],
-            sources: Sources { conflict: true, stale: true, proposal: vec!["canned".into()] },
+            sources: Sources {
+                conflict: true,
+                stale: true,
+                proposal: vec!["canned".into()],
+                undated: false,
+            },
             refused: BTreeMap::new(),
             dismissed: 0,
             conflicts_pending: 0,
