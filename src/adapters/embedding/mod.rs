@@ -28,7 +28,9 @@ pub fn create_spec(spec: &EmbedderSpec) -> Result<Arc<dyn Embedder>> {
             Ok(Arc::new(LocalEmbedder::new(&spec.model, spec.dim, &spec.cache_dir)?))
         }
         EmbedProvider::Hash => Ok(Arc::new(HashEmbedder::new(spec.dim))),
-        EmbedProvider::Openai => Ok(Arc::new(RemoteEmbedder::new(&spec.model, spec.dim, &spec.remote)?)),
+        EmbedProvider::Openai => {
+            Ok(Arc::new(RemoteEmbedder::new(&spec.model, spec.dim, &spec.remote)?))
+        }
     }
 }
 

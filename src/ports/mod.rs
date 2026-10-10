@@ -34,10 +34,11 @@ pub use ingest::{
     WatermarkAdvance,
 };
 pub use memory::{
-    ChainEdits, ChainLink, ChainNeighbours, ConflictPair, ConflictSweep, DeleteOutcome, DeletePlan,
-    DigestData, DigestQuery, DismissedPair, Emission, MemoryRepository, ModelVector, NamespaceRows,
-    NamespaceSummary, NeighbourQuery, NewMemory, RecallCall, RecallEvent, RecentQuery,
-    RegistrySummary, RestoreRow, SearchQuery, Staleness, TagCount, Timeline, Weights, slot_ordered,
+    slot_ordered, ChainEdits, ChainLink, ChainNeighbours, ConflictPair, ConflictSweep,
+    DeleteOutcome, DeletePlan, DigestData, DigestQuery, DismissedPair, Emission, MemoryRepository,
+    ModelVector, NamespaceRows, NamespaceSummary, NeighbourQuery, NewMemory, RecallCall,
+    RecallEvent, RecentQuery, RegistrySummary, RestoreRow, SearchQuery, Staleness, TagCount,
+    Timeline, Weights,
 };
 pub use oauth::{
     AccessTokenRecord, ClientGrantUpdate, CodeOutcome, NewAccessToken, NewAuthCode, NewOauthClient,

@@ -406,7 +406,8 @@ fn expect_written(out: &Outcome) {
 
 async fn insert(pool: &PgPool, n: u128, a: Option<&str>, b: Option<&str>) -> Uuid {
     let content = text(n);
-    let v = |model: Option<&str>| model.map(|m| pgvector::Vector::from(vector(marker(m), &content)));
+    let v =
+        |model: Option<&str>| model.map(|m| pgvector::Vector::from(vector(marker(m), &content)));
     sqlx::query(
         "INSERT INTO memory (id, tenant_id, namespace, content, source_client,
                              embedding, embedding_model, embedding_b, embedding_b_model)
@@ -543,8 +544,7 @@ async fn two_starts_write_one_generation() {
     let h = harness_or_skip!();
     h.on_bge(2).await;
     h.sweep().pass(&me()).await;
-    let (one, two) =
-        tokio::join!(h.exec(&["start", "--no-wait"]), h.exec(&["start", "--no-wait"]));
+    let (one, two) = tokio::join!(h.exec(&["start", "--no-wait"]), h.exec(&["start", "--no-wait"]));
     assert_eq!((one.code, two.code), (0, 0), "{}\n{}", one.output, two.output);
     let written = [&one, &two].iter().filter(|o| o.output.contains("generation 1 written")).count();
     let noop = [&one, &two].iter().filter(|o| o.output.contains("already")).count();
@@ -559,7 +559,11 @@ async fn start_is_refused_when_the_probe_fails() {
     h.sweep().pass(&me()).await;
     let out = h.exec_with(&["start", "--no-wait"], Arc::new(remote)).await;
     assert_eq!(out.code, 1, "{}", out.output);
-    assert!(out.output.contains(&format!("the probe embedding to {GEMMA} failed")), "{}", out.output);
+    assert!(
+        out.output.contains(&format!("the probe embedding to {GEMMA} failed")),
+        "{}",
+        out.output
+    );
     assert_eq!(h.intent().await.generation, 0);
 }
 
@@ -840,7 +844,11 @@ async fn boot_refuses_a_target_no_block_configures() {
     // The server reports the refusal where the operator reads, and does nothing else.
     sweep.pass(&me()).await;
     let status = h.exec(&["status"]).await;
-    assert!(status.output.contains("error: ") && status.output.contains(WITHDRAWN), "{}", status.output);
+    assert!(
+        status.output.contains("error: ") && status.output.contains(WITHDRAWN),
+        "{}",
+        status.output
+    );
     assert_eq!(h.state().await.model_b, None, "the sweep acted on a target it cannot build");
 
     // The fix the message names: rollback moves the target off the withdrawn model.
@@ -868,7 +876,12 @@ async fn env_mode_leaves_the_control_row_untouched() {
         h.repo.clone(),
         Arc::clone(&h.set),
         Arc::new(NoOpener),
-        Knobs { fill_chars: 4000, fill_duty: 100, floor_bytes: 0, fill_budget: Duration::from_secs(60) },
+        Knobs {
+            fill_chars: 4000,
+            fill_duty: 100,
+            floor_bytes: 0,
+            fill_budget: Duration::from_secs(60),
+        },
         Steer::Env(configured),
         false,
         None,

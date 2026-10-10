@@ -18,11 +18,22 @@ pub trait EmbeddingMigrationRepository: Send + Sync {
     /// Names `slot`'s model when it is NULL and `slot` is inactive. False when nothing changed.
     async fn name_slot(&self, unit: &str, slot: VectorSlot, model: &str) -> Result<bool>;
     /// `target` is the model the inactive slot should hold; `retire` the model being deleted.
-    async fn counts(&self, unit: &str, state: &UnitState, target: Option<&str>,
-                    retire: Option<&str>) -> Result<Counts>;
+    async fn counts(
+        &self,
+        unit: &str,
+        state: &UnitState,
+        target: Option<&str>,
+        retire: Option<&str>,
+    ) -> Result<Counts>;
     /// Rows pending in `slot` for `model`, id order, after `after`.
-    async fn next_batch(&self, unit: &str, slot: VectorSlot, model: &str,
-                        after: Option<uuid::Uuid>, limit: i64) -> Result<Vec<PendingRow>>;
+    async fn next_batch(
+        &self,
+        unit: &str,
+        slot: VectorSlot,
+        model: &str,
+        after: Option<uuid::Uuid>,
+        limit: i64,
+    ) -> Result<Vec<PendingRow>>;
     /// Eligible rows with no vector in `slot`, id order, after `after`. The `steady` fill reads
     /// these, so a row whose vector carries another model's id stays as it is.
     async fn next_holes(
@@ -33,10 +44,22 @@ pub trait EmbeddingMigrationRepository: Send + Sync {
         limit: i64,
     ) -> Result<Vec<PendingRow>>;
     /// True only when the vector landed. False when the row is no longer eligible or pending.
-    async fn store(&self, unit: &str, id: uuid::Uuid, slot: VectorSlot, model: &str,
-                   vector: Vec<f32>) -> Result<bool>;
+    async fn store(
+        &self,
+        unit: &str,
+        id: uuid::Uuid,
+        slot: VectorSlot,
+        model: &str,
+        vector: Vec<f32>,
+    ) -> Result<bool>;
     async fn flip(&self, req: &FlipRequest) -> Result<FlipOutcome>;
-    async fn retire_batch(&self, unit: &str, slot: VectorSlot, model: &str, limit: i64) -> Result<u64>;
+    async fn retire_batch(
+        &self,
+        unit: &str,
+        slot: VectorSlot,
+        model: &str,
+        limit: i64,
+    ) -> Result<u64>;
     /// Clears `slot`'s model only when no row still carries it. False when it did not clear.
     async fn clear_slot(&self, unit: &str, slot: VectorSlot, model: &str) -> Result<bool>;
     /// The control row; the defaults when it is missing.

@@ -44,7 +44,8 @@ fn aggregate_line(summary: &Value) -> String {
 }
 
 fn disk_line(disk: &Value) -> String {
-    let (Some(free), Some(floor)) = (disk["free_bytes"].as_u64(), disk["floor_bytes"].as_u64()) else {
+    let (Some(free), Some(floor)) = (disk["free_bytes"].as_u64(), disk["floor_bytes"].as_u64())
+    else {
         return "Disk floor: off.".to_string();
     };
     let state = if disk["paused"].as_bool().unwrap_or(false) {
@@ -121,7 +122,11 @@ mod tests {
     fn render(units: Vec<UnitStatus>) -> String {
         let status = SweepStatus {
             units,
-            disk: Some(DiskStatus { free_bytes: 30_064_771_072, floor_bytes: 16_106_127_360, paused: true }),
+            disk: Some(DiskStatus {
+                free_bytes: 30_064_771_072,
+                floor_bytes: 16_106_127_360,
+                paused: true,
+            }),
             error: Some("pass failed: <timeout>".into()),
             ..SweepStatus::default()
         };

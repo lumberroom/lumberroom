@@ -28,7 +28,10 @@ const PHASES: [Phase; 7] = [
 /// builds with `preserve_order`; without it a `Value` sorts its keys and the content is the same.
 ///
 /// `rows_pending` sums `other_pending`: the rows the inactive slot still lacks for its target.
-pub fn summary(status: &SweepStatus, thresholds: &HashMap<String, Arc<SimilarityThresholds>>) -> Value {
+pub fn summary(
+    status: &SweepStatus,
+    thresholds: &HashMap<String, Arc<SimilarityThresholds>>,
+) -> Value {
     let mut units = Map::new();
     for phase in PHASES {
         let n = status.units.iter().filter(|u| u.phase == phase).count();
@@ -50,8 +53,14 @@ pub fn summary(status: &SweepStatus, thresholds: &HashMap<String, Arc<Similarity
 
     let mut out = Map::new();
     out.insert("units".into(), Value::Object(units));
-    out.insert("rows_pending".into(), status.units.iter().map(|u| u.counts.other_pending).sum::<i64>().into());
-    out.insert("rows_failed".into(), status.units.iter().map(|u| u.counts.failed).sum::<i64>().into());
+    out.insert(
+        "rows_pending".into(),
+        status.units.iter().map(|u| u.counts.other_pending).sum::<i64>().into(),
+    );
+    out.insert(
+        "rows_failed".into(),
+        status.units.iter().map(|u| u.counts.failed).sum::<i64>().into(),
+    );
     out.insert("rate_rows_per_min".into(), json!(status.rate_rows_per_min));
     out.insert("rollback".into(), json!(status.rollback.unwrap_or(Rollback::Unavailable)));
     out.insert("disk".into(), json!(status.disk));
@@ -62,7 +71,10 @@ pub fn summary(status: &SweepStatus, thresholds: &HashMap<String, Arc<Similarity
 }
 
 /// What the sweep writes to `embedding_control.server_status` and the command reads back.
-pub fn published(status: &SweepStatus, thresholds: &HashMap<String, Arc<SimilarityThresholds>>) -> Value {
+pub fn published(
+    status: &SweepStatus,
+    thresholds: &HashMap<String, Arc<SimilarityThresholds>>,
+) -> Value {
     json!({ "summary": summary(status, thresholds), "units": status.units })
 }
 
@@ -100,13 +112,22 @@ mod tests {
     }
 
     fn status() -> SweepStatus {
-        let filling = Counts { eligible: 12000, other_pending: 1840, without_vector: 3, ..Counts::default() };
-        let mut failing = unit("two", Phase::Blocked, Counts { failed: 2, other_pending: 5, ..Counts::default() });
+        let filling =
+            Counts { eligible: 12000, other_pending: 1840, without_vector: 3, ..Counts::default() };
+        let mut failing = unit(
+            "two",
+            Phase::Blocked,
+            Counts { failed: 2, other_pending: 5, ..Counts::default() },
+        );
         failing.failed_ids = vec![uuid::Uuid::nil()];
         failing.blocked = Some(Blocked::Failed(2));
         SweepStatus {
             units: vec![unit("me", Phase::Filling, filling), failing],
-            disk: Some(DiskStatus { free_bytes: 30_064_771_072, floor_bytes: 16_106_127_360, paused: false }),
+            disk: Some(DiskStatus {
+                free_bytes: 30_064_771_072,
+                floor_bytes: 16_106_127_360,
+                paused: false,
+            }),
             rollback: None,
             rate_rows_per_min: 118.0,
             last_pass_at: Some("2026-10-12T09:30:00Z".parse().unwrap()),
@@ -117,7 +138,8 @@ mod tests {
     fn thresholds() -> HashMap<String, Arc<SimilarityThresholds>> {
         let mut values = BTreeMap::new();
         values.insert("conflict".to_string(), Resolved { value: 0.91, source: Source::Study });
-        values.insert("route_max_top".to_string(), Resolved { value: 0.65, source: Source::Carried });
+        values
+            .insert("route_max_top".to_string(), Resolved { value: 0.65, source: Source::Carried });
         let t = SimilarityThresholds {
             model: "openai:google/embeddinggemma-2".into(),
             family: Some("embeddinggemma-2".into()),
@@ -132,8 +154,15 @@ mod tests {
         let keys: std::collections::BTreeSet<&str> =
             v.as_object().unwrap().keys().map(String::as_str).collect();
         let want = [
-            "units", "rows_pending", "rows_failed", "rate_rows_per_min", "rollback", "disk",
-            "thresholds", "last_pass_at", "error",
+            "units",
+            "rows_pending",
+            "rows_failed",
+            "rate_rows_per_min",
+            "rollback",
+            "disk",
+            "thresholds",
+            "last_pass_at",
+            "error",
         ];
         assert_eq!(keys, want.into_iter().collect());
 

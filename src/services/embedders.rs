@@ -150,22 +150,24 @@ impl EmbedderSet {
             (None, Some(s)) => (s.active_slot, built(s.active_model())?, None),
             // A migration with no state row yet: the unit still serves the previous model from
             // slot A, and writes also embed with the current one.
-            (Some(previous), None) => (
-                VectorSlot::A,
-                built(previous)?,
-                Some(built(&configured.current)?),
-            ),
+            (Some(previous), None) => {
+                (VectorSlot::A, built(previous)?, Some(built(&configured.current)?))
+            }
             (Some(previous), Some(s)) => {
                 let active = s.active_model().to_string();
-                let other_id =
-                    if active == configured.current { previous.clone() } else { configured.current.clone() };
+                let other_id = if active == configured.current {
+                    previous.clone()
+                } else {
+                    configured.current.clone()
+                };
                 // The inactive slot holds a third model: a second vector there would overwrite it
                 // (review M1). The sweep reports the unit blocked instead.
                 let other_ok = match s.other_model() {
                     None => true,
                     Some(m) => m == other_id,
                 };
-                let second = if other_ok && other_id != active { self.by_id(&other_id) } else { None };
+                let second =
+                    if other_ok && other_id != active { self.by_id(&other_id) } else { None };
                 (s.active_slot, built(&active)?, second)
             }
         };

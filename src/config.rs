@@ -385,9 +385,9 @@ fn parse_embed_provider(key: &str, raw: &str) -> Result<EmbedProvider> {
         "local" => Ok(EmbedProvider::Local),
         "openai" => Ok(EmbedProvider::Openai),
         "hash" => Ok(EmbedProvider::Hash),
-        other => Err(DomainError::validation(format!(
-            "{key} must be local|openai|hash, got {other:?}"
-        ))),
+        other => {
+            Err(DomainError::validation(format!("{key} must be local|openai|hash, got {other:?}")))
+        }
     }
 }
 

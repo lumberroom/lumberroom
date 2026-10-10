@@ -550,11 +550,12 @@ async fn pair(pool: &PgPool, older: Uuid, newer: Uuid) {
 
 /// (pairs, scan marks) on record for the unit.
 async fn conflict_rows(pool: &PgPool) -> (i64, i64) {
-    let pairs: i64 = sqlx::query_scalar("SELECT count(*) FROM memory_conflict WHERE tenant_id = $1")
-        .bind(UNIT)
-        .fetch_one(pool)
-        .await
-        .unwrap();
+    let pairs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM memory_conflict WHERE tenant_id = $1")
+            .bind(UNIT)
+            .fetch_one(pool)
+            .await
+            .unwrap();
     let scans: i64 =
         sqlx::query_scalar("SELECT count(*) FROM memory_conflict_scan WHERE tenant_id = $1")
             .bind(UNIT)
@@ -572,7 +573,12 @@ fn me() -> SingleUnit {
     SingleUnit(UNIT.to_string())
 }
 
-fn flip_to(expect: UnitState, slot: VectorSlot, model: &str, generation: Option<i64>) -> FlipRequest {
+fn flip_to(
+    expect: UnitState,
+    slot: VectorSlot,
+    model: &str,
+    generation: Option<i64>,
+) -> FlipRequest {
     FlipRequest {
         expect,
         target_slot: slot,
@@ -624,8 +630,10 @@ async fn the_migration_leaves_one_resting_control_row_and_guards_the_state_row()
 
     let fresh = postgres::connect(&format!("{base}/{probe}")).await.unwrap();
     postgres::migrate(&fresh).await.unwrap();
-    let rows: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM embedding_control").fetch_one(&fresh).await.unwrap();
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM embedding_control")
+        .fetch_one(&fresh)
+        .await
+        .unwrap();
     assert_eq!(rows, 1, "migrate leaves exactly one control row");
     let repo = PgEmbeddingMigrationRepository::new(fresh.clone());
     let (intent, published) = repo.control().await.unwrap();
@@ -753,7 +761,12 @@ async fn next_batch_pages_pending_rows_in_id_order_and_skips_sealed_and_filled()
 
     let rest = h.repo.next_batch(UNIT, VectorSlot::B, GEMMA, Some(id(4)), 10).await.unwrap();
     assert_eq!(rest.iter().map(|r| r.id).collect::<Vec<_>>(), vec![id(5)]);
-    assert!(h.repo.next_batch(UNIT, VectorSlot::B, GEMMA, Some(id(5)), 10).await.unwrap().is_empty());
+    assert!(h
+        .repo
+        .next_batch(UNIT, VectorSlot::B, GEMMA, Some(id(5)), 10)
+        .await
+        .unwrap()
+        .is_empty());
 
     let active = h.repo.next_batch(UNIT, VectorSlot::A, BGE, None, 10).await.unwrap();
     assert!(active.is_empty(), "every eligible row holds bge in slot A: {active:?}");
@@ -1056,7 +1069,11 @@ async fn a_fill_of_the_inactive_slot_b_keeps_conflict_pairs() {
     let one = open_row(&h.pool, 1, Some(BGE), None).await;
     let two = open_row(&h.pool, 2, Some(BGE), None).await;
     pair(&h.pool, one, two).await;
-    assert!(h.repo.store(UNIT, one, VectorSlot::B, GEMMA, vector(marker(GEMMA), "x")).await.unwrap());
+    assert!(h
+        .repo
+        .store(UNIT, one, VectorSlot::B, GEMMA, vector(marker(GEMMA), "x"))
+        .await
+        .unwrap());
     assert_eq!(conflict_rows(&h.pool).await, (1, 2), "a fill of the inactive slot cleared pairs");
 
     // The control: the slot the unit reads still clears them.
@@ -1206,7 +1223,11 @@ async fn searches_read_the_active_slot_after_the_flip() {
     h.sweep(&set, view(GEMMA, Some(BGE), FlipScope::All)).pass(&me()).await;
     assert_eq!(h.state().await.active_slot, VectorSlot::B);
     let after = search::run(&ctx, &text(1), None, Some(5), None, None, None).await.unwrap();
-    assert!(similarity_of(&after.hits) > 0.99, "read the wrong slot: {}", similarity_of(&after.hits));
+    assert!(
+        similarity_of(&after.hits) > 0.99,
+        "read the wrong slot: {}",
+        similarity_of(&after.hits)
+    );
     assert_eq!((h.bge.queries(), h.gemma.queries()), (1, 1));
 }
 
@@ -1381,17 +1402,16 @@ async fn a_private_row_without_vectors_stays_without_them() {
     let held = insert(&h.pool, UNIT, 2, None, "private", Some(BGE), None).await;
     let opener = Arc::new(AnyOpener::default());
     let set = h.set(view(GEMMA, Some(BGE), FlipScope::None));
-    let sweep = h.sweep_with(
-        &set,
-        view(GEMMA, Some(BGE), FlipScope::None),
-        opener.clone(),
-        true,
-        None,
-    );
+    let sweep =
+        h.sweep_with(&set, view(GEMMA, Some(BGE), FlipScope::None), opener.clone(), true, None);
     sweep.pass(&me()).await;
 
     assert_eq!(slots(&h.pool, bare).await, Slots { a: None, b: None });
-    assert_eq!(slots(&h.pool, held).await.b, from(GEMMA), "the control: a private row with a vector fills");
+    assert_eq!(
+        slots(&h.pool, held).await.b,
+        from(GEMMA),
+        "the control: a private row with a vector fills"
+    );
     assert_eq!(opener.0.load(Ordering::SeqCst), 1, "the sweep opened a row it may not embed");
     assert_eq!(unit_status(&sweep).counts.without_vector, 1);
 }
@@ -1576,11 +1596,8 @@ async fn the_thresholds_script_maps_identical_slots_to_the_same_values() {
     let script = std::fs::read_to_string(path).unwrap();
     // psql fills the variables and runs the backslash lines; this test does both by hand. The
     // backslash lines only default `old` and `new`, which each direction below sets itself.
-    let body: String = script
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('\\'))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let body: String =
+        script.lines().filter(|l| !l.trim_start().starts_with('\\')).collect::<Vec<_>>().join("\n");
     for (old, new) in [("embedding", "embedding_b"), ("embedding_b", "embedding")] {
         let sql = body
             .replace(":\"old\"", old)

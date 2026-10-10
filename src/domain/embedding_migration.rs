@@ -31,7 +31,15 @@ impl UnitState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Phase { Steady, Filling, Held, Ready, Flipped, Retiring, Blocked }
+pub enum Phase {
+    Steady,
+    Filling,
+    Held,
+    Ready,
+    Flipped,
+    Retiring,
+    Blocked,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "reason", content = "detail")]
@@ -46,11 +54,19 @@ pub enum Blocked {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Rollback { Instant, NeedsFill, Unavailable }
+pub enum Rollback {
+    Instant,
+    NeedsFill,
+    Unavailable,
+}
 
 /// `EMBED_FLIP`: which units may flip.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FlipScope { All, None, Units(Vec<String>) }
+pub enum FlipScope {
+    All,
+    None,
+    Units(Vec<String>),
+}
 
 impl FlipScope {
     pub fn allows(&self, unit: &str) -> bool {
@@ -90,7 +106,12 @@ pub enum ControlMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Verb { Start, Flip, Rollback, Retire }
+pub enum Verb {
+    Start,
+    Flip,
+    Rollback,
+    Retire,
+}
 
 impl Verb {
     pub const fn as_str(self) -> &'static str {
@@ -196,7 +217,9 @@ pub struct FlipRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlipOutcome {
-    Flipped { flip_ms: u64 },
+    Flipped {
+        flip_ms: u64,
+    },
     /// State changed since the pass read it. Nothing written.
     Stale,
     /// Rows still pending in the target slot. Nothing written.
