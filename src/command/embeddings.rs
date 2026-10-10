@@ -834,6 +834,15 @@ mod tests {
         ) -> Result<Vec<PendingRow>> {
             unreachable!("only the sweep fills")
         }
+        async fn next_holes(
+            &self,
+            _: &str,
+            _: VectorSlot,
+            _: Option<uuid::Uuid>,
+            _: i64,
+        ) -> Result<Vec<PendingRow>> {
+            unreachable!("only the sweep fills")
+        }
         async fn store(
             &self,
             _: &str,

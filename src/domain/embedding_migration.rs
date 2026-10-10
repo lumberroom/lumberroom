@@ -140,7 +140,9 @@ pub struct Counts {
     pub other_pending: i64,
     /// Eligible rows with no vector in the active slot.
     pub active_holes: i64,
-    /// Rows whose active-slot vector carries an id other than the active model. Reported only.
+    /// Rows whose active-slot vector carries an id other than the active model. `steady` reports
+    /// them and leaves them, so a single-model store never re-embeds a row on its own. `flipped`
+    /// and `retiring` re-embed them with the active model as part of a move the operator started.
     pub foreign_model: i64,
     pub failed: i64,
     pub without_vector: i64,

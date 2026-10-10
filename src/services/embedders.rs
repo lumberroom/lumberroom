@@ -117,8 +117,8 @@ impl EmbedderSet {
         ids
     }
 
-    /// Every configured model's values. The status page will read them once the dual-model change
-    /// (decision 0027, the next PR) lands; nothing calls this yet.
+    /// Every configured model's values, for the sweep's published status and the console's
+    /// model-change section.
     pub fn all_thresholds(&self) -> &HashMap<String, Arc<SimilarityThresholds>> {
         &self.thresholds
     }

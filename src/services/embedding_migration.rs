@@ -354,15 +354,20 @@ impl Sweep {
 
         let goal = target(&state, view);
         let mut counts = self.counts(unit, &state, view, goal.as_deref()).await?;
+        let (beneath, beneath_reason) = phase(&state, view, &counts, None);
+        // `steady` fills holes only. A single-model store never re-embeds a row on its own, so a
+        // vector under another id shows in `foreign_model` and stays where it is.
+        let holes_only = beneath == Phase::Steady;
+        let active_pending =
+            counts.active_holes + if holes_only { 0 } else { counts.foreign_model };
         // A slot with nothing pending holds no failed row: the row was filled, forgotten or
         // deleted, and no fill will run to notice.
         if counts.other_pending == 0 {
             self.forget_unseen(unit, state.active_slot.other(), &HashSet::new());
         }
-        if counts.active_holes + counts.foreign_model == 0 {
+        if active_pending == 0 {
             self.forget_unseen(unit, state.active_slot, &HashSet::new());
         }
-        let (beneath, beneath_reason) = phase(&state, view, &counts, None);
         let blocked_by_service = self.service_reason(unit);
         let active = state.active_model().to_string();
         let (active_slot, inactive) = (state.active_slot, state.active_slot.other());
@@ -376,12 +381,13 @@ impl Sweep {
         let fill_active = matches!(beneath, Phase::Steady | Phase::Flipped | Phase::Retiring);
 
         // Active holes first: in `flipped` a row without its active vector is invisible to search.
-        if fill_active && counts.active_holes + counts.foreign_model > 0 {
+        if fill_active && active_pending > 0 {
             let end = self
                 .fill(
                     unit,
                     active_slot,
                     &active,
+                    holes_only,
                     view.generation,
                     deadline,
                     tally,
@@ -398,6 +404,7 @@ impl Sweep {
                         unit,
                         inactive,
                         goal,
+                        false,
                         view.generation,
                         deadline,
                         tally,
@@ -483,14 +490,16 @@ impl Sweep {
     }
 
     /// Fills `slot` with `model` for every row pending there, a page at a time from the lowest id.
-    /// The cursor lives for this call only: a row written mid-pass below it waits for the next
-    /// pass.
+    /// With `holes_only` it reads only rows with no vector in `slot`, and a vector under another
+    /// id stays. The cursor lives for this call only: a row written mid-pass below it waits for
+    /// the next pass.
     #[allow(clippy::too_many_arguments)]
     async fn fill(
         &self,
         unit: &str,
         slot: VectorSlot,
         model: &str,
+        holes_only: bool,
         generation: Option<i64>,
         deadline: Instant,
         tally: &mut Tally,
@@ -510,7 +519,11 @@ impl Sweep {
                 return Ok(FillEnd::Budget);
             }
             self.gate(generation).await?;
-            let rows = self.repo.next_batch(unit, slot, model, after, PAGE).await?;
+            let rows = if holes_only {
+                self.repo.next_holes(unit, slot, after, PAGE).await?
+            } else {
+                self.repo.next_batch(unit, slot, model, after, PAGE).await?
+            };
             let Some(last) = rows.last() else {
                 self.forget_unseen(unit, slot, &seen);
                 return Ok(FillEnd::Done);
@@ -1244,6 +1257,37 @@ mod tests {
                 })
                 .collect())
         }
+        async fn next_holes(
+            &self,
+            unit: &str,
+            slot: VectorSlot,
+            after: Option<Uuid>,
+            limit: i64,
+        ) -> Result<Vec<PendingRow>> {
+            let mut s = self.store();
+            s.afters.push(after);
+            let mut rows: Vec<&Row> = s
+                .rows
+                .iter()
+                .filter(|r| {
+                    r.unit == unit
+                        && r.eligible()
+                        && r.slot(slot).is_none()
+                        && after.is_none_or(|a| r.id > a)
+                })
+                .collect();
+            rows.sort_by_key(|r| r.id);
+            Ok(rows
+                .into_iter()
+                .take(limit as usize)
+                .map(|r| PendingRow {
+                    id: r.id,
+                    sensitivity: r.sensitivity,
+                    content: r.content.clone(),
+                    chars: r.content.as_ref().map_or(40, |c| c.len() as i64),
+                })
+                .collect())
+        }
         async fn store(
             &self,
             unit: &str,
@@ -1550,6 +1594,23 @@ mod tests {
         assert_eq!(r.repo.row(2).a.as_deref(), Some(C));
         assert_eq!(r.c.calls(), 1);
         assert_eq!(r.p.calls(), 0);
+    }
+
+    // A single-model store never re-embeds a row on its own: a vector under another id is
+    // reported, and only a hole gets filled.
+    #[tokio::test]
+    async fn a_steady_unit_reports_a_foreign_model_row_and_leaves_it() {
+        let r = rig(
+            vec![row("me", 1, Some(X), None), row("me", 2, None, None)],
+            vec![state("me", VectorSlot::A, Some(C), None)],
+        );
+        let sweep = r.sweep(Steer::Env(view(None)), knobs());
+        sweep.pass(&me()).await;
+        assert_eq!(r.repo.row(1).a.as_deref(), Some(X));
+        assert_eq!(r.repo.row(2).a.as_deref(), Some(C));
+        assert_eq!(r.log.lock().unwrap().as_slice(), [format!("{C} row 2")]);
+        let shown = unit_status(&sweep, "me");
+        assert_eq!((shown.phase, shown.counts.foreign_model), (Phase::Steady, 1));
     }
 
     #[tokio::test]

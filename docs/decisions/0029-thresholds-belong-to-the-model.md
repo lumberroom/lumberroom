@@ -21,12 +21,12 @@ of default values per model family in `src/domain/similarity.rs`, and each value
   `CONFLICT_THRESHOLD`, `BOOTSTRAP_DEDUP_COSINE`, `GRAPH_ROUTE_MAX_TOP` and `GRAPH_ROUTE_MAX_SPREAD`
   override their key for the one configured model, as before. Boot warns once for each one whose
   value differs from the model's table value, and names the variable, both values and the model.
-  The dual-model change (decision 0027, the next PR) will refuse them beside a second block, name
-  each with its value, and say to move it into the override for the model it was tuned on.
+  Beside a second block boot refuses them (decision 0027), names each with its value, and says to
+  move it into the override for the model it was tuned on.
 - **An unlisted model boots on guesses.** Each key it lacks takes bge-base-en-v1.5's value, and boot
-  logs one warning per model naming every guessed key. The dual-model change will flip a unit onto
-  a model only when none of its acting keys (`dedupe`, `conflict`, `cleanup_near_certain`) is
-  guessed.
+  logs one warning per model naming every guessed key. The migration sweep flips a unit onto a
+  model only when none of its acting keys (`dedupe`, `conflict`, `cleanup_near_certain`) is
+  guessed, and boot refuses a configuration that would.
 - **Cross-key checks run per model.** `conflict` at or below `dedupe`, and `cleanup_worth_asking`
   below `cleanup_near_certain`. Boot refuses a resolved model that fails one and names the model and
   both values.
@@ -132,8 +132,8 @@ The table carries measured values for the two models in use, and overrides cover
 
 **One value for every model.** The old single variables applied to whatever model ran. During a
 switch that hands a bge-tuned 0.97 to EmbeddingGemma 2, where the study puts the same key at 0.995.
-Boot now warns when one departs from the model's table, and the dual-model change will refuse them
-while two blocks are configured.
+Boot now warns when one departs from the model's table, and refuses them while two blocks are
+configured.
 
 **Keys by exact embedder id.** The same weights reach the server under several ids:
 `Xenova/bge-base-en-v1.5@q8` in process, `openai:BAAI/bge-base-en-v1.5` through an endpoint. An

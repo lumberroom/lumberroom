@@ -698,9 +698,10 @@ async fn verify_kek_command() -> Result<()> {
 /// `lumberroom-server verify-embedding`: the embedding boot checks, with no embedder built and no
 /// weights loaded.
 ///
-/// The deploy scripts run it before they stop the running server, as they run `verify-kek`. That
-/// runs before the new image migrates the store, so a store with no `embedding_b` column or no
-/// state table counts as pre-migration and only the configuration is checked. It seeds nothing:
+/// An operator runs it before recreating the server, as `verify-kek` checks a key; no script in
+/// `deploy/` or `scripts/` calls either one. It may run before the new image migrates the store,
+/// so a store with no `embedding_b` column or no state table counts as pre-migration and only the
+/// configuration is checked. It seeds nothing:
 /// a unit with vectors and no state row is the boot's to seed.
 async fn verify_embedding_command() -> Result<()> {
     let cfg = config::load()?;

@@ -23,6 +23,15 @@ pub trait EmbeddingMigrationRepository: Send + Sync {
     /// Rows pending in `slot` for `model`, id order, after `after`.
     async fn next_batch(&self, unit: &str, slot: VectorSlot, model: &str,
                         after: Option<uuid::Uuid>, limit: i64) -> Result<Vec<PendingRow>>;
+    /// Eligible rows with no vector in `slot`, id order, after `after`. The `steady` fill reads
+    /// these, so a row whose vector carries another model's id stays as it is.
+    async fn next_holes(
+        &self,
+        unit: &str,
+        slot: VectorSlot,
+        after: Option<uuid::Uuid>,
+        limit: i64,
+    ) -> Result<Vec<PendingRow>>;
     /// True only when the vector landed. False when the row is no longer eligible or pending.
     async fn store(&self, unit: &str, id: uuid::Uuid, slot: VectorSlot, model: &str,
                    vector: Vec<f32>) -> Result<bool>;

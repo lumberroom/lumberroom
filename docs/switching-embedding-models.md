@@ -108,8 +108,8 @@ reaches the commands below only after this:
 docker compose up -d server
 ```
 
-The server builds both embedders and stays `steady`: writes still embed once, with the current
-model.
+The server builds both embedders and stays `steady` until `start`: writes still embed once, with
+the model the store holds now, the one `EMBED_PREVIOUS_*` names.
 
 **2. Start.**
 
@@ -151,8 +151,10 @@ the command writes the request and the flip waits for the fill. `status` then sh
 docker compose exec server lumberroom-server embeddings rollback
 ```
 
-The old model's slot is complete, because every write kept it current, so each unit flips back on
-the next pass with no embedding calls.
+Every write since the flip stored an old-model vector as well, unless that second vector missed
+`EMBED_SHADOW_TIMEOUT_MS`, and a `flipped` unit fills those misses on its next pass. When `status`
+shows `rollback: instant`, each unit flips back on the next pass with no embedding calls. Under
+`rollback: needs_fill` the server first fills the rows still missing their old vector, then flips.
 
 To move forward again after a rollback, run `start` and then `flip`. `flip` alone does nothing,
 because the rollback made the old model the target. The new model's slot is still full, so after
@@ -202,7 +204,7 @@ skips the comparison and prints a warning.
 | `start` | target = the configured model no unit is on, flip off | one block configured (recreate first if you just added it); both blocks compute the same id; no unit holds vectors yet; units sit on different models; the units' model is in neither block; the model you leave has a `guessed` acting key (a rollback would land on it); an inactive slot holds a third model, or a retire of one is still deleting; free disk at or below the floor; the probe to a remote target fails |
 | `flip` | flip on | no target (run `start`); the target is in no configured block; the target has a `guessed` acting key |
 | `rollback` | before a flip: no target, retire the target (a cancel). After one: target = the old model, flip on | the old model's block is gone from `.env`; units on the target hold different old models |
-| `retire` | retire = the model in the inactive slots | a unit is not on the target yet; the server has published no status for a unit; a unit has rows with no active vector or failed rows; a unit's window has not closed (it names the date); inactive slots hold more than one model |
+| `retire` | retire = the model in the inactive slots | a unit is not on the target yet; the server has published no status for a unit; a unit has failed rows; a unit's window has not closed (it names the date); inactive slots hold more than one model |
 
 A verb that has nothing to change prints why and exits 0. That covers `start` toward the current
 target, `flip` when every unit is on the target or a flip is already requested, `rollback` with
@@ -280,9 +282,10 @@ source: `override` (your line), `legacy` (an old single variable), `shipped`, `s
   It maps each old threshold to the new model by matching the share of same-namespace neighbour
   scores at or above it, prints `support` beside each value, and ends with a line to paste after
   `EMBED_THRESHOLDS=`. A `support` under 30 means too few old scores sit near that threshold to trust
-  the mapped value. The script reads slot A as the old model and slot B as the new; swap `embedding`
-  and `embedding_b` in its two score CTEs when `status` shows the old model in slot B. Feed it the
-  old model's values from `status`:
+  the mapped value. The script reads slot A as the old model and slot B as the new. When `status`
+  shows the old model in slot B, add `-v old=embedding_b -v new=embedding` to the `psql` line; the
+  script uses each column for both the sampled rows and their neighbours, so the two models never
+  meet in one score. Feed it the old model's values from `status`:
 
   ```sh
   docker compose exec -T db pg_dump -U lumberroom -Fc lumberroom > lumberroom-copy.dump
@@ -303,7 +306,7 @@ source: `override` (your line), `legacy` (an old single variable), `shipped`, `s
 
 | Phase | Meaning | What the server does |
 |---|---|---|
-| `steady` | one model, nothing started | fills rows missing their active vector |
+| `steady` | one model, nothing started | fills rows missing their active vector; a row whose vector carries another model's id shows as `foreign_model` in `status --json` and stays as it is |
 | `filling` | started, the new slot is not full | fills it |
 | `held` | the new slot is full, no flip requested | keeps it current; waits for `flip` |
 | `ready` | full and flip requested | flips on this pass |
@@ -313,8 +316,9 @@ source: `override` (your line), `legacy` (an old single variable), `shipped`, `s
 
 The blocked reasons:
 
-- `other_holds_third`: the inactive slot holds a model neither block names. `embeddings retire`
-  clears it.
+- `other_holds_third`: the inactive slot holds a model neither block names. The unit fills nothing
+  while it stays blocked. `embeddings retire` clears it, and the server fills any row missing its
+  active vector before it deletes the first old vector.
 - `kek`: private rows need the key-encryption key, and this boot did not verify one. Fix the KEK
   (`curl -s 127.0.0.1:8787/readyz` shows `kek_verified`).
 - `failed`: rows the embedder refused three times while it answered other rows. `status --json` and the
@@ -365,6 +369,9 @@ starting the server.
 
 `EMBED_MIGRATION_CONTROL=env` replaces the command with configuration: `EMBED_PREVIOUS_*` starts the
 move, `EMBED_FLIP` (`all`, `none`, or a list of unit ids) allows flips, and `EMBED_RETIRE` names the
-model to delete once its window has passed, each applied by a recreate. Rollback swaps the two
-blocks. In this mode every `embeddings` verb exits 2. The command suits a single-unit install; `env`
-mode suits a deployment that manages many units from configuration.
+model to delete once its window has passed, each applied by a recreate. Write `EMBED_RETIRE` as the
+id `status` prints: `openai:<model>` for a remote model, `<model>@q8` for a local one. A bare name
+reads as a local model and gains the `@q8`, so a remote model needs its `openai:` prefix. Boot
+refuses a value that names either configured block. Rollback swaps the two blocks. In this mode
+every `embeddings` verb exits 2. The command suits a single-unit install; `env` mode suits a
+deployment that manages many units from configuration.

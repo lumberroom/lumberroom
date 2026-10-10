@@ -620,29 +620,27 @@ fn decide_retire(intent: &Intent, view: &View) -> Decision {
         view.states.iter().filter(|s| status_of(view, &s.unit).is_none()).collect();
     if !unpublished.is_empty() {
         return Decision::Refuse(format!(
-            "retire refused: the server has published no status for units {}, so their holes \
-             and failed rows are unknown. Start the server, wait one pass (EMBED_MIGRATE_SECS) \
-             and run retire again.",
+            "retire refused: the server has published no status for units {}, so their failed \
+             rows are unknown. Start the server, wait one pass (EMBED_MIGRATE_SECS) and run \
+             retire again.",
             names(unpublished)
         ));
     }
-    let unsafe_units: Vec<String> = view
+    // Active holes do not refuse. The sweep fills them before its first retire batch, and a unit
+    // blocked on a third model fills none until retire clears that model, so a hole check here
+    // would leave that unit no way out.
+    let failing: Vec<String> = view
         .states
         .iter()
         .filter_map(|s| status_of(view, &s.unit))
-        .filter(|st| st.counts.active_holes > 0 || st.counts.failed > 0)
-        .map(|st| {
-            format!(
-                "unit {} has {} active holes and {} failed rows",
-                st.unit, st.counts.active_holes, st.counts.failed
-            )
-        })
+        .filter(|st| st.counts.failed > 0)
+        .map(|st| format!("unit {} has {} failed rows", st.unit, st.counts.failed))
         .collect();
-    if !unsafe_units.is_empty() {
+    if !failing.is_empty() {
         return Decision::Refuse(format!(
-            "retire refused: {}. Retire deletes the only other vector those rows could fall back \
-             on. embeddings status names the failed rows; run retire once both counts are 0.",
-            unsafe_units.join("; ")
+            "retire refused: {}. Retire deletes the only other vector those rows hold. \
+             embeddings status names the failed rows; run retire once the count is 0.",
+            failing.join("; ")
         ));
     }
     let days = chrono::Duration::days(view.rollback_days);
@@ -1109,17 +1107,33 @@ mod tests {
     }
 
     #[test]
-    fn retire_refuses_an_active_hole_or_a_failed_row() {
+    fn retire_refuses_a_failed_row() {
         let s = flipped("me", GEMMA, Some(BGE), "2026-10-01T09:31:00Z");
         let i = intent(Some(GEMMA), true, None, Some(Verb::Flip));
-        for (holes, failed, part) in [(3, 0, "3 active holes"), (0, 2, "2 failed rows")] {
+        let mut f = Fixture::new(vec![s.clone()]);
+        f.statuses = vec![status(
+            &s,
+            Phase::Flipped,
+            Counts { eligible: 300, failed: 2, ..Counts::default() },
+        )];
+        assert_names(&refused(f.decide(Verb::Retire, &i)), &["me", "2 failed rows"]);
+    }
+
+    // A unit blocked on a third model never fills its active holes, and retire is the fix for that
+    // block. The sweep's retire fills holes before it deletes, so refusing here would deadlock.
+    #[test]
+    fn retire_writes_past_active_holes() {
+        let s = flipped("me", GEMMA, Some(BGE), "2026-10-01T09:31:00Z");
+        let i = intent(Some(GEMMA), true, None, Some(Verb::Flip));
+        for phase in [Phase::Flipped, Phase::Blocked] {
             let mut f = Fixture::new(vec![s.clone()]);
             f.statuses = vec![status(
                 &s,
-                Phase::Flipped,
-                Counts { eligible: 300, active_holes: holes, failed, ..Counts::default() },
+                phase,
+                Counts { eligible: 300, active_holes: 3, ..Counts::default() },
             )];
-            assert_names(&refused(f.decide(Verb::Retire, &i)), &["me", part]);
+            let (c, _) = written(f.decide(Verb::Retire, &i));
+            assert_eq!(c.retire.as_deref(), Some(BGE));
         }
     }
 

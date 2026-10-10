@@ -137,6 +137,31 @@ SELECT id, sensitivity, content,
    AND ($3::uuid IS NULL OR id > $3)
  ORDER BY id LIMIT $4";
 
+/// ($1 unit, $2 after or NULL, $3 limit): eligible rows with no vector in slot A. The `steady` fill
+/// reads these, so a row whose vector carries another model's id is counted in `foreign_model` and
+/// never re-embedded.
+const NEXT_HOLES_A: &str = "\
+SELECT id, sensitivity, content,
+       coalesce(length(content), octet_length(content_ct), 0)::int8 AS chars
+  FROM memory
+ WHERE tenant_id = $1
+   AND sensitivity <> 'sealed'
+   AND (content IS NOT NULL OR embedding IS NOT NULL OR embedding_b IS NOT NULL)
+   AND embedding IS NULL
+   AND ($2::uuid IS NULL OR id > $2)
+ ORDER BY id LIMIT $3";
+
+const NEXT_HOLES_B: &str = "\
+SELECT id, sensitivity, content,
+       coalesce(length(content), octet_length(content_ct), 0)::int8 AS chars
+  FROM memory
+ WHERE tenant_id = $1
+   AND sensitivity <> 'sealed'
+   AND (content IS NOT NULL OR embedding_b IS NOT NULL OR embedding IS NOT NULL)
+   AND embedding_b IS NULL
+   AND ($2::uuid IS NULL OR id > $2)
+ ORDER BY id LIMIT $3";
+
 /// ($1 unit, $2 id, $3 vector, $4 model). The eligibility rule repeats here: a revocation that
 /// committed after NEXT_A read the row leaves content NULL and both vectors NULL, and this store
 /// must land nothing on it. The EXISTS is review M1's guard: a pass that read state before a retire
@@ -198,10 +223,9 @@ const FLIP_NOTIFY: &str = "SELECT pg_notify($1, $2)";
 
 // ── retire ──────────────────────────────────────────────────────────────────────────────────────
 
-/// ($1 unit, $2 model, $3 limit). Carries no state guard: the sweep retires only the inactive
-/// slot, and nothing but the sweep moves `active_slot`.
-// The state guard keeps a batch from ever clearing the slot the unit reads, whatever a pass read
-// before it ran.
+/// ($1 unit, $2 model, $3 limit). The EXISTS on `embedding_state` matches only while slot A is
+/// inactive, so a batch never clears the slot the unit reads, whatever state a pass read before
+/// it ran.
 const RETIRE_A: &str = "\
 UPDATE memory SET embedding = NULL, embedding_model = NULL
  WHERE tenant_id = $1
@@ -281,6 +305,13 @@ const fn next_sql(slot: VectorSlot) -> &'static str {
     match slot {
         VectorSlot::A => NEXT_A,
         VectorSlot::B => NEXT_B,
+    }
+}
+
+const fn next_holes_sql(slot: VectorSlot) -> &'static str {
+    match slot {
+        VectorSlot::A => NEXT_HOLES_A,
+        VectorSlot::B => NEXT_HOLES_B,
     }
 }
 
@@ -584,6 +615,22 @@ impl EmbeddingMigrationRepository for PgEmbeddingMigrationRepository {
         rows.iter().map(pending_from_row).collect()
     }
 
+    async fn next_holes(
+        &self,
+        unit: &str,
+        slot: VectorSlot,
+        after: Option<uuid::Uuid>,
+        limit: i64,
+    ) -> Result<Vec<PendingRow>> {
+        let rows = sqlx::query(next_holes_sql(slot))
+            .bind(unit)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(pending_from_row).collect()
+    }
+
     async fn store(
         &self,
         unit: &str,
@@ -821,6 +868,7 @@ mod tests {
         ("NAME_SLOT", NAME_SLOT_A, NAME_SLOT_B),
         ("COUNTS_ACTIVE", COUNTS_ACTIVE_A, COUNTS_ACTIVE_B),
         ("NEXT", NEXT_A, NEXT_B),
+        ("NEXT_HOLES", NEXT_HOLES_A, NEXT_HOLES_B),
         ("STORE", STORE_A, STORE_B),
         ("FLIP_PENDING", FLIP_PENDING_A, FLIP_PENDING_B),
         ("RETIRE", RETIRE_A, RETIRE_B),
@@ -849,6 +897,9 @@ mod tests {
             let col = slot.column();
             let pending = format!("({col} IS NULL OR {col}_model IS DISTINCT FROM $");
             assert!(next_sql(slot).contains(&pending), "next for {slot:?}");
+            // The steady fill reads holes only: a foreign id in the slot never qualifies.
+            assert!(next_holes_sql(slot).contains(&format!("AND {col} IS NULL\n")));
+            assert!(!next_holes_sql(slot).contains("IS DISTINCT FROM"), "holes for {slot:?}");
             assert!(store_sql(slot).contains(&pending), "store for {slot:?}");
             assert!(flip_pending_sql(slot).contains(&pending), "flip_pending for {slot:?}");
             assert!(store_sql(slot).contains(&format!("SET {col} = $3, {col}_model = $4")));

@@ -514,6 +514,7 @@ pub struct MigrateConfig {
     pub fill_duty: u8,
     pub shadow_timeout_ms: u64,
     pub rollback_days: i64,
+    /// `EMBED_RETIRE` as a stored embedder id once `from_env` returns; see `resolve_retire`.
     pub retire: Option<String>,
 }
 
@@ -695,8 +696,8 @@ impl IngestConfig {
 
 impl Config {
     /// The old single threshold variables that are set. Each overrides its key for the one
-    /// configured model. The dual-model change (decision 0027, the next PR) will refuse them beside
-    /// a second model. The fork appends its dreaming ones.
+    /// configured model. `validate_migrate` refuses them beside a second model (decision 0027). The
+    /// fork appends its dreaming ones.
     pub fn legacy_thresholds(&self) -> Vec<crate::domain::similarity::Legacy> {
         use crate::domain::similarity::{self as s, Legacy};
         [
@@ -1091,7 +1092,7 @@ pub fn load() -> Result<Config> {
     let embed_model = env("EMBED_MODEL", "Xenova/bge-base-en-v1.5");
     refuse_embed_fallback(env_opt("EMBED_ALLOW_FALLBACK").as_deref())?;
 
-    let cfg = Config {
+    let mut cfg = Config {
         public_url: public_url.clone(),
         port: env_num("PORT", 8787u16)?,
         host: env("HOST", "0.0.0.0"),
@@ -1247,6 +1248,16 @@ pub fn load() -> Result<Config> {
         },
     };
 
+    // Resolved once, here, so every reader compares the same stored id. Command mode refuses the
+    // variable in `validate_migrate`, and that message is the one an operator needs there.
+    if cfg.embed.migrate.control == crate::domain::embedding_migration::ControlMode::Env {
+        if let Some(raw) = cfg.embed.migrate.retire.take() {
+            let blocks: Vec<EmbedderSpec> = std::iter::once(cfg.embed.current_spec())
+                .chain(cfg.embed.previous_spec())
+                .collect();
+            cfg.embed.migrate.retire = Some(resolve_retire(&raw, &blocks)?);
+        }
+    }
     validate(&cfg)?;
     Ok(cfg)
 }
@@ -1398,6 +1409,37 @@ fn validate_recall_events(r: &RecallEventConfig, cleanup: &CleanupConfig) -> Res
     Ok(())
 }
 
+/// `EMBED_RETIRE` as the stored embedder id the phase rules compare with `model_a` and `model_b`.
+/// The operator may write the id `status` prints or a bare model name. A value that already reads
+/// as an id (`openai:` or `hash-v1-` in front, `@q8` behind) passes as it is. Anything else is a
+/// local model's name and takes the local adapter's id rule, because a remote id always carries its
+/// `openai:` prefix and a bare name cannot say which endpoint it came from. A value naming either
+/// configured block, by name or by id, is refused: retire deletes vectors neither block may hold.
+fn resolve_retire(raw: &str, blocks: &[EmbedderSpec]) -> Result<String> {
+    use crate::adapters::embedding::id_for;
+    let raw = raw.trim();
+    let is_id = raw.starts_with("openai:") || raw.starts_with("hash-v1-") || raw.ends_with("@q8");
+    let id = if is_id {
+        raw.to_string()
+    } else {
+        id_for(&EmbedderSpec {
+            provider: EmbedProvider::Local,
+            model: raw.to_string(),
+            dim: 0,
+            cache_dir: String::new(),
+            remote: RemoteEmbedConfig::default(),
+        })
+    };
+    if let Some(block) = blocks.iter().find(|b| raw == b.model || id == id_for(b)) {
+        return Err(DomainError::validation(format!(
+            "EMBED_RETIRE={raw} names {}, which EMBED_* or EMBED_PREVIOUS_* configures. It names \
+             the model whose vectors are deleted, which neither block may hold.",
+            id_for(block)
+        )));
+    }
+    Ok(id)
+}
+
 /// The migration settings that need no store and no embedder. Rules that need either live in
 /// `domain::embedding_phase::boot_check`.
 fn validate_migrate(cfg: &Config) -> Result<()> {
@@ -1416,15 +1458,6 @@ fn validate_migrate(cfg: &Config) -> Result<()> {
                 "EMBED_RETIRE is set while EMBED_MIGRATION_CONTROL=command. In command mode \
                  `lumberroom-server embeddings retire` decides it; unset EMBED_RETIRE.",
             ));
-        }
-    }
-    if let Some(retire) = &m.retire {
-        let previous = cfg.embed.previous.as_ref().map(|p| p.model.as_str());
-        if *retire == cfg.embed.model || Some(retire.as_str()) == previous {
-            return Err(DomainError::validation(format!(
-                "EMBED_RETIRE={retire} names a configured model. It names the model whose vectors \
-                 are deleted, which must be neither EMBED_MODEL nor EMBED_PREVIOUS_MODEL."
-            )));
         }
     }
     if cfg.embed.disk.path.trim().is_empty() {
@@ -2425,6 +2458,53 @@ mod tests {
         auth.required_scopes = vec![];
         let err = validate_oidc(&auth).unwrap_err();
         assert!(err.client_message().contains("OIDC_REQUIRED_SCOPES"));
+    }
+
+    fn block(provider: EmbedProvider, model: &str) -> EmbedderSpec {
+        EmbedderSpec {
+            provider,
+            model: model.into(),
+            dim: 768,
+            cache_dir: "/nonexistent".into(),
+            remote: RemoteEmbedConfig::default(),
+        }
+    }
+
+    /// EMBED_* on EmbeddingGemma 2 through llama-server, EMBED_PREVIOUS_* on local bge.
+    fn two_blocks() -> Vec<EmbedderSpec> {
+        vec![
+            block(EmbedProvider::Openai, "google/embeddinggemma-2"),
+            block(EmbedProvider::Local, "Xenova/bge-base-en-v1.5"),
+        ]
+    }
+
+    #[test]
+    fn embed_retire_keeps_a_stored_id() {
+        for id in ["openai:text-embedding-3-small", "bge-small-en-v1.5@q8", "hash-v1-768"] {
+            assert_eq!(resolve_retire(id, &two_blocks()).unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn embed_retire_maps_a_bare_model_name_through_the_local_id_rule() {
+        let blocks = [block(EmbedProvider::Openai, "google/embeddinggemma-2")];
+        assert_eq!(
+            resolve_retire(" Xenova/bge-base-en-v1.5 ", &blocks).unwrap(),
+            "Xenova/bge-base-en-v1.5@q8"
+        );
+    }
+
+    #[test]
+    fn embed_retire_refuses_a_configured_model_by_name_or_id() {
+        for raw in [
+            "google/embeddinggemma-2",
+            "openai:google/embeddinggemma-2",
+            "Xenova/bge-base-en-v1.5",
+            "Xenova/bge-base-en-v1.5@q8",
+        ] {
+            let err = resolve_retire(raw, &two_blocks()).unwrap_err().client_message().to_string();
+            assert!(err.contains("EMBED_RETIRE") && err.contains(raw.trim()), "{err}");
+        }
     }
 
     #[test]
