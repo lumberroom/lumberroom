@@ -27,9 +27,13 @@ const EVAL_TAG: &str = "longmemeval";
 pub struct Corpus {
     /// Memory id to every session id that produced it. A dedupe collapse puts two here.
     pub owners: HashMap<String, Vec<String>>,
-    /// Writes the server accepted. A collapse counts: the content reached the store, on a row that
-    /// was already there. `owners.len()` is the number of distinct rows the haystack occupies.
+    /// Writes that created a row. A write the server collapsed into a row already stored lands in
+    /// `writes_collapsed` instead: counting it here once reported 19,195 rows for a pool that holds
+    /// at most 18,464, because that many distinct texts is all the 19,195 sessions render to.
     pub rows_written: usize,
+    /// Writes the server accepted and answered with an existing row's id. The content is in the
+    /// store, and the session maps to that row.
+    pub writes_collapsed: usize,
     /// Reason per refused write. A session that never landed cannot be retrieved, and a question
     /// whose gold session is in this list is unanswerable for a reason that is not ranking.
     pub failures: Vec<String>,
@@ -167,6 +171,17 @@ pub fn record_owner(owners: &mut HashMap<String, Vec<String>>, memory_id: &str, 
     }
 }
 
+impl Corpus {
+    /// Count one accepted write and map its session to the row that holds it.
+    pub fn accept(&mut self, outcome: &wire::WriteOutcome, session_id: &str) {
+        match outcome.deduplicated {
+            true => self.writes_collapsed += 1,
+            false => self.rows_written += 1,
+        }
+        record_owner(&mut self.owners, &outcome.id, session_id);
+    }
+}
+
 struct Job {
     session_id: String,
     content: String,
@@ -233,9 +248,8 @@ pub async fn build(
             jobs[start..end].iter().map(|job| write_one(c, namespace, job)).collect();
         for (job, outcome) in jobs[start..end].iter().zip(join_all(wave).await) {
             match outcome {
-                Ok(id) => {
-                    corpus.rows_written += 1;
-                    record_owner(&mut corpus.owners, &id, &job.session_id);
+                Ok(outcome) => {
+                    corpus.accept(&outcome, &job.session_id);
                     landed.insert(job.session_id.as_str());
                 }
                 // Auth is the one failure that is not about this row. Every remaining write fails
@@ -256,7 +270,7 @@ pub async fn build(
 }
 
 /// One row through the real tool path, so the eval exercises what a client exercises.
-async fn write_one(c: &Client, namespace: &str, job: &Job) -> Result<String> {
+async fn write_one(c: &Client, namespace: &str, job: &Job) -> Result<wire::WriteOutcome> {
     let req = wire::WriteArgsRequest {
         // The benchmark's own dates stay out of the write. Their harness carried none, so sending
         // one here would make the comparable number incomparable.
@@ -269,9 +283,8 @@ async fn write_one(c: &Client, namespace: &str, job: &Job) -> Result<String> {
         supersedes: None,
     };
     let output = c.call_tool("memory_write", serde_json::to_value(req).unwrap()).await?;
-    let outcome: wire::WriteOutcome = serde_json::from_value(output.structured.clone())
-        .map_err(|e| err(format!("memory_write response is not the expected shape ({e})")))?;
-    Ok(outcome.id)
+    serde_json::from_value(output.structured.clone())
+        .map_err(|e| err(format!("memory_write response is not the expected shape ({e})")))
 }
 
 /// Poll a wave of futures to completion together, keeping the input order.
@@ -400,6 +413,21 @@ mod tests {
         record_owner(&mut owners, "row-1", "session-a");
         record_owner(&mut owners, "row-1", "session-a");
         assert_eq!(owners["row-1"], vec!["session-a".to_string()]);
+    }
+
+    fn outcome(id: &str, deduplicated: bool) -> wire::WriteOutcome {
+        wire::WriteOutcome { id: id.into(), namespace: "project:lme-corpus".into(), deduplicated }
+    }
+
+    #[test]
+    fn a_collapsed_write_maps_its_session_and_adds_no_row() {
+        let mut corpus = Corpus::default();
+        corpus.accept(&outcome("row-1", false), "session-a");
+        corpus.accept(&outcome("row-1", true), "session-b");
+        corpus.accept(&outcome("row-2", false), "session-c");
+        assert_eq!(corpus.rows_written, 2);
+        assert_eq!(corpus.writes_collapsed, 1);
+        assert_eq!(corpus.owners["row-1"], vec!["session-a".to_string(), "session-b".to_string()]);
     }
 
     async fn number(n: i32, yields: usize) -> i32 {

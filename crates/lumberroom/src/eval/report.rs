@@ -92,7 +92,11 @@ fn deviations(report: &RunReport) -> String {
         .count();
     // A question that wrote nothing either resumed onto rows already in the store or built an
     // empty haystack. Either way its sessions_never_stored is not something this run observed.
-    let reused = report.per_question.iter().filter(|r| r.rows_written == 0).count();
+    let reused = report
+        .per_question
+        .iter()
+        .filter(|r| r.rows_written == 0 && r.writes_collapsed == 0)
+        .count();
 
     let mut s = String::from("DEVIATIONS from agentmemory's published run\n");
     for line in [
@@ -116,6 +120,15 @@ fn deviations(report: &RunReport) -> String {
         "  sessions    {} haystack sessions never reached the store.\n",
         report.sessions_never_stored,
     ));
+    if report.writes_collapsed > 0 {
+        s.push_str(&format!(
+            "  collapses   {} accepted writes landed on a row already stored, so the store holds\n",
+            report.writes_collapsed,
+        ));
+        s.push_str(
+            "              that many fewer rows than writes. Each such session maps to that row.\n",
+        );
+    }
     // In corpus-wide the same counter means the opposite thing. A hit from another question's
     // haystack is a distractor beating this question's sessions to a slot, which is the whole
     // point of that mode. Reading it as a harness fault there would hide the finding.
@@ -212,6 +225,7 @@ mod tests {
             protocol: "session-as-document".into(),
             mode: "scoped".into(),
             rows_at_end: 159,
+            writes_collapsed: 0,
             embedding_model: "hash-768".into(),
             retrieve_depth: 20,
             overall: aggregate(&results),
@@ -275,6 +289,23 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_writes_are_reported_beside_the_rows() {
+        let mut report = built(0, 0);
+        assert!(!render(&report).contains("collapses"), "no collapse, no line");
+        report.writes_collapsed = 13;
+        let text = render(&report);
+        assert!(text.contains("collapses   13 accepted writes"), "{text}");
+    }
+
+    #[test]
+    fn a_question_whose_every_write_collapsed_still_wrote() {
+        let mut report = built(0, 0);
+        report.per_question[0].rows_written = 0;
+        report.per_question[0].writes_collapsed = 2;
+        assert!(!render(&report).contains("resume      "), "a collapse is an accepted write");
+    }
+
+    #[test]
     fn the_json_carries_every_question() {
         let dir = std::env::temp_dir().join(format!("lumberroom-eval-{}", std::process::id()));
         let path = dir.join("report.json");
@@ -284,6 +315,7 @@ mod tests {
         assert_eq!(v["per_question"].as_array().unwrap().len(), 3);
         assert_eq!(v["per_question"][0]["question_id"], "q1");
         assert_eq!(v["sessions_never_stored"], 1);
+        assert_eq!(v["writes_collapsed"], 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -24,10 +24,10 @@
 #                       most realistic. --resume does not apply.
 #   --embed-model NAME  the server's EMBED_MODEL. Default all-MiniLM-L6-v2, the embedder agentmemory's
 #                       published run used. Any other model measures the embedder as well as the stack.
-#   --embed-max-tokens N  the server's EMBED_MAX_TOKENS, the embedder's input window. Unset leaves
-#                       the model's own default.
 #   --db NAME         the scratch database. Default lumberroom_eval. Two runs at once need two names,
-#                       two --port values and two LUMBERROOM_EVAL_SERVER_NAME values.
+#                       two --port values and two LUMBERROOM_EVAL_SERVER_NAME values. The name must
+#                       match ^lumberroom_eval[a-z0-9_]*$ and differ from POSTGRES_DB, because the
+#                       eval server migrates and writes into it and the exit trap drops it.
 #   --keep            leave the scratch database in place after the run. Without this flag the
 #                     script drops it on exit; with it, drop it later with:
 #                       docker compose exec db dropdb -U <POSTGRES_USER> <NAME>
@@ -35,6 +35,8 @@
 # LUMBERROOM_EVAL_EMBED_PROVIDER=openai with LUMBERROOM_EVAL_EMBED_BASE_URL, _API_KEY and
 # _MAX_INPUT_CHARS points the scratch server at an OpenAI-compatible embeddings endpoint. They are
 # not the server's own EMBED_* names because this script sources .env, which sets those.
+# _MAX_INPUT_CHARS caps characters. No setting here caps tokens: to run a model at a smaller token
+# window, start the embedding server with that window and the adapter cuts on its refusal.
 #
 # LUMBERROOM_TIMEOUT_MS reaches the harness either way. The client's default is 15 s per call, which
 # a search over a large pool can outrun.
@@ -56,10 +58,12 @@ REPO_DIR="$PWD"
 USAGE="usage: eval-longmemeval.sh [--dataset PATH] [--protocol session-as-document|chunked]
                             [--limit N] [--isolate] [--corpus-wide]
                             [--resume] [--out PATH] [--port N] [--keep]
-                            [--embed-model NAME] [--embed-max-tokens N]
+                            [--embed-model NAME] [--db NAME]
 
 Runs LongMemEval-S against a scratch server on port 8788 (default) and a scratch database
-named lumberroom_eval, both torn down or dropped on exit unless --keep is given. Never touches
+named lumberroom_eval, both torn down or dropped on exit unless --keep is given. --db names
+another scratch database; it must match ^lumberroom_eval[a-z0-9_]*$ and differ from
+POSTGRES_DB, and anything else is refused before any database is touched. Never touches
 127.0.0.1:8787 or the lumberroom database. See the top of this file for the full flag reference."
 
 PORT="${LUMBERROOM_EVAL_PORT:-8788}"
@@ -80,7 +84,6 @@ ONLY_TYPE=""
 # linear adds the two arms' raw scores, which is what ships. rrf fuses their ranks.
 FUSION=""
 EMBED_MODEL="all-MiniLM-L6-v2"
-EMBED_MAX_TOKENS=""
 KEEP=0
 EVAL_DB="lumberroom_eval"
 
@@ -98,7 +101,6 @@ while [ $# -gt 0 ]; do
     --fusion) FUSION="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --embed-model) EMBED_MODEL="$2"; shift 2 ;;
-    --embed-max-tokens) EMBED_MAX_TOKENS="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --db) EVAL_DB="$2"; shift 2 ;;
     -h|--help)
@@ -112,6 +114,27 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+# The eval server migrates this database and writes into it, and the exit trap drops it. A name
+# reaching the owner's store, the dev database or the test database would lose it, so only the
+# scratch prefix passes, checked before any docker call. The character class also keeps the name
+# safe inside the SQL literal and the quoted identifier below. Spelled out rather than a-z because
+# a bracket range in a shell pattern follows the locale.
+refuse_db() {
+  echo "refusing --db $1: $2" >&2
+  echo "$USAGE" >&2
+  exit 1
+}
+case "$EVAL_DB" in
+  lumberroom_eval*) ;;
+  *) refuse_db "\"$EVAL_DB\"" "a scratch database name starts with lumberroom_eval" ;;
+esac
+case "${EVAL_DB#lumberroom_eval}" in
+  *[!abcdefghijklmnopqrstuvwxyz0123456789_]*)
+    refuse_db "\"$EVAL_DB\"" "only lowercase letters, digits and _ may follow lumberroom_eval" ;;
+esac
+[ "$EVAL_DB" != "${POSTGRES_DB:-}" ] ||
+  refuse_db "\"$EVAL_DB\"" "it is POSTGRES_DB, the store this checkout's server uses"
 
 [ -f "$DATASET" ] || {
   echo "dataset not found at $DATASET" >&2
@@ -251,7 +274,6 @@ docker run -d --name "$SERVER_NAME" --network "$NETWORK" \
   -e EMBED_API_KEY="${LUMBERROOM_EVAL_EMBED_API_KEY:-}" \
   -e EMBED_MAX_INPUT_CHARS="${LUMBERROOM_EVAL_EMBED_MAX_INPUT_CHARS:-0}" \
   -e EMBED_MODEL="$EMBED_MODEL" \
-  -e EMBED_MAX_TOKENS="$EMBED_MAX_TOKENS" \
   -e EMBED_DIM=768 \
   -e SENSITIVITY_TRIPWIRE=false \
   -e WRITE_MAX_CONTENT_CHARS=200000 \

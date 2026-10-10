@@ -171,6 +171,7 @@ const CORPUS_BATCH: usize = 500;
 pub struct SharedCorpus {
     pub owners: HashMap<String, Vec<String>>,
     pub rows_written: usize,
+    pub writes_collapsed: usize,
     /// Session id to the reason it never landed, so each question reports its own losses.
     pub missing: HashMap<String, String>,
 }
@@ -181,7 +182,8 @@ pub struct SharedCorpus {
 /// haystacks written so far, so early questions took an easier test than late ones and no question
 /// saw the whole pool until the last. LongMemEval-S repeats sessions across haystacks (23,867
 /// references to 19,195 ids); a session id always carries the same turns, so the first occurrence
-/// stands for all of them. Its date is the first one seen, which matters only with --dates-in-text.
+/// stands for all of them. Its date is the first one seen, which is why `refuse_combinations` keeps
+/// --dates-in-text out of this mode.
 async fn write_corpus(
     c: &Client,
     selected: &[(usize, &Question)],
@@ -206,8 +208,12 @@ async fn write_corpus(
         ids.len()
     ));
 
-    let mut shared =
-        SharedCorpus { owners: HashMap::new(), rows_written: 0, missing: HashMap::new() };
+    let mut shared = SharedCorpus {
+        owners: HashMap::new(),
+        rows_written: 0,
+        writes_collapsed: 0,
+        missing: HashMap::new(),
+    };
     let started = Instant::now();
     let mut start = 0usize;
     while start < ids.len() {
@@ -235,6 +241,7 @@ async fn write_corpus(
             shared.owners.entry(id).or_default().extend(owners);
         }
         shared.rows_written += built.rows_written;
+        shared.writes_collapsed += built.writes_collapsed;
         for session in built.missing_sessions {
             let reason = built
                 .failures
@@ -321,13 +328,19 @@ pub async fn run_question(
         resumed = !probe.is_empty();
     }
 
-    let (owners, mut failures, rows_written, missing) = if resumed {
-        (owners_from_content(q, &probe), Vec::new(), 0usize, Vec::new())
+    let (owners, mut failures, rows_written, writes_collapsed, missing) = if resumed {
+        (owners_from_content(q, &probe), Vec::new(), 0usize, 0usize, Vec::new())
     } else {
         let built =
             corpus::build(c, q, &namespace, args.protocol, args.chunk_chars, args.dates_in_text)
                 .await?;
-        (built.owners, built.failures, built.rows_written, built.missing_sessions)
+        (
+            built.owners,
+            built.failures,
+            built.rows_written,
+            built.writes_collapsed,
+            built.missing_sessions,
+        )
     };
 
     for session in &missing {
@@ -358,6 +371,7 @@ pub async fn run_question(
     );
     result.write_failures = failures;
     result.rows_written = rows_written;
+    result.writes_collapsed = writes_collapsed;
     result.latency_ms = latency_ms;
 
     // Isolation is a parity device and nothing more. agentmemory built a fresh index holding one
@@ -399,8 +413,46 @@ fn is_write_failure(entry: &str) -> bool {
     !entry.starts_with(UNMAPPED_HIT)
 }
 
+/// Flag combinations a corpus-wide run cannot honour, refused before anything is written.
+fn refuse_combinations(args: &EvalArgs) -> Result<()> {
+    if args.scoped || args.isolate {
+        return Ok(());
+    }
+    if args.resume {
+        return Err(err(
+            "--resume does not apply to --corpus-wide: the corpus is written once up front, so \
+             rerun it whole against a fresh database",
+        ));
+    }
+    if args.dates_in_text {
+        return Err(err(
+            "--dates-in-text does not apply to --corpus-wide: each session is written once and \
+             keeps the first date seen, and about 20% of LongMemEval-S sessions carry different \
+             dates in different questions, so those rows would carry another question's date",
+        ));
+    }
+    Ok(())
+}
+
+/// Rows the store held at the end, and the writes that collapsed into a row already there.
+fn store_counts(
+    shared: Option<&SharedCorpus>,
+    isolate: bool,
+    results: &[QuestionResult],
+) -> (usize, usize) {
+    let collapsed = results.iter().map(|r| r.writes_collapsed).sum();
+    match shared {
+        Some(corpus) => (corpus.rows_written, corpus.writes_collapsed),
+        // Isolation deletes each haystack once it is scored, so the store never holds more than
+        // one question's worth. Reporting a corpus size here would flatter the run.
+        None if isolate => (results.last().map_or(0, |r| r.rows_written), collapsed),
+        None => (results.iter().map(|r| r.rows_written).sum(), collapsed),
+    }
+}
+
 /// Every question, in order, with progress on stdout.
 pub async fn run(c: &Client, args: &EvalArgs) -> Result<RunReport> {
+    refuse_combinations(args)?;
     let path = dataset_path(args)?;
     let questions = dataset::load(&path)?;
     let embedding_model = embedder_id(c).await;
@@ -426,12 +478,6 @@ pub async fn run(c: &Client, args: &EvalArgs) -> Result<RunReport> {
 
     let wall = Instant::now();
     let corpus_wide = !args.scoped && !args.isolate;
-    if corpus_wide && args.resume {
-        return Err(err(
-            "--resume does not apply to --corpus-wide: the corpus is written once up front, so \
-             rerun it whole against a fresh database",
-        ));
-    }
     let shared = match corpus_wide {
         true => Some(write_corpus(c, &selected, args).await?),
         false => None,
@@ -481,20 +527,13 @@ pub async fn run(c: &Client, args: &EvalArgs) -> Result<RunReport> {
         .filter(|f| f.starts_with(MISSING_SESSION))
         .count();
 
-    let rows_at_end = if let Some(corpus) = &shared {
-        corpus.rows_written
-    } else if args.isolate {
-        // Isolation deletes each haystack once it is scored, so the store never holds more than
-        // one question's worth. Reporting a corpus size here would flatter the run.
-        results.last().map_or(0, |r| r.rows_written)
-    } else {
-        results.iter().map(|r| r.rows_written).sum()
-    };
+    let (rows_at_end, writes_collapsed) = store_counts(shared.as_ref(), args.isolate, &results);
 
     Ok(RunReport {
         protocol: args.protocol.as_str().to_string(),
         mode: mode_name(args),
         rows_at_end,
+        writes_collapsed,
         embedding_model,
         retrieve_depth: crate::eval::RETRIEVE_DEPTH,
         overall: crate::eval::aggregate(&results),
@@ -623,6 +662,70 @@ mod tests {
         let agg = crate::eval::aggregate(&single);
         assert_eq!(agg.questions, 2);
         assert!((agg.recall_any_at_5 - 0.5).abs() < 1e-12);
+    }
+
+    fn args(scoped: bool, isolate: bool, dates_in_text: bool) -> EvalArgs {
+        EvalArgs {
+            dataset: None,
+            protocol: Protocol::SessionAsDocument,
+            limit: None,
+            skip_abstention: false,
+            chunk_chars: 2000,
+            out: None,
+            json: false,
+            resume: false,
+            isolate,
+            scoped,
+            dates_in_text,
+            only_type: None,
+        }
+    }
+
+    #[test]
+    fn corpus_wide_refuses_dates_in_text_and_says_why() {
+        let e = refuse_combinations(&args(false, false, true)).unwrap_err();
+        assert!(e.message.contains("first date"), "{}", e.message);
+        assert!(refuse_combinations(&args(false, false, false)).is_ok());
+        assert!(refuse_combinations(&args(true, false, true)).is_ok());
+        assert!(refuse_combinations(&args(false, true, true)).is_ok());
+    }
+
+    #[test]
+    fn corpus_wide_still_refuses_resume() {
+        let mut a = args(false, false, false);
+        a.resume = true;
+        assert!(refuse_combinations(&a).unwrap_err().message.contains("--resume"));
+    }
+
+    fn stored(rows: usize, collapsed: usize) -> QuestionResult {
+        let mut r = result("multi-session", &["g"], &["g"]);
+        r.rows_written = rows;
+        r.writes_collapsed = collapsed;
+        r
+    }
+
+    #[test]
+    fn corpus_wide_counts_rows_from_the_shared_corpus_and_collapses_apart() {
+        let shared = SharedCorpus {
+            owners: HashMap::new(),
+            rows_written: 18_464,
+            writes_collapsed: 731,
+            missing: HashMap::new(),
+        };
+        let results = vec![stored(0, 0), stored(0, 0)];
+        assert_eq!(store_counts(Some(&shared), false, &results), (18_464, 731));
+    }
+
+    #[test]
+    fn scoped_sums_rows_and_collapses_per_question() {
+        let results = vec![stored(47, 1), stored(53, 0)];
+        assert_eq!(store_counts(None, false, &results), (100, 1));
+    }
+
+    #[test]
+    fn isolated_holds_the_last_haystack_and_sums_every_collapse() {
+        let results = vec![stored(47, 1), stored(53, 2)];
+        assert_eq!(store_counts(None, true, &results), (53, 3));
     }
 
     #[test]
