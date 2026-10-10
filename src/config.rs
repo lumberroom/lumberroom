@@ -411,10 +411,15 @@ fn parse_previous_spec(dim: usize, cache_dir: &str) -> Result<Option<EmbedderSpe
     let remote = RemoteEmbedConfig {
         base_url: env("EMBED_PREVIOUS_BASE_URL", "").trim_end_matches('/').to_string(),
         api_key: env_opt("EMBED_PREVIOUS_API_KEY"),
-        query_prefix: env_opt("EMBED_PREVIOUS_QUERY_PREFIX")
-            .unwrap_or_else(|| default_embed_prefixes(&model).0.to_string()),
-        document_prefix: env_opt("EMBED_PREVIOUS_DOCUMENT_PREFIX")
-            .unwrap_or_else(|| default_embed_prefixes(&model).1.to_string()),
+        // Read as the current block's prefixes are: whitespace kept, set-but-empty means none.
+        query_prefix: embed_prefix(
+            std::env::var("EMBED_PREVIOUS_QUERY_PREFIX").ok(),
+            default_embed_prefixes(&model).0,
+        ),
+        document_prefix: embed_prefix(
+            std::env::var("EMBED_PREVIOUS_DOCUMENT_PREFIX").ok(),
+            default_embed_prefixes(&model).1,
+        ),
         max_input_chars: match env_num("EMBED_PREVIOUS_MAX_INPUT_CHARS", 0usize)? {
             0 => None,
             n => Some(n),
@@ -426,6 +431,9 @@ fn parse_previous_spec(dim: usize, cache_dir: &str) -> Result<Option<EmbedderSpe
             "EMBED_PREVIOUS_PROVIDER=openai needs EMBED_PREVIOUS_BASE_URL, the endpoint up to and \
              including /v1",
         ));
+    }
+    if provider == EmbedProvider::Openai {
+        check_base_url("EMBED_PREVIOUS_BASE_URL", &remote.base_url)?;
     }
     Ok(Some(EmbedderSpec { provider, model, dim, cache_dir: cache_dir.to_string(), remote }))
 }
@@ -818,9 +826,14 @@ fn embed_prefix(raw: Option<String>, default: &str) -> String {
 /// `EMBED_BASE_URL` parsed at boot. A typo here otherwise surfaces as a failed write long after the
 /// deploy, and the API key travels to whatever host this names.
 fn check_embed_base_url(raw: &str) -> Result<()> {
+    check_base_url("EMBED_BASE_URL", raw)
+}
+
+/// `check_embed_base_url` for either block; `var` names the setting in the refusal.
+fn check_base_url(var: &str, raw: &str) -> Result<()> {
     let refuse = |why: &str| {
         DomainError::validation(format!(
-            "EMBED_BASE_URL {raw:?} {why}. Give the endpoint up to and including /v1, as \
+            "{var} {raw:?} {why}. Give the endpoint up to and including /v1, as \
              http://host:port/v1 or https://host/v1"
         ))
     };
