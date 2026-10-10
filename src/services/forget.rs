@@ -236,6 +236,7 @@ pub async fn by_query(
             },
             include_superseded: true,
             tags: vec![],
+            slot: u.slot,
         })
         .await?;
 

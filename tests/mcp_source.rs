@@ -297,6 +297,7 @@ async fn setup(mode: AuthMode) -> Option<Harness> {
         keys: ctx.keys.clone(),
         kek_verified: ctx.kek_verified,
         proposals: vec![],
+        embedding_status: None,
     });
     let authenticator = auth::create(&ctx.cfg, Some(Arc::clone(&oauth))).ok()?;
     let app = lumberroom_server::http::router(state, authenticator);

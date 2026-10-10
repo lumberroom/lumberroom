@@ -40,6 +40,7 @@ src/mcp/        tool registration and the tool descriptions.
 src/http/       axum routes; the MCP transport mounts at /mcp.
 src/console/    the operator web console: mod.rs (router), pages.rs (HTML), data.rs, aliases.rs,
                 clients.rs, cleanup.rs.
+src/command/    embeddings.rs, the `lumberroom-server embeddings` subcommand (decision 0027).
 src/bin/        prefetch.rs, the model-download step the container build runs separately.
 migrations/     SQL, applied at boot by sqlx.
 ```
@@ -107,6 +108,42 @@ mutating actions, up from the handful the console started with; `pages.rs` rende
 self-contained HTML string, and a test (`tests/console.rs`,
 `every_page_is_self_contained`) asserts that shape holds. It depends on `services/` the same way the
 MCP tool layer does: through the service constructors, never through `adapters::postgres` directly.
+
+## Embedding models and the switch between them
+
+Decisions [0027](decisions/0027-the-server-moves-its-own-embeddings.md) and
+[0029](decisions/0029-thresholds-belong-to-the-model.md) carry the reasoning; this is the shape.
+
+**Two slots and a pointer.** Every `memory` row has two vector columns, `embedding` (slot A) and
+`embedding_b` (slot B), each with its own HNSW index and a `_model` column naming the embedder id
+that produced it. `embedding_state` holds one row per unit (a `tenant_id`) with the model in each
+slot and the `active_slot`. Readers pass a `VectorSlot` in each query struct and the Postgres adapter
+picks between two literal statements, a slot-A one and its slot-B twin. No SQL builds a column name
+at runtime, and tests hold each twin to its original.
+
+**`EmbedderSet` and `UnitEmbedding`.** `services::embedders::EmbedderSet` holds every configured
+embedder, the configured view (current model, previous model, retire, flip scope) and an in-memory
+map of unit states. `for_unit` answers a request with the unit's active slot, its embedder, the
+other configured embedder for dual writes, and the active model's thresholds. A stale map entry is
+safe: the slot it names still holds its model until retire clears it.
+
+**The sweep.** `services::embedding_migration` runs a pass every `EMBED_MIGRATE_SECS`. Each pass
+derives the view, seeds a state row for any unit that has vectors and none, and per unit names the
+inactive slot, fills it at a paced rate, flips the pointer once nothing is pending, or retires the
+old slot once its window has passed. The phase rules are pure functions in
+`domain::embedding_phase`. Private rows open through the `RowOpener` port, free disk comes through
+the `FreeSpace` port (`adapters::disk`, `statvfs` through `rustix`), and every statement sits behind
+`EmbeddingMigrationRepository` (`adapters::postgres::embedding_migration`).
+
+**The control row.** `embedding_control` is one row per instance. `lumberroom-server embeddings`
+(`src/command/embeddings.rs`, decisions in `domain::embedding_command`) writes the operator's intent
+there under a row lock. In `command` mode the sweep derives its view from that row each pass and
+publishes its status back; in `env` mode it derives the view from `.env` at boot and never touches
+the row. The console's reading page renders the same status.
+
+**Thresholds per model.** `domain::similarity` holds the keys, a value table per model family and
+the cross-key checks. Each configured model resolves its own values once at boot, and every
+consumer reads them from the request's `UnitEmbedding`, never from config.
 
 ## Prod readiness
 

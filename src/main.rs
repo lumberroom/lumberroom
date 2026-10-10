@@ -10,20 +10,22 @@
 //! operator needs both before the server will start in oauth mode.
 
 // The modules live in lib.rs so the integration suite can reach them; main is the entry point.
-use lumberroom_server::{adapters, config, crypto, domain, http, mcp, ports, services};
+use lumberroom_server::{adapters, command, config, crypto, domain, http, mcp, ports, services};
 
+use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Read, Write};
 use std::sync::Arc;
 
-use adapters::embedding::LocalEmbedder;
 use adapters::postgres::{self as pg, KekCheck};
-use config::{EmbedProvider, KekProvider};
+use config::{EmbedProvider, EmbedderSpec, KekProvider};
 use crypto::kek::{EnvKeyProvider, FileKeyProvider, KeyProvider};
+use domain::embedding_migration::{Configured, ControlMode, FlipScope, Intent, UnitState};
 use domain::errors::{DomainError, Result};
-use domain::similarity;
+use domain::similarity::{self, SimilarityThresholds};
 use mcp::AppState;
-use ports::Embedder;
+use ports::{Embedder, EmbeddingMigrationRepository, FreeSpace};
 use services::embedders::EmbedderSet;
+use services::embedding_migration::{Knobs, SingleUnit, Steer, Sweep};
 
 const USAGE: &str = "\
 lumberroom-server: durable memory over MCP
@@ -32,6 +34,8 @@ lumberroom-server: durable memory over MCP
   lumberroom-server hash-password    read a password on stdin, print an argon2id hash for OWNER_PASSWORD_HASH
   lumberroom-server generate-kek     print a fresh key-encryption key as hex, for KEK_PATH
   lumberroom-server verify-kek       report whether the configured KEK is the one this store was sealed with
+  lumberroom-server verify-embedding  check the embedding configuration against the store, load nothing
+  lumberroom-server embeddings <verb> switch embedding models: status | start | flip | rollback | retire
 ";
 
 #[tokio::main]
@@ -46,6 +50,18 @@ async fn main() {
         Some("hash-password") => (hash_password(), "lumberroom-server hash-password"),
         Some("generate-kek") => (generate_kek(), "lumberroom-server generate-kek"),
         Some("verify-kek") => (verify_kek_command().await, "lumberroom-server verify-kek"),
+        Some("verify-embedding") => {
+            (verify_embedding_command().await, "lumberroom-server verify-embedding")
+        }
+        // The command owns its exit codes (0 applied or no-op, 1 refused, 2 usage or wrong mode,
+        // 3 written but not applied), so only a failure to reach the store comes back here.
+        Some("embeddings") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            match command::embeddings::run(args, similarity::Registry::engine()).await {
+                Ok(code) => std::process::exit(code),
+                Err(e) => (Err(e), "lumberroom-server embeddings"),
+            }
+        }
         Some("-h" | "--help" | "help") => {
             print!("{USAGE}");
             return;
@@ -87,6 +103,7 @@ async fn run() -> Result<()> {
         tracing::info!("migrations up to date");
     }
     let dim = pg::assert_embedding_dim(&pool, cfg.embed.dim).await?;
+    pg::assert_embedding_b_dim(&pool, cfg.embed.dim).await?;
     pg::ensure_recall_settings(&pool).await?;
     tracing::info!(embedding_dim = dim, "schema checked");
 
@@ -105,9 +122,44 @@ async fn run() -> Result<()> {
     let keys = key_provider(&cfg);
     let kek_verified = verify_kek_at_boot(&pool, &cfg, keys.as_ref()).await?;
 
-    let embedder = warm_embedder(&cfg).await?;
-    tracing::info!(id = %embedder.id(), "embedder ready");
-    let embedders = embedder_set(&cfg, embedder)?;
+    // Every embedding refusal runs before any weights load: a boot that is going to refuse should
+    // not first spend the time a local model takes to warm.
+    let registry = similarity::Registry::engine();
+    refuse_hash_beside_previous(&cfg)?;
+    let blocks = resolve_blocks(&cfg, &registry)?;
+    for (model, keys) in &blocks.guessed {
+        tracing::warn!(
+            model = %model,
+            keys = ?keys,
+            "no threshold table entry for this embedding model; these keys use bge-base-en-v1.5's values"
+        );
+    }
+    let migration: Arc<dyn EmbeddingMigrationRepository> =
+        Arc::new(pg::PgEmbeddingMigrationRepository::new(pool.clone()));
+    let seeded = migration.seed().await?;
+    if !seeded.is_empty() {
+        tracing::info!(
+            units = ?seeded.iter().map(|s| s.unit.as_str()).collect::<Vec<_>>(),
+            "seeded embedding state from the vectors each unit holds"
+        );
+    }
+    let states = migration.states().await?;
+    let intent = match cfg.embed.migrate.control {
+        ControlMode::Command => migration.control().await?.0,
+        ControlMode::Env => Intent::default(),
+    };
+    let view = configured_view(&cfg, &blocks, &states, &intent)?;
+    embedding_boot_check(&cfg, &blocks, &states, &view)?;
+    let disk = disk_floor(&cfg)?;
+
+    let mut built = Vec::with_capacity(blocks.specs.len());
+    for spec in &blocks.specs {
+        let embedder = build_embedder(spec).await?;
+        tracing::info!(id = %embedder.id(), "embedder ready");
+        built.push(embedder);
+    }
+    let embedders = Arc::new(EmbedderSet::new(built, view.clone(), blocks.thresholds.clone()));
+    embedders.set_states(states);
 
     // The concrete memory repository is kept so it can be handed up as two handles: the port the
     // services read through, and the ciphertext reader they decrypt through. One object, because a
@@ -124,6 +176,26 @@ async fn run() -> Result<()> {
     let aliases: Arc<dyn lumberroom_server::ports::AliasRepository> =
         Arc::new(pg::PgAliasRepository::new(pool.clone()));
     warn_on_stranded_user_namespaces(memories.as_ref(), &cfg).await;
+
+    // Seeding and every boot check above run with the sweep off too; only fill, flip and retire
+    // stop.
+    let sweep = if cfg.embed.migrate.secs == 0 {
+        tracing::info!(
+            "embedding sweep is off (EMBED_MIGRATE_SECS=0): no fill, flip or retire runs, and the \
+             console shows no model-change status"
+        );
+        None
+    } else {
+        Some(Arc::new(Sweep::new(
+            migration,
+            Arc::clone(&embedders),
+            row_opener(Arc::clone(&memories) as Arc<dyn services::SealedReader>, keys.clone()),
+            Knobs::from_config(&cfg),
+            steer(&cfg, &blocks, view),
+            kek_verified,
+            disk,
+        )))
+    };
 
     let repos = services::Repos {
         aliases: Arc::clone(&aliases),
@@ -143,6 +215,7 @@ async fn run() -> Result<()> {
         ingest,
         cleanup: Arc::clone(&cleanup),
         embedders: Arc::clone(&embedders),
+        embedding_status: sweep.as_ref().map(|s| Arc::clone(&s.status)),
         keys,
         kek_verified,
         proposals: Vec::new(),
@@ -164,6 +237,12 @@ async fn run() -> Result<()> {
         Arc::clone(&embedders),
         pool.clone(),
     );
+    if let Some(sweep) = sweep {
+        tokio::spawn(sweep.run_loop(
+            Arc::new(SingleUnit(cfg.tenant_id.clone())),
+            std::time::Duration::from_secs(cfg.embed.migrate.secs),
+        ));
+    }
 
     let app = http::router(Arc::clone(&state), auth)
         // The digest is a few KB; anything much larger is a mistake or an attack.
@@ -616,63 +695,330 @@ async fn verify_kek_command() -> Result<()> {
     }
 }
 
-/// Resolves the model's thresholds once, here and nowhere else. The fork extends the registry at
-/// this point with its own keys. An unknown override key or a failed cross-key check stops the
-/// boot; a key the table has no value for runs on bge-base-en-v1.5's and the log names it.
-fn embedder_set(cfg: &config::Config, embedder: Arc<dyn Embedder>) -> Result<Arc<EmbedderSet>> {
+/// `lumberroom-server verify-embedding`: the embedding boot checks, with no embedder built and no
+/// weights loaded.
+///
+/// An operator runs it before recreating the server, as `verify-kek` checks a key; no script in
+/// `deploy/` or `scripts/` calls either one. It may run before the new image migrates the store,
+/// so a store with no `embedding_b` column or no state table counts as pre-migration and only the
+/// configuration is checked. It seeds nothing:
+/// a unit with vectors and no state row is the boot's to seed.
+async fn verify_embedding_command() -> Result<()> {
+    let cfg = config::load()?;
     let registry = similarity::Registry::engine();
-    let unknown = registry.unknown_keys(&cfg.embed.thresholds);
-    if !unknown.is_empty() {
-        return Err(DomainError::validation(format!(
-            "EMBED_THRESHOLDS names keys no table registers: {}. Known keys: {}.",
-            unknown.join(", "),
-            registry.keys().iter().map(|k| k.key).collect::<Vec<_>>().join(", ")
-        )));
+    refuse_hash_beside_previous(&cfg)?;
+    let blocks = resolve_blocks(&cfg, &registry)?;
+    let control = match cfg.embed.migrate.control {
+        ControlMode::Command => "command",
+        ControlMode::Env => "env",
+    };
+    println!("control:  {control}");
+    for (role, id) in ["current", "previous"].iter().zip(&blocks.ids) {
+        println!("{role}:  {id}");
     }
+    for (model, keys) in &blocks.guessed {
+        println!("guessed:  {model} runs on bge-base-en-v1.5's values for {}", keys.join(", "));
+    }
+    if disk_floor(&cfg)?.is_some() {
+        println!("disk:     statvfs({}) answers", cfg.embed.disk.path);
+    }
+
+    let pool = pg::connect_with(&cfg.database_url, &cfg.db).await?;
+    let read = read_embedding_store(&pool, &cfg).await;
+    pool.close().await;
+    let (states, intent) = match read? {
+        Some(read) => read,
+        None => {
+            println!(
+                "store:    pre-migration (no memory.embedding_b column or no embedding_state \
+                 table). Checked the configuration only; the new image's migrations create both."
+            );
+            (Vec::new(), Intent::default())
+        }
+    };
+    for s in &states {
+        println!(
+            "unit:     {} active on {} in slot {}",
+            s.unit,
+            s.active_model(),
+            s.active_slot.as_str()
+        );
+    }
+
+    let view = configured_view(&cfg, &blocks, &states, &intent)?;
+    embedding_boot_check(&cfg, &blocks, &states, &view)?;
+    println!("verified: yes");
+    Ok(())
+}
+
+/// The states and, in command mode, the intent, after both width checks. None on a pre-migration
+/// store.
+async fn read_embedding_store(
+    pool: &sqlx::PgPool,
+    cfg: &config::Config,
+) -> Result<Option<(Vec<UnitState>, Intent)>> {
+    if !pg::embedding_migration_schema(pool).await? {
+        return Ok(None);
+    }
+    pg::assert_embedding_dim(pool, cfg.embed.dim).await?;
+    pg::assert_embedding_b_dim(pool, cfg.embed.dim).await?;
+    let repo = pg::PgEmbeddingMigrationRepository::new(pool.clone());
+    let states = repo.states().await?;
+    let intent = match cfg.embed.migrate.control {
+        ControlMode::Command => repo.control().await?.0,
+        ControlMode::Env => Intent::default(),
+    };
+    Ok(Some((states, intent)))
+}
+
+/// The configured embedding blocks, `EMBED_*` and then `EMBED_PREVIOUS_*` when set, each with its
+/// model's thresholds resolved. Computed from config alone, so `verify-embedding` and the boot
+/// refuse on the same values.
+struct Blocks {
+    specs: Vec<EmbedderSpec>,
+    /// `id_for` each spec, in the same order.
+    ids: Vec<String>,
+    thresholds: HashMap<String, Arc<SimilarityThresholds>>,
+    guessed_acting: BTreeMap<String, Vec<String>>,
+    /// Every guessed key per model, acting or not, for the boot warning.
+    guessed: Vec<(String, Vec<String>)>,
+}
+
+/// Resolves each model's thresholds once, here and nowhere else. The fork extends the registry
+/// before this call. An unknown override key or a failed cross-key check stops the boot; a key the
+/// table has no value for runs on bge-base-en-v1.5's and the caller names it.
+fn resolve_blocks(cfg: &config::Config, registry: &similarity::Registry) -> Result<Blocks> {
+    let mut sources =
+        vec![(cfg.embed.current_spec(), cfg.embed.thresholds.as_slice(), "EMBED_THRESHOLDS")];
+    if let Some(previous) = cfg.embed.previous_spec() {
+        sources.push((
+            previous,
+            cfg.embed.previous_thresholds.as_slice(),
+            "EMBED_PREVIOUS_THRESHOLDS",
+        ));
+    }
+    // Empty whenever two blocks are configured: config refuses an old single threshold variable
+    // beside a second model, since nobody can say which model it was tuned on.
     let legacy = cfg.legacy_thresholds();
-    let t = registry.resolve(&embedder.id(), &cfg.embed.thresholds, &legacy);
-    // Installer deployments copied an .env.example that set DEDUPE_THRESHOLD=0.97 and its
-    // siblings. Those beat the family table, so a store that switches models keeps bge's scale
-    // with no other sign. Before the check, so a refusal the old value caused arrives explained.
-    for (l, table) in registry.legacy_departures(&t.model, &cfg.embed.thresholds, &legacy) {
-        tracing::warn!(
-            variable = l.variable,
-            value = l.value,
-            table_value = table,
-            model = %t.model,
-            "an old single threshold variable overrides this model's table value; clear it unless \
-             it was tuned on this model, or move it into EMBED_THRESHOLDS"
-        );
+
+    let mut blocks = Blocks {
+        specs: Vec::new(),
+        ids: Vec::new(),
+        thresholds: HashMap::new(),
+        guessed_acting: BTreeMap::new(),
+        guessed: Vec::new(),
+    };
+    for (spec, overrides, variable) in sources {
+        let unknown = registry.unknown_keys(overrides);
+        if !unknown.is_empty() {
+            return Err(DomainError::validation(format!(
+                "{variable} names keys no table registers: {}. Known keys: {}.",
+                unknown.join(", "),
+                registry.keys().iter().map(|k| k.key).collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let id = adapters::embedding::id_for(&spec);
+        let t = registry.resolve(&id, overrides, &legacy);
+        // Installer deployments copied an .env.example that set DEDUPE_THRESHOLD=0.97 and its
+        // siblings. Those beat the family table, so a store that switches models keeps bge's scale
+        // with no other sign. Before the check, so a refusal the old value caused arrives explained.
+        for (l, table) in registry.legacy_departures(&t.model, overrides, &legacy) {
+            tracing::warn!(
+                variable = l.variable,
+                value = l.value,
+                table_value = table,
+                model = %t.model,
+                "an old single threshold variable overrides this model's table value; clear it \
+                 unless it was tuned on this model, or move it into EMBED_THRESHOLDS"
+            );
+        }
+        let problems = registry.check(&t);
+        if !problems.is_empty() {
+            return Err(DomainError::validation(problems.join("; ")));
+        }
+        let guessed: Vec<String> = t.guessed().into_iter().map(str::to_string).collect();
+        if !guessed.is_empty() {
+            blocks.guessed.push((id.clone(), guessed));
+        }
+        blocks.guessed_acting.insert(id.clone(), registry.guessed_acting(&t));
+        blocks.thresholds.insert(id.clone(), Arc::new(t));
+        blocks.ids.push(id);
+        blocks.specs.push(spec);
     }
-    let problems = registry.check(&t);
-    if !problems.is_empty() {
-        return Err(DomainError::validation(problems.join("; ")));
+    Ok(blocks)
+}
+
+/// The hash embedder's vectors are a token sketch no model's vectors compare with, so a migration
+/// to or from it moves nothing a search can use. It stays legal on its own, for tests.
+fn refuse_hash_beside_previous(cfg: &config::Config) -> Result<()> {
+    let Some(previous) = &cfg.embed.previous else { return Ok(()) };
+    let hashed: Vec<&str> =
+        [("EMBED_PROVIDER", cfg.embed.provider), ("EMBED_PREVIOUS_PROVIDER", previous.provider)]
+            .into_iter()
+            .filter(|(_, provider)| *provider == EmbedProvider::Hash)
+            .map(|(variable, _)| variable)
+            .collect();
+    if hashed.is_empty() {
+        return Ok(());
     }
-    let guessed = t.guessed();
-    if !guessed.is_empty() {
-        tracing::warn!(
-            model = %t.model,
-            keys = ?guessed,
-            "no threshold table entry for this embedding model; these keys use bge-base-en-v1.5's values"
-        );
-    }
-    Ok(Arc::new(EmbedderSet::single(
-        Arc::clone(&embedder),
-        std::collections::HashMap::from([(embedder.id(), Arc::new(t))]),
+    Err(DomainError::validation(format!(
+        "{} selects the hash embedder while EMBED_PREVIOUS_* is set. Its vectors are a token \
+         sketch that no model's vectors can be compared with. Configure a model in both blocks, \
+         or remove the EMBED_PREVIOUS_* block.",
+        hashed.join(" and ")
     )))
+}
+
+/// The view the phase rules read. Env mode fixes it here from `.env`; command mode derives it from
+/// the control row, and the sweep derives it again on every pass.
+fn configured_view(
+    cfg: &config::Config,
+    blocks: &Blocks,
+    states: &[UnitState],
+    intent: &Intent,
+) -> Result<Configured> {
+    let m = &cfg.embed.migrate;
+    match m.control {
+        ControlMode::Env => Ok(Configured {
+            current: blocks.ids[0].clone(),
+            previous: blocks.ids.get(1).cloned(),
+            retire: m.retire.clone(),
+            flip: m.flip.clone().unwrap_or(FlipScope::All),
+            rollback_days: m.rollback_days,
+            guessed_acting: blocks.guessed_acting.clone(),
+            generation: None,
+        }),
+        // The default unit's active model, as the sweep's first listed unit gives it.
+        ControlMode::Command => domain::embedding_command::configured_from_intent(
+            intent,
+            &blocks.ids,
+            states.iter().find(|s| s.unit == cfg.tenant_id).map(UnitState::active_model),
+            m.rollback_days,
+            &blocks.guessed_acting,
+        )
+        .map_err(DomainError::validation),
+    }
+}
+
+/// `boot_check`, plus the two command-mode rules it cannot see. With no target written, command
+/// mode's view names only the model the default unit is active on, so `boot_check` alone would
+/// pass a unit active on a model no block configures, and a request for it would fail on every
+/// call. It would also pass two blocks naming one model.
+fn embedding_boot_check(
+    cfg: &config::Config,
+    blocks: &Blocks,
+    states: &[UnitState],
+    view: &Configured,
+) -> Result<()> {
+    if cfg.embed.migrate.control == ControlMode::Command {
+        let refusals = command_mode_refusals(&blocks.ids, states);
+        if !refusals.is_empty() {
+            return Err(DomainError::validation(refusals.join("\n")));
+        }
+    }
+    domain::embedding_phase::boot_check(states, view).map_err(DomainError::validation)
+}
+
+fn command_mode_refusals(ids: &[String], states: &[UnitState]) -> Vec<String> {
+    let mut refusals = Vec::new();
+    if let [current, previous] = ids {
+        if current == previous {
+            refusals.push(format!(
+                "EMBED_PREVIOUS_* names the same model as EMBED_*: {current}. Remove the \
+                 EMBED_PREVIOUS_* block, or point it at the other model."
+            ));
+        }
+    }
+    let off: Vec<String> = states
+        .iter()
+        .filter(|s| !ids.iter().any(|id| id == s.active_model()))
+        .map(|s| format!("{} (active on {})", s.unit, s.active_model()))
+        .collect();
+    if !off.is_empty() {
+        refusals.push(format!(
+            "units active on a model no block configures: {}. This server configures {}. Either \
+             set EMBED_* back to the model each unit is active on, or name that model in \
+             EMBED_PREVIOUS_* and run lumberroom-server embeddings start.",
+            off.join(", "),
+            ids.join(" and ")
+        ));
+    }
+    refusals
+}
+
+/// The free-space reader the sweep pauses on, or None with no floor set. The first read happens
+/// here, so a path statvfs cannot read refuses the boot instead of pausing every pass.
+fn disk_floor(cfg: &config::Config) -> Result<Option<Arc<dyn FreeSpace>>> {
+    let d = &cfg.embed.disk;
+    if d.floor_mb == 0 {
+        return Ok(None);
+    }
+    let disk = adapters::disk::StatvfsFreeSpace { path: d.path.clone() };
+    let free = disk.free_bytes().map_err(|e| {
+        DomainError::validation(format!(
+            "EMBED_DISK_FLOOR_MB={} needs the free space under EMBED_DISK_PATH={}, and statvfs \
+             failed: {}. Point EMBED_DISK_PATH at a path on the database's filesystem as this \
+             process sees it, or set EMBED_DISK_FLOOR_MB=0.",
+            d.floor_mb,
+            d.path,
+            e.log_message()
+        ))
+    })?;
+    tracing::info!(
+        path = %d.path,
+        free_bytes = free,
+        floor_bytes = d.floor_mb.saturating_mul(1_048_576),
+        "embedding disk floor set"
+    );
+    Ok(Some(Arc::new(disk)))
+}
+
+/// Where the sweep's view comes from: `.env` at boot, or the control row on every pass.
+fn steer(cfg: &config::Config, blocks: &Blocks, view: Configured) -> Steer {
+    match cfg.embed.migrate.control {
+        ControlMode::Env => Steer::Env(view),
+        ControlMode::Command => Steer::Command {
+            blocks: blocks.ids.clone(),
+            rollback_days: cfg.embed.migrate.rollback_days,
+            guessed_acting: blocks.guessed_acting.clone(),
+        },
+    }
+}
+
+/// With no KEK provider the sweep cannot open a private row. `kek_verified` is false then, so the
+/// sweep skips those rows and reports `blocked: kek` instead of counting each as a failure.
+fn row_opener(
+    reader: Arc<dyn services::SealedReader>,
+    keys: Option<Arc<dyn KeyProvider>>,
+) -> Arc<dyn services::row_opener::RowOpener> {
+    match keys {
+        Some(keys) => Arc::new(services::row_opener::ServiceKeyOpener { reader, keys }),
+        None => Arc::new(services::row_opener::NoOpener),
+    }
 }
 
 /// A model that fails to load stops the boot. Falling back to another embedder would write vectors
 /// that no existing row can be compared with (decision 0028).
-async fn warm_embedder(cfg: &config::Config) -> Result<Arc<dyn Embedder>> {
-    if cfg.embed.provider != EmbedProvider::Local {
-        return adapters::embedding::create(cfg);
-    }
+///
+/// Only a local model warms here. A remote embedder makes no call at boot: a probe would put
+/// compose in a restart loop behind a sidecar that starts late.
+async fn build_embedder(spec: &EmbedderSpec) -> Result<Arc<dyn Embedder>> {
     let started = std::time::Instant::now();
-    let local = LocalEmbedder::new(&cfg.embed.model, cfg.embed.dim, &cfg.embed.cache_dir)?;
-    local.warm().await?;
-    tracing::info!(ms = started.elapsed().as_millis(), "embedder loaded");
-    Ok(Arc::new(local))
+    let embedder = adapters::embedding::create_spec(spec)?;
+    // Thresholds and state were resolved against `id_for`. An adapter whose id drifted from it
+    // would serve every request with no thresholds.
+    let expected = adapters::embedding::id_for(spec);
+    if embedder.id() != expected {
+        return Err(DomainError::internal(format!(
+            "the embedder reports id {} where config computes {expected}",
+            embedder.id()
+        )));
+    }
+    if spec.provider == EmbedProvider::Local {
+        embedder.embed_documents(vec!["warm".to_string()]).await?;
+        tracing::info!(id = %expected, ms = started.elapsed().as_millis(), "embedder loaded");
+    }
+    Ok(embedder)
 }
 
 fn init_tracing() {
@@ -705,5 +1051,46 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => tracing::info!(signal = "SIGINT", "shutting down"),
         _ = terminate => tracing::info!(signal = "SIGTERM", "shutting down"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::embedding_slot::VectorSlot;
+
+    fn unit(name: &str, active: &str) -> UnitState {
+        UnitState {
+            unit: name.into(),
+            active_slot: VectorSlot::A,
+            model_a: Some(active.into()),
+            model_b: None,
+            flipped_at: None,
+        }
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn command_mode_passes_units_on_either_block() {
+        let states = [unit("me", "bge"), unit("other", "gemma")];
+        assert!(command_mode_refusals(&ids(&["gemma", "bge"]), &states).is_empty());
+    }
+
+    #[test]
+    fn command_mode_refuses_a_unit_active_on_no_block() {
+        let refusals = command_mode_refusals(&ids(&["gemma"]), &[unit("me", "bge")]);
+        assert_eq!(refusals.len(), 1);
+        assert!(refusals[0].contains("me (active on bge)"), "{}", refusals[0]);
+        assert!(refusals[0].contains("configures gemma"), "{}", refusals[0]);
+    }
+
+    #[test]
+    fn command_mode_refuses_two_blocks_naming_one_model() {
+        let refusals = command_mode_refusals(&ids(&["bge", "bge"]), &[unit("me", "bge")]);
+        assert_eq!(refusals.len(), 1);
+        assert!(refusals[0].contains("same model"), "{}", refusals[0]);
     }
 }

@@ -291,4 +291,6 @@ docker compose exec -T server lumberroom-server verify-kek
   screen.
 - [../DEPLOY.md](../DEPLOY.md): the runbook. Both deploy paths, the key-encryption key, backups,
   troubleshooting.
+- [switching-embedding-models.md](switching-embedding-models.md): moving the store to a new
+  embedding model with `lumberroom-server embeddings`, and rolling it back.
 - [faq.md](faq.md): the short answers, with links to the long ones.

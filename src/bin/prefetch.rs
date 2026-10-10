@@ -3,10 +3,20 @@
 //! A first-request download on the VM is a silent failure mode when egress is locked down, so the
 //! weights ship inside the image instead. Same reasoning as the previous build; different runtime.
 
+/// The image carries the weights while either block names a local model. A previous block on
+/// `local` keeps its weights in the image through the whole rollback window.
+fn should_download(provider: &str, previous_provider: Option<&str>) -> bool {
+    provider == "local" || previous_provider == Some("local")
+}
+
 fn main() {
     let provider = std::env::var("EMBED_PROVIDER").unwrap_or_else(|_| "local".into());
-    if provider != "local" {
-        println!("prefetch skipped: EMBED_PROVIDER={provider}");
+    let previous = std::env::var("EMBED_PREVIOUS_PROVIDER").ok().filter(|p| !p.is_empty());
+    if !should_download(&provider, previous.as_deref()) {
+        println!(
+            "prefetch skipped: EMBED_PROVIDER={provider} EMBED_PREVIOUS_PROVIDER={}",
+            previous.as_deref().unwrap_or("")
+        );
         return;
     }
 
@@ -36,5 +46,20 @@ fn main() {
             eprintln!("prefetch produced no vector: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_download;
+
+    #[test]
+    fn prefetch_runs_when_either_block_is_local() {
+        assert!(should_download("local", None));
+        assert!(should_download("local", Some("openai")));
+        assert!(should_download("openai", Some("local")));
+        assert!(!should_download("openai", None));
+        assert!(!should_download("openai", Some("openai")));
+        assert!(!should_download("hash", Some("hash")));
     }
 }

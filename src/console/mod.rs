@@ -52,6 +52,7 @@ pub mod aliases;
 pub mod cleanup;
 pub mod clients;
 pub mod data;
+pub mod embedding;
 pub mod pages;
 
 use std::net::SocketAddr;
@@ -216,6 +217,17 @@ impl Console {
             last_write: None,
             now: chrono::Utc::now(),
         }
+    }
+
+    /// The model-change section, from the sweep's last published status. The status is cloned out
+    /// so the lock is not held while the page renders.
+    fn embedding_section(&self) -> Option<String> {
+        let status = self.state.embedding_status.as_ref()?.read().ok()?.clone();
+        let summary = crate::services::embedding_status::summary(
+            &status,
+            self.state.embedders.all_thresholds(),
+        );
+        Some(embedding::section(&status, &summary))
     }
 
     /// Every route goes through this. Two refusals, in this order: a mode with no owner password,
@@ -474,7 +486,10 @@ async fn reading(
         Err(e) => return failed(&app, "the entries did not load", &e),
     };
 
-    page(StatusCode::OK, pages::reading(&contents, &listing, None, &health))
+    page(
+        StatusCode::OK,
+        pages::reading(&contents, &listing, None, &health, app.embedding_section().as_deref()),
+    )
 }
 
 async fn namespace(
@@ -529,7 +544,7 @@ async fn namespace(
         Err(e) => return failed(&app, "the entries did not load", &e),
     };
 
-    page(StatusCode::OK, pages::reading(&contents, &listing, Some(&ns), &health))
+    page(StatusCode::OK, pages::reading(&contents, &listing, Some(&ns), &health, None))
 }
 
 async fn fact(State(app): State<Console>, headers: HeaderMap, Path(id): Path<String>) -> Response {

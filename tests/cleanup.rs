@@ -230,6 +230,7 @@ async fn setup() -> Option<Harness> {
         keys: ctx.keys.clone(),
         kek_verified: ctx.kek_verified,
         proposals: Vec::new(),
+        embedding_status: None,
     });
     let authenticator = auth::create(&ctx.cfg, Some(oauth)).ok()?;
     let app = lumberroom_server::http::router(state, authenticator);
@@ -469,7 +470,16 @@ async fn the_similarity_window_admits_a_pair_where_only_one_side_is_new() {
         since: Some(Utc::now() - chrono::Duration::days(1)),
         limit: 100,
     };
-    let pairs = h.repo.similar_pairs(&h.ctx.cfg.tenant_id, &q, 0.0).await.unwrap();
+    let pairs = h
+        .repo
+        .similar_pairs(
+            &h.ctx.cfg.tenant_id,
+            &q,
+            0.0,
+            lumberroom_server::domain::embedding_slot::VectorSlot::A,
+        )
+        .await
+        .unwrap();
     let covered = pairs.iter().any(|p| {
         let ids = [p.older.id.as_str(), p.newer.id.as_str()];
         ids.contains(&old.as_str()) && ids.contains(&fresh.as_str())

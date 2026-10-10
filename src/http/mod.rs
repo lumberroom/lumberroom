@@ -347,8 +347,18 @@ fn static_checks(
 }
 
 async fn readyz(State(http): State<Http>) -> Response {
+    // The default unit's active model. Mid-migration that is the model its searches embed with,
+    // which after a flip or a rollback is not the one `EMBED_*` names.
+    let embedder = match http.state.embedders.for_unit(&http.state.cfg.tenant_id) {
+        Ok(u) => u.embedder,
+        Err(e) => {
+            let checks = serde_json::json!({ "error": e.client_message() });
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(merge_ok(checks, false)))
+                .into_response();
+        }
+    };
     let mut checks = static_checks(
-        &http.state.embedders.current().id(),
+        &embedder.id(),
         http.state.cfg.mode_str(),
         http.state.cfg.crypto.provider.as_str(),
         http.state.kek_verified,
@@ -360,7 +370,7 @@ async fn readyz(State(http): State<Http>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(merge_ok(checks, false))).into_response();
     }
     checks["db_ms"] = serde_json::json!(started.elapsed().as_millis());
-    checks["embedding_dim"] = serde_json::json!(http.state.embedders.current().dim());
+    checks["embedding_dim"] = serde_json::json!(embedder.dim());
 
     // An unverified KEK does not make the server unready. Open reads and writes work, and reporting
     // 503 would take a store that is serving most of its traffic out of rotation.
@@ -520,7 +530,14 @@ async fn whoami(State(http): State<Http>, headers: HeaderMap) -> Response {
         "may_read_history": principal.may_read_history,
         "scopes": principal.scopes,
         "tenant": http.state.cfg.tenant_id,
-        "embedder": http.state.embedders.current().id(),
+        // The default unit's active model, as /readyz reports it; null when no built embedder
+        // serves it.
+        "embedder": http
+            .state
+            .embedders
+            .for_unit(&http.state.cfg.tenant_id)
+            .ok()
+            .map(|u| u.embedder.id()),
     }))
     .into_response()
 }

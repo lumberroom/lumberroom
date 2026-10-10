@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Copy)]
 pub struct KeySpec {
     pub key: &'static str,
-    /// Changes or merges data with no person reading it first. The dual-model change (decision
-    /// 0027, the next PR) will flip a unit onto a model only when none of its acting keys is guessed.
+    /// Changes or merges data with no person reading it first. The migration sweep flips a unit
+    /// onto a model only when none of its acting keys is guessed (decision 0027).
     pub acts: bool,
 }
 
@@ -30,8 +30,8 @@ pub const ENGINE_KEYS: &[KeySpec] = &[
     KeySpec { key: ROUTE_MAX_SPREAD, acts: false },
 ];
 
-/// Why a table value is what it is. The status page will print it beside the value once the
-/// dual-model change (decision 0027) lands.
+/// Why a table value is what it is. `embeddings status` prints it beside each value, as that
+/// value's `Source`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Basis {

@@ -2452,6 +2452,7 @@ dependencies = [
  "pgvector",
  "reqwest",
  "rmcp",
+ "rustix",
  "schemars",
  "secrecy",
  "serde",

@@ -23,12 +23,13 @@ use std::collections::HashMap;
 
 use crate::config::{Fusion, SearchConfig, DEFAULT_RRF_K};
 use crate::crypto::envelope::SealedContent;
+use crate::domain::embedding_slot::VectorSlot;
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::policy::{NamespaceCeiling, NamespaceGrant};
 use crate::domain::types::{ConflictCandidate, Memory, SearchHit, Sensitivity};
 use crate::ports::memory::{
-    ChainEdits, ChainLink, ChainNeighbours, DeleteOutcome, DeletePlan, GraphEdge, PairCounts,
-    RestoreRow, Retired, Superseded, Timeline, WalkBounds,
+    slot_ordered, ChainEdits, ChainLink, ChainNeighbours, DeleteOutcome, DeletePlan, GraphEdge,
+    ModelVector, PairCounts, RestoreRow, Retired, Superseded, Timeline, WalkBounds,
 };
 use crate::ports::RecallCall;
 use crate::ports::{
@@ -200,12 +201,18 @@ macro_rules! select_memory {
 /// contain. That matters more than it looks: `row_number()` puts a WindowAgg above the vector arm's
 /// ordered index scan, and the plan that arm gets is what pgvector's iterative scan depends on.
 ///
+/// `$col` names the vector column, `"embedding"` for slot A or `"embedding_b"` for slot B (decision
+/// 0027). Every statement exists once per slot as a sibling constant, and the selector picks one by
+/// a match on the slot, so no column name reaches the text at runtime. The slot-A expansion is the
+/// text this server ran before slot B existed, byte for byte.
+///
 /// Everything after this point is `concat!` over literals: no runtime string building reaches the
 /// query text.
 macro_rules! search_sql {
     (
+        $col:literal,
         $live:expr,
-        $vec_rank:literal,
+        $vec_rank:expr,
         $lex_rank:literal,
         $merged_ranks:literal,
         $score:literal
@@ -232,7 +239,7 @@ macro_rules! search_sql {
                 -- Both filters sit inside the arm, ahead of its LIMIT. Filtering after the LIMIT
                 -- is the same failure as the HNSW truncation trap: the arm returns its quota,
                 -- the filter empties it, and the caller is told nothing is known.
-                SELECT m.id, 1 - (m.embedding <=> $6) AS similarity"#, $vec_rank, r#"
+                SELECT m.id, 1 - (m."#, $col, r#" <=> $6) AS similarity"#, $vec_rank, r#"
                   FROM memory m
                   JOIN reachable rg ON rg.namespace = m.namespace
                  WHERE m.tenant_id = $1
@@ -244,9 +251,9 @@ macro_rules! search_sql {
                    -- resumes when the filters discard most of a candidate batch.
                    AND m.namespace = ANY($2 || $4)
                    AND sensitivity_rank(m.sensitivity) <= rg.max_rank
-                   AND m.embedding IS NOT NULL
+                   AND m."#, $col, r#" IS NOT NULL
                    AND "#, $live, r#"
-                 ORDER BY m.embedding <=> $6
+                 ORDER BY m."#, $col, r#" <=> $6
                  LIMIT $7
             ),
             lex AS (
@@ -310,8 +317,9 @@ macro_rules! search_sql {
 /// lexical match scores 0.259, which the 0.35 weight turns into 0.091, against a cosine near 0.7 at
 /// weight 1.0. The lexical arm supplies candidates and hardly reorders them.
 macro_rules! linear_search_sql {
-    ($live:expr) => {
+    ($col:literal, $live:expr) => {
         search_sql!(
+            $col,
             $live,
             "",
             "",
@@ -337,11 +345,16 @@ macro_rules! linear_search_sql {
 ///
 /// This variant binds a fourteenth parameter, `k`.
 macro_rules! rrf_search_sql {
-    ($live:expr) => {
+    ($col:literal, $live:expr) => {
         search_sql!(
+            $col,
             $live,
-            r#",
-                       row_number() OVER (ORDER BY m.embedding <=> $6) AS rank"#,
+            concat!(
+                r#",
+                       row_number() OVER (ORDER BY m."#,
+                $col,
+                r#" <=> $6) AS rank"#
+            ),
             r#",
                        -- The window repeats the ts_rank expression because an OVER clause cannot
                        -- see the `lexical` alias. Edit one and edit both: a rank that describes a
@@ -374,12 +387,19 @@ macro_rules! rrf_search_sql {
     };
 }
 
-const SEARCH_LIVE: &str = linear_search_sql!(live!());
+const SEARCH_LIVE: &str = linear_search_sql!("embedding", live!());
 /// `include_superseded`. The decision log and `lumberroom review` read history by hand; nothing on a
 /// request path uses this, so losing the partial index here costs nothing that matters.
-const SEARCH_ALL: &str = linear_search_sql!("true");
-const SEARCH_RRF_LIVE: &str = rrf_search_sql!(live!());
-const SEARCH_RRF_ALL: &str = rrf_search_sql!("true");
+const SEARCH_ALL: &str = linear_search_sql!("embedding", "true");
+const SEARCH_RRF_LIVE: &str = rrf_search_sql!("embedding", live!());
+const SEARCH_RRF_ALL: &str = rrf_search_sql!("embedding", "true");
+
+/// The slot-B twin of each search statement. A twin differs from its slot-A sibling in the column
+/// alone, and `every_slot_b_statement_differs_from_its_a_twin_only_in_the_column` holds them there.
+const SEARCH_LIVE_B: &str = linear_search_sql!("embedding_b", live!());
+const SEARCH_ALL_B: &str = linear_search_sql!("embedding_b", "true");
+const SEARCH_RRF_LIVE_B: &str = rrf_search_sql!("embedding_b", live!());
+const SEARCH_RRF_ALL_B: &str = rrf_search_sql!("embedding_b", "true");
 
 /// What held at one instant, on the valid-time axis. One statement per blend.
 ///
@@ -414,6 +434,12 @@ const SEARCH_RRF_ALL: &str = rrf_search_sql!("true");
 /// character: the parameter number, which is the first number each blend has spare. Edit one and
 /// edit the other.
 const SEARCH_AS_OF: &str = linear_search_sql!(
+    "embedding",
+    r#"(COALESCE(m.occurred_at, m.created_at) <= $14
+                   AND (m.occurred_until IS NULL OR m.occurred_until >  $14))"#
+);
+const SEARCH_AS_OF_B: &str = linear_search_sql!(
+    "embedding_b",
     r#"(COALESCE(m.occurred_at, m.created_at) <= $14
                    AND (m.occurred_until IS NULL OR m.occurred_until >  $14))"#
 );
@@ -422,6 +448,12 @@ const SEARCH_AS_OF: &str = linear_search_sql!(
 /// Renumbering `k` would have given both blends the same as-of parameter and changed the text of
 /// two statements that are not changing, which is the one thing this addition may not do.
 const SEARCH_RRF_AS_OF: &str = rrf_search_sql!(
+    "embedding",
+    r#"(COALESCE(m.occurred_at, m.created_at) <= $15
+                   AND (m.occurred_until IS NULL OR m.occurred_until >  $15))"#
+);
+const SEARCH_RRF_AS_OF_B: &str = rrf_search_sql!(
+    "embedding_b",
     r#"(COALESCE(m.occurred_at, m.created_at) <= $15
                    AND (m.occurred_until IS NULL OR m.occurred_until >  $15))"#
 );
@@ -436,23 +468,44 @@ const SEARCH_RRF_AS_OF: &str = rrf_search_sql!(
 /// The tag array binds last, on the first parameter number its sibling leaves spare: `$14` for the
 /// linear pair, `$15` where rank fusion holds `k` or the linear as-of statement holds the instant,
 /// and `$16` for rank fusion as of an instant. `search` binds in that order.
-const SEARCH_LIVE_TAGGED: &str = linear_search_sql!(concat!(live!(), " AND m.tags @> $14::text[]"));
-const SEARCH_ALL_TAGGED: &str = linear_search_sql!("m.tags @> $14::text[]");
+const SEARCH_LIVE_TAGGED: &str =
+    linear_search_sql!("embedding", concat!(live!(), " AND m.tags @> $14::text[]"));
+const SEARCH_ALL_TAGGED: &str = linear_search_sql!("embedding", "m.tags @> $14::text[]");
 const SEARCH_RRF_LIVE_TAGGED: &str =
-    rrf_search_sql!(concat!(live!(), " AND m.tags @> $15::text[]"));
-const SEARCH_RRF_ALL_TAGGED: &str = rrf_search_sql!("m.tags @> $15::text[]");
+    rrf_search_sql!("embedding", concat!(live!(), " AND m.tags @> $15::text[]"));
+const SEARCH_RRF_ALL_TAGGED: &str = rrf_search_sql!("embedding", "m.tags @> $15::text[]");
 const SEARCH_AS_OF_TAGGED: &str = linear_search_sql!(
+    "embedding",
     r#"(COALESCE(m.occurred_at, m.created_at) <= $14
                    AND (m.occurred_until IS NULL OR m.occurred_until >  $14))
                    AND m.tags @> $15::text[]"#
 );
 const SEARCH_RRF_AS_OF_TAGGED: &str = rrf_search_sql!(
+    "embedding",
+    r#"(COALESCE(m.occurred_at, m.created_at) <= $15
+                   AND (m.occurred_until IS NULL OR m.occurred_until >  $15))
+                   AND m.tags @> $16::text[]"#
+);
+const SEARCH_LIVE_TAGGED_B: &str =
+    linear_search_sql!("embedding_b", concat!(live!(), " AND m.tags @> $14::text[]"));
+const SEARCH_ALL_TAGGED_B: &str = linear_search_sql!("embedding_b", "m.tags @> $14::text[]");
+const SEARCH_RRF_LIVE_TAGGED_B: &str =
+    rrf_search_sql!("embedding_b", concat!(live!(), " AND m.tags @> $15::text[]"));
+const SEARCH_RRF_ALL_TAGGED_B: &str = rrf_search_sql!("embedding_b", "m.tags @> $15::text[]");
+const SEARCH_AS_OF_TAGGED_B: &str = linear_search_sql!(
+    "embedding_b",
+    r#"(COALESCE(m.occurred_at, m.created_at) <= $14
+                   AND (m.occurred_until IS NULL OR m.occurred_until >  $14))
+                   AND m.tags @> $15::text[]"#
+);
+const SEARCH_RRF_AS_OF_TAGGED_B: &str = rrf_search_sql!(
+    "embedding_b",
     r#"(COALESCE(m.occurred_at, m.created_at) <= $15
                    AND (m.occurred_until IS NULL OR m.occurred_until >  $15))
                    AND m.tags @> $16::text[]"#
 );
 
-/// Which of the twelve search statements answers this question.
+/// Which of the twelve search statements answers this question, in the unit's slot.
 ///
 /// `as_of` decides before `include_superseded`: the period predicate already reaches retired rows,
 /// which is the whole reason to ask, so the flag says nothing under it.
@@ -461,20 +514,25 @@ fn search_statement(
     as_of: bool,
     include_superseded: bool,
     tagged: bool,
+    slot: VectorSlot,
 ) -> &'static str {
-    match (fusion, as_of, include_superseded, tagged) {
-        (Fusion::Linear, true, _, false) => SEARCH_AS_OF,
-        (Fusion::Rrf, true, _, false) => SEARCH_RRF_AS_OF,
-        (Fusion::Linear, false, false, false) => SEARCH_LIVE,
-        (Fusion::Linear, false, true, false) => SEARCH_ALL,
-        (Fusion::Rrf, false, false, false) => SEARCH_RRF_LIVE,
-        (Fusion::Rrf, false, true, false) => SEARCH_RRF_ALL,
-        (Fusion::Linear, true, _, true) => SEARCH_AS_OF_TAGGED,
-        (Fusion::Rrf, true, _, true) => SEARCH_RRF_AS_OF_TAGGED,
-        (Fusion::Linear, false, false, true) => SEARCH_LIVE_TAGGED,
-        (Fusion::Linear, false, true, true) => SEARCH_ALL_TAGGED,
-        (Fusion::Rrf, false, false, true) => SEARCH_RRF_LIVE_TAGGED,
-        (Fusion::Rrf, false, true, true) => SEARCH_RRF_ALL_TAGGED,
+    let (a, b) = match (fusion, as_of, include_superseded, tagged) {
+        (Fusion::Linear, true, _, false) => (SEARCH_AS_OF, SEARCH_AS_OF_B),
+        (Fusion::Rrf, true, _, false) => (SEARCH_RRF_AS_OF, SEARCH_RRF_AS_OF_B),
+        (Fusion::Linear, false, false, false) => (SEARCH_LIVE, SEARCH_LIVE_B),
+        (Fusion::Linear, false, true, false) => (SEARCH_ALL, SEARCH_ALL_B),
+        (Fusion::Rrf, false, false, false) => (SEARCH_RRF_LIVE, SEARCH_RRF_LIVE_B),
+        (Fusion::Rrf, false, true, false) => (SEARCH_RRF_ALL, SEARCH_RRF_ALL_B),
+        (Fusion::Linear, true, _, true) => (SEARCH_AS_OF_TAGGED, SEARCH_AS_OF_TAGGED_B),
+        (Fusion::Rrf, true, _, true) => (SEARCH_RRF_AS_OF_TAGGED, SEARCH_RRF_AS_OF_TAGGED_B),
+        (Fusion::Linear, false, false, true) => (SEARCH_LIVE_TAGGED, SEARCH_LIVE_TAGGED_B),
+        (Fusion::Linear, false, true, true) => (SEARCH_ALL_TAGGED, SEARCH_ALL_TAGGED_B),
+        (Fusion::Rrf, false, false, true) => (SEARCH_RRF_LIVE_TAGGED, SEARCH_RRF_LIVE_TAGGED_B),
+        (Fusion::Rrf, false, true, true) => (SEARCH_RRF_ALL_TAGGED, SEARCH_RRF_ALL_TAGGED_B),
+    };
+    match slot {
+        VectorSlot::A => a,
+        VectorSlot::B => b,
     }
 }
 
@@ -877,16 +935,6 @@ const SAMPLE_CONTENT_SQL: &str = r#"
      ORDER BY random() LIMIT $4
 "#;
 
-/// The vector the digest compares, as one SQL expression over `memory m`.
-///
-/// One place on purpose: a store that keeps its current embedding in another column swaps it here
-/// and nowhere else. Both sides of every comparison read the same expression, so the widths match.
-macro_rules! digest_vector {
-    () => {
-        "m.embedding"
-    };
-}
-
 /// The digest, as one statement with seven filtered subqueries.
 ///
 /// The three memory arms are candidate pools, newest first, which the service trims to its
@@ -906,8 +954,13 @@ macro_rules! digest_vector {
 /// subqueries skipped the namespace filter, and the leak path in a memory system is the convenience
 /// surface rather than the obvious one; the unit test at the bottom of this file counts the joins so
 /// a later edit cannot drop one silently.
-const DIGEST_SQL: &str = concat!(
-    r#"
+///
+/// `$col` is the vector column the pairs compare, one per slot (decision 0027). Both sides of every
+/// comparison read the same column, so the widths match.
+macro_rules! digest_sql {
+    ($col:literal) => {
+        concat!(
+            r#"
     WITH reachable AS (
         SELECT namespace, min(sensitivity_rank(max)) AS max_rank
           FROM unnest($6::text[], $7::text[]) AS g(namespace, max)
@@ -923,8 +976,8 @@ const DIGEST_SQL: &str = concat!(
          WHERE m.tenant_id = $1
            AND sensitivity_rank(m.sensitivity) <= rg.max_rank
            AND "#,
-    live!(),
-    r#"
+            live!(),
+            r#"
            -- 'global' is a namespace like any other and has to be granted. The join is what
            -- enforces that; this line only narrows which granted namespaces are profile.
            AND m.namespace IN ($2, 'global')
@@ -941,8 +994,8 @@ const DIGEST_SQL: &str = concat!(
          WHERE m.tenant_id = $1
            AND sensitivity_rank(m.sensitivity) <= rg.max_rank
            AND "#,
-    live!(),
-    r#"
+            live!(),
+            r#"
            AND $4::text IS NOT NULL AND m.namespace = $4
          ORDER BY m.created_at DESC
          LIMIT $5
@@ -957,8 +1010,8 @@ const DIGEST_SQL: &str = concat!(
          WHERE m.tenant_id = $1
            AND sensitivity_rank(m.sensitivity) <= rg.max_rank
            AND "#,
-    live!(),
-    r#"
+            live!(),
+            r#"
            AND m.created_at > now() - ($8 || ' days')::interval
          ORDER BY m.created_at DESC
          LIMIT $9
@@ -968,16 +1021,16 @@ const DIGEST_SQL: &str = concat!(
         -- materialized CTE kept the pointer, so every one of the n-squared comparisons below read
         -- the vector again: 11,532 buffer hits at 20,000 rows on a synthetic store, against 372
         -- with one in-memory copy per pooled row.
-        SELECT p.id, ("#,
-    digest_vector!(),
-    r#")::real[]::vector AS v
+        SELECT p.id, (m."#,
+            $col,
+            r#")::real[]::vector AS v
           FROM (SELECT id FROM profile_pool
                 UNION SELECT id FROM project_pool
                 UNION SELECT id FROM recent_pool) p
           JOIN memory m ON m.id = p.id AND m.tenant_id = $1
-         WHERE $11::float8 < 1 AND "#,
-    digest_vector!(),
-    r#" IS NOT NULL
+         WHERE $11::float8 < 1 AND m."#,
+            $col,
+            r#" IS NOT NULL
     )
     SELECT json_build_object(
         'profile', COALESCE((
@@ -1010,8 +1063,8 @@ const DIGEST_SQL: &str = concat!(
              WHERE m.tenant_id = $1
                AND sensitivity_rank(m.sensitivity) <= rg.max_rank
                AND "#,
-    live!(),
-    r#"),
+            live!(),
+            r#"),
         'registry_count', (
             SELECT count(*) FROM registry e
               JOIN reachable rg ON rg.namespace = e.namespace
@@ -1028,13 +1081,90 @@ const DIGEST_SQL: &str = concat!(
                WHERE m.tenant_id = $1
                  AND sensitivity_rank(m.sensitivity) <= rg.max_rank
                  AND "#,
-    live!(),
-    r#"
+            live!(),
+            r#"
                GROUP BY m.namespace
             ) c), '{}'::json)
     )
 "#
-);
+        )
+    };
+}
+
+const DIGEST_SQL: &str = digest_sql!("embedding");
+const DIGEST_B_SQL: &str = digest_sql!("embedding_b");
+
+fn digest_statement(slot: VectorSlot) -> &'static str {
+    match slot {
+        VectorSlot::A => DIGEST_SQL,
+        VectorSlot::B => DIGEST_B_SQL,
+    }
+}
+
+/// The recall monitor's probe: the `k` nearest ids in one slot, over every row with a vector there.
+macro_rules! nearest_ids_sql {
+    ($col:literal) => {
+        concat!(
+            "SELECT id FROM memory
+              WHERE tenant_id = $1 AND ",
+            $col,
+            " IS NOT NULL
+              ORDER BY ",
+            $col,
+            " <=> $2 LIMIT $3"
+        )
+    };
+}
+
+const NEAREST_IDS_SQL: &str = nearest_ids_sql!("embedding");
+const NEAREST_IDS_B_SQL: &str = nearest_ids_sql!("embedding_b");
+
+fn nearest_ids_statement(slot: VectorSlot) -> &'static str {
+    match slot {
+        VectorSlot::A => NEAREST_IDS_SQL,
+        VectorSlot::B => NEAREST_IDS_B_SQL,
+    }
+}
+
+/// Live rows in one namespace above a similarity floor, in one slot. `neighbours` carries the
+/// reasoning.
+macro_rules! neighbours_sql {
+    ($col:literal) => {
+        concat!(
+            "SELECT id, namespace, COALESCE(content, '') AS content,
+                    (1 - (",
+            $col,
+            " <=> $3))::float8 AS similarity
+               FROM memory
+              WHERE tenant_id = $1
+                AND namespace = $2
+                AND sensitivity_rank(sensitivity) <= sensitivity_rank($4)
+                -- `live!()` under this statement's own spelling: the table carries no alias here.
+                AND superseded_by IS NULL
+                AND (occurred_until IS NULL OR occurred_until > now())
+                AND ",
+            $col,
+            " IS NOT NULL
+                AND 1 - (",
+            $col,
+            " <=> $3) >= $5
+              ORDER BY ",
+            $col,
+            " <=> $3
+              LIMIT $6"
+        )
+    };
+}
+
+const NEIGHBOURS_SQL: &str = neighbours_sql!("embedding");
+const NEIGHBOURS_B_SQL: &str = neighbours_sql!("embedding_b");
+
+fn neighbours_statement(slot: VectorSlot) -> &'static str {
+    match slot {
+        VectorSlot::A => NEIGHBOURS_SQL,
+        VectorSlot::B => NEIGHBOURS_B_SQL,
+    }
+}
 
 /// Chain walk shared by the cycle check and by `supersession_head`.
 ///
@@ -1445,10 +1575,28 @@ const RESTORE_ROW_SQL: &str = r#"
                         source_client, embedding_model, sensitivity,
                         content_ct, content_nonce, dek_wrapped, dek_nonce, enc_alg, kek_id,
                         occurred_at, occurred_until, superseded_by, superseded_at,
-                        access_count, last_accessed_at, last_confirmed_at, created_at)
+                        access_count, last_accessed_at, last_confirmed_at, created_at,
+                        embedding_b, embedding_b_model)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-            $17, $18, $19, $20, $21, $22, $23, $24)
+            $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
 "#;
+
+/// The vector columns of an `INSERT INTO memory`, as ((slot A vector, model), (slot B vector,
+/// model)).
+///
+/// Both inserts bind through here, so one statement serves either slot and no writer picks a
+/// column at runtime. A slot the write has no vector for binds NULL in both its columns, and the
+/// sweep fills it later.
+type SlotBinds = ((Option<Vec<f32>>, Option<String>), (Option<Vec<f32>>, Option<String>));
+
+fn slot_binds(slot: VectorSlot, active: ModelVector, second: Option<ModelVector>) -> SlotBinds {
+    let split = |v: Option<ModelVector>| match v {
+        Some(ModelVector { vector, model }) => (Some(vector), Some(model)),
+        None => (None, None),
+    };
+    let (a, b) = slot_ordered(slot, active, second);
+    (split(a), split(b))
+}
 
 /// The second pass of a restore: the chain links, once every row they point at is in the table.
 ///
@@ -1789,7 +1937,8 @@ impl MemoryRepository for PgMemoryRepository {
         let candidates = (q.limit * 4).max(20);
 
         let tagged = !q.tags.is_empty();
-        let sql = search_statement(self.fusion, q.as_of.is_some(), q.include_superseded, tagged);
+        let sql =
+            search_statement(self.fusion, q.as_of.is_some(), q.include_superseded, tagged, q.slot);
         let mut stmt = sqlx::query(sql)
             .bind(&q.tenant_id)
             .bind(&primary_ns)
@@ -1866,7 +2015,11 @@ impl MemoryRepository for PgMemoryRepository {
             ),
         };
 
-        let embedding = pgvector::Vector::from(m.embedding);
+        let ((a_vector, a_model), (b_vector, b_model)) = slot_binds(
+            m.slot,
+            ModelVector { vector: m.embedding, model: m.embedding_model },
+            m.second,
+        );
         let sealed = m.sealed.as_ref();
         // The embedding stays plaintext for a private row, because search has to work. That trade
         // is stated and defended in docs/research/encryption-and-sensitivity.md rather than made
@@ -1892,9 +2045,9 @@ impl MemoryRepository for PgMemoryRepository {
                 INSERT INTO memory (id, tenant_id, namespace, content, embedding, tags, supersedes,
                                     source_client, embedding_model, sensitivity,
                                     content_ct, content_nonce, dek_wrapped, dek_nonce, enc_alg,
-                                    kek_id, occurred_at)
+                                    kek_id, occurred_at, embedding_b, embedding_b_model)
                 VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                        $11, $12, $13, $14, $15, $16, $17)
+                        $11, $12, $13, $14, $15, $16, $17, $18, $19)
                 RETURNING *
              ) ",
             "",
@@ -1904,11 +2057,11 @@ impl MemoryRepository for PgMemoryRepository {
         .bind(&m.tenant_id)
         .bind(&m.namespace)
         .bind(content)
-        .bind(&embedding)
+        .bind(a_vector.map(pgvector::Vector::from))
         .bind(&m.tags)
         .bind(m.supersedes)
         .bind(&m.source_client)
-        .bind(&m.embedding_model)
+        .bind(a_model)
         .bind(m.sensitivity.as_str())
         .bind(sealed.map(|s| s.content_ct.as_slice()))
         .bind(sealed.map(|s| s.content_nonce.as_slice()))
@@ -1921,6 +2074,8 @@ impl MemoryRepository for PgMemoryRepository {
         // outside what the encryption seam covers, and sealing it would take the ordering the
         // column exists to support with it.
         .bind(m.occurred_at)
+        .bind(b_vector.map(pgvector::Vector::from))
+        .bind(b_model)
         .fetch_one(&mut *tx)
         .await
         // `supersedes` is a foreign key into this table, so a target that does not exist arrives
@@ -2036,7 +2191,7 @@ impl MemoryRepository for PgMemoryRepository {
 
     async fn digest(&self, q: DigestQuery) -> Result<DigestData> {
         let (readable_ns, readable_max) = split_ceilings(&q.readable);
-        let payload: serde_json::Value = sqlx::query_scalar(DIGEST_SQL)
+        let payload: serde_json::Value = sqlx::query_scalar(digest_statement(q.slot))
             .bind(&q.tenant_id)
             .bind(&q.user_namespace)
             .bind(q.profile_limit)
@@ -2319,6 +2474,7 @@ impl MemoryRepository for PgMemoryRepository {
         embedding: &[f32],
         k: i64,
         exact: bool,
+        slot: VectorSlot,
     ) -> Result<Vec<String>> {
         let vector = pgvector::Vector::from(embedding.to_vec());
         let mut tx = self.pool.begin().await?;
@@ -2326,16 +2482,12 @@ impl MemoryRepository for PgMemoryRepository {
             sqlx::query("SET LOCAL enable_indexscan = off").execute(&mut *tx).await?;
             sqlx::query("SET LOCAL enable_indexonlyscan = off").execute(&mut *tx).await?;
         }
-        let ids = sqlx::query_scalar::<_, uuid::Uuid>(
-            "SELECT id FROM memory
-              WHERE tenant_id = $1 AND embedding IS NOT NULL
-              ORDER BY embedding <=> $2 LIMIT $3",
-        )
-        .bind(tenant)
-        .bind(&vector)
-        .bind(k)
-        .fetch_all(&mut *tx)
-        .await?;
+        let ids = sqlx::query_scalar::<_, uuid::Uuid>(nearest_ids_statement(slot))
+            .bind(tenant)
+            .bind(&vector)
+            .bind(k)
+            .fetch_all(&mut *tx)
+            .await?;
         // Read-only, so a rollback is as correct as a commit and cannot fail on a conflict.
         tx.rollback().await?;
         Ok(ids.into_iter().map(|u| u.to_string()).collect())
@@ -2350,29 +2502,15 @@ impl MemoryRepository for PgMemoryRepository {
     /// own scan cap stops it rather than until the limit is filled.
     async fn neighbours(&self, q: NeighbourQuery) -> Result<Vec<ConflictCandidate>> {
         let embedding = pgvector::Vector::from(q.embedding);
-        let rows = sqlx::query(
-            "SELECT id, namespace, COALESCE(content, '') AS content,
-                    (1 - (embedding <=> $3))::float8 AS similarity
-               FROM memory
-              WHERE tenant_id = $1
-                AND namespace = $2
-                AND sensitivity_rank(sensitivity) <= sensitivity_rank($4)
-                -- `live!()` under this statement's own spelling: the table carries no alias here.
-                AND superseded_by IS NULL
-                AND (occurred_until IS NULL OR occurred_until > now())
-                AND embedding IS NOT NULL
-                AND 1 - (embedding <=> $3) >= $5
-              ORDER BY embedding <=> $3
-              LIMIT $6",
-        )
-        .bind(&q.tenant_id)
-        .bind(&q.namespace)
-        .bind(&embedding)
-        .bind(q.max_sensitivity.as_str())
-        .bind(q.min_similarity)
-        .bind(q.limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(neighbours_statement(q.slot))
+            .bind(&q.tenant_id)
+            .bind(&q.namespace)
+            .bind(&embedding)
+            .bind(q.max_sensitivity.as_str())
+            .bind(q.min_similarity)
+            .bind(q.limit)
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .iter()
@@ -3361,7 +3499,11 @@ impl MemoryRepository for PgMemoryRepository {
             ),
         };
 
-        let embedding = pgvector::Vector::from(row.embedding);
+        let ((a_vector, a_model), (b_vector, b_model)) = slot_binds(
+            row.slot,
+            ModelVector { vector: row.embedding, model: row.embedding_model },
+            row.second,
+        );
         let sealed = row.sealed.as_ref();
         // The same single line `insert` relies on: a sealed row has no plaintext column to write,
         // and there is no branch below that could give it one.
@@ -3372,11 +3514,11 @@ impl MemoryRepository for PgMemoryRepository {
             .bind(&row.tenant_id)
             .bind(&row.namespace)
             .bind(content)
-            .bind(&embedding)
+            .bind(a_vector.map(pgvector::Vector::from))
             .bind(&row.tags)
             .bind(row.supersedes)
             .bind(&row.source_client)
-            .bind(&row.embedding_model)
+            .bind(a_model)
             .bind(row.sensitivity.as_str())
             .bind(sealed.map(|s| s.content_ct.as_slice()))
             .bind(sealed.map(|s| s.content_nonce.as_slice()))
@@ -3392,6 +3534,8 @@ impl MemoryRepository for PgMemoryRepository {
             .bind(row.last_accessed_at)
             .bind(row.last_confirmed_at)
             .bind(row.created_at)
+            .bind(b_vector.map(pgvector::Vector::from))
+            .bind(b_model)
             .execute(&self.pool)
             .await
             .map_err(|e| match e.as_database_error().and_then(|d| d.code()) {
@@ -3803,30 +3947,175 @@ mod tests {
     }
 
     #[test]
-    fn the_search_statement_follows_the_blend_the_period_the_history_and_the_tags() {
+    fn the_search_statement_follows_the_blend_the_period_the_history_the_tags_and_the_slot() {
         use Fusion::{Linear, Rrf};
         let cases = [
-            ((Linear, false, false, false), SEARCH_LIVE),
-            ((Linear, false, true, false), SEARCH_ALL),
-            ((Linear, true, false, false), SEARCH_AS_OF),
-            ((Linear, true, true, false), SEARCH_AS_OF),
-            ((Rrf, false, false, false), SEARCH_RRF_LIVE),
-            ((Rrf, false, true, false), SEARCH_RRF_ALL),
-            ((Rrf, true, false, false), SEARCH_RRF_AS_OF),
-            ((Linear, false, false, true), SEARCH_LIVE_TAGGED),
-            ((Linear, false, true, true), SEARCH_ALL_TAGGED),
-            ((Linear, true, true, true), SEARCH_AS_OF_TAGGED),
-            ((Rrf, false, false, true), SEARCH_RRF_LIVE_TAGGED),
-            ((Rrf, false, true, true), SEARCH_RRF_ALL_TAGGED),
-            ((Rrf, true, false, true), SEARCH_RRF_AS_OF_TAGGED),
+            ((Linear, false, false, false), SEARCH_LIVE, SEARCH_LIVE_B),
+            ((Linear, false, true, false), SEARCH_ALL, SEARCH_ALL_B),
+            ((Linear, true, false, false), SEARCH_AS_OF, SEARCH_AS_OF_B),
+            ((Linear, true, true, false), SEARCH_AS_OF, SEARCH_AS_OF_B),
+            ((Rrf, false, false, false), SEARCH_RRF_LIVE, SEARCH_RRF_LIVE_B),
+            ((Rrf, false, true, false), SEARCH_RRF_ALL, SEARCH_RRF_ALL_B),
+            ((Rrf, true, false, false), SEARCH_RRF_AS_OF, SEARCH_RRF_AS_OF_B),
+            ((Linear, false, false, true), SEARCH_LIVE_TAGGED, SEARCH_LIVE_TAGGED_B),
+            ((Linear, false, true, true), SEARCH_ALL_TAGGED, SEARCH_ALL_TAGGED_B),
+            ((Linear, true, true, true), SEARCH_AS_OF_TAGGED, SEARCH_AS_OF_TAGGED_B),
+            ((Rrf, false, false, true), SEARCH_RRF_LIVE_TAGGED, SEARCH_RRF_LIVE_TAGGED_B),
+            ((Rrf, false, true, true), SEARCH_RRF_ALL_TAGGED, SEARCH_RRF_ALL_TAGGED_B),
+            ((Rrf, true, false, true), SEARCH_RRF_AS_OF_TAGGED, SEARCH_RRF_AS_OF_TAGGED_B),
         ];
-        for ((fusion, as_of, superseded, tagged), want) in cases {
+        for ((fusion, as_of, superseded, tagged), want_a, want_b) in cases {
+            for (slot, want) in [(VectorSlot::A, want_a), (VectorSlot::B, want_b)] {
+                assert_eq!(
+                    search_statement(fusion, as_of, superseded, tagged, slot),
+                    want,
+                    "{fusion:?} as_of={as_of} include_superseded={superseded} tagged={tagged} \
+                     slot={slot:?}"
+                );
+            }
+        }
+    }
+
+    /// Every statement that reads a vector, beside its slot-B twin.
+    const SLOT_TWINS: [(&str, &str, &str); 15] = [
+        ("SEARCH_LIVE", SEARCH_LIVE, SEARCH_LIVE_B),
+        ("SEARCH_ALL", SEARCH_ALL, SEARCH_ALL_B),
+        ("SEARCH_RRF_LIVE", SEARCH_RRF_LIVE, SEARCH_RRF_LIVE_B),
+        ("SEARCH_RRF_ALL", SEARCH_RRF_ALL, SEARCH_RRF_ALL_B),
+        ("SEARCH_AS_OF", SEARCH_AS_OF, SEARCH_AS_OF_B),
+        ("SEARCH_RRF_AS_OF", SEARCH_RRF_AS_OF, SEARCH_RRF_AS_OF_B),
+        ("SEARCH_LIVE_TAGGED", SEARCH_LIVE_TAGGED, SEARCH_LIVE_TAGGED_B),
+        ("SEARCH_ALL_TAGGED", SEARCH_ALL_TAGGED, SEARCH_ALL_TAGGED_B),
+        ("SEARCH_RRF_LIVE_TAGGED", SEARCH_RRF_LIVE_TAGGED, SEARCH_RRF_LIVE_TAGGED_B),
+        ("SEARCH_RRF_ALL_TAGGED", SEARCH_RRF_ALL_TAGGED, SEARCH_RRF_ALL_TAGGED_B),
+        ("SEARCH_AS_OF_TAGGED", SEARCH_AS_OF_TAGGED, SEARCH_AS_OF_TAGGED_B),
+        ("SEARCH_RRF_AS_OF_TAGGED", SEARCH_RRF_AS_OF_TAGGED, SEARCH_RRF_AS_OF_TAGGED_B),
+        ("DIGEST_SQL", DIGEST_SQL, DIGEST_B_SQL),
+        ("NEAREST_IDS_SQL", NEAREST_IDS_SQL, NEAREST_IDS_B_SQL),
+        ("NEIGHBOURS_SQL", NEIGHBOURS_SQL, NEIGHBOURS_B_SQL),
+    ];
+
+    /// How often `sql` names the slot-A vector column. `embedding_model` and `embedding_b` do not
+    /// count: the first is a label every statement selects, the second is the other slot.
+    fn slot_a_columns(sql: &str) -> usize {
+        sql.match_indices("embedding")
+            .filter(|(at, word)| {
+                let before = sql[..*at].chars().next_back();
+                let after = sql[at + word.len()..].chars().next();
+                !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+            .count()
+    }
+
+    /// A twin that reads slot B in one clause and slot A in another would pass a plain
+    /// replace-and-compare, so the test also counts the columns on both sides.
+    #[test]
+    fn every_slot_b_statement_differs_from_its_a_twin_only_in_the_column() {
+        for (name, a, b) in SLOT_TWINS {
+            assert!(slot_a_columns(a) > 0, "{name} reads no vector, so it needs no twin");
+            assert!(!a.contains("embedding_b"), "{name} reads slot B");
+            assert_eq!(slot_a_columns(b), 0, "{name}'s twin still reads slot A");
             assert_eq!(
-                search_statement(fusion, as_of, superseded, tagged),
-                want,
-                "{fusion:?} as_of={as_of} include_superseded={superseded} tagged={tagged}"
+                b.matches("embedding_b").count(),
+                slot_a_columns(a),
+                "{name}'s twin reads slot B in a different number of places"
+            );
+            assert_eq!(b.replace("embedding_b", "embedding"), a, "{name} and its twin drifted");
+        }
+    }
+
+    /// The text of this file before its tests, with comment lines dropped, so the literals in the
+    /// assertions below cannot count as evidence for themselves (review m7).
+    fn adapter_source() -> String {
+        include_str!("memory.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A hand-written vector statement with no twin shows up as an unmatched `embedding <=>`, and a
+    /// macro call with no twin as an unmatched column literal.
+    #[test]
+    fn the_file_spells_each_vector_operator_once_per_slot() {
+        let head = adapter_source();
+        assert_eq!(head.matches("embedding <=>").count(), head.matches("embedding_b <=>").count());
+        assert_eq!(head.matches("\"embedding\"").count(), head.matches("\"embedding_b\"").count());
+        assert_eq!(head.matches("\"embedding_b\"").count(), SLOT_TWINS.len());
+    }
+
+    /// The writer set is closed at two: `insert` and `restore_row`. A third writer has to land here
+    /// and name both slots, or a migrating unit gets a row the fill must embed again.
+    #[test]
+    fn every_insert_into_memory_names_both_slots() {
+        let head = adapter_source();
+        let mut seen = 0;
+        for (at, word) in head.match_indices("INSERT INTO memory") {
+            let rest = &head[at + word.len()..];
+            if !rest.starts_with(|c: char| c.is_whitespace() || c == '(') {
+                continue; // memory_edge, memory_conflict and the other tables
+            }
+            seen += 1;
+            let values = rest.find("VALUES").expect("an INSERT INTO memory carries VALUES");
+            let columns: Vec<&str> = rest[..values]
+                .split(|c: char| c == ',' || c == '(' || c == ')' || c.is_whitespace())
+                .filter(|c| !c.is_empty())
+                .collect();
+            for column in ["embedding", "embedding_model", "embedding_b", "embedding_b_model"] {
+                assert!(columns.contains(&column), "an INSERT INTO memory lacks {column}");
+            }
+            // The VALUES tuple runs to the parenthesis that closes its first one.
+            let mut depth = 0;
+            let mut end = None;
+            for (i, c) in rest[values..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' if depth == 1 => {
+                        end = Some(values + i);
+                        break;
+                    }
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+            }
+            let tuple = &rest[values..end.expect("the VALUES tuple closes")];
+            assert_eq!(
+                tuple.matches('$').count(),
+                columns.len(),
+                "an INSERT INTO memory binds a different number of values than it names columns"
             );
         }
+        assert_eq!(seen, 2, "the write insert and the restore insert");
+    }
+
+    #[test]
+    fn slot_ordered_puts_the_active_vector_in_its_slot() {
+        let active = ModelVector { vector: vec![1.0], model: "new".into() };
+        let other = ModelVector { vector: vec![2.0], model: "old".into() };
+        let new = (Some(vec![1.0]), Some("new".to_string()));
+        let old = (Some(vec![2.0]), Some("old".to_string()));
+        let empty = (None, None);
+
+        let both = |slot| slot_binds(slot, active.clone(), Some(other.clone()));
+        assert_eq!(both(VectorSlot::A), (new.clone(), old.clone()));
+        assert_eq!(both(VectorSlot::B), (old.clone(), new.clone()));
+        // A missed second vector leaves its slot NULL for the fill, and never moves the active one.
+        assert_eq!(slot_binds(VectorSlot::A, active.clone(), None), (new.clone(), empty.clone()));
+        assert_eq!(slot_binds(VectorSlot::B, active, None), (empty, new));
+    }
+
+    #[test]
+    fn the_digest_the_recall_probe_and_the_neighbours_read_the_slot_they_are_handed() {
+        assert_eq!(digest_statement(VectorSlot::A), DIGEST_SQL);
+        assert_eq!(digest_statement(VectorSlot::B), DIGEST_B_SQL);
+        assert_eq!(nearest_ids_statement(VectorSlot::A), NEAREST_IDS_SQL);
+        assert_eq!(nearest_ids_statement(VectorSlot::B), NEAREST_IDS_B_SQL);
+        assert_eq!(neighbours_statement(VectorSlot::A), NEIGHBOURS_SQL);
+        assert_eq!(neighbours_statement(VectorSlot::B), NEIGHBOURS_B_SQL);
     }
 
     /// The keyset comparison and the tag test sit in one WHERE clause, so the cursor pages through
@@ -4430,19 +4719,19 @@ mod tests {
     /// compare one vector expression on both sides, gated by the threshold.
     #[test]
     fn the_digest_pools_send_ids_not_vectors_and_profile_orders_by_recency_alone() {
-        // One cast, in the pair CTE. A vector in a pool's select list is detoasted before LIMIT.
-        assert_eq!(DIGEST_SQL.matches("::real[]").count(), 1);
-        let pools = &DIGEST_SQL[..DIGEST_SQL.find("pooled_vectors AS").unwrap()];
-        assert!(!pools.contains("embedding AS") && !pools.contains("::vector"));
-        assert!(!DIGEST_SQL.contains("m.tags &&"), "no tag sorts a row above a newer one");
-        assert_eq!(DIGEST_SQL.matches("ORDER BY m.created_at DESC").count(), 3);
-        assert_eq!(
-            DIGEST_SQL.matches(concat!("(", digest_vector!(), ")::real[]::vector AS v")).count(),
-            1
-        );
-        assert_eq!(DIGEST_SQL.matches(concat!(digest_vector!(), " IS NOT NULL")).count(), 1);
-        assert!(DIGEST_SQL.contains("WHERE $11::float8 < 1 AND"));
-        assert!(DIGEST_SQL.contains("(a.v <=> b.v) <= 1 - $11::float8"));
+        for (sql, column) in [(DIGEST_SQL, "m.embedding"), (DIGEST_B_SQL, "m.embedding_b")] {
+            // One cast, in the pair CTE. A vector in a pool's select list is detoasted before LIMIT.
+            assert_eq!(sql.matches("::real[]").count(), 1);
+            let pools = &sql[..sql.find("pooled_vectors AS").unwrap()];
+            assert!(!pools.contains("embedding AS") && !pools.contains("embedding_b AS"));
+            assert!(!pools.contains("::vector"));
+            assert!(!sql.contains("m.tags &&"), "no tag sorts a row above a newer one");
+            assert_eq!(sql.matches("ORDER BY m.created_at DESC").count(), 3);
+            assert_eq!(sql.matches(&format!("({column})::real[]::vector AS v")).count(), 1);
+            assert_eq!(sql.matches(&format!("{column} IS NOT NULL")).count(), 1);
+            assert!(sql.contains("WHERE $11::float8 < 1 AND"));
+            assert!(sql.contains("(a.v <=> b.v) <= 1 - $11::float8"));
+        }
     }
 
     /// Three digest select lists gained two columns each. The join count is what says no arm lost

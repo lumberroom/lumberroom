@@ -27,6 +27,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::domain::cleanup::{cluster_key, CleanupKind, Disposition};
+use crate::domain::embedding_slot::VectorSlot;
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::policy::NamespaceGrant;
 use crate::domain::types::Sensitivity;
@@ -142,16 +143,23 @@ const EXACT_DUPLICATES_SQL: &str = concat!(
 /// duplicates were already grouped per namespace by the `norm` prefix; this brings the cosine band
 /// to the same rule. The cost is that a fact restated under a second namespace is not a finding,
 /// which `docs/cleanup-schedule.md` had been promising all along.
-const SIMILAR_PAIRS_SQL: &str = concat!(
-    r#"
+///
+/// `$col` is the vector column, one statement per slot (decision 0027); `similar_pairs_statement`
+/// picks the twin.
+macro_rules! similar_pairs_sql {
+    ($col:literal) => {
+        concat!(
+            r#"
             WITH scoped AS (
               SELECT m.id, m.namespace, m.sensitivity, m.content, m.created_at, m.access_count,
-                     m.embedding
+                     m."#,
+            $col,
+            r#"
                 FROM memory m
                WHERE     m.tenant_id = $1
     AND "#,
-    live!(),
-    r#"
+            live!(),
+            r#"
     AND m.content IS NOT NULL
     AND (
       CASE $2::text
@@ -166,7 +174,9 @@ const SIMILAR_PAIRS_SQL: &str = concat!(
        WHERE CASE WHEN g.exact THEN m.namespace = g.prefix
                   ELSE left(m.namespace, length(g.prefix)) = g.prefix END
          AND sensitivity_rank(m.sensitivity) <= sensitivity_rank(g.max)
-    ) AND m.embedding IS NOT NULL
+    ) AND m."#,
+            $col,
+            r#" IS NOT NULL
             )
             SELECT a.id AS a_id, a.namespace AS a_namespace, a.sensitivity AS a_sensitivity,
                    a.content AS a_content, a.created_at AS a_created_at,
@@ -174,15 +184,35 @@ const SIMILAR_PAIRS_SQL: &str = concat!(
                    b.id AS b_id, b.namespace AS b_namespace, b.sensitivity AS b_sensitivity,
                    b.content AS b_content, b.created_at AS b_created_at,
                    b.access_count AS b_access_count,
-                   1 - (a.embedding <=> b.embedding) AS similarity
+                   1 - (a."#,
+            $col,
+            r#" <=> b."#,
+            $col,
+            r#") AS similarity
               FROM scoped a
               JOIN scoped b ON b.id <> a.id AND a.id < b.id AND b.namespace = a.namespace
              WHERE ($8::timestamptz IS NULL OR a.created_at >= $8 OR b.created_at >= $8)
-               AND 1 - (a.embedding <=> b.embedding) >= $9
+               AND 1 - (a."#,
+            $col,
+            r#" <=> b."#,
+            $col,
+            r#") >= $9
              ORDER BY similarity DESC
              LIMIT $10
             "#
-);
+        )
+    };
+}
+
+const SIMILAR_PAIRS_SQL: &str = similar_pairs_sql!("embedding");
+const SIMILAR_PAIRS_B_SQL: &str = similar_pairs_sql!("embedding_b");
+
+fn similar_pairs_statement(slot: VectorSlot) -> &'static str {
+    match slot {
+        VectorSlot::A => SIMILAR_PAIRS_SQL,
+        VectorSlot::B => SIMILAR_PAIRS_B_SQL,
+    }
+}
 
 /// The newest live row in scope. No window: the question is what the store now holds.
 const NEWEST_SQL: &str = concat!(
@@ -559,6 +589,7 @@ impl CleanupRepository for PgCleanupRepository {
         tenant: &str,
         q: &CandidateQuery,
         min_similarity: f64,
+        slot: VectorSlot,
     ) -> Result<Vec<CandidatePair>> {
         let (ns, exact) = ns_bounds(q.namespace.as_deref());
         let (g_prefix, g_exact, g_max) = grant_arrays(&q.grant);
@@ -567,7 +598,7 @@ impl CleanupRepository for PgCleanupRepository {
         // rather than both directions, and the ORDER BY on created_at decides which is the older.
         //
         // No index hint and no HNSW. See the module comment.
-        let rows = sqlx::query(SIMILAR_PAIRS_SQL)
+        let rows = sqlx::query(similar_pairs_statement(slot))
             .bind(tenant)
             .bind(q.max_sensitivity.as_str())
             .bind(&ns)
@@ -1078,11 +1109,71 @@ mod tests {
     fn the_similar_pairs_query_never_reaches_for_the_index() {
         // Filtered HNSW returned zero rows against 40,000 here once. A pass that answers "nothing
         // to clean up" because an index truncated is the same failure wearing a different hat.
-        assert!(
-            !SIMILAR_PAIRS_SQL.contains("ORDER BY a.embedding <=>"),
-            "an ORDER BY on the operator is what makes the planner choose HNSW"
-        );
-        assert!(SIMILAR_PAIRS_SQL.contains("ORDER BY similarity DESC"));
+        for sql in [SIMILAR_PAIRS_SQL, SIMILAR_PAIRS_B_SQL] {
+            assert!(
+                !sql.contains("ORDER BY a.embedding"),
+                "an ORDER BY on the operator is what makes the planner choose HNSW"
+            );
+            assert!(sql.contains("ORDER BY similarity DESC"));
+        }
+    }
+
+    /// Every statement here that reads a vector, beside its slot-B twin.
+    const SLOT_TWINS: [(&str, &str, &str); 1] =
+        [("SIMILAR_PAIRS_SQL", SIMILAR_PAIRS_SQL, SIMILAR_PAIRS_B_SQL)];
+
+    /// How often `sql` names the slot-A vector column, leaving out `embedding_model` and the other
+    /// slot's `embedding_b`.
+    fn slot_a_columns(sql: &str) -> usize {
+        sql.match_indices("embedding")
+            .filter(|(at, word)| {
+                let before = sql[..*at].chars().next_back();
+                let after = sql[at + word.len()..].chars().next();
+                !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+            .count()
+    }
+
+    /// A twin that reads slot B in one clause and slot A in another would pass a plain
+    /// replace-and-compare, so the test also counts the columns on both sides.
+    #[test]
+    fn every_slot_b_statement_differs_from_its_a_twin_only_in_the_column() {
+        for (name, a, b) in SLOT_TWINS {
+            assert!(slot_a_columns(a) > 0, "{name} reads no vector, so it needs no twin");
+            assert!(!a.contains("embedding_b"), "{name} reads slot B");
+            assert_eq!(slot_a_columns(b), 0, "{name}'s twin still reads slot A");
+            assert_eq!(
+                b.matches("embedding_b").count(),
+                slot_a_columns(a),
+                "{name}'s twin reads slot B in a different number of places"
+            );
+            assert_eq!(b.replace("embedding_b", "embedding"), a, "{name} and its twin drifted");
+        }
+    }
+
+    /// The text before the tests, comment lines dropped, so the assertions cannot count their own
+    /// literals (review m7). A hand-written vector statement with no twin shows up as an unmatched
+    /// `embedding <=>`, and a macro call with no twin as an unmatched column literal.
+    #[test]
+    fn the_file_spells_each_vector_operator_once_per_slot() {
+        let head = include_str!("cleanup.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(head.matches("embedding <=>").count(), head.matches("embedding_b <=>").count());
+        assert_eq!(head.matches("\"embedding\"").count(), head.matches("\"embedding_b\"").count());
+        assert_eq!(head.matches("\"embedding_b\"").count(), SLOT_TWINS.len());
+    }
+
+    #[test]
+    fn similar_pairs_reads_the_slot_it_is_handed() {
+        assert_eq!(similar_pairs_statement(VectorSlot::A), SIMILAR_PAIRS_SQL);
+        assert_eq!(similar_pairs_statement(VectorSlot::B), SIMILAR_PAIRS_B_SQL);
     }
 
     #[test]

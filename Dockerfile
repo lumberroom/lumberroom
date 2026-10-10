@@ -114,12 +114,18 @@ RUN --mount=type=cache,target=/build/target,id=lumberroom-server-target,sharing=
 # failure that looks like a hung tool call.
 ARG EMBED_PROVIDER=local
 ARG EMBED_MODEL=Xenova/bge-base-en-v1.5
+# A migration away from a local model keeps its weights in the image for the rollback window, so the
+# previous block's provider and model ride along. prefetch downloads when either provider is local.
+ARG EMBED_PREVIOUS_PROVIDER=
+ARG EMBED_PREVIOUS_MODEL=
 ENV MODEL_CACHE_DIR=/models
 # The download goes to a cache mount and is copied into the image from there. This layer sits after
 # the build, so any server change invalidated it and re-downloaded 209MB of weights: 21s of every
 # build, spent fetching bytes that had not changed. The cache makes the second build a local copy.
 RUN --mount=type=cache,target=/model-cache,id=lumberroom-models,sharing=locked \
-    MODEL_CACHE_DIR=/model-cache EMBED_PROVIDER=$EMBED_PROVIDER EMBED_MODEL=$EMBED_MODEL /out/prefetch \
+    MODEL_CACHE_DIR=/model-cache EMBED_PROVIDER=$EMBED_PROVIDER EMBED_MODEL=$EMBED_MODEL \
+    EMBED_PREVIOUS_PROVIDER=$EMBED_PREVIOUS_PROVIDER EMBED_PREVIOUS_MODEL=$EMBED_PREVIOUS_MODEL \
+    /out/prefetch \
  && mkdir -p /models && cp -a /model-cache/. /models/
 
 # /models measures ~209MB against an expected ~110MB. An earlier finding attributed this to Docker COPY

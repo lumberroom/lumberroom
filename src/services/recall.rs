@@ -94,11 +94,13 @@ pub async fn measure(ctx: &Ctx, sample: i64, k: i64) -> Result<RecallReport> {
     // comparison means nothing.
     for (probe, vector) in probes.iter().zip(vectors.iter()) {
         let t = std::time::Instant::now();
-        let indexed = ctx.repos.memories.nearest_ids(&ctx.cfg.tenant_id, vector, k, false).await?;
+        let indexed =
+            ctx.repos.memories.nearest_ids(&ctx.cfg.tenant_id, vector, k, false, u.slot).await?;
         index_ms += t.elapsed().as_millis();
 
         let t = std::time::Instant::now();
-        let exact = ctx.repos.memories.nearest_ids(&ctx.cfg.tenant_id, vector, k, true).await?;
+        let exact =
+            ctx.repos.memories.nearest_ids(&ctx.cfg.tenant_id, vector, k, true, u.slot).await?;
         exact_ms += t.elapsed().as_millis();
 
         let got: std::collections::HashSet<&String> = indexed.iter().collect();

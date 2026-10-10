@@ -237,6 +237,7 @@ async fn setup() -> Option<Harness> {
         keys: Some(keys),
         kek_verified,
         proposals: Vec::new(),
+        embedding_status: None,
     });
     let authenticator = auth::create(&cfg, Some(oauth)).ok()?;
     let app: Router = lumberroom_server::http::router(state, authenticator);

@@ -121,6 +121,8 @@ services:
       args:
         EMBED_PROVIDER: ${EMBED_PROVIDER:-local}
         EMBED_MODEL: ${EMBED_MODEL:-Xenova/bge-base-en-v1.5}
+        EMBED_PREVIOUS_PROVIDER: ${EMBED_PREVIOUS_PROVIDER:-}
+        EMBED_PREVIOUS_MODEL: ${EMBED_PREVIOUS_MODEL:-}
         # What the binary reports on /readyz and what scripts/deploy-check.sh compares against, so
         # a container serving an image older than the one on disk says so. Compose cannot run
         # `git rev-parse` itself: whoever builds exports these first, and deploy/install.sh does.
@@ -192,6 +194,27 @@ services:
       EMBED_ALLOW_FALLBACK: ${EMBED_ALLOW_FALLBACK:-}
       # Per-key overrides of this model's similarity table (decision 0029).
       EMBED_THRESHOLDS: ${EMBED_THRESHOLDS:-}
+      # Switching embedding models (decision 0027). docs/switching-embedding-models.md.
+      EMBED_PREVIOUS_PROVIDER: ${EMBED_PREVIOUS_PROVIDER:-}
+      EMBED_PREVIOUS_MODEL: ${EMBED_PREVIOUS_MODEL:-}
+      EMBED_PREVIOUS_DIM: ${EMBED_PREVIOUS_DIM:-}
+      EMBED_PREVIOUS_BASE_URL: ${EMBED_PREVIOUS_BASE_URL:-}
+      EMBED_PREVIOUS_API_KEY: ${EMBED_PREVIOUS_API_KEY:-}
+      EMBED_PREVIOUS_QUERY_PREFIX:
+      EMBED_PREVIOUS_DOCUMENT_PREFIX:
+      EMBED_PREVIOUS_MAX_INPUT_CHARS: ${EMBED_PREVIOUS_MAX_INPUT_CHARS:-}
+      EMBED_PREVIOUS_TIMEOUT_SECS: ${EMBED_PREVIOUS_TIMEOUT_SECS:-}
+      EMBED_PREVIOUS_THRESHOLDS: ${EMBED_PREVIOUS_THRESHOLDS:-}
+      EMBED_MIGRATION_CONTROL: ${EMBED_MIGRATION_CONTROL:-}
+      EMBED_FLIP: ${EMBED_FLIP:-}
+      EMBED_MIGRATE_SECS: ${EMBED_MIGRATE_SECS:-}
+      EMBED_FILL_CHARS: ${EMBED_FILL_CHARS:-}
+      EMBED_FILL_DUTY: ${EMBED_FILL_DUTY:-}
+      EMBED_SHADOW_TIMEOUT_MS: ${EMBED_SHADOW_TIMEOUT_MS:-}
+      EMBED_ROLLBACK_DAYS: ${EMBED_ROLLBACK_DAYS:-}
+      EMBED_RETIRE: ${EMBED_RETIRE:-}
+      EMBED_DISK_PATH: ${EMBED_DISK_PATH:-}
+      EMBED_DISK_FLOOR_MB: ${EMBED_DISK_FLOOR_MB:-}
       # Sensitivity axis (Phase 3).
       #
       # Blank here means the server reads the `sensitivity_default` table instead, which migration
@@ -422,6 +445,27 @@ services:
       EMBED_ALLOW_FALLBACK: ${EMBED_ALLOW_FALLBACK:-}
       # Per-key overrides of this model's similarity table (decision 0029).
       EMBED_THRESHOLDS: ${EMBED_THRESHOLDS:-}
+      # Switching embedding models (decision 0027). docs/switching-embedding-models.md.
+      EMBED_PREVIOUS_PROVIDER: ${EMBED_PREVIOUS_PROVIDER:-}
+      EMBED_PREVIOUS_MODEL: ${EMBED_PREVIOUS_MODEL:-}
+      EMBED_PREVIOUS_DIM: ${EMBED_PREVIOUS_DIM:-}
+      EMBED_PREVIOUS_BASE_URL: ${EMBED_PREVIOUS_BASE_URL:-}
+      EMBED_PREVIOUS_API_KEY: ${EMBED_PREVIOUS_API_KEY:-}
+      EMBED_PREVIOUS_QUERY_PREFIX:
+      EMBED_PREVIOUS_DOCUMENT_PREFIX:
+      EMBED_PREVIOUS_MAX_INPUT_CHARS: ${EMBED_PREVIOUS_MAX_INPUT_CHARS:-}
+      EMBED_PREVIOUS_TIMEOUT_SECS: ${EMBED_PREVIOUS_TIMEOUT_SECS:-}
+      EMBED_PREVIOUS_THRESHOLDS: ${EMBED_PREVIOUS_THRESHOLDS:-}
+      EMBED_MIGRATION_CONTROL: ${EMBED_MIGRATION_CONTROL:-}
+      EMBED_FLIP: ${EMBED_FLIP:-}
+      EMBED_MIGRATE_SECS: ${EMBED_MIGRATE_SECS:-}
+      EMBED_FILL_CHARS: ${EMBED_FILL_CHARS:-}
+      EMBED_FILL_DUTY: ${EMBED_FILL_DUTY:-}
+      EMBED_SHADOW_TIMEOUT_MS: ${EMBED_SHADOW_TIMEOUT_MS:-}
+      EMBED_ROLLBACK_DAYS: ${EMBED_ROLLBACK_DAYS:-}
+      EMBED_RETIRE: ${EMBED_RETIRE:-}
+      EMBED_DISK_PATH: ${EMBED_DISK_PATH:-}
+      EMBED_DISK_FLOOR_MB: ${EMBED_DISK_FLOOR_MB:-}
       MODEL_CACHE_DIR: /models
       SENSITIVITY_DEFAULTS: ${SENSITIVITY_DEFAULTS:-}
       SENSITIVITY_TRIPWIRE: ${SENSITIVITY_TRIPWIRE:-}

@@ -80,6 +80,10 @@ pub struct AppState {
     /// rename and cannot record it has noticed nothing anyone can use.
     pub aliases: Arc<dyn crate::ports::AliasRepository>,
     pub embedders: Arc<crate::services::embedders::EmbedderSet>,
+    /// The embedding sweep's last published status, for the console. None when the sweep is off
+    /// (`EMBED_MIGRATE_SECS=0`): an empty status would read as a store with no units.
+    pub embedding_status:
+        Option<Arc<std::sync::RwLock<crate::services::embedding_migration::SweepStatus>>>,
     /// `None` when KEK_PROVIDER=none. A write at `private` is then refused rather than stored in
     /// plaintext.
     pub keys: Option<Arc<dyn KeyProvider>>,

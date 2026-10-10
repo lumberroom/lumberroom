@@ -22,14 +22,17 @@
 //! it. Everything in this file that touches the second one exists to keep it from decaying into a
 //! copy of the first.
 
+use std::time::Duration;
+
 use chrono::{DateTime, SubsecRound, Utc};
 
+use super::embedders::UnitEmbedding;
 use super::Ctx;
 use crate::adapters::auth::{assert_writable, can_read, can_write};
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::types::{ConflictCandidate, Memory, Sensitivity, WriteOutcome};
 use crate::domain::{namespaces, policy, similarity, tripwire};
-use crate::ports::{NeighbourQuery, NewMemory};
+use crate::ports::{ModelVector, NeighbourQuery, NewMemory};
 
 /// The default, kept as a name so callers and tests have one. The effective limit is
 /// `cfg.policy.max_content_chars`, which reads `WRITE_MAX_CONTENT_CHARS`.
@@ -272,15 +275,14 @@ async fn run_inner(
     // One unit for the vector, its model id and the dedupe bands: a band read from another model's
     // values would fold or keep rows on a scale the vector does not use.
     let u = ctx.embedders.for_unit(ctx.tenant())?;
-    let mut vectors = u.embedder.embed_documents(vec![content.to_string()]).await?;
-    let embedding =
-        vectors.pop().ok_or_else(|| DomainError::internal("embedder returned no vector"))?;
+    let Embedded { vector: embedding, second, missed } =
+        embed_document(&u, content, shadow_wait(ctx)).await?;
 
     // (f) The dedupe bands. One query at the lower threshold; the bands are split here.
     let mut possible_conflicts = Vec::new();
     if supersedes_id.is_none() {
         let floor = u.thresholds.get(similarity::CONFLICT);
-        let neighbours = neighbours(ctx, &namespace, &embedding, floor).await?;
+        let neighbours = neighbours(ctx, &u, &namespace, &embedding, floor).await?;
         for (candidate, row) in resolve_candidates(ctx, neighbours).await? {
             let above_dedupe = candidate.similarity >= u.thresholds.get(similarity::DEDUPE);
             let block = collapse_block(content, &candidate.content);
@@ -366,10 +368,13 @@ async fn run_inner(
             supersedes: supersedes_id,
             source_client: ctx.principal.client.clone(),
             embedding_model: u.embedder.id(),
+            slot: u.slot,
+            second,
             sensitivity: resolved,
             sealed: sealed.map(|(_, s)| s),
         })
         .await?;
+    log_missed(&u, &written.id, missed.as_deref());
 
     let new_id = uuid::Uuid::parse_str(&written.id)
         .map_err(|_| DomainError::internal("repository returned an id that is not a uuid"))?;
@@ -435,6 +440,7 @@ fn clean_tags(tags: Option<Vec<String>>) -> Vec<String> {
 /// it cannot see. That is the storing-too-much side of the trade, which is the side to be on.
 async fn neighbours(
     ctx: &Ctx,
+    u: &UnitEmbedding,
     namespace: &str,
     embedding: &[f32],
     floor: f64,
@@ -451,8 +457,64 @@ async fn neighbours(
             min_similarity: floor,
             limit: ctx.cfg.quality.conflict_limit,
             max_sensitivity: ceiling,
+            slot: u.slot,
         })
         .await
+}
+
+/// A document's vectors for one unit: the active model's, and during a migration the other's.
+pub(super) struct Embedded {
+    pub vector: Vec<f32>,
+    pub second: Option<ModelVector>,
+    /// Why `u.second` produced no vector. Logged once the row has an id.
+    pub missed: Option<String>,
+}
+
+/// `EMBED_SHADOW_TIMEOUT_MS`, the longest a write waits for its second vector.
+pub(super) fn shadow_wait(ctx: &Ctx) -> Duration {
+    Duration::from_millis(ctx.cfg.embed.migrate.shadow_timeout_ms)
+}
+
+/// Embeds with both of the unit's models at once. The active vector is required and its error
+/// fails the write. The second waits at most `wait`, and a miss lands the row with that slot NULL
+/// for the sweep to fill: a write must not stall on the model it does not read yet.
+///
+/// Write and archive restore both call this, so a restored row and a written row carry the same
+/// pair. A second copy of the join in archive would drift on the timeout or the log line.
+pub(super) async fn embed_document(
+    u: &UnitEmbedding,
+    content: &str,
+    wait: Duration,
+) -> Result<Embedded> {
+    let first = u.embedder.embed_documents(vec![content.to_string()]);
+    let second = async {
+        let s = u.second.as_ref()?;
+        let call = s.embed_documents(vec![content.to_string()]);
+        Some(match tokio::time::timeout(wait, call).await {
+            Ok(Ok(mut v)) => v
+                .pop()
+                .map(|vector| ModelVector { vector, model: s.id() })
+                .ok_or_else(|| format!("{} returned no vector", s.id())),
+            Ok(Err(e)) => Err(e.log_message()),
+            Err(_) => Err(format!("timeout after {} ms", wait.as_millis())),
+        })
+    };
+    let (first, second) = tokio::join!(first, second);
+    let vector =
+        first?.pop().ok_or_else(|| DomainError::internal("embedder returned no vector"))?;
+    let (second, missed) = match second {
+        None => (None, None),
+        Some(Ok(v)) => (Some(v), None),
+        Some(Err(why)) => (None, Some(why)),
+    };
+    Ok(Embedded { vector, second, missed })
+}
+
+/// The line an operator greps for when a unit will not flip: each miss leaves a row pending.
+pub(super) fn log_missed(u: &UnitEmbedding, id: &str, missed: Option<&str>) {
+    if let Some(why) = missed {
+        tracing::warn!(unit = %u.unit, id = %id, error = %why, "embedding second vector missed");
+    }
 }
 
 /// Fill in the text of every candidate before any of them is judged.
@@ -1277,5 +1339,139 @@ mod tests {
         assert_eq!(parse_sensitivity(Some("  ")).unwrap(), None);
         assert_eq!(parse_sensitivity(None).unwrap(), None);
         assert_eq!(parse_sensitivity(Some("private")).unwrap(), Some(Sensitivity::Private));
+    }
+
+    use std::sync::Arc;
+
+    use crate::domain::embedding_slot::VectorSlot;
+    use crate::domain::similarity::SimilarityThresholds;
+    use crate::ports::Embedder;
+
+    /// How a fake embedder answers.
+    enum Answer {
+        Vector(f32),
+        Fails,
+        Sleeps,
+    }
+
+    struct Fake(&'static str, Answer);
+
+    #[async_trait::async_trait]
+    impl Embedder for Fake {
+        fn id(&self) -> String {
+            self.0.to_string()
+        }
+        fn dim(&self) -> usize {
+            2
+        }
+        async fn embed_documents(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            match self.1 {
+                Answer::Vector(x) => Ok(texts.iter().map(|_| vec![x, x]).collect()),
+                Answer::Fails => Err(DomainError::internal("the sidecar is down")),
+                Answer::Sleeps => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Ok(texts.iter().map(|_| vec![9.0, 9.0]).collect())
+                }
+            }
+        }
+        async fn embed_query(&self, _: &str) -> Result<Vec<f32>> {
+            unreachable!("the write path embeds documents")
+        }
+    }
+
+    fn unit(slot: VectorSlot, first: Fake, second: Option<Fake>) -> UnitEmbedding {
+        UnitEmbedding {
+            unit: "me".into(),
+            slot,
+            thresholds: Arc::new(SimilarityThresholds {
+                model: first.0.into(),
+                family: None,
+                values: Default::default(),
+            }),
+            embedder: Arc::new(first),
+            second: second.map(|s| Arc::new(s) as Arc<dyn Embedder>),
+        }
+    }
+
+    const WAIT: Duration = Duration::from_millis(10_000);
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_with_the_second_embedder_down_lands_on_the_active_model() {
+        for down in [Answer::Fails, Answer::Sleeps] {
+            let u =
+                unit(VectorSlot::A, Fake("bge", Answer::Vector(1.0)), Some(Fake("gemma", down)));
+            let got = embed_document(&u, "Dana prefers TypeScript", WAIT).await.unwrap();
+            assert_eq!(got.vector, vec![1.0, 1.0]);
+            assert!(got.second.is_none());
+            assert!(got.missed.is_some(), "a miss has to reach the log");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_carries_both_vectors_when_both_answer() {
+        let u = unit(
+            VectorSlot::B,
+            Fake("gemma", Answer::Vector(2.0)),
+            Some(Fake("bge", Answer::Vector(1.0))),
+        );
+        let got = embed_document(&u, "Dana prefers TypeScript", WAIT).await.unwrap();
+        assert_eq!(got.vector, vec![2.0, 2.0]);
+        let second = got.second.expect("both models answered");
+        assert_eq!(second.model, "bge");
+        assert_eq!(second.vector, vec![1.0, 1.0]);
+        assert!(got.missed.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_write_with_the_active_embedder_down_fails_even_when_the_second_answers() {
+        let u = unit(
+            VectorSlot::A,
+            Fake("bge", Answer::Fails),
+            Some(Fake("gemma", Answer::Vector(2.0))),
+        );
+        assert!(embed_document(&u, "Dana prefers TypeScript", WAIT).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_write_outside_a_migration_embeds_once() {
+        let u = unit(VectorSlot::A, Fake("bge", Answer::Vector(1.0)), None);
+        let got = embed_document(&u, "Dana prefers TypeScript", WAIT).await.unwrap();
+        assert_eq!(got.vector, vec![1.0, 1.0]);
+        assert!(got.second.is_none());
+        assert!(got.missed.is_none(), "no second model means nothing missed");
+    }
+
+    /// The text of a service file before its tests, so this test's own literals cannot fail it.
+    fn production(src: &str) -> &str {
+        src.split("#[cfg(test)]").next().unwrap_or(src)
+    }
+
+    /// A service that picked a slot itself would read one column while its thresholds and query
+    /// vector came from the other unit's model. Every slot a service names comes from `u`.
+    #[test]
+    fn queries_carry_the_unit_slot() {
+        let files = [
+            ("write.rs", include_str!("write.rs")),
+            ("search.rs", include_str!("search.rs")),
+            ("forget.rs", include_str!("forget.rs")),
+            ("archive.rs", include_str!("archive.rs")),
+            ("recall.rs", include_str!("recall.rs")),
+            ("cleanup.rs", include_str!("cleanup.rs")),
+            ("bootstrap.rs", include_str!("bootstrap.rs")),
+        ];
+        let mut set = 0;
+        for (name, src) in files {
+            let text = production(src);
+            assert!(!text.contains("VectorSlot::"), "{name} names a slot itself");
+            for line in text.lines().map(str::trim) {
+                if line.starts_with("slot:") && !line.ends_with("VectorSlot,") {
+                    assert_eq!(line, "slot: u.slot,", "{name} sets a slot from somewhere else");
+                    set += 1;
+                }
+            }
+        }
+        // Two SearchQuery literals, NeighbourQuery, DigestQuery, NewMemory, RestoreRow, and the
+        // two cleanup bounds.
+        assert_eq!(set, 8, "a query literal lost its slot");
     }
 }

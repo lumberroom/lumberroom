@@ -4525,6 +4525,7 @@ async fn a_tagged_search_drops_a_text_match_that_lacks_the_tag() {
                     include_superseded,
                     as_of,
                     tags: vec!["infra".into()],
+                    slot: lumberroom_server::domain::embedding_slot::VectorSlot::A,
                 })
                 .await
                 .unwrap_or_else(|e| {

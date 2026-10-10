@@ -241,6 +241,7 @@ pub trait CleanupRepository: Send + Sync {
         tenant: &str,
         q: &CandidateQuery,
         min_similarity: f64,
+        slot: crate::domain::embedding_slot::VectorSlot,
     ) -> Result<Vec<CandidatePair>>;
 
     /// Live rows carrying `tag` that have a start date, oldest first by valid time.

@@ -325,6 +325,7 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
         // The engine ships no proposal source of its own; "canned" is this suite's test double,
         // held here so T4's tool tests can decide a proposal over the real MCP surface.
         proposals: vec![canned.clone()],
+        embedding_status: None,
     });
     let authenticator = auth::create(&ctx.cfg, Some(oauth)).ok()?;
     let app = lumberroom_server::http::router(state, authenticator);

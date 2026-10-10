@@ -237,12 +237,19 @@ pub fn trouble(title: &str, detail: &str, health: &Health) -> String {
 ///
 /// `namespace` set means one section of the document; absent means arrivals across everything this
 /// reader may reach.
+/// `embedding` is `console::embedding::section`'s HTML, already escaped. Only the arrivals page
+/// draws it; None when the sweep is off.
 pub fn reading(
     contents: &Contents,
     page: &Page,
     namespace: Option<&str>,
     health: &Health,
+    embedding: Option<&str>,
 ) -> String {
+    let embedding = match namespace {
+        None => embedding.unwrap_or(""),
+        Some(_) => "",
+    };
     let heading = match namespace {
         Some(ns) => escape(ns),
         None => "Arrivals".to_string(),
@@ -281,11 +288,12 @@ a write landing while you read cannot show you one twice.</span></div>",
         &format!(
             "<div class=\"c-body\">{rail}<main class=\"page\">\
 <div class=\"pagehead\"><h2>{heading}</h2><div class=\"when\">{count}</div><div class=\"grow\"></div>\
-{ask}</div>{body}{older}</main></div>",
+{ask}</div>{embedding}{body}{older}</main></div>",
             rail = rail(contents, namespace),
             heading = heading,
             count = escape(&count),
             ask = ask(""),
+            embedding = embedding,
             body = body,
             older = older,
         ),
@@ -1670,7 +1678,7 @@ mod tests {
     fn a_fact_carrying_markup_renders_as_text() {
         let hostile = "<script>alert(1)</script><img src=x onerror=alert(2)>";
         let page = Page { entries: vec![entry(hostile, Sensitivity::Open)], older: None };
-        let html = reading(&contents(), &page, None, &health());
+        let html = reading(&contents(), &page, None, &health(), None);
         // The payload has to survive as text and reach no parser as markup, so the assertion is
         // that no tag opens rather than that the words are gone.
         assert!(!html.contains("<script"));
@@ -1685,7 +1693,7 @@ mod tests {
         hostile.id = "\" onmouseover=\"alert(1)".into();
         hostile.source_client = "\"><b>injected".into();
         let page = Page { entries: vec![hostile], older: None };
-        let html = reading(&contents(), &page, None, &health());
+        let html = reading(&contents(), &page, None, &health(), None);
         assert!(!html.contains("onmouseover=\"alert"));
         assert!(!html.contains("\"><b>injected"));
         assert!(html.contains("&quot;"));
@@ -1712,7 +1720,7 @@ mod tests {
         let page = Page { entries: vec![sealed.clone()], older: None };
 
         for html in [
-            reading(&contents(), &page, None, &health()),
+            reading(&contents(), &page, None, &health(), None),
             fact(&leaf(sealed), &contents(), &health(), "tok", DAY),
         ] {
             assert!(!html.contains("this string must never reach a page"));
@@ -1726,7 +1734,7 @@ mod tests {
             entries: vec![entry("Hetzner renewal, 41 euro.", Sensitivity::Private)],
             older: None,
         };
-        let html = reading(&contents(), &page, None, &health());
+        let html = reading(&contents(), &page, None, &health(), None);
         assert!(html.contains("Hetzner renewal, 41 euro."));
         assert!(html.contains("class=\"e private\""), "the level travels on more than a word");
         assert!(html.contains("<span class=\"lv\">private</span>"));
@@ -1736,7 +1744,7 @@ mod tests {
     fn every_page_is_self_contained() {
         let page = Page { entries: vec![entry("A fact.", Sensitivity::Open)], older: None };
         let pages = [
-            reading(&contents(), &page, None, &health()),
+            reading(&contents(), &page, None, &health(), None),
             fact(&leaf(entry("A fact.", Sensitivity::Open)), &contents(), &health(), "tok", DAY),
             fact(&chained(), &contents(), &health(), "tok", DAY),
             search(&Answer::default(), &contents(), &health()),
@@ -1762,7 +1770,7 @@ mod tests {
     #[test]
     fn the_sealed_block_counts_and_names_the_command_that_reads_them() {
         let page = Page::default();
-        let html = reading(&contents(), &page, None, &health());
+        let html = reading(&contents(), &page, None, &health(), None);
         assert!(html.contains("credentials:lumberroom"));
         assert!(html.contains("6 items"));
         assert!(html.contains("lumberroom unseal"));
@@ -1772,7 +1780,7 @@ mod tests {
     fn the_health_line_reports_a_key_that_does_not_match() {
         let mut bad = health();
         bad.key_verified = false;
-        let html = reading(&contents(), &Page::default(), None, &bad);
+        let html = reading(&contents(), &Page::default(), None, &bad, None);
         assert!(html.contains("does not match"));
         assert!(html.contains("class=\"c-health bad\""));
     }
@@ -2170,8 +2178,13 @@ mod tests {
     fn a_dated_entry_carries_its_period_on_the_reading_page_and_an_undated_one_adds_nothing() {
         let mut dated = entry("The port is 8787.", Sensitivity::Open);
         dated.occurred_at = Some("2026-08-20T00:00:00Z".parse().unwrap());
-        let with =
-            reading(&contents(), &Page { entries: vec![dated], older: None }, None, &health());
+        let with = reading(
+            &contents(),
+            &Page { entries: vec![dated], older: None },
+            None,
+            &health(),
+            None,
+        );
         assert!(with.contains("<span class=\"vt\">since 20 Aug 2026</span>"));
 
         let without = reading(
@@ -2182,8 +2195,23 @@ mod tests {
             },
             Some("user:me"),
             &health(),
+            None,
         );
         assert!(!without.contains("class=\"vt\""), "no marker and no placeholder");
+    }
+
+    /// The arrivals page is the console's front door, so the model-change section sits there and
+    /// nowhere else. A namespace page reads one slice of the store and carries no store-wide status.
+    #[test]
+    fn the_embedding_section_shows_on_arrivals_and_not_on_a_namespace() {
+        let section = "<section class=\"em-sec\">model change</section>";
+        let page = Page { entries: vec![entry("A fact.", Sensitivity::Open)], older: None };
+        let arrivals = reading(&contents(), &page, None, &health(), Some(section));
+        assert!(arrivals.contains(section));
+        let namespace = reading(&contents(), &page, Some("user:me"), &health(), Some(section));
+        assert!(!namespace.contains("em-sec"));
+        let off = reading(&contents(), &page, None, &health(), None);
+        assert!(!off.contains("em-sec"));
     }
 
     /// The interval is half-open, so a fact ending on 20 August did not hold on 20 August and its

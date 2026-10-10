@@ -14,6 +14,8 @@
 pub mod alias;
 pub mod cleanup;
 pub mod embedder;
+pub mod embedding_migration;
+pub mod free_space;
 pub mod ingest;
 pub mod memory;
 pub mod oauth;
@@ -24,16 +26,19 @@ pub mod tool_calls;
 pub use alias::{Alias, AliasRepository, NewAlias};
 pub use cleanup::CleanupRepository;
 pub use embedder::Embedder;
+pub use embedding_migration::{ChangeOutcome, EmbeddingMigrationRepository};
+pub use free_space::FreeSpace;
 pub use ingest::{
     EmissionHit, EmissionProbe, IngestRepository, NewProposal, NewRun, Proposal, ProposalFilter,
     ProposalSource, ProposalState, ProposalUpsert, RunRecord, RunTotals, Watermark,
     WatermarkAdvance,
 };
 pub use memory::{
-    ChainEdits, ChainLink, ChainNeighbours, ConflictPair, ConflictSweep, DeleteOutcome, DeletePlan,
-    DigestData, DigestQuery, DismissedPair, Emission, MemoryRepository, NamespaceRows,
-    NamespaceSummary, NeighbourQuery, NewMemory, RecallCall, RecallEvent, RecentQuery,
-    RegistrySummary, RestoreRow, SearchQuery, Staleness, TagCount, Timeline, Weights,
+    slot_ordered, ChainEdits, ChainLink, ChainNeighbours, ConflictPair, ConflictSweep,
+    DeleteOutcome, DeletePlan, DigestData, DigestQuery, DismissedPair, Emission, MemoryRepository,
+    ModelVector, NamespaceRows, NamespaceSummary, NeighbourQuery, NewMemory, RecallCall,
+    RecallEvent, RecentQuery, RegistrySummary, RestoreRow, SearchQuery, Staleness, TagCount,
+    Timeline, Weights,
 };
 pub use oauth::{
     AccessTokenRecord, ClientGrantUpdate, CodeOutcome, NewAccessToken, NewAuthCode, NewOauthClient,

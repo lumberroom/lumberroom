@@ -260,6 +260,7 @@ pub(super) async fn run_with(
             },
             include_superseded,
             tags: tags::normalise(tags),
+            slot: u.slot,
         })
         .await?;
 
