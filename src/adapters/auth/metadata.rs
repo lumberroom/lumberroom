@@ -157,7 +157,6 @@ mod tests {
                 dim: 768,
                 model: "test".into(),
                 cache_dir: String::new(),
-                allow_fallback: true,
                 remote: Default::default(),
             },
             bootstrap: BootstrapConfig {

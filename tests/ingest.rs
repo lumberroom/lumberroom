@@ -249,7 +249,6 @@ async fn setup() -> Option<Harness> {
         oauth: Arc::clone(&oauth),
         ingest: Arc::clone(&repo),
         embedder: Arc::clone(&ctx.embedder),
-        degraded_embedder: false,
         keys: ctx.keys.clone(),
         kek_verified: ctx.kek_verified,
         proposals: Vec::new(),

@@ -1,6 +1,5 @@
 {
   "embedder": "bge-base-en-v1.5",
-  "embedder_degraded": false,
   "auth_mode": "oauth",
   "kek_provider": "file",
   "kek_verified": true,

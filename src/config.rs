@@ -351,7 +351,6 @@ pub struct EmbedConfig {
     pub dim: usize,
     pub model: String,
     pub cache_dir: String,
-    pub allow_fallback: bool,
     /// Read only when the provider is `openai`.
     pub remote: RemoteEmbedConfig,
 }
@@ -644,6 +643,18 @@ fn parse_fusion(raw: &str) -> Result<Fusion> {
     }
 }
 
+/// `EMBED_ALLOW_FALLBACK`, refused when set to anything but false. Decision 0028.
+fn refuse_embed_fallback(raw: Option<&str>) -> Result<()> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("false") | Some("0") => Ok(()),
+        Some(_) => Err(DomainError::validation(
+            "EMBED_ALLOW_FALLBACK was removed (decision 0028): a fallback embedder writes vectors \
+             that cannot be compared with the rest of the store. Unset it; a model that fails to \
+             load now stops the boot.",
+        )),
+    }
+}
+
 /// `WRITE_MIN_OCCURRED_AGE_SECS`, refused at boot at both ends.
 ///
 /// A free function for `parse_fusion`'s reason: the refusal is testable without two tests racing
@@ -885,6 +896,7 @@ pub fn load() -> Result<Config> {
     // router's cosine thresholds mean anything at all.
     let fusion = parse_fusion(&env("SEARCH_FUSION", "linear"))?;
     let embed_model = env("EMBED_MODEL", "Xenova/bge-base-en-v1.5");
+    refuse_embed_fallback(env_opt("EMBED_ALLOW_FALLBACK").as_deref())?;
 
     let cfg = Config {
         public_url: public_url.clone(),
@@ -930,7 +942,6 @@ pub fn load() -> Result<Config> {
             dim: env_num("EMBED_DIM", 768usize)?,
             model: embed_model.clone(),
             cache_dir: env("MODEL_CACHE_DIR", "/models"),
-            allow_fallback: env_bool("EMBED_ALLOW_FALLBACK", false),
             remote: RemoteEmbedConfig {
                 base_url: env("EMBED_BASE_URL", "").trim_end_matches('/').to_string(),
                 api_key: env_opt("EMBED_API_KEY"),
@@ -2008,6 +2019,20 @@ mod tests {
         let err = parse_fusion("reciprocal").unwrap_err().to_string();
         assert!(err.contains("linear|rrf"), "the message has to name what to write: {err}");
         assert!(parse_fusion("RRF").is_err(), "the other enums here match lowercase only");
+    }
+
+    /// An operator who still sets `EMBED_ALLOW_FALLBACK=true` must learn at boot that it is gone,
+    /// not meet a setting that does nothing. Explicit false spellings stay legal so a stale `.env`
+    /// that says `false` keeps booting.
+    #[test]
+    fn config_refuses_embed_allow_fallback() {
+        assert!(refuse_embed_fallback(Some("true")).is_err());
+        assert!(refuse_embed_fallback(Some("1")).is_err());
+        let err = refuse_embed_fallback(Some("true")).unwrap_err().to_string();
+        assert!(err.contains("EMBED_ALLOW_FALLBACK") && err.contains("0028"), "{err}");
+        assert!(refuse_embed_fallback(None).is_ok());
+        assert!(refuse_embed_fallback(Some("")).is_ok());
+        assert!(refuse_embed_fallback(Some("false")).is_ok());
     }
 
     #[test]

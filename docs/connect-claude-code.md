@@ -208,7 +208,7 @@ all checks passed
 ```
 
 A pass ends with `all checks passed` and exits 0. Read four lines of it before moving on: `readyz`
-must say `embedder_degraded: false` or every write lands as a hash vector that retrieves badly;
+must name the embedder you configured;
 `credential` must name the credential you meant; `whoami` is the grant the server will enforce; and
 `tools` is what your credential can see, which section 5 explains. This transcript predates
 `alias_list`: a bare grant today lists five tools, not four, and section 5 has the current count.

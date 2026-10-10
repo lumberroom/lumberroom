@@ -538,19 +538,6 @@ async fn restore(
         ));
     }
 
-    // Every row is embedded here, and a store embedded by the fallback sketch is not a store: the
-    // vectors are an unsalted bucket count over each row's own tokens. Checked once, because the
-    // embedder is chosen at boot and nothing reloads it.
-    let sketch = ctx.embedder.id().starts_with(super::write::HASH_EMBEDDER_ID_PREFIX);
-    let chosen = ctx.cfg.embed.provider == crate::config::EmbedProvider::Hash;
-    if sketch && !chosen {
-        return Err(DomainError::unavailable(
-            "the embedding model failed to load at boot and the server is running on the fallback \
-             hash embedder. Restoring now would write the whole store's vectors as token sketches. \
-             Restart with the model reachable and run the restore again.",
-        ));
-    }
-
     // Every row is classified before any row is written, and a single refusal stops the run.
     //
     // Merge tolerates a refused row because it adds to a store that already exists. Restore claims

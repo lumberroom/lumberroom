@@ -503,9 +503,10 @@ type and rebuilds the HNSW index, then set `EMBED_DIM` to match.
 
 ## Troubleshooting
 
-**`/readyz` returns 503 with `embedder_degraded: true`.** The model failed to load and
-`EMBED_ALLOW_FALLBACK` sent it to the hash embedder. Anything written meanwhile retrieves badly.
-Check `docker compose logs server`, fix the cause, restart, and rewrite those rows.
+**The server exits at boot naming the embedder.** The model failed to load or the endpoint did
+not answer. No fallback embedder exists (decision 0028), so the server stops rather than write
+vectors nothing else can be compared with. Check `docker compose logs server`, fix the cause and
+start it again.
 
 **The server will not start in oauth mode.** It names the setting. The three it refuses without are
 `OWNER_PASSWORD_HASH`, `OAUTH_COOKIE_SECRET` and an `https` or loopback `PUBLIC_URL`. A hash mangled

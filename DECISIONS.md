@@ -43,9 +43,9 @@ already stored; `DEPLOY.md` has the procedure. Every row records its `embedding_
 mixed store is detectable rather than mysterious.
 
 A third provider, `hash`, is deterministic and needs no weights. It exists so the test suite runs
-in three seconds without downloading anything, and as an emergency fallback under
-`EMBED_ALLOW_FALLBACK=true`. Its retrieval quality is word overlap only, so it is never a
-production setting, and `/readyz` reports 503 when the server has fallen back to it.
+in three seconds without downloading anything. Its retrieval quality is word overlap only, so it
+is never a production setting. It used to stand in as an emergency fallback under
+`EMBED_ALLOW_FALLBACK=true`; decision 0028 removed that.
 
 ---
 

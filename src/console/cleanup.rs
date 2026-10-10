@@ -695,7 +695,6 @@ mod tests {
             key_verified: true,
             keys_configured: true,
             embedder: "bge-small-en-v1.5".into(),
-            degraded_embedder: false,
             last_write: None,
             now: Utc::now(),
         }

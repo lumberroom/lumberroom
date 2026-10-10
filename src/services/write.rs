@@ -269,15 +269,6 @@ async fn run_inner(
         }
     }
 
-    // An encrypted row's embedding is stored in the clear, and with the real model that leaks the
-    // gist, which is the documented trade. The hash embedder leaks more than the gist: it is an
-    // unsalted bucket count over the row's own tokens, so a dump holder can test words against it
-    // one at a time. While the server is degraded onto it, a private write is refused rather than
-    // stored beside a sketch of itself.
-    if resolved.is_encrypted() {
-        refuse_sketch_of_private_content(ctx)?;
-    }
-
     let mut vectors = ctx.embedder.embed_documents(vec![content.to_string()]).await?;
     let embedding =
         vectors.pop().ok_or_else(|| DomainError::internal("embedder returned no vector"))?;
@@ -405,37 +396,6 @@ async fn run_inner(
         end_left_open,
         possible_conflicts,
     })
-}
-
-/// How the hash embedder's `id()` begins. The adapter formats it as `hash-v1-<dim>`, and this
-/// layer cannot name the adapter, so the prefix is the contract; `tests/integration.rs` pins the
-/// two against each other.
-pub const HASH_EMBEDDER_ID_PREFIX: &str = "hash-v1-";
-
-/// Refuse a private write while the embedder in use is the hash sketch and the operator did not
-/// choose it.
-///
-/// The fallback case only. `EMBED_ALLOW_FALLBACK` swaps the sketch in when the model fails to
-/// load, `/readyz` already reports that window as degraded, and an outage on private writes for
-/// its duration costs less than a token-membership oracle stored for good. `EMBED_PROVIDER=hash`
-/// is the operator's own choice and the test suite's, and it goes through; the config documents
-/// that setting as never for production.
-///
-/// The embedder is picked once at boot and nothing reloads it, so the way out of this refusal is
-/// a restart, and the message says so. Telling the caller to retry would have it retry forever.
-fn refuse_sketch_of_private_content(ctx: &Ctx) -> Result<()> {
-    let sketch = ctx.embedder.id().starts_with(HASH_EMBEDDER_ID_PREFIX);
-    let chosen = ctx.cfg.embed.provider == crate::config::EmbedProvider::Hash;
-    if !sketch || chosen {
-        return Ok(());
-    }
-    Err(DomainError::unavailable(
-        "this content classifies as private and the server is running on the fallback hash \
-         embedder because the embedding model failed to load at boot. Its vector is a token \
-         sketch of the content, which would sit in the clear beside the ciphertext. The embedder \
-         is chosen once at startup: restart the server with the model reachable (/readyz reports \
-         degraded_embedder until then), or write it to a namespace that defaults to open.",
-    ))
 }
 
 /// An unrecognised level is a refusal, never a silent `open`: defaulting a level the server does

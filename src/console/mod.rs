@@ -213,7 +213,6 @@ impl Console {
             key_verified: self.state.kek_verified,
             keys_configured: self.state.keys.is_some(),
             embedder: self.cfg().embed.model.clone(),
-            degraded_embedder: self.state.degraded_embedder,
             last_write: None,
             now: chrono::Utc::now(),
         }

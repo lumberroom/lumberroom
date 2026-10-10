@@ -140,9 +140,6 @@ if [ "$(get /readyz "$WORK/ready.json")" = 200 ]; then
     fail "KEK_PROVIDER=$KEK and kek_verified is false. The server is up and refusing every private \
 write. Check the boot log for the fingerprint mismatch before writing anything."
   fi
-  [ "$(field "$WORK/ready.json" embedder_degraded)" = "false" ] \
-    && pass "the embedder is the configured one, not a fallback" \
-    || warn "embedder_degraded is true: search quality is not what the eval measured"
 else
   fail "readyz did not answer 200"
 fi

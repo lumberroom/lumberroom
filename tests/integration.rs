@@ -4063,44 +4063,6 @@ async fn a_write_only_grant_cannot_learn_whether_its_exact_sentence_is_stored() 
 }
 
 #[tokio::test]
-async fn a_private_write_is_refused_while_the_server_is_degraded_onto_the_hash_embedder() {
-    use lumberroom_server::config::EmbedProvider;
-    use lumberroom_server::ports::Embedder as _;
-    // The harness runs the hash embedder under EMBED_PROVIDER=hash, which is the operator's own
-    // choice and goes through. Tuning the config to `local` while the embedder stays the hash
-    // sketch is the fallback window.
-    let (ctx, _pool, _serial) =
-        ctx_or_skip!(|cfg: &mut Config| cfg.embed.provider = EmbedProvider::Local);
-    assert!(
-        HashEmbedder::new(768).id().starts_with(write::HASH_EMBEDDER_ID_PREFIX),
-        "the service keys on this prefix"
-    );
-
-    let refused = write::run(
-        &ctx,
-        "a private fact while degraded",
-        "user:me",
-        None,
-        None,
-        Some("private"),
-        None,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(refused.kind.http_status(), 503);
-    assert!(
-        refused.client_message().contains("fallback hash embedder"),
-        "{}",
-        refused.client_message()
-    );
-
-    // Open writes are unaffected: the sketch of an open row sits beside its plaintext anyway.
-    write::run(&ctx, "an open fact while degraded", "user:me", None, None, None, None)
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
 async fn an_open_ceiling_writer_cannot_replace_or_declassify_a_private_registry_row() {
     let (ctx, pool, _serial) = ctx_or_skip!();
     let secret = nonce("regslot");

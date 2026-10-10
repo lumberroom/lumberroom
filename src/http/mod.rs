@@ -329,14 +329,12 @@ async fn healthz() -> impl IntoResponse {
 /// honest and expected: a plain `cargo build` passes no stamp.
 fn static_checks(
     embedder: &str,
-    embedder_degraded: bool,
     auth_mode: &str,
     kek_provider: &str,
     kek_verified: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "embedder": embedder,
-        "embedder_degraded": embedder_degraded,
         "auth_mode": auth_mode,
         "kek_provider": kek_provider,
         // A server whose KEK did not verify refuses every private write and looks healthy
@@ -351,7 +349,6 @@ fn static_checks(
 async fn readyz(State(http): State<Http>) -> Response {
     let mut checks = static_checks(
         &http.state.embedder.id(),
-        http.state.degraded_embedder,
         http.state.cfg.mode_str(),
         http.state.cfg.crypto.provider.as_str(),
         http.state.kek_verified,
@@ -367,9 +364,7 @@ async fn readyz(State(http): State<Http>) -> Response {
 
     // An unverified KEK does not make the server unready. Open reads and writes work, and reporting
     // 503 would take a store that is serving most of its traffic out of rotation.
-    let ok = !http.state.degraded_embedder;
-    let status = if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    (status, Json(merge_ok(checks, ok))).into_response()
+    (StatusCode::OK, Json(merge_ok(checks, true))).into_response()
 }
 
 fn merge_ok(mut v: serde_json::Value, ok: bool) -> serde_json::Value {
@@ -2222,7 +2217,7 @@ mod tests {
     /// name. A rename here turns the stale-image check into a permanent warning that nobody trusts.
     #[test]
     fn readyz_publishes_the_build_stamp_under_the_names_deploy_check_reads() {
-        let v = static_checks("hash-32", false, "token", "none", false);
+        let v = static_checks("hash-32", "token", "none", false);
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
         keys.sort();
         assert_eq!(
@@ -2233,7 +2228,6 @@ mod tests {
                 "build_tag",
                 "built_at",
                 "embedder",
-                "embedder_degraded",
                 "kek_provider",
                 "kek_verified",
             ]
@@ -2247,9 +2241,17 @@ mod tests {
         }
 
         // merge_ok runs over this on the 503 path too, so the stamp survives a failing ping.
-        let failed = merge_ok(static_checks("hash-32", true, "token", "none", false), false);
+        let failed = merge_ok(static_checks("hash-32", "token", "none", false), false);
         assert_eq!(failed["ok"], serde_json::json!(false));
         assert_eq!(failed["build_sha"], serde_json::json!(crate::build_info::SHA));
+    }
+
+    /// Decision 0028 removed the fallback, so no state exists for this key to report. A client that
+    /// still reads it would see a field that is always false and trust it.
+    #[test]
+    fn readyz_has_no_embedder_degraded_key() {
+        let v = static_checks("Xenova/bge-base-en-v1.5@q8", "token", "none", true);
+        assert!(v.get("embedder_degraded").is_none(), "{v}");
     }
 }
 

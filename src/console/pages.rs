@@ -63,7 +63,6 @@ pub struct Health {
     pub key_verified: bool,
     pub keys_configured: bool,
     pub embedder: String,
-    pub degraded_embedder: bool,
     pub last_write: Option<DateTime<Utc>>,
     pub now: DateTime<Utc>,
 }
@@ -77,11 +76,7 @@ impl Health {
         } else {
             "key <b>does not match</b>".to_string()
         };
-        let embedder = if self.degraded_embedder {
-            format!("embedder <b>{} fallback</b>", escape(&self.embedder))
-        } else {
-            format!("embedder {}", escape(&self.embedder))
-        };
+        let embedder = format!("embedder {}", escape(&self.embedder));
         let write = match self.last_write {
             Some(at) => format!("last write {}", ago(at, self.now)),
             None => "nothing written yet".to_string(),
@@ -90,7 +85,7 @@ impl Health {
     }
 
     fn bad(&self) -> bool {
-        !self.key_verified || self.degraded_embedder
+        !self.key_verified
     }
 }
 
@@ -1460,7 +1455,6 @@ mod tests {
             key_verified: true,
             keys_configured: true,
             embedder: "onnx-minilm".into(),
-            degraded_embedder: false,
             last_write: Some("2026-08-19T14:02:00Z".parse().unwrap()),
             now: "2026-08-19T16:02:00Z".parse().unwrap(),
         }

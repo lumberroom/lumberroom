@@ -178,7 +178,6 @@ services:
       EMBED_PROVIDER: ${EMBED_PROVIDER:-local}
       EMBED_MODEL: ${EMBED_MODEL:-Xenova/bge-base-en-v1.5}
       EMBED_DIM: ${EMBED_DIM:-768}
-      EMBED_ALLOW_FALLBACK: ${EMBED_ALLOW_FALLBACK:-false}
       # EMBED_PROVIDER=openai only. Compose hands the server an explicit map, so a remote embedder
       # set in .env reaches the server only through these lines.
       EMBED_BASE_URL: ${EMBED_BASE_URL:-}
@@ -401,7 +400,6 @@ services:
       EMBED_PROVIDER: ${EMBED_PROVIDER:-local}
       EMBED_MODEL: ${EMBED_MODEL:-Xenova/bge-base-en-v1.5}
       EMBED_DIM: ${EMBED_DIM:-768}
-      EMBED_ALLOW_FALLBACK: ${EMBED_ALLOW_FALLBACK:-false}
       # EMBED_PROVIDER=openai only. Compose hands the server an explicit map, so a remote embedder
       # set in .env reaches the server only through these lines.
       EMBED_BASE_URL: ${EMBED_BASE_URL:-}
