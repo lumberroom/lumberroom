@@ -402,6 +402,9 @@ async fn merge(
             continue;
         }
 
+        // `run_restored` is `run_observed` with the carried cap. An exported row was valid where it
+        // was written, and a cap of 2000 would refuse every longer one.
+        //
         // `run_observed` rather than `run`, and the near-now fence is the whole difference.
         //
         // The fence refuses an `occurred_at` inside the last day because a model reading a date out
@@ -409,7 +412,7 @@ async fn merge(
         // the source store's own column, which is the same kind of metadata `services::ingest`
         // passes, and fencing it would refuse every row a person wrote yesterday. Migrating a store
         // and losing this week is not a trade an import gets to make silently.
-        let outcome = super::write::run_observed(
+        let outcome = super::write::run_restored(
             ctx,
             &rec.content,
             &rec.namespace,

@@ -204,6 +204,11 @@ fn message(result: &serde_json::Value) -> String {
 /// Returns None when no database is reachable, so the suite skips rather than fails on a machine
 /// without one.
 async fn setup() -> Option<Harness> {
+    setup_with(|_| {}).await
+}
+
+/// `setup` with the loaded config open to the case before the server and the context share it.
+async fn setup_with(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
     let guard = SERIAL.lock().await;
     let admin_url = std::env::var("DATABASE_URL").ok()?;
     let base = admin_url.rsplit_once('/')?.0.to_string();
@@ -258,7 +263,8 @@ async fn setup() -> Option<Harness> {
     .await;
     step!("truncating the test database", truncated);
 
-    let cfg: Config = step!("loading the config", config::load());
+    let mut cfg: Config = step!("loading the config", config::load());
+    tune(&mut cfg);
     let keys: Arc<dyn KeyProvider> = Arc::new(EnvKeyProvider::new(TEST_KEK_VAR, TEST_KEK_ID));
     let kek = step!("reading the test key", keys.kek().await);
     let check = postgres::verify_kek(
@@ -730,4 +736,104 @@ async fn whoami_reports_every_capability_that_gates_a_tool() {
     for field in ["may_delete", "may_ingest", "may_read_history", "registry_write"] {
         assert!(body.contains(field), "whoami omits {field}, which gates a tool: {body}");
     }
+}
+
+// -- the write cap -------------------------------------------------------------------------------
+
+/// `WRITE_MAX_CONTENT_CHARS` for these cases. Not the default of 2000, so a description or refusal
+/// that printed the default in place of the setting fails here.
+const CAP: usize = 1500;
+
+macro_rules! capped_or_skip {
+    () => {
+        match setup_with(|cfg| cfg.policy.max_content_chars = CAP).await {
+            Some(h) => h,
+            None => {
+                eprintln!("skipping: no database reachable");
+                return;
+            }
+        }
+    };
+}
+
+/// Plain prose of exactly `chars` characters. It ends on a full stop because the write path trims
+/// the content before it counts, and a trailing space would shorten the row by one.
+fn prose(chars: usize) -> String {
+    const SENTENCE: &str =
+        "The settlement worker drains the payout queue each hour and posts a summary to the ledger channel. ";
+    let mut text: String =
+        SENTENCE.repeat(chars / SENTENCE.len() + 1).chars().take(chars).collect();
+    text.pop();
+    text.push('.');
+    text
+}
+
+/// One character over the setting, through the transport a model uses. The refusal is the only
+/// thing the agent reads before it retries, so it has to carry both numbers and the fix.
+#[tokio::test]
+async fn a_write_one_past_the_cap_is_refused_with_both_numbers_and_the_split() {
+    let h = capped_or_skip!();
+    let content = prose(CAP + 1);
+    assert_eq!(content.chars().count(), 1501);
+
+    let result = h
+        .tool_call(
+            OWNER_TOKEN,
+            "memory_write",
+            serde_json::json!({ "content": content, "namespace": "user:me" }),
+        )
+        .await;
+    let text = message(&result);
+    assert!(refused(&result), "a write past the cap was stored: {text}");
+    assert!(text.contains("content is 1501 chars and the limit is 1500."), "{text}");
+    assert!(text.contains("separate memory_write calls"), "{text}");
+    assert!(text.contains("one durable fact each"), "{text}");
+    assert!(text.contains("supersedes"), "a correction is told nothing about supersedes: {text}");
+}
+
+#[tokio::test]
+async fn a_write_at_the_cap_is_stored() {
+    let h = capped_or_skip!();
+    let content = prose(CAP);
+    assert_eq!(content.chars().count(), 1500);
+
+    let result = h
+        .tool_call(
+            OWNER_TOKEN,
+            "memory_write",
+            serde_json::json!({ "content": content, "namespace": "user:me" }),
+        )
+        .await;
+    assert!(!refused(&result), "a write at the cap was refused: {}", message(&result));
+    let id = result["structuredContent"]["id"].as_str().unwrap_or_default();
+    assert!(!id.is_empty(), "the write answered with no id: {result}");
+}
+
+/// The description a credential is served, read off `tools/list` itself. The unit test in
+/// `src/mcp/mod.rs` holds the helper; only this one proves `list_tools` calls it with the setting.
+async fn listed_description(h: &Harness, name: &str) -> String {
+    let result = h.call(OWNER_TOKEN, "tools/list", serde_json::json!({})).await;
+    let tools = result["tools"].as_array().expect("tools/list returns an array");
+    let tool = tools
+        .iter()
+        .find(|t| t["name"] == name)
+        .unwrap_or_else(|| panic!("{name} is not listed: {result}"));
+    tool["description"].as_str().unwrap_or_default().to_string()
+}
+
+#[tokio::test]
+async fn tools_list_states_the_configured_cap_on_memory_write() {
+    let h = capped_or_skip!();
+    let write = listed_description(&h, "memory_write").await;
+    assert!(write.contains("Content over 1500 characters is refused."), "{write}");
+    // The default must not leak through beside the setting.
+    assert!(!write.contains("2000"), "{write}");
+}
+
+#[tokio::test]
+async fn tools_list_carries_no_cap_on_memory_search() {
+    let h = capped_or_skip!();
+    let search = listed_description(&h, "memory_search").await;
+    assert!(!search.contains("1500"), "{search}");
+    assert!(!search.contains("characters is refused"), "{search}");
 }

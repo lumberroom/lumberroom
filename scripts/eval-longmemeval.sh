@@ -238,7 +238,7 @@ trap cleanup EXIT INT TERM
 #     mode as a write-ceiling truncation below and just as fatal to the number.
 #   WRITE_MAX_CONTENT_CHARS=200000
 #     The comparable protocol writes a whole haystack session as one document, and a real session
-#     rendered whole runs past the default 8000-char write ceiling. Raised well past the longest
+#     rendered whole runs past the default 2000-char write ceiling. Raised well past the longest
 #     session in the set rather than tuned to it, so nothing here is silently truncated either.
 #   SEARCH_INCLUDE_ALL_PROJECTS=false
 #     Each question's haystack lives in its own project: namespace (see question_namespace in

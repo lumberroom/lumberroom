@@ -115,6 +115,12 @@ pub const DEFAULT_BOOTSTRAP_DEDUP_COSINE: f64 = 0.90;
 /// pin the default without setting a process-wide variable.
 pub const DEFAULT_MIN_OCCURRED_AGE_SECS: u64 = 86_400;
 
+/// The longest content one memory may carry when `WRITE_MAX_CONTENT_CHARS` is unset. 2000 since
+/// decision 0030; 8000 before it.
+///
+/// Named so the write path, the test configs and a test pinning the default read one number.
+pub const DEFAULT_MAX_CONTENT_CHARS: usize = 2000;
+
 /// Widest window the boot check allows. A year.
 const MAX_MIN_OCCURRED_AGE_SECS: u64 = 365 * 24 * 60 * 60;
 
@@ -619,10 +625,12 @@ pub struct PolicyConfig {
     /// The credential tripwire. On by default; a write of credential-shaped content at `open` is
     /// refused with the pattern named.
     pub tripwire: bool,
-    /// The longest content one memory may carry. A memory is a fact, not a transcript, and 8000
-    /// characters is generous for one. It is a setting rather than a constant because a retrieval
-    /// benchmark stores whole chat sessions as single documents, and refusing those would measure
-    /// the cap instead of the ranking.
+    /// The longest content one memory may carry. A memory is a fact, not a transcript, and 2000
+    /// characters holds one fact in a few sentences (decision 0030). It is a setting rather than a
+    /// constant because a retrieval benchmark stores whole chat sessions as single documents, and
+    /// refusing those would measure the cap instead of the ranking.
+    ///
+    /// An archive merge answers to the larger of this and 8000, through `write::run_restored`.
     pub max_content_chars: usize,
     /// Highest level `memory_write` will accept from a tool at all. Sealed content goes through the
     /// client-side path, never through a plaintext tool argument.
@@ -1295,10 +1303,11 @@ pub fn load() -> Result<Config> {
             defaults_from_env: sensitivity_defaults_env.is_some(),
             tripwire: env_bool("SENSITIVITY_TRIPWIRE", true),
             max_write_sensitivity: env_sensitivity("MAX_WRITE_SENSITIVITY", Sensitivity::Private)?,
-            // A memory is a fact, not a transcript, and 8000 characters is generous for one. It
-            // moves for one reason: a retrieval benchmark stores whole chat sessions as single
-            // documents, and refusing those would measure the cap rather than the ranking.
-            max_content_chars: env_num("WRITE_MAX_CONTENT_CHARS", 8000usize)?,
+            // A memory is a fact, not a transcript. Agents wrote session narrative under a cap of
+            // 8000, so the default is 2000 (decision 0030). It moves for one reason: a retrieval
+            // benchmark stores whole chat sessions as single documents, and refusing those would
+            // measure the cap rather than the ranking.
+            max_content_chars: env_num("WRITE_MAX_CONTENT_CHARS", DEFAULT_MAX_CONTENT_CHARS)?,
             write_min_occurred_age_secs: env_num(
                 "WRITE_MIN_OCCURRED_AGE_SECS",
                 DEFAULT_MIN_OCCURRED_AGE_SECS,
@@ -2485,6 +2494,12 @@ mod tests {
         assert!(check_min_occurred_age(DEFAULT_MIN_OCCURRED_AGE_SECS).is_ok());
         assert!(check_min_occurred_age(1).is_ok(), "a one second window is an operator's escape");
         assert!(check_min_occurred_age(MAX_MIN_OCCURRED_AGE_SECS).is_ok());
+    }
+
+    /// The number the changelog, `.env.example` and decision 0030 quote.
+    #[test]
+    fn the_default_write_cap_is_2000_characters() {
+        assert_eq!(DEFAULT_MAX_CONTENT_CHARS, 2000);
     }
 
     #[test]

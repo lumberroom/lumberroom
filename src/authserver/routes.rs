@@ -2516,7 +2516,7 @@ mod tests {
                     defaults_from_env: false,
                     tripwire: true,
                     max_write_sensitivity: crate::domain::types::Sensitivity::Private,
-                    max_content_chars: 8000,
+                    max_content_chars: DEFAULT_MAX_CONTENT_CHARS,
                     write_min_occurred_age_secs: DEFAULT_MIN_OCCURRED_AGE_SECS,
                 },
                 crypto: CryptoConfig {

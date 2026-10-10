@@ -36,7 +36,55 @@ use crate::ports::{ModelVector, NeighbourQuery, NewMemory};
 
 /// The default, kept as a name so callers and tests have one. The effective limit is
 /// `cfg.policy.max_content_chars`, which reads `WRITE_MAX_CONTENT_CHARS`.
-pub const MAX_CONTENT_CHARS: usize = 8000;
+pub const MAX_CONTENT_CHARS: usize = crate::config::DEFAULT_MAX_CONTENT_CHARS;
+
+/// The floor for [`Cap::Carried`]. Rows written before the default dropped to 2000 were bounded by
+/// 8000, and so is anything an older archive carries in.
+///
+/// Its own number, and not [`MAX_CONTENT_CHARS`]. A floor tied to the default dropped with it, and
+/// refused imports again with every test green.
+const CARRIED_MAX_CHARS: usize = 8000;
+
+/// Which length cap a write answers to.
+///
+/// Private for the same reason [`Fence`] is: the tool layer cannot name it, so a model cannot set
+/// it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cap {
+    /// `cfg.policy.max_content_chars`. A model or a person composing a fact now.
+    Configured,
+    /// The larger of the setting and [`CARRIED_MAX_CHARS`]. Content the caller did not compose
+    /// here: a row an archive carries in.
+    /// A tighter setting is a rule about how agents write, and applying it to these refuses a row
+    /// that was valid where it came from, with advice the caller cannot follow.
+    Carried,
+}
+
+fn cap_chars(cap: Cap, configured: usize) -> usize {
+    match cap {
+        Cap::Configured => configured,
+        Cap::Carried => configured.max(CARRIED_MAX_CHARS),
+    }
+}
+
+/// The length refusal, with both numbers and nothing else.
+///
+/// The console, an ingest approval, a review merge and an archive merge all read it, and none of
+/// them can act on advice to split into `memory_write` calls. The MCP layer adds that advice for
+/// the one caller that can.
+fn too_long_message(chars: usize, max_chars: usize) -> String {
+    format!("content is {chars} chars and the limit is {max_chars}.")
+}
+
+/// The length check every write runs, for a caller that has to refuse before it reaches one.
+///
+/// It counts characters after the trim, as the write does, so a caller that checks here first
+/// refuses exactly what the write would. The ingest post runs it so an over-long fact never
+/// reaches the queue, and the MCP layer runs it to add its split advice.
+pub fn length_refusal(content: &str, max_chars: usize) -> Option<String> {
+    let chars = content.trim().chars().count();
+    (chars > max_chars).then(|| too_long_message(chars, max_chars))
+}
 
 /// Whether the near-now fence runs on this write.
 ///
@@ -66,8 +114,18 @@ pub async fn run(
     sensitivity: Option<&str>,
     occurred_at: Option<DateTime<Utc>>,
 ) -> Result<WriteOutcome> {
-    run_inner(ctx, content, namespace, tags, supersedes, sensitivity, occurred_at, Fence::Apply)
-        .await
+    run_inner(
+        ctx,
+        content,
+        namespace,
+        tags,
+        supersedes,
+        sensitivity,
+        occurred_at,
+        Fence::Apply,
+        Cap::Configured,
+    )
+    .await
 }
 
 /// The ingest fill's write, exempt from the near-now fence and identical in every other check.
@@ -87,8 +145,47 @@ pub(super) async fn run_observed(
     sensitivity: Option<&str>,
     occurred_at: Option<DateTime<Utc>>,
 ) -> Result<WriteOutcome> {
-    run_inner(ctx, content, namespace, tags, supersedes, sensitivity, occurred_at, Fence::Bypass)
-        .await
+    run_inner(
+        ctx,
+        content,
+        namespace,
+        tags,
+        supersedes,
+        sensitivity,
+        occurred_at,
+        Fence::Bypass,
+        Cap::Configured,
+    )
+    .await
+}
+
+/// An archive merge's write. `run_observed` with [`Cap::Carried`] in place of the setting.
+///
+/// An exported row was valid in the store that wrote it, and a cap of 2000 would refuse every
+/// longer one with a refusal about a fact the importer did not write. The near-now fence is off for
+/// the reason `services::archive::merge` gives at its call. Its one caller is that loop.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_restored(
+    ctx: &Ctx,
+    content: &str,
+    namespace: &str,
+    tags: Option<Vec<String>>,
+    supersedes: Option<&str>,
+    sensitivity: Option<&str>,
+    occurred_at: Option<DateTime<Utc>>,
+) -> Result<WriteOutcome> {
+    run_inner(
+        ctx,
+        content,
+        namespace,
+        tags,
+        supersedes,
+        sensitivity,
+        occurred_at,
+        Fence::Bypass,
+        Cap::Carried,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -101,17 +198,15 @@ async fn run_inner(
     sensitivity: Option<&str>,
     occurred_at: Option<DateTime<Utc>>,
     fence: Fence,
+    cap: Cap,
 ) -> Result<WriteOutcome> {
     let content = content.trim();
     if content.is_empty() {
         return Err(DomainError::validation("content cannot be empty"));
     }
-    let max_chars = ctx.cfg.policy.max_content_chars;
-    if content.chars().count() > max_chars {
-        return Err(DomainError::validation(format!(
-            "content is {} chars, limit is {max_chars}. Write the durable fact, not the transcript.",
-            content.chars().count()
-        )));
+    if let Some(refusal) = length_refusal(content, cap_chars(cap, ctx.cfg.policy.max_content_chars))
+    {
+        return Err(DomainError::validation(refusal));
     }
 
     let namespace = namespaces::normalize(namespace)?;
@@ -1300,6 +1395,75 @@ mod tests {
         let mcp = include_str!("../mcp/mod.rs");
         assert!(!mcp.contains("run_observed"), "the MCP layer must not name the unfenced entry");
         assert!(mcp.contains("write::run("), "the MCP layer writes through the fenced entry");
+        // The carried-cap entry is as far out of a model's reach as the fence's.
+        assert!(!mcp.contains("run_restored"), "the MCP layer must not name run_restored");
+    }
+
+    // -- the length cap -------------------------------------------------------------------------
+
+    #[test]
+    fn the_length_refusal_names_the_length_and_the_limit() {
+        let msg = too_long_message(3120, 2000);
+        assert!(msg.contains("content is 3120 chars and the limit is 2000"), "{msg}");
+    }
+
+    /// The console, the ingest approval and a review merge all read this message, and none of them
+    /// can follow advice about `memory_write` calls. The MCP layer adds that advice for its caller.
+    #[test]
+    fn the_length_refusal_carries_only_the_numbers() {
+        let msg = too_long_message(3120, 2000);
+        assert_eq!(msg, "content is 3120 chars and the limit is 2000.");
+    }
+
+    #[test]
+    fn content_at_the_limit_passes_and_one_character_past_it_is_refused() {
+        assert_eq!(length_refusal(&"a".repeat(2000), 2000), None);
+        assert_eq!(
+            length_refusal(&"a".repeat(2001), 2000).as_deref(),
+            Some("content is 2001 chars and the limit is 2000.")
+        );
+    }
+
+    /// The write path trims before it counts, and it counts characters. `é` is two bytes, so a byte
+    /// count would refuse this and an untrimmed count would refuse it by four.
+    #[test]
+    fn the_length_counts_characters_after_the_trim() {
+        let text = format!("  {}  ", "é".repeat(2000));
+        assert_eq!(length_refusal(&text, 2000), None);
+    }
+
+    #[test]
+    fn a_composed_write_answers_to_the_configured_cap() {
+        assert_eq!(cap_chars(Cap::Configured, 2000), 2000);
+        assert_eq!(cap_chars(Cap::Configured, 200_000), 200_000);
+    }
+
+    /// The literal, not a constant: the floor must not follow the default down.
+    #[test]
+    fn a_carried_row_keeps_8000_under_a_tighter_setting() {
+        assert_eq!(cap_chars(Cap::Carried, 2000), 8000);
+    }
+
+    #[test]
+    fn a_carried_row_follows_a_looser_setting() {
+        assert_eq!(cap_chars(Cap::Carried, 200_000), 200_000);
+    }
+
+    /// The carried cap only helps a writer that reaches it. `cargo check` reports an unused entry
+    /// as a warning, so this reads the merge as text, the way the fence test reads the tool layer.
+    /// If it fails, the merge moved back to an entry that answers to the setting and an import
+    /// refuses every exported row over 2000.
+    #[test]
+    fn the_archive_merge_writes_through_the_carried_cap() {
+        let archive = include_str!("archive.rs");
+        assert!(
+            archive.contains("write::run_restored("),
+            "the merge must write through run_restored"
+        );
+        assert!(
+            !archive.contains("write::run_observed(") && !archive.contains("write::run("),
+            "the merge must not write through an entry capped by the setting"
+        );
     }
 
     // -- the ordering guard, rule S4 ------------------------------------------------------------
