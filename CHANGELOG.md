@@ -28,6 +28,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Memory content is capped at 2,000 characters by default, down from 8,000.** A `memory_write`,
+  console write, ingest approval or review merge longer than `WRITE_MAX_CONTENT_CHARS` is refused
+  with `content is N chars and the limit is M.` `memory_write` adds advice to split the content into
+  separate calls, one durable fact each, and to set `supersedes` when correcting a long row.
+  `tools/list` states the configured limit in `memory_write`'s description. `lumberroom ingest`
+  facts over the limit are refused at post under rule `content_too_long`, with the same message in
+  `detail`, so they never reach the queue. Rows already stored are unaffected. An archive merge
+  imports rows up to 8,000 characters, or up to the setting when it is higher, and an archive
+  restore has no length cap. To keep the old limit, set `WRITE_MAX_CONTENT_CHARS=8000` in `.env`;
+  `docker-compose.yml` now forwards the variable. Decision 0030.
+
 - **Clear the old threshold variables before switching embedding models.** Each model now reads its
   cosine thresholds from a table (decision 0029), but `DEDUPE_THRESHOLD`, `CONFLICT_THRESHOLD`,
   `BOOTSTRAP_DEDUP_COSINE` and `CLEANUP_MIN_SIMILARITY` still win over it when set. An `.env`

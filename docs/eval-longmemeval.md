@@ -83,9 +83,9 @@ of these is set on that scratch server:
   would refuse haystack sessions for a reason that has nothing to do with retrieval. Refusing them
   would silently shrink the haystack the same way a write failure does, so the tripwire has to be
   off for a run whose write-failure count needs to mean what it says.
-- `WRITE_MAX_CONTENT_CHARS` raised past the default 8000. A haystack session rendered whole can run
-  longer than the default write ceiling; a ceiling that truncates a session mid-write is another way
-  to shrink the haystack for a reason unrelated to ranking.
+- `WRITE_MAX_CONTENT_CHARS=200000`, far past the default 2000 (8000 before decision 0030). A haystack
+  session rendered whole runs longer than the default write ceiling; a ceiling that refuses a session
+  is another way to shrink the haystack for a reason unrelated to ranking.
 - `AUTH_MODE=token` with a single `AUTH_TOKENS` grant scoped to the `project:` namespace prefix the
   harness writes under. The eval has no need for OAuth, and a static token keeps the run's own
   authorization out of the variables being measured.
