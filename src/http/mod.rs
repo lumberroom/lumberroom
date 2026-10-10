@@ -298,7 +298,7 @@ fn ctx_for(http: &Http, principal: Principal, session: SessionId) -> Ctx {
     Ctx {
         cfg: Arc::clone(&http.state.cfg),
         repos: http.state.repos.clone(),
-        embedder: Arc::clone(&http.state.embedder),
+        embedders: Arc::clone(&http.state.embedders),
         keys: http.state.keys.clone(),
         kek_verified: http.state.kek_verified,
         principal,
@@ -348,7 +348,7 @@ fn static_checks(
 
 async fn readyz(State(http): State<Http>) -> Response {
     let mut checks = static_checks(
-        &http.state.embedder.id(),
+        &http.state.embedders.current().id(),
         http.state.cfg.mode_str(),
         http.state.cfg.crypto.provider.as_str(),
         http.state.kek_verified,
@@ -360,7 +360,7 @@ async fn readyz(State(http): State<Http>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(merge_ok(checks, false))).into_response();
     }
     checks["db_ms"] = serde_json::json!(started.elapsed().as_millis());
-    checks["embedding_dim"] = serde_json::json!(http.state.embedder.dim());
+    checks["embedding_dim"] = serde_json::json!(http.state.embedders.current().dim());
 
     // An unverified KEK does not make the server unready. Open reads and writes work, and reporting
     // 503 would take a store that is serving most of its traffic out of rotation.
@@ -520,7 +520,7 @@ async fn whoami(State(http): State<Http>, headers: HeaderMap) -> Response {
         "may_read_history": principal.may_read_history,
         "scopes": principal.scopes,
         "tenant": http.state.cfg.tenant_id,
-        "embedder": http.state.embedder.id(),
+        "embedder": http.state.embedders.current().id(),
     }))
     .into_response()
 }

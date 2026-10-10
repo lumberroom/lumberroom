@@ -191,7 +191,7 @@ impl Console {
         Ctx {
             cfg: Arc::clone(&self.state.cfg),
             repos: self.state.repos.clone(),
-            embedder: Arc::clone(&self.state.embedder),
+            embedders: Arc::clone(&self.state.embedders),
             keys: self.state.keys.clone(),
             kek_verified: self.state.kek_verified,
             principal,

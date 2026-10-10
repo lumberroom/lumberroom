@@ -37,8 +37,8 @@ use serde::Serialize;
 use super::Ctx;
 use crate::adapters::auth::{can_read, can_write, filter_readable};
 use crate::domain::errors::{DomainError, Result};
-use crate::domain::namespaces;
 use crate::domain::types::{Memory, Principal, Sensitivity};
+use crate::domain::{namespaces, similarity};
 use crate::ports::memory::{ChainLink, ChainNeighbours, DeleteOutcome, DeletePlan};
 use crate::ports::{SearchQuery, Weights};
 
@@ -195,7 +195,8 @@ pub async fn by_query(
         return Err(DomainError::validation("query cannot be empty"));
     }
     let limit = limit.unwrap_or(MAX_QUERY_DELETES).clamp(1, MAX_QUERY_DELETES);
-    let floor = min_similarity.unwrap_or(ctx.cfg.quality.conflict_threshold);
+    let u = ctx.embedders.for_unit(ctx.tenant())?;
+    let floor = min_similarity.unwrap_or_else(|| u.thresholds.get(similarity::CONFLICT));
 
     let asked = match requested {
         Some(list) if !list.is_empty() => {
@@ -211,7 +212,7 @@ pub async fn by_query(
         return Ok(outcome(dry_run, vec![], Edits::default(), vec![]));
     }
 
-    let embedding = ctx.embedder.embed_query(query).await?;
+    let embedding = u.embedder.embed_query(query).await?;
     let mut hits = ctx
         .repos
         .memories

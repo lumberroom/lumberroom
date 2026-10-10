@@ -35,28 +35,39 @@
 //! they run over every sensitivity the caller holds because nothing they read leaves this machine,
 //! and on a store this size they are the majority of the findings.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
+use super::embedders::EmbedderSet;
 use super::Ctx;
 use crate::adapters::auth::can_read;
 use crate::domain::cleanup::{model_may_see, ApplyRefusal, CleanupKind, Disposition};
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::namespaces;
 use crate::domain::policy::NamespaceGrant;
+use crate::domain::similarity::{SimilarityThresholds, CLEANUP_NEAR_CERTAIN, CLEANUP_WORTH_ASKING};
 use crate::domain::types::Sensitivity;
 use crate::ports::cleanup::{
     Candidate, CandidateQuery, CleanupRepository, NewMember, NewProposal, Proposal, QueueOutcome,
 };
 
-/// Above this, two rows are the same fact and the pass says so without asking anyone.
+/// bge-base-en-v1.5's value for `cleanup_near_certain`. No decision reads this constant: a pass reads
+/// the unit's value from its `UnitEmbedding` (decision 0029). It stays `pub` because the fork's
+/// config validation names it, and a test holds it equal to the bge table entry.
+///
+/// Above the unit's value, two rows are the same fact and the pass says so without asking anyone.
 ///
 /// A guess, and labelled one. Phase 4 set 0.97 for duplicate collapse on write from the same guess,
 /// and nobody has read real pairs with their scores to check it. Every proposal publishes the
 /// similarity that produced it precisely so that reading the queue is the calibration.
 pub const NEAR_CERTAIN: f64 = 0.97;
 
-/// Below this, two rows are not worth a model's attention.
+/// bge-base-en-v1.5's value for `cleanup_worth_asking`. Read only by the same test and the fork's
+/// config validation; a pass reads the unit's value.
+///
+/// Below the unit's value, two rows are not worth a model's attention.
 ///
 /// The band between here and `NEAR_CERTAIN` is what a model is asked about: close enough to be
 /// suspicious, not close enough to act on.
@@ -154,6 +165,7 @@ fn assert_model_visible(rows: &[&Candidate]) -> Result<()> {
 pub async fn run(
     tenant: &str,
     repo: &dyn CleanupRepository,
+    embedders: &EmbedderSet,
     scope: Option<&str>,
     cadence: &str,
     limit: i64,
@@ -164,6 +176,7 @@ pub async fn run(
         tenant,
         repo,
         Bounds {
+            thresholds: embedders.for_unit(tenant)?.thresholds,
             scope: scope.map(str::to_string),
             scope_key,
             cadence: cadence.to_string(),
@@ -208,6 +221,7 @@ pub async fn run_as(
         ctx.tenant(),
         repo,
         Bounds {
+            thresholds: ctx.embedders.for_unit(ctx.tenant())?.thresholds,
             scope,
             scope_key,
             cadence: cadence.to_string(),
@@ -248,6 +262,8 @@ fn reads_everything(grant: &[NamespaceGrant]) -> bool {
 /// What one pass runs over. Built by `run` for the scheduler and by `run_as` for a caller, and
 /// the only way into `pass`.
 struct Bounds {
+    /// The unit's cosine thresholds. Read per pass, so a unit on another model gets its own bands.
+    thresholds: Arc<SimilarityThresholds>,
     scope: Option<String>,
     scope_key: String,
     cadence: String,
@@ -257,19 +273,40 @@ struct Bounds {
     posted_by: Option<String>,
 }
 
+/// The two cut points of one pass, taken from the unit's thresholds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Bands {
+    /// A pair has to clear this to be worth a model's attention.
+    floor: f64,
+    /// At or above this, two rows are the same fact and no model is asked.
+    near_certain: f64,
+}
+
+impl Bands {
+    /// A caller's `min_similarity` wins over the unit's `cleanup_worth_asking`. The floor is a guess
+    /// and the store says so: on 21 August 2026 the owner's two statements of the same
+    /// image-generation preference scored 0.694 against bge-base-en-v1.5, so the Phase 4 floor of 0.85
+    /// would never have shown a model the one duplicate anyone had noticed by reading. It is clamped
+    /// below the unit's near-certain value, because a floor at or above it leaves the model nothing
+    /// to decide.
+    fn of(t: &SimilarityThresholds, min_similarity: Option<f64>) -> Self {
+        let near_certain = t.get(CLEANUP_NEAR_CERTAIN);
+        let floor = min_similarity
+            .unwrap_or_else(|| t.get(CLEANUP_WORTH_ASKING))
+            .clamp(0.0, near_certain - 0.001);
+        Self { floor, near_certain }
+    }
+}
+
 async fn pass(
     tenant: &str,
     repo: &dyn CleanupRepository,
     bounds: Bounds,
 ) -> Result<(RunReport, Vec<ModelCandidate>)> {
-    let Bounds { scope, scope_key, cadence, limit, min_similarity, grant, posted_by } = bounds;
+    let Bounds { thresholds, scope, scope_key, cadence, limit, min_similarity, grant, posted_by } =
+        bounds;
     let cadence = cadence.as_str();
-    // The floor a pair has to clear to be worth a model's attention. `WORTH_ASKING` is a guess and
-    // the store says so: on 21 August 2026 the owner's two statements of the same image-generation
-    // preference scored 0.694 against this embedder, so the shipped floor of 0.85 would never have
-    // shown a model the one duplicate anyone had noticed by reading. Clamped below `NEAR_CERTAIN`,
-    // because a floor at or above it leaves the model nothing to decide.
-    let floor = min_similarity.unwrap_or(WORTH_ASKING).clamp(0.0, NEAR_CERTAIN - 0.001);
+    let Bands { floor, near_certain } = Bands::of(&thresholds, min_similarity);
     let mut report = RunReport {
         scope: scope.clone().unwrap_or_else(|| "*".to_string()),
         cadence: cadence.to_string(),
@@ -371,7 +408,7 @@ async fn pass(
         if claimed.contains(&pair.older.id) && claimed.contains(&pair.newer.id) {
             continue;
         }
-        if pair.similarity >= NEAR_CERTAIN {
+        if pair.similarity >= near_certain {
             report.near_certain_pairs += 1;
             let outcome = queue_checked(
                 tenant,
@@ -941,21 +978,52 @@ mod tests {
         assert!(assert_model_visible(&[&open, &private]).is_err());
     }
 
-    #[test]
-    fn the_bands_do_not_overlap_and_leave_a_gap_for_the_model() {
-        assert!(WORTH_ASKING < NEAR_CERTAIN, "a model would never be asked about anything");
+    /// Thresholds as boot would resolve them, written by hand so the test names its inputs.
+    fn thresholds(model: &str, near_certain: f64, worth_asking: f64) -> SimilarityThresholds {
+        use crate::domain::similarity::{Resolved, Source};
+        let at = |value| Resolved { value, source: Source::Override };
+        SimilarityThresholds {
+            model: model.to_string(),
+            family: None,
+            values: [
+                (CLEANUP_NEAR_CERTAIN.to_string(), at(near_certain)),
+                (CLEANUP_WORTH_ASKING.to_string(), at(worth_asking)),
+            ]
+            .into(),
+        }
     }
 
     #[test]
-    fn a_floor_at_or_above_the_certain_band_is_clamped_below_it() {
-        // A caller passing 0.99 means "only near-identical pairs", and the near-identical ones are
-        // already handled without a model. Left alone it asks the model about an empty list and
-        // reports that as a clean store.
-        let clamp = |v: f64| v.clamp(0.0, NEAR_CERTAIN - 0.001);
-        assert!(clamp(0.99) < NEAR_CERTAIN);
-        assert!(clamp(1.0) < NEAR_CERTAIN);
-        assert_eq!(clamp(0.70), 0.70);
-        assert_eq!(clamp(-1.0), 0.0);
+    fn cleanup_reads_the_unit_near_certain_value() {
+        let bge = thresholds("Xenova/bge-base-en-v1.5@q8", 0.97, 0.65);
+        let gemma = thresholds("embeddinggemma-2", 0.995, 0.754);
+        assert_eq!(
+            Bands::of(&bge, None),
+            Bands { floor: 0.65, near_certain: 0.97 },
+            "bge keeps the values production ran on"
+        );
+        assert_eq!(
+            Bands::of(&gemma, None),
+            Bands { floor: 0.754, near_certain: 0.995 },
+            "a pair at 0.98 is near-certain under bge and still the model's question under gemma"
+        );
+        // A caller's floor wins over the unit's worth-asking value, and the clamp moves with the
+        // unit's near-certain value: 0.99 is above bge's band and inside gemma's.
+        assert_eq!(Bands::of(&gemma, Some(0.80)).floor, 0.80);
+        assert_eq!(Bands::of(&gemma, Some(0.99)).floor, 0.99);
+        assert_eq!(Bands::of(&bge, Some(0.99)).floor, 0.97 - 0.001);
+        assert_eq!(Bands::of(&gemma, Some(1.0)).floor, 0.995 - 0.001);
+        assert_eq!(Bands::of(&bge, Some(-1.0)).floor, 0.0);
+    }
+
+    #[test]
+    fn cleanup_constants_equal_the_bge_table() {
+        use crate::domain::similarity::{BGE_BASE, ENGINE_FAMILIES};
+        let bge = ENGINE_FAMILIES.iter().find(|f| f.family == BGE_BASE).expect("bge family");
+        let table = |key: &str| bge.values.iter().find(|v| v.key == key).expect(key).value;
+        assert_eq!(NEAR_CERTAIN, table(CLEANUP_NEAR_CERTAIN));
+        assert_eq!(WORTH_ASKING, table(CLEANUP_WORTH_ASKING));
+        assert!(WORTH_ASKING < NEAR_CERTAIN, "a model would never be asked about anything");
     }
 
     #[test]

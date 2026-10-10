@@ -190,8 +190,9 @@ async fn setup() -> Option<Harness> {
     let kek_verified = !matches!(check, postgres::KekCheck::Mismatch { .. });
 
     let memories = Arc::new(postgres::PgMemoryRepository::new(pool.clone()));
+    let cfg = Arc::new(cfg);
     let ctx = Ctx {
-        cfg: Arc::new(cfg),
+        cfg: Arc::clone(&cfg),
         repos: Repos {
             aliases: Arc::new(postgres::PgAliasRepository::new(pool.clone())),
             memories: memories.clone(),
@@ -201,7 +202,7 @@ async fn setup() -> Option<Harness> {
             ciphertext: Some(memories),
             oauth: None,
         },
-        embedder: Arc::new(HashEmbedder::new(768)),
+        embedders: common::test_embedders(Arc::new(HashEmbedder::new(768)), &cfg),
         // A private row is in the fixture on purpose, so this half of the harness is load-bearing:
         // without a key the write path refuses it and the replay assertions never run.
         keys: Some(keys),

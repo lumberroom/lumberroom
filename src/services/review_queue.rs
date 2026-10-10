@@ -14,6 +14,7 @@ use uuid::Uuid;
 use super::Ctx;
 use crate::adapters::auth::{can_read, can_write};
 use crate::domain::errors::{DomainError, Kind, Result};
+use crate::domain::similarity;
 use crate::domain::types::{Memory, Sensitivity};
 
 pub const DEFAULT_LIMIT: i64 = 50;
@@ -628,11 +629,8 @@ pub async fn queue(
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = checked_offset(q.offset.unwrap_or(0))?;
     let days = q.days.unwrap_or(ctx.cfg.quality.stale_days).clamp(0, 36_500);
-    let min_similarity = q
-        .min_similarity
-        .unwrap_or(ctx.cfg.quality.conflict_threshold)
-        .max(ctx.cfg.quality.conflict_threshold)
-        .min(1.0);
+    let floor = ctx.embedders.for_unit(ctx.tenant())?.thresholds.get(similarity::CONFLICT);
+    let min_similarity = q.min_similarity.unwrap_or(floor).max(floor).min(1.0);
     let wants = |s: Source| q.sources.as_ref().is_none_or(|list| list.contains(&s));
     let asked_for = |s: Source| q.sources.as_ref().is_some_and(|list| list.contains(&s));
 

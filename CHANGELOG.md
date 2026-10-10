@@ -28,6 +28,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Clear the old threshold variables before switching embedding models.** Each model now reads its
+  cosine thresholds from a table (decision 0029), but `DEDUPE_THRESHOLD`, `CONFLICT_THRESHOLD`,
+  `BOOTSTRAP_DEDUP_COSINE` and `CLEANUP_MIN_SIMILARITY` still win over it when set. An `.env`
+  copied from an older `.env.example` sets them to bge-base-en-v1.5's values, and those would hold
+  any other model on bge's scale. Empty them before you change `EMBED_MODEL` or `EMBED_PROVIDER`.
+  Boot logs a warning for each of the first three whose value differs from the model's table. The
+  compose `cleanup` service now hands `CLEANUP_MIN_SIMILARITY` to the daemon as an environment
+  variable instead of `--min-similarity`, because the 0.5.0 client refuses an empty flag. The 0.5.0
+  client image ignores the variable and sends no floor, so a number set there takes effect from the
+  next client release.
 - **A local model that fails to load stops the boot.** A remote embedder (`EMBED_PROVIDER=openai`)
   is not probed at boot: a down endpoint fails each write and search with an error, and `/readyz`
   stays green because it checks only the database.

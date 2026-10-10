@@ -32,9 +32,9 @@ use super::Ctx;
 use crate::adapters::auth::filter_readable;
 use crate::domain::digest_dedup::Selection;
 use crate::domain::errors::Result;
-use crate::domain::namespaces;
 use crate::domain::policy::NamespaceCeiling;
 use crate::domain::types::{Memory, Sensitivity};
+use crate::domain::{namespaces, similarity};
 use crate::ports::{DigestQuery, RegistrySummary};
 
 /// The name this tool records its emissions under, and the same string `recall_emission.tool`
@@ -144,6 +144,8 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
     }
 
     let b = &ctx.cfg.bootstrap;
+    // The digest compares stored vectors, so the cosine belongs to the model that wrote them.
+    let u = ctx.embedders.for_unit(ctx.tenant())?;
     let mut data = ctx
         .repos
         .memories
@@ -159,7 +161,7 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
             recent_limit: pool(b.recent_limit, b.profile_limit.max(0) + b.project_limit.max(0)),
             registry_limit: b.registry_limit,
             recent_days: b.recent_days,
-            dedup_cosine: b.dedup_cosine,
+            dedup_cosine: u.thresholds.get(similarity::BOOTSTRAP_DEDUP),
         })
         .await?;
 

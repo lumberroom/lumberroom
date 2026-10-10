@@ -196,8 +196,9 @@ async fn setup(key: Key) -> Option<Harness> {
     };
 
     let memories = Arc::new(postgres::PgMemoryRepository::new(pool.clone()));
+    let cfg = Arc::new(cfg);
     let ctx = Ctx {
-        cfg: Arc::new(cfg),
+        cfg: Arc::clone(&cfg),
         repos: Repos {
             aliases: Arc::new(postgres::PgAliasRepository::new(pool.clone())),
             memories: memories.clone(),
@@ -207,7 +208,7 @@ async fn setup(key: Key) -> Option<Harness> {
             ciphertext: Some(memories),
             oauth: None,
         },
-        embedder: Arc::new(HashEmbedder::new(768)),
+        embedders: common::test_embedders(Arc::new(HashEmbedder::new(768)), &cfg),
         keys,
         kek_verified,
         principal: owner_like("mac"),

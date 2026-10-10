@@ -214,7 +214,7 @@ async fn setup() -> Option<Harness> {
     let ctx = Ctx {
         cfg: Arc::clone(&cfg),
         repos: repos.clone(),
-        embedder: embedder.clone(),
+        embedders: common::test_embedders(embedder.clone(), &cfg),
         keys: Some(Arc::clone(&keys)),
         kek_verified,
         principal: owner_like(),
@@ -233,7 +233,7 @@ async fn setup() -> Option<Harness> {
         repos,
         oauth: Arc::clone(&oauth),
         ingest,
-        embedder,
+        embedders: Arc::clone(&ctx.embedders),
         keys: Some(keys),
         kek_verified,
         proposals: Vec::new(),

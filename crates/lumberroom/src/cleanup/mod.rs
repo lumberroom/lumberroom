@@ -276,6 +276,34 @@ pub async fn dispatch(c: &Client, args: &Args, sub: &str) -> Result<()> {
     }
 }
 
+/// The floor for the pass: the flag, else `CLEANUP_MIN_SIMILARITY`, else none, so the server
+/// applies the unit's model value (decision 0029).
+///
+/// Compose hands the floor over as an environment variable and never as a flag. The 0.5.0 client
+/// refuses `--min-similarity ""`, so a flag fed from an unset variable failed every night on that
+/// image, while a variable the old client never reads leaves it sending no floor.
+fn min_similarity(args: &Args) -> Result<Option<f64>> {
+    let env = std::env::var("CLEANUP_MIN_SIMILARITY").ok();
+    floor_from(args.value("min-similarity"), env.as_deref())
+}
+
+/// Blank counts as absent in both places, so an empty flag still falls through to the variable.
+fn floor_from(flag: Option<&str>, env: Option<&str>) -> Result<Option<f64>> {
+    let flag = flag.map(str::trim).filter(|v| !v.is_empty());
+    let env = env.map(str::trim).filter(|v| !v.is_empty());
+    match (flag, env) {
+        (Some(raw), _) => raw
+            .parse()
+            .map(Some)
+            .map_err(|_| err(format!("--min-similarity takes a number, got {raw:?}"))),
+        (None, Some(raw)) => raw
+            .parse()
+            .map(Some)
+            .map_err(|_| err(format!("CLEANUP_MIN_SIMILARITY takes a number, got {raw:?}"))),
+        (None, None) => Ok(None),
+    }
+}
+
 async fn run(c: &Client, args: &Args) -> Result<()> {
     let cadence = args.value("cadence").unwrap_or("hourly").to_string();
     let namespace = args.value("namespace").map(str::to_string);
@@ -285,10 +313,7 @@ async fn run(c: &Client, args: &Args) -> Result<()> {
     if let Some(ns) = &namespace {
         body["namespace"] = json!(ns);
     }
-    if let Some(raw) = args.value("min-similarity") {
-        let f: f64 = raw
-            .parse()
-            .map_err(|_| err(format!("--min-similarity takes a number, got {raw:?}")))?;
+    if let Some(f) = min_similarity(args)? {
         body["min_similarity"] = json!(f);
     }
     let (status, response) =
@@ -578,6 +603,31 @@ async fn unreject(c: &Client, args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_min_similarity_sends_no_floor() {
+        // No environment here, so a CLEANUP_MIN_SIMILARITY in the shell running the tests cannot
+        // change the answer.
+        let parse = |argv: &[&str]| {
+            floor_from(Args::parse(argv.iter().copied()).value("min-similarity"), None)
+        };
+        assert_eq!(parse(&["daemon", "--min-similarity", ""]).unwrap(), None);
+        assert_eq!(parse(&["daemon", "--min-similarity", "  "]).unwrap(), None);
+        assert_eq!(parse(&["daemon"]).unwrap(), None);
+        assert_eq!(parse(&["daemon", "--min-similarity", "0.7"]).unwrap(), Some(0.7));
+        assert!(parse(&["daemon", "--min-similarity", "high"]).is_err());
+    }
+
+    #[test]
+    fn the_environment_supplies_the_floor_when_the_flag_is_absent() {
+        assert_eq!(floor_from(None, Some("0.72")).unwrap(), Some(0.72));
+        assert_eq!(floor_from(Some(""), Some(" 0.72 ")).unwrap(), Some(0.72));
+        assert_eq!(floor_from(Some("0.7"), Some("0.72")).unwrap(), Some(0.7));
+        assert_eq!(floor_from(None, Some("")).unwrap(), None);
+        assert_eq!(floor_from(Some("  "), Some("  ")).unwrap(), None);
+        let e = floor_from(None, Some("high")).unwrap_err();
+        assert!(e.message.contains("CLEANUP_MIN_SIMILARITY"), "{}", e.message);
+    }
 
     fn pair() -> Pair {
         Pair {

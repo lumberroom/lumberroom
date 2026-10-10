@@ -131,8 +131,9 @@ async fn setup() -> Option<Harness> {
 
     let cfg: Config = step!("loading the config", config::load());
     let memories = Arc::new(postgres::PgMemoryRepository::new(pool.clone()));
+    let cfg = Arc::new(cfg);
     let ctx = Ctx {
-        cfg: Arc::new(cfg),
+        cfg: Arc::clone(&cfg),
         repos: Repos {
             aliases: Arc::new(postgres::PgAliasRepository::new(pool.clone())),
             memories: memories.clone(),
@@ -142,7 +143,7 @@ async fn setup() -> Option<Harness> {
             ciphertext: Some(memories),
             oauth: None,
         },
-        embedder: Arc::new(HashEmbedder::new(768)),
+        embedders: common::test_embedders(Arc::new(HashEmbedder::new(768)), &cfg),
         // No key and nothing encrypted. Every row here is written at `open`, and the queue this
         // file is about holds ids and rationales rather than content.
         keys: None,
@@ -188,7 +189,8 @@ fn owner_like(client: &str) -> Principal {
 /// write into the row it matches and so cannot make the duplicates this queue is about.
 async fn put_raw(h: &Harness, content: &str) -> String {
     let id = uuid::Uuid::new_v4();
-    let vectors = h.ctx.embedder.embed_documents(vec![content.to_string()]).await.unwrap();
+    let vectors =
+        h.ctx.embedders.current().embed_documents(vec![content.to_string()]).await.unwrap();
     let embedding = pgvector::Vector::from(vectors[0].clone());
     sqlx::query(
         "INSERT INTO memory (id, tenant_id, namespace, content, embedding, source_client,

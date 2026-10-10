@@ -46,7 +46,7 @@ run to noon. Waking on the clock keeps the schedule where you put it.
 | `CLEANUP_DAILY_AT` | `04:25` | local clock time for the model pass |
 | `CLEANUP_PROVIDER` | `openrouter` | `openrouter`, `zai`, `openai`, `anthropic` or `custom` |
 | `CLEANUP_MODEL` | `qwen/qwen3.7-flash` | the tier that decides the undecided pairs |
-| `CLEANUP_MIN_SIMILARITY` | `0.65` | the floor for the band the model is asked about |
+| `CLEANUP_MIN_SIMILARITY` | empty | the floor for the band the model is asked about; empty leaves it to the store's model (`cleanup_worth_asking`, decision 0029), and a number pins it for every model. Compose passes it to the daemon as an environment variable; `--min-similarity` on the command line wins over it |
 
 The provider key comes from `ZAI_API_KEY` or `OPENROUTER_API_KEY` in `.env`, passed to the container
 as `LUMBERROOM_INGEST_KEY_<PROVIDER>`. It never reaches a command line.

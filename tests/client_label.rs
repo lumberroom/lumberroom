@@ -507,7 +507,7 @@ async fn setup() -> Option<Harness> {
     let ctx = Ctx {
         cfg: Arc::clone(&cfg),
         repos: repos.clone(),
-        embedder: Arc::new(HashEmbedder::new(768)),
+        embedders: common::test_embedders(Arc::new(HashEmbedder::new(768)), &cfg),
         keys: Some(Arc::clone(&keys)),
         kek_verified,
         principal: owner(),
@@ -522,7 +522,7 @@ async fn setup() -> Option<Harness> {
         repos,
         oauth: Arc::clone(&oauth),
         ingest: Arc::new(postgres::PgIngestRepository::new(pool.clone())),
-        embedder: Arc::clone(&ctx.embedder),
+        embedders: Arc::clone(&ctx.embedders),
         keys: Some(keys),
         kek_verified,
         proposals: Vec::new(),

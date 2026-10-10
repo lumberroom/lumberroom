@@ -149,7 +149,7 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
     let ctx = Ctx {
         cfg: cfg.clone(),
         repos: repos.clone(),
-        embedder: Arc::new(HashEmbedder::new(768)),
+        embedders: common::test_embedders(Arc::new(HashEmbedder::new(768)), &cfg),
         keys: Some(keys.clone()),
         kek_verified,
         principal: owner_like("mac"),
@@ -166,7 +166,7 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
         repos: repos.clone(),
         oauth: Arc::clone(&oauth),
         ingest: Arc::new(postgres::PgIngestRepository::new(pool.clone())),
-        embedder: Arc::clone(&ctx.embedder),
+        embedders: Arc::clone(&ctx.embedders),
         keys: ctx.keys.clone(),
         kek_verified: ctx.kek_verified,
         // The engine ships no proposal source. `source_proposal_on_an_engine_answers_400_source_not_filled`
@@ -333,7 +333,11 @@ async fn sweep_pairs(ctx: &Ctx) {
     let report = conflicts::sweep(
         ctx.repos.memories.as_ref(),
         ctx.tenant(),
-        ctx.cfg.quality.conflict_threshold,
+        ctx.embedders
+            .for_unit(ctx.tenant())
+            .unwrap()
+            .thresholds
+            .get(lumberroom_server::domain::similarity::CONFLICT),
         std::time::Duration::from_secs(10),
     )
     .await
@@ -357,7 +361,7 @@ async fn break_ciphertext(pool: &PgPool, id: &str) {
 /// because `opened` has to come from `decrypt`'s returned ids and never from the text.
 async fn put_empty_open(ctx: &Ctx, pool: &PgPool, namespace: &str) -> String {
     let id = uuid::Uuid::new_v4();
-    let vectors = ctx.embedder.embed_documents(vec![String::new()]).await.unwrap();
+    let vectors = ctx.embedders.current().embed_documents(vec![String::new()]).await.unwrap();
     let embedding = pgvector::Vector::from(vectors[0].clone());
     sqlx::query(
         "INSERT INTO memory (id, tenant_id, namespace, content, embedding, source_client,
@@ -465,7 +469,7 @@ fn no_sources() -> Vec<Arc<dyn ProposalSource>> {
 
 #[tokio::test]
 async fn a_kept_pair_leaves_the_queue_and_undismiss_brings_it_back() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "keep1").await;
     let key = format!("conflict:{older}:{newer}");
 
@@ -589,7 +593,7 @@ async fn conflict_pair_at(
 
 #[tokio::test]
 async fn keep_both_needs_the_write_grant_on_both_rows() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
 
     // Read covers both rows (open and private); write covers open alone, so exactly one row of
     // each pair is writable. `writable_row` runs on both ids in the key's order, so the check has
@@ -656,7 +660,7 @@ async fn keep_both_needs_the_write_grant_on_both_rows() {
 
 #[tokio::test]
 async fn keep_both_records_the_client_and_the_token_fingerprint() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "keep3").await;
 
     review_queue::decide(
@@ -701,7 +705,7 @@ async fn undismiss_answers_false_for_a_pair_the_caller_may_not_change() {
 
 #[tokio::test]
 async fn undismiss_answers_false_for_a_narrow_grant_that_cannot_read_the_pair() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "project:vault", "undismiss-narrow").await;
     review_queue::decide(
         &h.ctx,
@@ -730,7 +734,7 @@ async fn undismiss_answers_false_for_a_narrow_grant_that_cannot_read_the_pair() 
 
 #[tokio::test]
 async fn a_deleted_row_takes_its_dismissals_with_it() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "keep4").await;
     review_queue::decide(
         &h.ctx,
@@ -804,7 +808,7 @@ async fn a_narrow_grant_sees_a_full_page_of_its_own_pairs_and_no_count_of_the_re
 /// back empty instead of holding its one pair.
 #[tokio::test]
 async fn a_narrow_grant_sees_a_full_page_of_its_own_conflict_pairs_and_none_of_the_rest() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
 
     for (i, ns) in ["project:secret0", "project:secret1", "project:secret2"].iter().enumerate() {
         let older = write_at(&h.ctx, "the rota tie aa bb cc", ns).await;
@@ -842,7 +846,7 @@ async fn a_narrow_grant_sees_a_full_page_of_its_own_conflict_pairs_and_none_of_t
 
 #[tokio::test]
 async fn the_envelope_carries_no_tenant_wide_count() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let vault_id = write_at(
         &h.ctx,
         &format!("a fact the narrow grant cannot reach {}", nonce("t")),
@@ -919,7 +923,7 @@ async fn the_envelope_carries_no_tenant_wide_count() {
 
 #[tokio::test]
 async fn two_pairs_at_one_similarity_page_once_each() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     // Identical wording in two namespaces: the self-join runs per namespace, so both pairs get the
     // exact same embedding and therefore the exact same rounded similarity, a genuine tie rather
     // than one contrived by rounding.
@@ -984,7 +988,7 @@ async fn an_offset_past_the_ceiling_is_refused_rather_than_clamped() {
 /// stored pair, and `conflicts_pending` counts the fillers.
 #[tokio::test]
 async fn a_namespace_past_two_thousand_rows_gets_its_conflicts() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.5);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.5));
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "ceiling").await;
     // `WHERE g > 0` correlates the subquery, so Postgres draws a fresh vector per row rather than
     // evaluating it once and handing every filler the same one.
@@ -1097,7 +1101,7 @@ async fn a_row_whose_content_is_empty_still_takes_every_verdict() {
 
 #[tokio::test]
 async fn a_merge_writes_once_and_retires_both_sources_into_it() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let old_date = Utc::now() - Duration::days(10);
     let new_date = Utc::now() - Duration::days(3);
     let older = write_dated(&h.ctx, "the pair merges old", "global", old_date).await;
@@ -1147,7 +1151,7 @@ async fn a_merge_writes_once_and_retires_both_sources_into_it() {
 
 #[tokio::test]
 async fn a_merge_of_two_same_day_rows_writes_without_an_occurred_at() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let now = Utc::now();
     let older = write_at(&h.ctx, "same day merge old", "global").await;
     set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
@@ -1190,7 +1194,7 @@ async fn a_merge_of_two_same_day_rows_writes_without_an_occurred_at() {
 
 #[tokio::test]
 async fn a_merge_whose_second_retirement_fails_reports_the_leftover_in_unfinished() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let older = write_at(&h.ctx, "leftover merge old", "global").await;
     set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
     let newer = write_at(&h.ctx, "leftover merge new", "global").await;
@@ -1263,7 +1267,7 @@ async fn live_holding(pool: &PgPool, content: &str) -> Vec<String> {
 /// A reviewer who keeps the newer source's wording merges into text that row already holds.
 #[tokio::test]
 async fn a_merge_whose_content_is_the_newer_source_retires_both_sources() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let older =
         write_at(&h.ctx, &format!("the gate code is 4411 {}", nonce("mnew")), "global").await;
     set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
@@ -1281,7 +1285,7 @@ async fn a_merge_whose_content_is_the_newer_source_retires_both_sources() {
 /// written row must not come back as a retirement the merge failed to make.
 #[tokio::test]
 async fn a_merge_whose_content_is_the_older_source_reports_nothing_unfinished() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let text = format!("the gate code is 5511 {}", nonce("mold"));
     let older = write_at(&h.ctx, &text, "global").await;
     set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
@@ -1299,7 +1303,7 @@ async fn a_merge_whose_content_is_the_older_source_reports_nothing_unfinished() 
 /// stores. Merging them into that content leaves one live row.
 #[tokio::test]
 async fn a_merge_of_an_identical_pair_leaves_one_live_row() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let text = format!("the gate code is 6611 {}", nonce("mpair"));
     let older = write_at(&h.ctx, &text, "global").await;
     set_created_at(&h.pool, &older, Utc::now() - Duration::hours(1)).await;
@@ -1321,7 +1325,7 @@ async fn a_merge_of_an_identical_pair_leaves_one_live_row() {
 
 #[tokio::test]
 async fn a_verdict_the_source_does_not_take_is_refused_before_any_row_changes() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "badverdict").await;
 
     let err = review_queue::decide(
@@ -1384,7 +1388,7 @@ async fn delete_through_the_queue_still_needs_may_delete() {
 
 #[tokio::test]
 async fn a_supersede_default_keeps_the_newer_row_whatever_order_the_key_spelled() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "spelled").await;
 
     // Spelled with the newer id first: `parse_key`'s job is to reorder from the stored rows, not
@@ -1428,16 +1432,21 @@ async fn the_queue_route_answers_the_envelope_with_sources_and_defaults_from_con
     assert_eq!(v["sources"]["stale"], true);
     assert_eq!(v["sources"]["proposal"], serde_json::json!([]));
     assert_eq!(v["stale_days"], h.ctx.cfg.quality.stale_days);
-    assert!(
-        (v["min_similarity"].as_f64().unwrap() - h.ctx.cfg.quality.conflict_threshold).abs() < 1e-9
-    );
+    let floor = h
+        .ctx
+        .embedders
+        .for_unit(h.ctx.tenant())
+        .unwrap()
+        .thresholds
+        .get(lumberroom_server::domain::similarity::CONFLICT);
+    assert!((v["min_similarity"].as_f64().unwrap() - floor).abs() < 1e-9);
     assert_eq!(v["limit"], review_queue::DEFAULT_LIMIT);
     assert_eq!(v["offset"], 0);
 }
 
 #[tokio::test]
 async fn the_old_conflicts_and_stale_routes_answer_the_same_json_they_did_before() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let id = write_at(&h.ctx, &format!("stale route shape {}", nonce("route")), "global").await;
     make_stale(&h.pool, &id).await;
     conflict_pair(&h.ctx, &h.pool, "global", "routeconf").await;
@@ -1480,7 +1489,7 @@ async fn the_old_conflicts_and_stale_routes_answer_the_same_json_they_did_before
 /// default is 50 and a client that reads these routes never asked for it.
 #[tokio::test]
 async fn the_old_routes_keep_their_own_page_default() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     // Each text differs by more than a number: two rows the dedupe threshold collapses would seed
     // one row and the page count would read as a paging bug.
     let words = [

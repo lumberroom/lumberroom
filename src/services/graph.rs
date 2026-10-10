@@ -34,6 +34,7 @@ use serde::Serialize;
 use super::Ctx;
 use crate::domain::errors::Result;
 use crate::domain::routing::{self, Route, Verdict};
+use crate::domain::similarity;
 use crate::ports::memory::{GraphEdge, WalkBounds};
 
 /// The three numbers 0014 fixed. Design targets, pinned here and by a test rather than left in a
@@ -197,11 +198,19 @@ pub async fn routed(ctx: &Ctx, query: &str, degree_cap: i64) -> Result<Walk> {
         });
     }
 
-    let found = super::search::run(ctx, query, None, Some(SEEDS), None, None, None).await?;
+    // One unit for the search and the verdict: the scores come from its model, so the route
+    // thresholds have to as well.
+    let u = ctx.embedders.for_unit(ctx.tenant())?;
+    let found =
+        super::search::run_with(ctx, &u, query, None, Some(SEEDS), None, None, None, &[]).await?;
     let scores: Vec<f64> = found.hits.iter().map(|h| h.score).collect();
     let names_entity = names_known_entity(ctx, query).await?;
-    let verdict =
-        routing::route(routing::signals(&scores, names_entity), ctx.cfg.search.graph_route);
+    let thresholds = routing::Thresholds {
+        scale: ctx.cfg.search.graph_route_scale,
+        max_top: u.thresholds.get(similarity::ROUTE_MAX_TOP),
+        max_spread: u.thresholds.get(similarity::ROUTE_MAX_SPREAD),
+    };
+    let verdict = routing::route(routing::signals(&scores, names_entity), thresholds);
 
     if verdict.route == Route::Search {
         // Search already answered, and its hits are what the caller would have got anyway. Handing

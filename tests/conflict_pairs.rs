@@ -189,10 +189,11 @@ fn ctx_on(pool: &PgPool, cfg: Arc<Config>, keys: Arc<dyn KeyProvider>, kek_verif
         oauth: None,
         aliases: Arc::new(postgres::PgAliasRepository::new(pool.clone())),
     };
+    let embedders = common::test_embedders(Arc::new(HashEmbedder::new(DIM)), &cfg);
     Ctx {
         cfg,
         repos,
-        embedder: Arc::new(HashEmbedder::new(DIM)),
+        embedders,
         keys: Some(keys),
         kek_verified,
         principal: Principal {
@@ -336,7 +337,8 @@ fn rota_pair(tag: &str) -> (String, String) {
 }
 
 async fn similarity_of(ctx: &Ctx, a: &str, b: &str) -> f64 {
-    let v = ctx.embedder.embed_documents(vec![a.to_string(), b.to_string()]).await.unwrap();
+    let v =
+        ctx.embedders.current().embed_documents(vec![a.to_string(), b.to_string()]).await.unwrap();
     v[0].iter().zip(&v[1]).map(|(x, y)| (*x as f64) * (*y as f64)).sum()
 }
 
@@ -1034,7 +1036,7 @@ async fn a_sweep_and_concurrent_writes_in_one_namespace_do_not_deadlock() {
                     on every weekday morning after the standup ends {v} {v}";
     let texts: Vec<String> =
         (0..200).map(|i| template.replace("{v}", &format!("zqv{i}zq"))).collect();
-    let vectors = h.ctx.embedder.embed_documents(texts).await.unwrap();
+    let vectors = h.ctx.embedders.current().embed_documents(texts).await.unwrap();
     for (i, v) in vectors.iter().enumerate() {
         insert_row(&h.pool, h.tenant(), ns, v, 1000 - i as i64).await;
     }
@@ -1288,7 +1290,7 @@ async fn a_wake_records_a_write_s_pair_without_a_tick() {
     let sweeper = tokio::spawn(conflicts::run_loop(
         h.repo(),
         h.tenant().to_string(),
-        FLOOR,
+        Arc::clone(&h.ctx.embedders),
         Duration::from_secs(10),
         Duration::from_secs(3600),
         wakes,
@@ -1309,7 +1311,7 @@ async fn a_lost_wake_is_swept_on_the_next_tick() {
     let sweeper = tokio::spawn(conflicts::run_loop(
         h.repo(),
         h.tenant().to_string(),
-        FLOOR,
+        Arc::clone(&h.ctx.embedders),
         Duration::from_secs(10),
         Duration::from_secs(1),
         Arc::new(Wakes::default()),

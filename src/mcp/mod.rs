@@ -30,7 +30,7 @@ use crate::config::Config;
 use crate::crypto::kek::KeyProvider;
 use crate::domain::errors::DomainError;
 use crate::domain::types::{Invocation, Principal, ToolCall};
-use crate::ports::{Embedder, IngestRepository, OauthStore};
+use crate::ports::{IngestRepository, OauthStore};
 use crate::services::{bootstrap, forget, registry, search, write, Ctx, Repos};
 
 pub mod capability;
@@ -79,7 +79,7 @@ pub struct AppState {
     /// alias is a naming fact of the same class as a registry key, and a model that notices a
     /// rename and cannot record it has noticed nothing anyone can use.
     pub aliases: Arc<dyn crate::ports::AliasRepository>,
-    pub embedder: Arc<dyn Embedder>,
+    pub embedders: Arc<crate::services::embedders::EmbedderSet>,
     /// `None` when KEK_PROVIDER=none. A write at `private` is then refused rather than stored in
     /// plaintext.
     pub keys: Option<Arc<dyn KeyProvider>>,
@@ -452,7 +452,7 @@ impl Lumberroom {
         let ctx = Ctx {
             cfg: Arc::clone(&self.state.cfg),
             repos: self.state.repos.clone(),
-            embedder: Arc::clone(&self.state.embedder),
+            embedders: Arc::clone(&self.state.embedders),
             keys: self.state.keys.clone(),
             kek_verified: self.state.kek_verified,
             principal: principal.clone(),

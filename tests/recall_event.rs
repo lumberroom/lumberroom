@@ -22,6 +22,10 @@ use lumberroom_server::ports::{Emission, RecallCall, RecallEvent};
 use lumberroom_server::services::{bootstrap, forget, recall_events, search, write, Ctx, Repos};
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
+// These tests own their database and never take the suite lock, so most of the module is unused.
+#[allow(dead_code)]
+mod common;
+
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
 const TEST_KEK_VAR: &str = "LUMBERROOM_RECALL_EVENT_TEST_KEK";
 const TEST_KEK_ID: &str = "kek-recall-event";
@@ -108,8 +112,9 @@ async fn probe(name: &'static str, tune: impl FnOnce(&mut Config)) -> Option<Pro
     let kek_verified = !matches!(check, postgres::KekCheck::Mismatch { .. });
 
     let memories = Arc::new(postgres::PgMemoryRepository::new(pool.clone()));
+    let cfg = Arc::new(cfg);
     let ctx = Ctx {
-        cfg: Arc::new(cfg),
+        cfg: Arc::clone(&cfg),
         repos: Repos {
             aliases: Arc::new(postgres::PgAliasRepository::new(pool.clone())),
             memories: memories.clone(),
@@ -119,7 +124,7 @@ async fn probe(name: &'static str, tune: impl FnOnce(&mut Config)) -> Option<Pro
             ciphertext: Some(memories),
             oauth: None,
         },
-        embedder: Arc::new(HashEmbedder::new(768)),
+        embedders: common::test_embedders(Arc::new(HashEmbedder::new(768)), &cfg),
         keys: Some(keys),
         kek_verified,
         principal: Principal {
