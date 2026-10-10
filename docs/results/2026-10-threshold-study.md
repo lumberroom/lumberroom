@@ -13,7 +13,8 @@ count over the study's labelled-pair table, and says so.
 
 This file covers the engine's keys: `dedupe`, `conflict`, `bootstrap_dedup`,
 `cleanup_near_certain` and `cleanup_worth_asking`, and why the study could not measure
-`route_max_top` and `route_max_spread`.
+`route_max_top` and `route_max_spread`. A LongMemEval-S fusion sweep measured those two on 10
+October 2026 (`docs/results/2026-10-fusion-sweep.md`).
 
 ## Results
 
@@ -24,8 +25,8 @@ This file covers the engine's keys: `dedupe`, `conflict`, `bootstrap_dedup`,
 | `conflict` | 0.90 | 0.91 | yes | medium | chosen to reproduce the share of client corrections flagged (71.0% against 69.9%); the pool mapping gives 0.9185 |
 | `bootstrap_dedup` | 0.90 | 0.919 | no | medium | pool mapping 0.9185, support 246 |
 | `cleanup_worth_asking` | 0.65 | 0.754 | no | medium | pool mapping 0.7544, support 34,613 |
-| `route_max_top` | 0.65 | not measured | no | none | compares a query with stored rows; see "Query-side keys" |
-| `route_max_spread` | 0.08 | not measured | no | none | as `route_max_top` |
+| `route_max_top` | 0.65 | 0.76 (fusion sweep, not this study) | no | medium | compares a query with stored rows; see "Query-side keys" |
+| `route_max_spread` | 0.08 | 0.07 (fusion sweep, not this study) | no | medium | as `route_max_top` |
 
 ## Method
 
@@ -196,10 +197,15 @@ Both come from the same-namespace pool (`results2.json: mapping`).
 `route_max_top` (0.65) and `route_max_spread` (0.08) compare a query vector with stored rows. The
 store keeps no query text, and the recall log records memory ids and ranks with no scores, so the
 copy cannot measure either. EmbeddingGemma 2 also embeds queries with a different prefix from
-documents, which rules out reusing the document-to-document mapping. A retrieval harness that
-records the cosine and rank of every returned hit under both models can map `route_max_top` by the
-share of top-1 scores at or above bge's value, and `route_max_spread` by the distribution of top-1
-minus top-k gaps.
+documents, which rules out reusing the document-to-document mapping.
+
+A retrieval harness that records the cosine and rank of every returned hit under both models can
+map the keys, and the fusion sweep of 10 October 2026 did. It ran LongMemEval-S and matched
+`route_max_top` by the share of rank-1 fused scores at or above bge's value, and `route_max_spread`
+by the rank-1 minus rank-5 gap. Both mapped from lin035 fused scores (cosine plus 0.35 times
+keyword). It put `route_max_top` at 0.76 (scoped 0.7559, corpus 0.7655) and `route_max_spread` at
+0.07 (scoped 0.0665, corpus 0.0696), medium confidence. Decision 0029 and
+`docs/results/2026-10-fusion-sweep.md` carry the intervals and the walk shares.
 
 ## Limits
 

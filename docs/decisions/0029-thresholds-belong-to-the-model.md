@@ -36,22 +36,24 @@ of default values per model family in `src/domain/similarity.rs`, and each value
 
 The table this record ships:
 
-| Key | Acts | bge-base-en-v1.5 | EmbeddingGemma 2 | Gemma basis | Study confidence |
+| Key | Acts | bge-base-en-v1.5 | EmbeddingGemma 2 | Gemma basis | Confidence |
 |---|---|---|---|---|---|
 | `dedupe` | yes | 0.97 | 0.995 | study | low |
 | `conflict` | yes | 0.90 | 0.91 | study | medium |
 | `bootstrap_dedup` | no | 0.90 | 0.919 | study | medium |
 | `cleanup_near_certain` | yes | 0.97 | 0.995 | study | low |
 | `cleanup_worth_asking` | no | 0.65 | 0.754 | study | medium |
-| `route_max_top` | no | 0.65 | 0.65 | carried | none |
-| `route_max_spread` | no | 0.08 | 0.08 | carried | none |
+| `route_max_top` | no | 0.65 | 0.76 | sweep | medium |
+| `route_max_spread` | no | 0.08 | 0.07 | sweep | medium |
 
 Every bge-base-en-v1.5 value has basis `shipped`: production ran on it before this record. The label
 claims nothing more. `DEDUPE_THRESHOLD` and `CONFLICT_THRESHOLD` were picked before any real data
 existed (`VERIFY.md`), and `src/domain/routing.rs` calls both route values design targets. `study`
-means the threshold study below measured it. `carried` means bge-base-en-v1.5's shipped value,
-copied with no measurement for this model. An acting key changes or merges data with no person
-reading it first.
+means the threshold study below measured it. `sweep` means the LongMemEval-S fusion sweep of 10
+October 2026 measured it ([`docs/results/2026-10-fusion-sweep.md`](../results/2026-10-fusion-sweep.md)).
+`carried` means bge-base-en-v1.5's shipped value, copied with no measurement for this model; no
+EmbeddingGemma 2 key carries it now. An acting key changes or merges data with no person reading it
+first.
 
 ## Context
 
@@ -76,7 +78,8 @@ of the anchors. A regression line would have pulled every high threshold toward 
 models correlate at 0.70 on the pool, and a least-squares fit puts `dedupe` at 0.900. Where the pool
 held too few high scores, the study read labelled pairs instead: pairs a person dismissed as "both
 are fine", corrections clients wrote with `supersedes`, and pairs a person or a model merged as the
-same fact. Every figure below is a study measurement.
+same fact. Every figure below is a study measurement except the two route keys, which the fusion
+sweep measured.
 
 - **`dedupe` 0.995, low confidence.** The mapping had a support of 2 scores, and 373 of the 1,000
   resamples held none at bge 0.97, so labels decided it. All 248 human-judged must-not-merge pairs
@@ -94,11 +97,21 @@ same fact. Every figure below is a study measurement.
   0.9234.
 - **`cleanup_worth_asking` 0.754, medium confidence.** Mapped 0.7544, support 34,613, interval
   0.7523 to 0.7567.
-- **`route_max_top` and `route_max_spread`, unmeasured.** Both compare a query vector with stored
-  rows. The store keeps no query text, the recall log records ids and ranks with no scores, and
-  EmbeddingGemma 2 embeds queries with a different prefix from documents, so the doc-to-doc mapping
-  does not carry over. A fusion sweep is measuring both keys now. The table carries bge's 0.65 and
-  0.08 until it reports.
+- **`route_max_top` 0.76 and `route_max_spread` 0.07, from the fusion sweep, medium confidence.**
+  Both compare a query with stored rows. The store keeps no query text, the recall log records ids
+  and ranks with no scores, and EmbeddingGemma 2 embeds queries with a different prefix from
+  documents, so the doc-to-doc mapping does not carry over. The threshold study left them
+  unmeasured and the table carried bge's 0.65 and 0.08. The sweep then ran LongMemEval-S on 10
+  October 2026 and matched each key by quantile on the fused score at `SEARCH_LEXICAL_WEIGHT=0.35`.
+  `route_max_top` matches the share of questions whose rank-1 fused score sits at or above bge's
+  0.65: scoped 0.7559 (interval 0.7503 to 0.7643), corpus 0.7655 (0.7576 to 0.7730).
+  `route_max_spread` matches the rank-1 minus rank-5 gap against bge's 0.08: scoped 0.0665 (0.0603
+  to 0.0728), corpus 0.0696 (0.0584 to 0.0861). 0.76 and 0.07 lie inside all four intervals, and the
+  corpus interval for the spread still contains 0.08. With bge's pair, Gemma's router walked 0 of
+  500 corpus questions and 59 of 500 scoped. At 0.76 and 0.07 Gemma's router walks 125 of 500 scoped
+  questions (25.0%) and 150 of 500 corpus (30.0%), against bge's 23.2% and 32.0% at 0.65 and 0.08,
+  measured on the sweep's baseline runs. Quantile matching shows the
+  router fires as often as it does under bge. It does not show that the walks help.
 
 The study names its own limits. It read one snapshot. Live rows exclude writes that dedupe had
 already folded, so the pool holds few near-duplicates. Every dismissed pair and every stored
@@ -133,9 +146,11 @@ listed falls to the guess.
   pair: llama.cpp Q8_0 and the ONNX q8 export of EmbeddingGemma 2 agreed at cosine 0.9997 or above
   (measured, `docs/results/2026-10-embedding-model-comparison.md`). A fine-tune whose id contains a
   family name inherits that family's values; its operator sets `EMBED_THRESHOLDS`.
-- **EmbeddingGemma 2 routes on bge's route values** until the sweep reports. Gemma scores run
-  higher, so the weak-top test should fire on fewer queries after a flip. Nobody has measured how
-  many.
+- **EmbeddingGemma 2's route values rest on distribution matching.** No run exercised the graph
+  walk or scored its output, so the sweep shows the router fires about as often as under bge and
+  not that the walks help. The values hold only at fused scores from `SEARCH_FUSION=linear` with
+  `SEARCH_LEXICAL_WEIGHT=0.35`; a different weight needs a remap, and under `rrf` or `linear_minmax`
+  the router stands down and the values stop mattering.
 - **`dedupe` at 0.995 folds fewer true duplicates at write:** 7 of the study's 131 merge-like pairs,
   against 24 under bge at 0.97. Cleanup still finds the rest with a model in the loop. A wrong fold
   loses a fact with nobody watching; a missed one leaves a duplicate somebody can still merge.
@@ -158,8 +173,10 @@ It does not retune search fusion weights, and it does not claim the study's valu
 - **Two quantisations of one model measure apart.** If a mapping on one store puts a key for two
   quantisations of one family further apart than that key's bootstrap interval, key that family by
   exact id.
-- **The fusion sweep reports.** Its values replace EmbeddingGemma 2's `route_max_top` and
-  `route_max_spread`, with basis `study`. If it finds bge's values hold, the values stay and the
-  basis changes.
+- **A run that scores the graph walk disagrees.** The sweep reported on 10 October 2026 and
+  found that bge's values do not hold: with 0.65 and 0.08 Gemma's router walks 0 of 500 corpus
+  questions. It replaced EmbeddingGemma 2's `route_max_top` and `route_max_spread` with 0.76 and
+  0.07, basis `sweep`. If a later run that scores walk output, or a move of
+  `SEARCH_LEXICAL_WEIGHT` off 0.35, puts the best pair elsewhere, replace the two values.
 - **A correction folds at 0.995.** If the fold log line shows a correction collapsing into the row
   it corrects, revisit EmbeddingGemma 2's `dedupe`.

@@ -40,6 +40,8 @@ pub enum Basis {
     Shipped,
     /// Measured in the threshold study of 10 October 2026.
     Study,
+    /// Measured by a LongMemEval-S fusion sweep, 10 October 2026.
+    Sweep,
     /// bge-base-en-v1.5's shipped value, copied with no measurement for this model.
     Carried,
 }
@@ -92,10 +94,11 @@ pub const ENGINE_FAMILIES: &[Family] = &[
             FamilyValue { key: BOOTSTRAP_DEDUP, value: 0.919, basis: Basis::Study },
             FamilyValue { key: CLEANUP_NEAR_CERTAIN, value: 0.995, basis: Basis::Study },
             FamilyValue { key: CLEANUP_WORTH_ASKING, value: 0.754, basis: Basis::Study },
-            // Unmeasured. Both compare a query vector with stored rows, the store keeps no query
-            // text, and a fusion sweep is measuring them. bge's values until it reports.
-            FamilyValue { key: ROUTE_MAX_TOP, value: 0.65, basis: Basis::Carried },
-            FamilyValue { key: ROUTE_MAX_SPREAD, value: 0.08, basis: Basis::Carried },
+            // LongMemEval-S fusion sweep, 10 October 2026, medium confidence
+            // (docs/results/2026-10-fusion-sweep.md). The router compares fused scores at
+            // SEARCH_LEXICAL_WEIGHT=0.35; remap both if that weight moves.
+            FamilyValue { key: ROUTE_MAX_TOP, value: 0.76, basis: Basis::Sweep },
+            FamilyValue { key: ROUTE_MAX_SPREAD, value: 0.07, basis: Basis::Sweep },
         ],
     },
 ];
@@ -107,6 +110,7 @@ pub enum Source {
     Legacy,
     Shipped,
     Study,
+    Sweep,
     Carried,
     Guessed,
 }
@@ -264,6 +268,7 @@ impl Registry {
                 let source = match fv.basis {
                     Basis::Shipped => Source::Shipped,
                     Basis::Study => Source::Study,
+                    Basis::Sweep => Source::Sweep,
                     Basis::Carried => Source::Carried,
                 };
                 Resolved { value: fv.value, source }
@@ -439,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn the_gemma_id_reads_the_study_values() {
+    fn the_gemma_id_reads_the_study_and_sweep_values() {
         let t = Registry::engine().resolve(GEMMA, &[], &[]);
         assert_eq!(t.family.as_deref(), Some(EMBEDDINGGEMMA_2));
         for (key, value) in [
@@ -451,9 +456,24 @@ mod tests {
         ] {
             assert_eq!(t.values[key], Resolved { value, source: Source::Study }, "{key}");
         }
-        for (key, value) in [(ROUTE_MAX_TOP, 0.65), (ROUTE_MAX_SPREAD, 0.08)] {
-            assert_eq!(t.values[key], Resolved { value, source: Source::Carried }, "{key}");
+        for (key, value) in [(ROUTE_MAX_TOP, 0.76), (ROUTE_MAX_SPREAD, 0.07)] {
+            assert_eq!(t.values[key], Resolved { value, source: Source::Sweep }, "{key}");
         }
+    }
+
+    #[test]
+    fn a_swept_value_resolves_with_the_sweep_source() {
+        const SWEPT: &[FamilyValue] =
+            &[FamilyValue { key: "extra", value: 0.5, basis: Basis::Sweep }];
+        let r = Registry::engine().extend(
+            &[KeySpec { key: "extra", acts: false }],
+            &[Family { family: BGE_BASE, values: SWEPT }],
+            &[],
+        );
+        assert_eq!(
+            r.resolve(BGE_Q8, &[], &[]).values["extra"],
+            Resolved { value: 0.5, source: Source::Sweep }
+        );
     }
 
     #[test]
