@@ -103,7 +103,9 @@ pub struct QuestionResult {
     /// session from the haystack, and a question whose gold session never landed is unanswerable
     /// for a reason that has nothing to do with ranking.
     pub write_failures: Vec<String>,
+    /// Writes that created a row. A collapse into an existing row is in `writes_collapsed`.
     pub rows_written: usize,
+    pub writes_collapsed: usize,
     pub latency_ms: u64,
 }
 
@@ -126,6 +128,7 @@ impl QuestionResult {
             retrieved_session_ids: retrieved,
             write_failures: vec![],
             rows_written: 0,
+            writes_collapsed: 0,
             latency_ms: 0,
         }
     }
@@ -148,8 +151,13 @@ pub struct RunReport {
     /// that built a fresh index per question, and it is the one that says least about scale.
     pub mode: String,
     /// Rows the store held when the last question searched. The whole point of the two harder
-    /// modes, and meaningless in `isolated`, where it is one question's haystack.
+    /// modes, and meaningless in `isolated`, where it is one question's haystack. Counts writes
+    /// that created a row; reports written before October 2026 counted every accepted write, and
+    /// their corpus-wide figure overstates the pool by the collapses.
     pub rows_at_end: usize,
+    /// Accepted writes the server collapsed into a row already stored, over the whole run. Two
+    /// sessions with identical text share one row, and both are credited when it is retrieved.
+    pub writes_collapsed: usize,
     pub embedding_model: String,
     pub retrieve_depth: i64,
     pub overall: Aggregate,

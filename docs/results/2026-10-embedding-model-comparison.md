@@ -1,8 +1,10 @@
 # EmbeddingGemma 2 against bge-base-en-v1.5, October 2026
 
-Runs from 9 and 10 October 2026, on branch `feat/embeddinggemma-2`. Every number here came from a
-run named below, and the JSON reports sit beside this file. Where a figure is arithmetic or a
-single sample, it says so.
+Runs from 9 and 10 October 2026, on branch `feat/embeddinggemma-2`. Every retrieval metric, latency
+percentile and wall time came from a run named below, and those JSON reports sit beside this file.
+The reference-build agreement, the write-cost table, the embedding-latency table and the memory
+figures are single-host observations with no report in this PR; each says so where it appears.
+Where a figure is arithmetic or a single sample, it says so.
 
 These are LongMemEval-S **retrieval recall** numbers: does the right session reach the top k. No
 answer is generated and no judge runs, so none of this is the paper's QA accuracy.
@@ -23,13 +25,19 @@ answer is generated and no judge runs, so none of this is the paper's QA accurac
 | Prefixes | query: `Represent this sentence for searching relevant passages: ` | query: `task: search result \| query: `, document: `title: none \| text: ` |
 | Agreement with a reference build | cosine ≥ 0.9998 against fastembed's `Qdrant/bge-base-en-v1.5-onnx-Q`, the model the engine ships | cosine ≥ 0.9997 against the `onnx-community/embeddinggemma-2-ONNX` q8 export |
 
+The agreement row is a single-host observation; no log of it is in this PR.
+
 **The comparison mixes model and window.** A median session is about 2,240 Gemma tokens, so bge
 reads roughly the first quarter of it and Gemma reads nearly all of it. A Gemma run capped at 512
 tokens would separate the two; it has not been run.
 
 ## Scoped: each question searches its own ~48 sessions
 
-Both runs stored all 23,867 sessions. Reports: `longmemeval-bge-base-api-20261009.json`,
+Both runs wrote all 23,867 session references with no write refused. That is at most 23,854 rows,
+whatever the reports' `rows_at_end` of 23,867 says: a recount of the dataset during review found
+13 sessions whose text repeats another session in the same haystack, and the server collapses a
+repeat into the row already there. Both copies are credited when that row is retrieved, the same
+way for both models, so no metric moves. Reports: `longmemeval-bge-base-api-20261009.json`,
 `longmemeval-embeddinggemma2-20261009.json`.
 
 | metric | bge-base | EmbeddingGemma 2 | Gemma minus bge, paired [95% CI] | Gemma better / worse |
@@ -60,15 +68,24 @@ Search latency per question (the whole `memory_search` round trip, query embeddi
 | bge-base | 83 ms | 94 ms | 132 ms | 174 ms |
 | EmbeddingGemma 2 | 92 ms | 113 ms | 228 ms | 474 ms |
 
-The roughly 9 ms between them is the query embedding. Postgres does the same work for both: both
-store 768-dimension vectors. Run wall time was 535 s for bge and 3,071 s for Gemma, almost all of it
-write-side embedding of whole sessions.
+The roughly 9 ms between them is probably the query embedding, since Postgres does the same work
+for both: both store 768-dimension vectors. That is an inference. The reports time the whole round
+trip and carry no per-stage timing. Run wall time was 535 s for bge and 3,071 s for Gemma, almost
+all of it write-side embedding of whole sessions.
 
-## Corpus-wide: every question searches all 19,188 sessions
+## Corpus-wide: every question searches the whole pool
 
-On this branch, `--corpus-wide` writes each unique session once (19,195 of the 23,867
-references) into one namespace, `project:lme-corpus`, before the first search. The earlier behaviour
-wrote and searched question by question, so early questions met a smaller pool than late ones.
+On this branch, `--corpus-wide` writes each unique session id once (19,195 ids across the 23,867
+references) into one namespace, `project:lme-corpus`, before the first search. The earlier
+behaviour wrote and searched question by question, so early questions met a smaller pool than late
+ones.
+
+A recount of the dataset during review found those 19,195 ids render to 18,464 distinct texts, and
+the server collapses a repeated text into the row already stored, so the pool holds at most 18,464
+rows. The `rows_at_end` in these two reports, 19,188 for bge (7 writes refused) and 19,195 for
+Gemma, counts accepted writes with collapses included; the harness now counts rows and collapses
+apart. Identical twins are credited together when their row is retrieved, for both models alike,
+so the metrics stand.
 
 **This mode is harsher than a real store.** LongMemEval simulates a different user for each question.
 Pooled, "what's my dog's name?" competes with 499 other personas' dogs, where a real store holds one
@@ -106,7 +123,8 @@ with the rows a search can reach. Query plans for the slow searches have not bee
 
 ### EmbeddingGemma 2, against bge-base
 
-Report: `longmemeval-embeddinggemma2-corpuswide-20261010.json`. All 19,195 sessions stored. Wall
+Report: `longmemeval-embeddinggemma2-corpuswide-20261010.json`. Every one of the 19,195 session ids
+was written with no refusal, into at most 18,464 rows. Wall
 time 2,763 s against bge's 1,165 s, almost all of it write-side embedding.
 
 | metric | bge-base | EmbeddingGemma 2 | Gemma minus bge, paired [95% CI] | Gemma better / worse |
@@ -138,7 +156,8 @@ as bge's. The tail is the store's, not the model's.
 ## Write cost grows with the namespace
 
 From a corpus-wide bge write phase on 9 October (Docker Postgres on a Mac, 4 writes in flight, the
-run stopped at 18,000 sessions when the embedding host lost power):
+run stopped at 18,000 sessions when the embedding host lost power). A single-host observation read
+off the harness's progress lines; that run left no report and its log is not in this PR:
 
 | rows already in the namespace | time per 500 writes |
 |---|---|
@@ -154,7 +173,8 @@ stored: the dedupe or conflict checks, or the HNSW insert. Not isolated yet.
 
 ## Embedding latency
 
-One request at a time, median of 3 unless marked.
+One request at a time, median of 3 unless marked. Single-host observations on the machines named in
+the header row; no log of these timings is in this PR.
 
 | input | GPU, RTX 5070 Ti | CPU, Ryzen 5 3600, 2 threads | CPU, Ryzen 5 3600, 4 threads | CPU, AWS m6a.xlarge (EPYC 7R13), 2 CPUs |
 |---|---|---|---|---|
@@ -167,13 +187,14 @@ One request at a time, median of 3 unless marked.
 | ~8k tokens | 0.6 s | 46 s | 24.8 s | 53.8 s (one run) |
 
 EmbeddingGemma 2 Q8_0 on llama.cpp build 11515 in every column. The first GPU request after start
-took 19 s; the table shows steady state.
+took 19 s, one observation; the table shows steady state.
 
 **Memory is the trap at long inputs.** llama.cpp turns flash attention off for this architecture
 ("Flash Attention not supported"), so attention memory grows with the square of the micro-batch. On
 the m6a at `-ub 8192`, the container reached 8.1 GiB after the 8k input. At a 2,048-token window it
 should need about a sixteenth of that: arithmetic, not measured. On the GPU the server used 2.5 GiB
-of VRAM with 4 slots at an 8k window.
+of VRAM with 4 slots at an 8k window. Both memory figures are single readings on one host, with no
+log in this PR.
 
 `llama-server` refuses an input past its window ("input (N tokens) is too large to process") rather
 than truncating it. The `openai` adapter caps input by characters and, on that refusal, cuts by the
@@ -183,7 +204,9 @@ retries were not enough and five are.
 
 ## Not measured yet
 
-- Gemma at a 512-token window, to split model from window.
+- Gemma at a 512-token window, to split model from window. The harness has no token setting:
+  start llama-server with a 512-token window and the adapter cuts each input on the refusal.
+  `LUMBERROOM_EVAL_EMBED_MAX_INPUT_CHARS` caps characters, which is a different bound.
 - Why Gemma loses on multi-session questions corpus-wide.
 - Query plans behind the corpus-wide search tail, and the cause of the write-cost growth.
 - Any of this on the QA-accuracy protocol.
