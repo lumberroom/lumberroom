@@ -23,6 +23,7 @@ macro_rules! live {
 mod alias;
 mod cleanup;
 pub mod conflict_wake;
+mod embedding_migration;
 mod ingest;
 mod memory;
 mod oauth;
@@ -35,6 +36,7 @@ pub use alias::PgAliasRepository;
 /// three arrays, so a second translation cannot drift from the first.
 pub(crate) use cleanup::grant_arrays;
 pub use cleanup::PgCleanupRepository;
+pub use embedding_migration::PgEmbeddingMigrationRepository;
 pub use ingest::PgIngestRepository;
 pub use memory::PgMemoryRepository;
 pub use oauth::PgOauthStore;
@@ -361,18 +363,30 @@ fn quote_ident(name: &str) -> String {
 /// The embedding column width is fixed in SQL and the embedder is configurable, so a mismatch
 /// would produce a confusing error on every write. Fail loudly at boot instead.
 pub async fn assert_embedding_dim(pool: &PgPool, expected: usize) -> Result<usize> {
+    assert_column_dim(pool, "embedding", expected).await
+}
+
+/// Slot B, checked the same way. `EMBED_PREVIOUS_DIM` must equal `EMBED_DIM`, so both slots share
+/// one width and this takes the same `expected`.
+pub async fn assert_embedding_b_dim(pool: &PgPool, expected: usize) -> Result<usize> {
+    assert_column_dim(pool, "embedding_b", expected).await
+}
+
+/// The column name is bound as a value: it selects a catalog row and never reaches the SQL text.
+async fn assert_column_dim(pool: &PgPool, column: &'static str, expected: usize) -> Result<usize> {
     let row = sqlx::query(
         "SELECT format_type(a.atttypid, a.atttypmod) AS type
            FROM pg_attribute a
            JOIN pg_class c ON c.oid = a.attrelid
-          WHERE c.relname = 'memory' AND a.attname = 'embedding' AND a.attnum > 0",
+          WHERE c.relname = 'memory' AND a.attname = $1 AND a.attnum > 0",
     )
+    .bind(column)
     .fetch_optional(pool)
     .await?;
 
     let ty: String = row
         .ok_or_else(|| {
-            DomainError::internal("memory.embedding column not found. Did migrations run?")
+            DomainError::internal(format!("memory.{column} column not found. Did migrations run?"))
         })?
         .get("type");
 
@@ -383,9 +397,26 @@ pub async fn assert_embedding_dim(pool: &PgPool, expected: usize) -> Result<usiz
 
     if actual != expected {
         return Err(DomainError::internal(format!(
-            "embedding dimension mismatch: memory.embedding is {ty} but EMBED_DIM={expected}. \
+            "embedding dimension mismatch: memory.{column} is {ty} but EMBED_DIM={expected}. \
              Change EMBED_DIM back, or migrate the column."
         )));
     }
     Ok(actual)
+}
+
+/// Whether the embedding migration's schema exists: `memory.embedding_b` and `embedding_state`.
+/// `verify-embedding` runs before a new image migrates the store, so a false here is the normal
+/// state of that pre-flight, not a fault.
+pub async fn embedding_migration_schema(pool: &PgPool) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (
+                  SELECT 1
+                    FROM pg_attribute a
+                    JOIN pg_class c ON c.oid = a.attrelid
+                   WHERE c.relname = 'memory' AND a.attname = 'embedding_b'
+                     AND a.attnum > 0 AND NOT a.attisdropped)
+            AND to_regclass('embedding_state') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?)
 }

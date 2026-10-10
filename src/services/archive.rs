@@ -585,8 +585,9 @@ async fn restore(
             report.applied += 1;
             continue;
         }
-        let row = restore_row(ctx, &u, rec, namespace, resolved, &mut kek).await?;
+        let (row, missed) = restore_row(ctx, &u, rec, namespace, resolved, &mut kek).await?;
         ctx.repos.memories.restore_row(row).await?;
+        super::write::log_missed(&u, &rec.id, missed.as_deref());
         report.applied += 1;
         // The id is the archive's own. The map is still written so an interrupted restore resumes
         // on the same terms a merge does.
@@ -667,14 +668,14 @@ async fn restore_row(
     namespace: String,
     resolved: Sensitivity,
     kek: &mut Option<crate::crypto::kek::Kek>,
-) -> Result<RestoreRow> {
+) -> Result<(RestoreRow, Option<String>)> {
     let id = uuid::Uuid::parse_str(&rec.id)
         .map_err(|_| DomainError::validation("a restored row needs a uuid for an id"))?;
     let content = rec.content.trim();
 
-    let mut vectors = u.embedder.embed_documents(vec![content.to_string()]).await?;
-    let embedding =
-        vectors.pop().ok_or_else(|| DomainError::internal("embedder returned no vector"))?;
+    // Both models, as a write does, so a restore during a migration leaves nothing extra to fill.
+    let super::write::Embedded { vector: embedding, second, missed } =
+        super::write::embed_document(u, content, super::write::shadow_wait(ctx)).await?;
 
     // Sealed under this install's key, bound to this row's id. Never the archive's bytes: no
     // archive carries any, and copied ciphertext fails its tag check even when the id survives.
@@ -692,7 +693,7 @@ async fn restore_row(
         false => None,
     };
 
-    Ok(RestoreRow {
+    let row = RestoreRow {
         tenant_id: ctx.tenant().to_string(),
         id,
         namespace,
@@ -706,6 +707,8 @@ async fn restore_row(
         tags: rec.tags.clone(),
         source_client: rec.source_client.clone(),
         embedding_model: u.embedder.id(),
+        slot: u.slot,
+        second,
         sensitivity: resolved,
         sealed,
         // Both links are foreign keys into this table and neither is deferrable, so binding them
@@ -726,7 +729,8 @@ async fn restore_row(
         created_at: parse_opt(Some(rec.created_at.as_str()))
             .map_err(DomainError::validation)?
             .ok_or_else(|| DomainError::validation("a restored row needs a created_at"))?,
-    })
+    };
+    Ok((row, missed))
 }
 
 /// The refusals a row meets before anything is written, and the level it lands at.

@@ -172,6 +172,7 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
         // The engine ships no proposal source. `source_proposal_on_an_engine_answers_400_source_not_filled`
         // is the test that leans on this being empty.
         proposals: Vec::new(),
+        embedding_status: None,
     });
     let authenticator = auth::create(&ctx.cfg, Some(oauth)).ok()?;
     let app = lumberroom_server::http::router(state, authenticator);

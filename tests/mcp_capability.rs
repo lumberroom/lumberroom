@@ -306,6 +306,7 @@ async fn setup() -> Option<Harness> {
         keys: ctx.keys.clone(),
         kek_verified: ctx.kek_verified,
         proposals: Vec::new(),
+        embedding_status: None,
     });
     let authenticator = auth::create(&ctx.cfg, Some(oauth)).ok()?;
     let app = lumberroom_server::http::router(state, authenticator);

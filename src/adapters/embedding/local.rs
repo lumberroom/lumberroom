@@ -15,6 +15,12 @@ use crate::ports::Embedder;
 /// bge retrieval is asymmetric: queries carry this instruction, stored documents do not.
 const BGE_QUERY_PREFIX: &str = "Represent this sentence for searching relevant passages: ";
 
+/// The id stored in `embedding_model` for a local model. Rows already carry these strings, so the
+/// format never changes; `adapters::embedding::id_for` calls this too, so the two cannot drift.
+pub(super) fn id(model_name: &str) -> String {
+    format!("{model_name}@q8")
+}
+
 pub struct LocalEmbedder {
     model: Arc<Mutex<TextEmbedding>>,
     id: String,
@@ -56,7 +62,7 @@ impl LocalEmbedder {
 
         Ok(Self {
             model: Arc::new(Mutex::new(model)),
-            id: format!("{model_name}@q8"),
+            id: id(model_name),
             dim,
             is_bge: model_name.to_ascii_lowercase().contains("bge"),
         })

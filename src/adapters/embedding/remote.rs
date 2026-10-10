@@ -23,6 +23,12 @@ const SHRINK_RETRIES: usize = 5;
 /// Cut used when the server's refusal does not say how many tokens it counted.
 const BLIND_SHRINK: f64 = 0.5;
 
+/// The id stored in `embedding_model` for a remote model. Rows already carry these strings, so the
+/// format never changes; `adapters::embedding::id_for` calls this too, so the two cannot drift.
+pub(super) fn id(model: &str) -> String {
+    format!("openai:{model}")
+}
+
 pub struct RemoteEmbedder {
     http: reqwest::Client,
     url: String,
@@ -186,7 +192,7 @@ fn number_after(text: &str, marker: &str) -> Option<u64> {
 #[async_trait]
 impl Embedder for RemoteEmbedder {
     fn id(&self) -> String {
-        format!("openai:{}", self.model)
+        id(&self.model)
     }
 
     fn dim(&self) -> usize {

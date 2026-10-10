@@ -121,7 +121,11 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
     let readable = filter_readable(&ctx.principal, &all);
 
     let budget = ctx.cfg.bootstrap.budget_for(&ctx.principal.client);
-    let cache_key = cache_key(&ctx.principal.client, project_ns.as_deref(), &readable, budget);
+    // Resolved before the cache lookup: the key carries the unit's model, so a flip misses.
+    let u = ctx.embedders.for_unit(ctx.tenant())?;
+    let model = u.embedder.id();
+    let cache_key =
+        cache_key(&ctx.principal.client, project_ns.as_deref(), &readable, budget, &model);
     if let Ok(c) = cache().lock() {
         if let Some(entry) = c.get(&cache_key) {
             if entry.at.elapsed().as_millis() < ctx.cfg.bootstrap.cache_ms as u128 {
@@ -145,7 +149,6 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
 
     let b = &ctx.cfg.bootstrap;
     // The digest compares stored vectors, so the cosine belongs to the model that wrote them.
-    let u = ctx.embedders.for_unit(ctx.tenant())?;
     let mut data = ctx
         .repos
         .memories
@@ -162,6 +165,7 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
             registry_limit: b.registry_limit,
             recent_days: b.recent_days,
             dedup_cosine: u.thresholds.get(similarity::BOOTSTRAP_DEDUP),
+            slot: u.slot,
         })
         .await?;
 
@@ -293,16 +297,19 @@ fn choose(selection: &mut Selection, pool: Vec<Memory>, limit: i64) -> Vec<Memor
 /// It carries the client, every namespace with its ceiling, and the render budget. A key built from
 /// namespace names alone would let a client granted `user:me` at open serve a cached digest built
 /// for a client granted `user:me` at private, which is a leak with no attacker in it. The budget is
-/// in the key because the rendered text is part of the cached value.
+/// in the key because the rendered text is part of the cached value. The model is in it because
+/// the near-duplicate drop compares the unit's slot at that model's cosine: a digest cached before
+/// a flip would keep answering with the other model's pairs until it expired.
 fn cache_key(
     client: &str,
     project: Option<&str>,
     readable: &[NamespaceCeiling],
     budget: usize,
+    model: &str,
 ) -> String {
     let grant =
         readable.iter().map(|c| format!("{}@{}", c.namespace, c.max)).collect::<Vec<_>>().join(",");
-    format!("{client}|{}|{budget}|{grant}", project.unwrap_or("-"))
+    format!("{client}|{}|{budget}|{model}|{grant}", project.unwrap_or("-"))
 }
 
 /// Sealed counts, only for namespaces where this client's ceiling actually reaches sealed.
@@ -1766,17 +1773,32 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
 
     #[test]
     fn two_clients_with_the_same_namespaces_at_different_ceilings_do_not_share_a_cache_entry() {
-        let open = cache_key("chatgpt", None, &[ceiling("user:me", Sensitivity::Open)], 6000);
-        let private = cache_key("chatgpt", None, &[ceiling("user:me", Sensitivity::Private)], 6000);
+        let open = cache_key("chatgpt", None, &[ceiling("user:me", Sensitivity::Open)], 6000, BGE);
+        let private =
+            cache_key("chatgpt", None, &[ceiling("user:me", Sensitivity::Private)], 6000, BGE);
         assert_ne!(open, private, "a cache shared across ceilings is a policy hole");
     }
 
     #[test]
     fn the_cache_key_separates_clients_projects_and_budgets() {
         let grant = vec![ceiling("user:me", Sensitivity::Open)];
-        let base = cache_key("mac", None, &grant, 6000);
-        assert_ne!(base, cache_key("chatgpt", None, &grant, 6000));
-        assert_ne!(base, cache_key("mac", Some("project:lumberroom"), &grant, 6000));
-        assert_ne!(base, cache_key("mac", None, &grant, 150_000));
+        let base = cache_key("mac", None, &grant, 6000, BGE);
+        assert_ne!(base, cache_key("chatgpt", None, &grant, 6000, BGE));
+        assert_ne!(base, cache_key("mac", Some("project:lumberroom"), &grant, 6000, BGE));
+        assert_ne!(base, cache_key("mac", None, &grant, 150_000, BGE));
+    }
+
+    const BGE: &str = "Xenova/bge-base-en-v1.5@q8";
+
+    /// The digest drops near-duplicates by comparing stored vectors in the unit's slot at its
+    /// model's cosine. A digest cached under one model and served after a flip answers with the
+    /// other model's pairs and thresholds.
+    #[test]
+    fn a_flip_never_serves_a_digest_built_under_the_other_model() {
+        let grant = vec![ceiling("user:me", Sensitivity::Open)];
+        assert_ne!(
+            cache_key("mac", None, &grant, 6000, BGE),
+            cache_key("mac", None, &grant, 6000, "openai:embeddinggemma-2"),
+        );
     }
 }

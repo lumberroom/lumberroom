@@ -44,6 +44,7 @@ use super::embedders::EmbedderSet;
 use super::Ctx;
 use crate::adapters::auth::can_read;
 use crate::domain::cleanup::{model_may_see, ApplyRefusal, CleanupKind, Disposition};
+use crate::domain::embedding_slot::VectorSlot;
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::namespaces;
 use crate::domain::policy::NamespaceGrant;
@@ -172,11 +173,13 @@ pub async fn run(
     min_similarity: Option<f64>,
 ) -> Result<(RunReport, Vec<ModelCandidate>)> {
     let scope_key = scope.unwrap_or("*").to_string();
+    let u = embedders.for_unit(tenant)?;
     pass(
         tenant,
         repo,
         Bounds {
-            thresholds: embedders.for_unit(tenant)?.thresholds,
+            thresholds: u.thresholds,
+            slot: u.slot,
             scope: scope.map(str::to_string),
             scope_key,
             cadence: cadence.to_string(),
@@ -217,11 +220,13 @@ pub async fn run_as(
         }
     }
     let scope_key = format!("{}@{}", scope.as_deref().unwrap_or("*"), ctx.principal.client);
+    let u = ctx.embedders.for_unit(ctx.tenant())?;
     pass(
         ctx.tenant(),
         repo,
         Bounds {
-            thresholds: ctx.embedders.for_unit(ctx.tenant())?.thresholds,
+            thresholds: u.thresholds,
+            slot: u.slot,
             scope,
             scope_key,
             cadence: cadence.to_string(),
@@ -264,6 +269,9 @@ fn reads_everything(grant: &[NamespaceGrant]) -> bool {
 struct Bounds {
     /// The unit's cosine thresholds. Read per pass, so a unit on another model gets its own bands.
     thresholds: Arc<SimilarityThresholds>,
+    /// The column the pairs come from. Resolved with `thresholds`, so the bands and the cosines
+    /// belong to one model.
+    slot: VectorSlot,
     scope: Option<String>,
     scope_key: String,
     cadence: String,
@@ -303,8 +311,17 @@ async fn pass(
     repo: &dyn CleanupRepository,
     bounds: Bounds,
 ) -> Result<(RunReport, Vec<ModelCandidate>)> {
-    let Bounds { thresholds, scope, scope_key, cadence, limit, min_similarity, grant, posted_by } =
-        bounds;
+    let Bounds {
+        thresholds,
+        slot,
+        scope,
+        scope_key,
+        cadence,
+        limit,
+        min_similarity,
+        grant,
+        posted_by,
+    } = bounds;
     let cadence = cadence.as_str();
     let Bands { floor, near_certain } = Bands::of(&thresholds, min_similarity);
     let mut report = RunReport {
@@ -399,7 +416,7 @@ async fn pass(
 
     // The near-certain band, then the band worth a model's attention. One query at the lower bound
     // serves both, because the pass has to look at everything above 0.85 either way.
-    let pairs = repo.similar_pairs(tenant, &query, floor).await?;
+    let pairs = repo.similar_pairs(tenant, &query, floor, slot).await?;
     truncated |= pairs.len() as i64 >= limit;
     let mut for_model = Vec::new();
     for pair in pairs {

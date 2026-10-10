@@ -97,6 +97,7 @@ async fn search_ids(repo: &impl MemoryRepository, lexical: f64) -> Vec<String> {
         include_superseded: false,
         as_of: None,
         tags: vec![],
+        slot: lumberroom_server::domain::embedding_slot::VectorSlot::A,
     })
     .await
     .expect("search")

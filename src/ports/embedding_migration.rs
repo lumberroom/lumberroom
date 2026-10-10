@@ -40,8 +40,14 @@ pub trait EmbeddingMigrationRepository: Send + Sync {
     async fn change_intent(
         &self,
         // The states are re-read inside the transaction, after the row lock (review M7).
-        decide: &(dyn Fn(&Intent, &[UnitState]) -> std::result::Result<Option<IntentChange>, String>
-                  + Send + Sync),
+        // Higher-ranked: async_trait names elided lifetimes inside a dyn Fn argument, and the
+        // adapter passes values it reads inside the transaction.
+        decide: &(dyn for<'i, 's> Fn(
+            &'i Intent,
+            &'s [UnitState],
+        ) -> std::result::Result<Option<IntentChange>, String>
+              + Send
+              + Sync),
     ) -> Result<ChangeOutcome>;
     /// Command mode, end of each pass.
     async fn publish(&self, published: &Published) -> Result<()>;

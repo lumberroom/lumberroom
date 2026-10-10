@@ -593,6 +593,8 @@ fn restore_row(tenant: &str, ns: &str, emb: Vec<f32>, age: chrono::Duration) -> 
         last_accessed_at: None,
         last_confirmed_at: None,
         created_at: chrono::Utc::now() - age,
+        slot: lumberroom_server::domain::embedding_slot::VectorSlot::A,
+        second: None,
     }
 }
 
