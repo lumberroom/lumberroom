@@ -41,8 +41,7 @@ Exit codes: 0 written and applied, or nothing to write; 1 refused; 2 usage or wr
 pub const PROBE_TEXT: &str = "lumberroom embeddings probe";
 
 const ENV_MODE: &str = "This server takes its embedding switch from .env \
-                        (EMBED_MIGRATION_CONTROL=env). Read progress on the console or the \
-                        operator route.";
+                        (EMBED_MIGRATION_CONTROL=env). Read progress on the console.";
 
 #[derive(Debug)]
 pub struct Outcome {

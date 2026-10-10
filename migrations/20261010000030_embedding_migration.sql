@@ -40,7 +40,9 @@ CREATE TABLE IF NOT EXISTS embedding_control (
   server_models      text[] NOT NULL DEFAULT '{}',
   server_status      jsonb,
   server_seen_at     timestamptz,
-  CONSTRAINT embedding_control_retire_not_target CHECK (retire IS DISTINCT FROM target)
+  -- Both NULL is the resting row, so this compares only when both are named.
+  CONSTRAINT embedding_control_retire_not_target
+    CHECK (retire IS NULL OR target IS NULL OR retire <> target)
 );
 INSERT INTO embedding_control (singleton) VALUES (true) ON CONFLICT DO NOTHING;
 
