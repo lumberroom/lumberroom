@@ -182,8 +182,10 @@ services:
       # set in .env reaches the server only through these lines.
       EMBED_BASE_URL: ${EMBED_BASE_URL:-}
       EMBED_API_KEY: ${EMBED_API_KEY:-}
-      EMBED_QUERY_PREFIX: ${EMBED_QUERY_PREFIX:-}
-      EMBED_DOCUMENT_PREFIX: ${EMBED_DOCUMENT_PREFIX:-}
+      # Bare keys: unset in .env leaves the model's default prefix, and an empty value switches it
+      # off. ${VAR:-} would always pass an empty value.
+      EMBED_QUERY_PREFIX:
+      EMBED_DOCUMENT_PREFIX:
       EMBED_MAX_INPUT_CHARS: ${EMBED_MAX_INPUT_CHARS:-}
       EMBED_TIMEOUT_SECS: ${EMBED_TIMEOUT_SECS:-}
       # Removed in decision 0028. Forwarded for one release only so the boot can refuse a stale value.
@@ -406,8 +408,10 @@ services:
       # set in .env reaches the server only through these lines.
       EMBED_BASE_URL: ${EMBED_BASE_URL:-}
       EMBED_API_KEY: ${EMBED_API_KEY:-}
-      EMBED_QUERY_PREFIX: ${EMBED_QUERY_PREFIX:-}
-      EMBED_DOCUMENT_PREFIX: ${EMBED_DOCUMENT_PREFIX:-}
+      # Bare keys: unset in .env leaves the model's default prefix, and an empty value switches it
+      # off. ${VAR:-} would always pass an empty value.
+      EMBED_QUERY_PREFIX:
+      EMBED_DOCUMENT_PREFIX:
       EMBED_MAX_INPUT_CHARS: ${EMBED_MAX_INPUT_CHARS:-}
       EMBED_TIMEOUT_SECS: ${EMBED_TIMEOUT_SECS:-}
       # Removed in decision 0028. Forwarded for one release only so the boot can refuse a stale value.
