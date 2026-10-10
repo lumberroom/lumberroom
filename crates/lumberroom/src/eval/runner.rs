@@ -33,8 +33,9 @@ pub struct EvalArgs {
     /// Run one question type only, so a 133-question category can be measured without the other
     /// 367.
     pub only_type: Option<String>,
-    /// Search inside the question's own namespace. Off means every question competes against the
-    /// whole corpus with no filter, which is the configuration a real store lives in.
+    /// Search inside the question's own namespace. Off means corpus-wide: every unique session is
+    /// written once into one namespace before the first search, and every question searches all
+    /// of it, which is the configuration a large real store lives in.
     pub scoped: bool,
 }
 
@@ -140,25 +141,15 @@ pub fn owners_from_content(q: &Question, hits: &[wire::Hit]) -> HashMap<String, 
     owners
 }
 
-async fn search(
-    c: &Client,
-    query: &str,
-    namespace: &str,
-    limit: i64,
-    all: Option<&[String]>,
-) -> Result<Vec<wire::Hit>> {
+async fn search(c: &Client, query: &str, namespace: &str, limit: i64) -> Result<Vec<wire::Hit>> {
     let req = wire::SearchArgsRequest {
         // Live search. An as-of read is a different question and no benchmark question asks it.
         as_of: None,
         query: query.to_string(),
-        // Corpus-wide names every question's namespace rather than sending none. Sending none
-        // means "the caller's defaults", which are user, global and the active project, and those
-        // hold nothing here: the first attempt at this returned zero hits on every question and
-        // read as a score of zero rather than as the mistake it was.
-        namespaces: Some(match all {
-            Some(list) => list.to_vec(),
-            None => vec![namespace.to_string()],
-        }),
+        // Named explicitly. Sending none means "the caller's defaults", which are user, global and
+        // the active project, and those hold nothing here: the first attempt at this returned zero
+        // hits on every question and read as a score of zero rather than as the mistake it was.
+        namespaces: Some(vec![namespace.to_string()]),
         limit: Some(limit),
         project: None,
     };
@@ -166,6 +157,132 @@ async fn search(
     let result: wire::SearchResult = serde_json::from_value(output.structured.clone())
         .map_err(|e| err(format!("memory_search response is not the expected shape ({e})")))?;
     Ok(result.hits)
+}
+
+/// The namespace a corpus-wide run writes every session into. One project holding the whole corpus
+/// is the shape of a large real store, where a search meets every row the owner ever wrote.
+pub const CORPUS_NAMESPACE: &str = "project:lme-corpus";
+
+/// Sessions per write batch in a corpus-wide run, so a write phase of tens of thousands of rows
+/// prints progress instead of going quiet for an hour.
+const CORPUS_BATCH: usize = 500;
+
+/// Every unique session written once, and the map from memory id to the sessions it holds.
+pub struct SharedCorpus {
+    pub owners: HashMap<String, Vec<String>>,
+    pub rows_written: usize,
+    /// Session id to the reason it never landed, so each question reports its own losses.
+    pub missing: HashMap<String, String>,
+}
+
+/// Write each session the selected questions mention exactly once, before any search runs.
+///
+/// Writing per question and searching straight away meant question N competed against only the N
+/// haystacks written so far, so early questions took an easier test than late ones and no question
+/// saw the whole pool until the last. LongMemEval-S repeats sessions across haystacks (23,867
+/// references to 19,195 ids); a session id always carries the same turns, so the first occurrence
+/// stands for all of them. Its date is the first one seen, which matters only with --dates-in-text.
+async fn write_corpus(
+    c: &Client,
+    selected: &[(usize, &Question)],
+    args: &EvalArgs,
+) -> Result<SharedCorpus> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut sessions: Vec<Vec<crate::eval::Turn>> = Vec::new();
+    let mut dates: Vec<String> = Vec::new();
+    for (_, q) in selected {
+        for (i, id) in q.haystack_session_ids.iter().enumerate() {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            ids.push(id.clone());
+            sessions.push(q.haystack_sessions.get(i).cloned().unwrap_or_default());
+            dates.push(q.haystack_dates.get(i).cloned().unwrap_or_default());
+        }
+    }
+    crate::out(&format!(
+        "corpus-wide: writing {} unique sessions into {CORPUS_NAMESPACE} before the first search",
+        ids.len()
+    ));
+
+    let mut shared =
+        SharedCorpus { owners: HashMap::new(), rows_written: 0, missing: HashMap::new() };
+    let started = Instant::now();
+    let mut start = 0usize;
+    while start < ids.len() {
+        let end = (start + CORPUS_BATCH).min(ids.len());
+        let batch = Question {
+            question_id: "corpus".into(),
+            question_type: "corpus".into(),
+            question: String::new(),
+            question_date: None,
+            haystack_session_ids: ids[start..end].to_vec(),
+            haystack_sessions: sessions[start..end].to_vec(),
+            haystack_dates: dates[start..end].to_vec(),
+            answer_session_ids: vec![],
+        };
+        let built = corpus::build(
+            c,
+            &batch,
+            CORPUS_NAMESPACE,
+            args.protocol,
+            args.chunk_chars,
+            args.dates_in_text,
+        )
+        .await?;
+        for (id, owners) in built.owners {
+            shared.owners.entry(id).or_default().extend(owners);
+        }
+        shared.rows_written += built.rows_written;
+        for session in built.missing_sessions {
+            let reason = built
+                .failures
+                .iter()
+                .find(|f| f.starts_with(&format!("{session}:")))
+                .cloned()
+                .unwrap_or_else(|| "no row".into());
+            shared.missing.insert(session, reason);
+        }
+        start = end;
+        crate::out(&format!(
+            "  {end}/{} sessions written  {:>6.0}s",
+            ids.len(),
+            started.elapsed().as_secs_f64()
+        ));
+    }
+    Ok(shared)
+}
+
+/// One corpus-wide question: search the shared pool, map hits through the corpus-wide owners, score.
+async fn search_corpus(c: &Client, q: &Question, corpus: &SharedCorpus) -> Result<QuestionResult> {
+    let started = Instant::now();
+    let hits = search(c, &q.question, CORPUS_NAMESPACE, crate::eval::RETRIEVE_DEPTH).await?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    let hit_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+    let (retrieved, unmapped) = sessions_in_rank_order(&hit_ids, &corpus.owners);
+    // A question owns the losses of its own haystack, so a run's sessions_never_stored keeps
+    // meaning what it means in the other modes.
+    let mut failures: Vec<String> = q
+        .haystack_session_ids
+        .iter()
+        .filter_map(|id| corpus.missing.get(id).map(|why| format!("{MISSING_SESSION}{id} ({why})")))
+        .collect();
+    for id in &unmapped {
+        failures.push(format!("{UNMAPPED_HIT}{id}"));
+    }
+
+    let mut result = QuestionResult::score(
+        q.question_id.clone(),
+        q.question_type.clone(),
+        q.answer_session_ids.clone(),
+        retrieved,
+    );
+    result.write_failures = failures;
+    result.rows_written = 0;
+    result.latency_ms = latency_ms;
+    Ok(result)
 }
 
 /// What configuration produced a report. Printed at the top of it, because a parity number and a
@@ -186,7 +303,6 @@ pub async fn run_question(
     q: &Question,
     index: usize,
     args: &EvalArgs,
-    all: Option<&[String]>,
 ) -> Result<QuestionResult> {
     let namespace = crate::eval::question_namespace(index);
 
@@ -200,7 +316,7 @@ pub async fn run_question(
     let mut resumed = false;
     if args.resume {
         let started = Instant::now();
-        probe = search(c, &q.question, &namespace, crate::eval::RETRIEVE_DEPTH, all).await?;
+        probe = search(c, &q.question, &namespace, crate::eval::RETRIEVE_DEPTH).await?;
         probe_ms = started.elapsed().as_millis() as u64;
         resumed = !probe.is_empty();
     }
@@ -224,7 +340,7 @@ pub async fn run_question(
     let (hits, latency_ms) = if resumed {
         (probe, probe_ms)
     } else {
-        let hits = search(c, &q.question, &namespace, crate::eval::RETRIEVE_DEPTH, all).await?;
+        let hits = search(c, &q.question, &namespace, crate::eval::RETRIEVE_DEPTH).await?;
         (hits, started.elapsed().as_millis() as u64)
     };
 
@@ -309,12 +425,16 @@ pub async fn run(c: &Client, args: &EvalArgs) -> Result<RunReport> {
     ));
 
     let wall = Instant::now();
-    // Corpus-wide competes every question against every session the run stored, so the list has
-    // to name each namespace. Scoped leaves it None and each question searches its own.
-    let all_namespaces: Option<Vec<String>> = if args.scoped {
-        None
-    } else {
-        Some((0..selected.len()).map(crate::eval::question_namespace).collect())
+    let corpus_wide = !args.scoped && !args.isolate;
+    if corpus_wide && args.resume {
+        return Err(err(
+            "--resume does not apply to --corpus-wide: the corpus is written once up front, so \
+             rerun it whole against a fresh database",
+        ));
+    }
+    let shared = match corpus_wide {
+        true => Some(write_corpus(c, &selected, args).await?),
+        false => None,
     };
 
     let mut results: Vec<QuestionResult> = Vec::with_capacity(selected.len());
@@ -323,7 +443,10 @@ pub async fn run(c: &Client, args: &EvalArgs) -> Result<RunReport> {
         // A failed question stops the run rather than scoring itself zero, because a transient HTTP
         // error is not a retrieval miss and averaging it in would quietly lower the number. The
         // haystacks already written stay in the store, so `--resume` picks the run back up.
-        let result = run_question(c, q, index, args, all_namespaces.as_deref()).await?;
+        let result = match &shared {
+            Some(corpus) => search_corpus(c, q, corpus).await?,
+            None => run_question(c, q, index, args).await?,
+        };
         hits_at_5 += result.recall_any_at_5;
         results.push(result);
         let last = results.last().expect("just pushed");
@@ -358,7 +481,9 @@ pub async fn run(c: &Client, args: &EvalArgs) -> Result<RunReport> {
         .filter(|f| f.starts_with(MISSING_SESSION))
         .count();
 
-    let rows_at_end = if args.isolate {
+    let rows_at_end = if let Some(corpus) = &shared {
+        corpus.rows_written
+    } else if args.isolate {
         // Isolation deletes each haystack once it is scored, so the store never holds more than
         // one question's worth. Reporting a corpus size here would flatter the run.
         results.last().map_or(0, |r| r.rows_written)
