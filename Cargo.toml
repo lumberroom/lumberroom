@@ -28,6 +28,8 @@ name = "lumberroom-server"
 path = "src/main.rs"
 
 [dependencies]
+# statvfs for the embedding migration's disk floor (decision 0027). Already in the graph via tempfile.
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 # MCP. Streamable HTTP server transport, mounted as an axum service.
 rmcp = { version = "3.1", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = "0.8"

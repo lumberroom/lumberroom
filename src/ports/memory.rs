@@ -7,6 +7,25 @@ use crate::domain::errors::Result;
 use crate::domain::policy::{NamespaceCeiling, NamespaceGrant};
 use crate::domain::types::{ConflictCandidate, Memory, SearchHit, Sensitivity};
 
+/// A vector and the id of the model that produced it.
+#[derive(Debug, Clone)]
+pub struct ModelVector {
+    pub vector: Vec<f32>,
+    pub model: String,
+}
+
+/// Orders a write's two vectors into (slot A, slot B). The adapter binds the pair as returned.
+pub fn slot_ordered(
+    slot: crate::domain::embedding_slot::VectorSlot,
+    first: ModelVector,
+    second: Option<ModelVector>,
+) -> (Option<ModelVector>, Option<ModelVector>) {
+    match slot {
+        crate::domain::embedding_slot::VectorSlot::A => (Some(first), second),
+        crate::domain::embedding_slot::VectorSlot::B => (second, Some(first)),
+    }
+}
+
 /// One subject's versions, oldest first, with what the caller was not shown.
 ///
 /// The counts exist because a timeline that silently drops a version is a lie in the shape of an
@@ -231,6 +250,9 @@ pub struct SearchQuery {
     pub text: String,
     pub limit: i64,
     pub weights: Weights,
+    /// The column this unit reads. Statements carry their column as a literal; the adapter picks
+    /// the statement by slot (decision 0027).
+    pub slot: crate::domain::embedding_slot::VectorSlot,
     /// Live rows only by default. History stays queryable, which is what makes the decision log a
     /// side effect rather than a feature to build.
     ///
@@ -303,6 +325,11 @@ pub struct NewMemory {
     /// content rather than stated by the owner is a guess stored as a fact, which is the pattern
     /// the credential tripwire exists to refuse.
     pub occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The slot `embedding` and `embedding_model` belong to: the unit's active model's.
+    pub slot: crate::domain::embedding_slot::VectorSlot,
+    /// The other configured model's vector, for `slot.other()`, while a migration runs. None
+    /// leaves that slot NULL for the fill to complete.
+    pub second: Option<ModelVector>,
 }
 
 /// A row reproduced exactly, for restore alone.
@@ -339,6 +366,11 @@ pub struct RestoreRow {
     pub last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_confirmed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The slot `embedding` and `embedding_model` belong to: the unit's active model's.
+    pub slot: crate::domain::embedding_slot::VectorSlot,
+    /// The other configured model's vector, for `slot.other()`, while a migration runs. None
+    /// leaves that slot NULL for the fill to complete.
+    pub second: Option<ModelVector>,
 }
 
 /// Live rows in one namespace near a candidate embedding. Feeds both duplicate collapse and the
@@ -353,6 +385,9 @@ pub struct NeighbourQuery {
     pub limit: i64,
     /// Ceiling for the caller, so a neighbour they may not read is never quoted back at them.
     pub max_sensitivity: Sensitivity,
+    /// The column this unit reads. Statements carry their column as a literal; the adapter picks
+    /// the statement by slot (decision 0027).
+    pub slot: crate::domain::embedding_slot::VectorSlot,
 }
 
 /// One page of stored facts, newest first, for a reading surface.
@@ -436,6 +471,9 @@ pub struct DigestQuery {
     /// Pooled rows at or above this cosine come back as a pair in `near_duplicates`. At 1.0 or
     /// above the adapter compares nothing.
     pub dedup_cosine: f64,
+    /// The column this unit reads. Statements carry their column as a literal; the adapter picks
+    /// the statement by slot (decision 0027).
+    pub slot: crate::domain::embedding_slot::VectorSlot,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -621,6 +659,7 @@ pub trait MemoryRepository: Send + Sync {
         embedding: &[f32],
         k: i64,
         exact: bool,
+        slot: crate::domain::embedding_slot::VectorSlot,
     ) -> Result<Vec<String>>;
 
     /// Live rows near this embedding, for dedupe bands and conflict candidates.

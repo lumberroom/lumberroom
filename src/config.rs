@@ -356,7 +356,125 @@ pub struct EmbedConfig {
     /// `EMBED_THRESHOLDS`: per-key overrides for this model's similarity table. Keys are checked
     /// against the registry in `main.rs`, because the fork registers keys the engine does not know.
     pub thresholds: Vec<(String, f64)>,
+    /// The `EMBED_PREVIOUS_*` block: the model a migration moves away from. None outside one.
+    pub previous: Option<EmbedderSpec>,
+    /// `EMBED_PREVIOUS_THRESHOLDS`, as `thresholds` for the previous model.
+    pub previous_thresholds: Vec<(String, f64)>,
+    pub migrate: MigrateConfig,
+    pub disk: DiskConfig,
 }
+
+impl EmbedConfig {
+    pub fn current_spec(&self) -> EmbedderSpec {
+        EmbedderSpec {
+            provider: self.provider,
+            model: self.model.clone(),
+            dim: self.dim,
+            cache_dir: self.cache_dir.clone(),
+            remote: self.remote.clone(),
+        }
+    }
+
+    pub fn previous_spec(&self) -> Option<EmbedderSpec> {
+        self.previous.clone()
+    }
+}
+
+fn parse_embed_provider(key: &str, raw: &str) -> Result<EmbedProvider> {
+    match raw {
+        "local" => Ok(EmbedProvider::Local),
+        "openai" => Ok(EmbedProvider::Openai),
+        "hash" => Ok(EmbedProvider::Hash),
+        other => Err(DomainError::validation(format!(
+            "{key} must be local|openai|hash, got {other:?}"
+        ))),
+    }
+}
+
+/// The `EMBED_PREVIOUS_*` block. Set `EMBED_PREVIOUS_PROVIDER` means a migration is configured.
+fn parse_previous_spec(dim: usize, cache_dir: &str) -> Result<Option<EmbedderSpec>> {
+    let Some(raw) = env_opt("EMBED_PREVIOUS_PROVIDER") else { return Ok(None) };
+    let provider = parse_embed_provider("EMBED_PREVIOUS_PROVIDER", &raw)?;
+    let model = env_opt("EMBED_PREVIOUS_MODEL").ok_or_else(|| {
+        DomainError::validation(
+            "EMBED_PREVIOUS_PROVIDER is set without EMBED_PREVIOUS_MODEL. Name the model the store \
+             holds now.",
+        )
+    })?;
+    let previous_dim = env_num("EMBED_PREVIOUS_DIM", dim)?;
+    if previous_dim != dim {
+        return Err(DomainError::validation(format!(
+            "EMBED_PREVIOUS_DIM is {previous_dim} and EMBED_DIM is {dim}. Both slots are vector({dim}) \
+             columns, so both models have to produce that width."
+        )));
+    }
+    let remote = RemoteEmbedConfig {
+        base_url: env("EMBED_PREVIOUS_BASE_URL", "").trim_end_matches('/').to_string(),
+        api_key: env_opt("EMBED_PREVIOUS_API_KEY"),
+        query_prefix: env_opt("EMBED_PREVIOUS_QUERY_PREFIX")
+            .unwrap_or_else(|| default_embed_prefixes(&model).0.to_string()),
+        document_prefix: env_opt("EMBED_PREVIOUS_DOCUMENT_PREFIX")
+            .unwrap_or_else(|| default_embed_prefixes(&model).1.to_string()),
+        max_input_chars: match env_num("EMBED_PREVIOUS_MAX_INPUT_CHARS", 0usize)? {
+            0 => None,
+            n => Some(n),
+        },
+        timeout_secs: env_num("EMBED_PREVIOUS_TIMEOUT_SECS", 60u64)?,
+    };
+    if provider == EmbedProvider::Openai && remote.base_url.is_empty() {
+        return Err(DomainError::validation(
+            "EMBED_PREVIOUS_PROVIDER=openai needs EMBED_PREVIOUS_BASE_URL, the endpoint up to and \
+             including /v1",
+        ));
+    }
+    Ok(Some(EmbedderSpec { provider, model, dim, cache_dir: cache_dir.to_string(), remote }))
+}
+
+fn parse_migrate() -> Result<MigrateConfig> {
+    use crate::domain::embedding_migration::ControlMode;
+    let control = match env("EMBED_MIGRATION_CONTROL", "command").trim() {
+        "command" => ControlMode::Command,
+        "env" => ControlMode::Env,
+        other => {
+            return Err(DomainError::validation(format!(
+                "EMBED_MIGRATION_CONTROL must be command|env, got {other:?}"
+            )))
+        }
+    };
+    let flip = match env_opt("EMBED_FLIP") {
+        None => None,
+        Some(raw) => Some(
+            crate::domain::embedding_phase::parse_flip_scope(&raw)
+                .map_err(|e| DomainError::validation(format!("EMBED_FLIP: {e}")))?,
+        ),
+    };
+    let ranged = |key: &str, value: u64, lo: u64, hi: u64| -> Result<u64> {
+        if (lo..=hi).contains(&value) {
+            Ok(value)
+        } else {
+            Err(DomainError::validation(format!("{key} must be {lo} to {hi}, got {value}")))
+        }
+    };
+    Ok(MigrateConfig {
+        control,
+        flip,
+        secs: env_num("EMBED_MIGRATE_SECS", 30u64)?,
+        fill_chars: ranged("EMBED_FILL_CHARS", env_num("EMBED_FILL_CHARS", 4000u64)?, 500, 16_000)?
+            as usize,
+        fill_duty: ranged("EMBED_FILL_DUTY", env_num("EMBED_FILL_DUTY", 50u64)?, 1, 100)? as u8,
+        shadow_timeout_ms: ranged(
+            "EMBED_SHADOW_TIMEOUT_MS",
+            env_num("EMBED_SHADOW_TIMEOUT_MS", 10_000u64)?,
+            100,
+            120_000,
+        )?,
+        rollback_days: ranged("EMBED_ROLLBACK_DAYS", env_num("EMBED_ROLLBACK_DAYS", 7u64)?, 0, 365)?
+            as i64,
+        retire: env_opt("EMBED_RETIRE"),
+    })
+}
+
+/// The prefixes a model was trained with, by name.
 
 /// An OpenAI-compatible `/embeddings` endpoint: Workers AI, OpenRouter, llama-server, TEI.
 #[derive(Debug, Clone, Default)]
@@ -372,6 +490,38 @@ pub struct RemoteEmbedConfig {
     /// refuses an input past its window outright rather than truncating it.
     pub max_input_chars: Option<usize>,
     pub timeout_secs: u64,
+}
+
+/// One embedding model's settings: the `EMBED_*` block or the `EMBED_PREVIOUS_*` block.
+#[derive(Debug, Clone)]
+pub struct EmbedderSpec {
+    pub provider: EmbedProvider,
+    pub model: String,
+    pub dim: usize,
+    pub cache_dir: String,
+    pub remote: RemoteEmbedConfig,
+}
+
+/// How a model change runs (decision 0027).
+#[derive(Debug, Clone)]
+pub struct MigrateConfig {
+    /// `EMBED_MIGRATION_CONTROL`.
+    pub control: crate::domain::embedding_migration::ControlMode,
+    /// None when `EMBED_FLIP` is unset: env mode reads that as `All`; command mode refuses it set.
+    pub flip: Option<crate::domain::embedding_migration::FlipScope>,
+    pub secs: u64,
+    pub fill_chars: usize,
+    pub fill_duty: u8,
+    pub shadow_timeout_ms: u64,
+    pub rollback_days: i64,
+    pub retire: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiskConfig {
+    pub path: String,
+    /// 0 turns the floor off.
+    pub floor_mb: u64,
 }
 
 /// The prefixes a model was trained with, by name. An unknown model gets none, which is right for
@@ -1000,6 +1150,20 @@ pub fn load() -> Result<Config> {
             },
             thresholds: crate::domain::similarity::parse_overrides(&env("EMBED_THRESHOLDS", ""))
                 .map_err(|e| DomainError::validation(format!("EMBED_THRESHOLDS: {e}")))?,
+            previous: parse_previous_spec(
+                env_num("EMBED_DIM", 768usize)?,
+                &env("MODEL_CACHE_DIR", "/models"),
+            )?,
+            previous_thresholds: crate::domain::similarity::parse_overrides(&env(
+                "EMBED_PREVIOUS_THRESHOLDS",
+                "",
+            ))
+            .map_err(|e| DomainError::validation(format!("EMBED_PREVIOUS_THRESHOLDS: {e}")))?,
+            migrate: parse_migrate()?,
+            disk: DiskConfig {
+                path: env("EMBED_DISK_PATH", "/"),
+                floor_mb: env_num("EMBED_DISK_FLOOR_MB", 0u64)?,
+            },
         },
         bootstrap: BootstrapConfig {
             cache_ms: env_num("BOOTSTRAP_CACHE_MS", 30_000u64)?,
@@ -1234,6 +1398,55 @@ fn validate_recall_events(r: &RecallEventConfig, cleanup: &CleanupConfig) -> Res
     Ok(())
 }
 
+/// The migration settings that need no store and no embedder. Rules that need either live in
+/// `domain::embedding_phase::boot_check`.
+fn validate_migrate(cfg: &Config) -> Result<()> {
+    use crate::domain::embedding_migration::ControlMode;
+    let m = &cfg.embed.migrate;
+    if m.control == ControlMode::Command {
+        if m.flip.is_some() {
+            return Err(DomainError::validation(
+                "EMBED_FLIP is set while EMBED_MIGRATION_CONTROL=command. In command mode \
+                 `lumberroom-server embeddings flip` decides the flip; unset EMBED_FLIP, or set \
+                 EMBED_MIGRATION_CONTROL=env to steer from .env.",
+            ));
+        }
+        if m.retire.is_some() {
+            return Err(DomainError::validation(
+                "EMBED_RETIRE is set while EMBED_MIGRATION_CONTROL=command. In command mode \
+                 `lumberroom-server embeddings retire` decides it; unset EMBED_RETIRE.",
+            ));
+        }
+    }
+    if let Some(retire) = &m.retire {
+        let previous = cfg.embed.previous.as_ref().map(|p| p.model.as_str());
+        if *retire == cfg.embed.model || Some(retire.as_str()) == previous {
+            return Err(DomainError::validation(format!(
+                "EMBED_RETIRE={retire} names a configured model. It names the model whose vectors \
+                 are deleted, which must be neither EMBED_MODEL nor EMBED_PREVIOUS_MODEL."
+            )));
+        }
+    }
+    if cfg.embed.disk.path.trim().is_empty() {
+        return Err(DomainError::validation("EMBED_DISK_PATH must not be empty"));
+    }
+    // An old single variable means "this value for the one model". Beside a second model it would
+    // apply to whichever model the code read it for, which is the bug decision 0029 removes.
+    if cfg.embed.previous.is_some() {
+        let legacy = cfg.legacy_thresholds();
+        if !legacy.is_empty() {
+            let named: Vec<String> =
+                legacy.iter().map(|l| format!("{}={}", l.variable, l.value)).collect();
+            return Err(DomainError::validation(format!(
+                "{} set beside a second embedding model. Move each into EMBED_THRESHOLDS or \
+                 EMBED_PREVIOUS_THRESHOLDS as key=value for the model it was tuned on.",
+                named.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Split out of `validate` so a test can reach it without building a whole `Config`.
 fn validate_bootstrap(b: &BootstrapConfig) -> Result<()> {
     // Zero or below calls every pair of rows that points the same general way a duplicate, so each
@@ -1423,6 +1636,8 @@ fn validate(cfg: &Config) -> Result<()> {
     if cfg.embed.dim < 8 {
         return Err(DomainError::validation("EMBED_DIM looks wrong"));
     }
+
+    validate_migrate(cfg)?;
 
     if cfg.embed.provider == EmbedProvider::Openai && cfg.embed.remote.base_url.is_empty() {
         return Err(DomainError::validation(
