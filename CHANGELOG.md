@@ -17,8 +17,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `fill_date` with `occurred_at` set to one of them, under the checks `lumberroom fill-date` already
   ran. The source is opt-in, so the default queue is unchanged. Decision 0026.
 
+### Removed
+
+- **`EMBED_ALLOW_FALLBACK` and the hash fallback.** The server no longer swaps in the hash embedder
+  when the real one fails. A boot with the variable set to anything but `false`, `0`, `no` or `off`
+  stops with a message that names the removal. Compose forwards it for one release so the refusal
+  reaches the server. Decision 0028.
+- `/readyz` no longer reports `embedder_degraded`, and the console no longer shows the fallback badge.
+  Clients and scripts that read the key must stop.
+
 ### Changed
 
+- **A local model that fails to load stops the boot.** A remote embedder (`EMBED_PROVIDER=openai`)
+  is not probed at boot: a down endpoint fails each write and search with an error, and `/readyz`
+  stays green because it checks only the database.
 - **The digest ranks by recency, and a restatement gives up its slot.** Profile shows the 10 newest
   rows from `user:me` and `global` with no tag sorting first, and project the 5 newest. Recent no
   longer repeats a row either of them chose. Of two candidate rows at cosine 0.90 or more, the

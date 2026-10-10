@@ -643,16 +643,20 @@ fn parse_fusion(raw: &str) -> Result<Fusion> {
     }
 }
 
-/// `EMBED_ALLOW_FALLBACK`, refused when set to anything but false. Decision 0028.
+/// `EMBED_ALLOW_FALLBACK`, refused when set to anything but an "off" spelling. Decision 0028.
+///
+/// The off spellings match what `env_bool` accepted (false, 0, no, off, any case), so a stale `.env`
+/// that says `FALSE` keeps booting. Any other value stops the boot.
 fn refuse_embed_fallback(raw: Option<&str>) -> Result<()> {
-    match raw.map(str::trim) {
-        None | Some("") | Some("false") | Some("0") => Ok(()),
-        Some(_) => Err(DomainError::validation(
-            "EMBED_ALLOW_FALLBACK was removed (decision 0028): a fallback embedder writes vectors \
-             that cannot be compared with the rest of the store. Unset it; a model that fails to \
-             load now stops the boot.",
-        )),
+    let v = raw.map(str::trim).unwrap_or("");
+    if v.is_empty() || ["false", "0", "no", "off"].iter().any(|o| v.eq_ignore_ascii_case(o)) {
+        return Ok(());
     }
+    Err(DomainError::validation(
+        "EMBED_ALLOW_FALLBACK was removed (decision 0028): a fallback embedder writes vectors \
+         that cannot be compared with the rest of the store. Unset it; a model that fails to \
+         load now stops the boot.",
+    ))
 }
 
 /// `WRITE_MIN_OCCURRED_AGE_SECS`, refused at boot at both ends.
@@ -2022,17 +2026,19 @@ mod tests {
     }
 
     /// An operator who still sets `EMBED_ALLOW_FALLBACK=true` must learn at boot that it is gone,
-    /// not meet a setting that does nothing. Explicit false spellings stay legal so a stale `.env`
-    /// that says `false` keeps booting.
+    /// not meet a setting that does nothing. Every spelling of "off" the old `env_bool` accepted
+    /// stays legal, in any case, so a stale `.env` that says `FALSE` or `off` keeps booting.
     #[test]
     fn config_refuses_embed_allow_fallback() {
-        assert!(refuse_embed_fallback(Some("true")).is_err());
-        assert!(refuse_embed_fallback(Some("1")).is_err());
+        for on in ["true", "TRUE", "1", "yes", "on", "enabled", "tru"] {
+            assert!(refuse_embed_fallback(Some(on)).is_err(), "{on:?} must stop the boot");
+        }
         let err = refuse_embed_fallback(Some("true")).unwrap_err().to_string();
         assert!(err.contains("EMBED_ALLOW_FALLBACK") && err.contains("0028"), "{err}");
         assert!(refuse_embed_fallback(None).is_ok());
-        assert!(refuse_embed_fallback(Some("")).is_ok());
-        assert!(refuse_embed_fallback(Some("false")).is_ok());
+        for off in ["", "  ", "false", "False", "FALSE", "0", "no", "No", "off", "OFF", " off "] {
+            assert!(refuse_embed_fallback(Some(off)).is_ok(), "{off:?} must boot");
+        }
     }
 
     #[test]

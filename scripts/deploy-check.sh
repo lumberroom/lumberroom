@@ -125,7 +125,7 @@ say "2/7 it is ready, and its key is the one this store was sealed with"
 if [ "$(get /readyz "$WORK/ready.json")" = 200 ]; then
   pass "readyz: $(cat "$WORK/ready.json")"
   [ "$(field "$WORK/ready.json" ok)" = "true" ] \
-    && pass "ok: true, so Postgres answers and the embedder has produced a real vector" \
+    && pass "ok: true, so Postgres answers and the schema dimension matches (the embedder is not called)" \
     || fail "ok is not true"
   # `|| true` because `field` exits 1 on a key that is not there, and under `set -e` a bare
   # assignment from it ends the run right here with no message at all. An older server that

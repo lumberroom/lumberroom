@@ -186,6 +186,8 @@ services:
       EMBED_DOCUMENT_PREFIX: ${EMBED_DOCUMENT_PREFIX:-}
       EMBED_MAX_INPUT_CHARS: ${EMBED_MAX_INPUT_CHARS:-}
       EMBED_TIMEOUT_SECS: ${EMBED_TIMEOUT_SECS:-}
+      # Removed in decision 0028. Forwarded for one release only so the boot can refuse a stale value.
+      EMBED_ALLOW_FALLBACK: ${EMBED_ALLOW_FALLBACK:-}
       # Sensitivity axis (Phase 3).
       #
       # Blank here means the server reads the `sensitivity_default` table instead, which migration
@@ -408,6 +410,8 @@ services:
       EMBED_DOCUMENT_PREFIX: ${EMBED_DOCUMENT_PREFIX:-}
       EMBED_MAX_INPUT_CHARS: ${EMBED_MAX_INPUT_CHARS:-}
       EMBED_TIMEOUT_SECS: ${EMBED_TIMEOUT_SECS:-}
+      # Removed in decision 0028. Forwarded for one release only so the boot can refuse a stale value.
+      EMBED_ALLOW_FALLBACK: ${EMBED_ALLOW_FALLBACK:-}
       MODEL_CACHE_DIR: /models
       SENSITIVITY_DEFAULTS: ${SENSITIVITY_DEFAULTS:-}
       SENSITIVITY_TRIPWIRE: ${SENSITIVITY_TRIPWIRE:-}
