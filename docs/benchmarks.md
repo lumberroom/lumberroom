@@ -20,6 +20,13 @@ Run it with `./scripts/eval-longmemeval.sh --dataset <path>`. The harness writes
 `memory_write` tool into real Postgres and searches through the real `memory_search`, on a scratch
 server and a scratch database that are created and dropped per run.
 
+### EmbeddingGemma 2 against bge-base, October 2026
+
+`docs/results/2026-10-embedding-model-comparison.md` holds the 9 and 10 October runs: both models
+served by llama.cpp through the `openai` embedder, scoped and corpus-wide, with paired intervals,
+search and embedding latency, and the write-cost growth. Scoped R@5 is 98.0% for EmbeddingGemma 2
+against 96.2% for bge-base.
+
 ### The headline, 20 August 2026
 
 500 questions, session-as-document, scoped, embedder `all-MiniLM-L6-v2@q8`, depth 20.
