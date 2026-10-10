@@ -353,6 +353,9 @@ pub struct EmbedConfig {
     pub cache_dir: String,
     /// Read only when the provider is `openai`.
     pub remote: RemoteEmbedConfig,
+    /// `EMBED_THRESHOLDS`: per-key overrides for this model's similarity table. Keys are checked
+    /// against the registry in `main.rs`, because the fork registers keys the engine does not know.
+    pub thresholds: Vec<(String, f64)>,
 }
 
 /// An OpenAI-compatible `/embeddings` endpoint: Workers AI, OpenRouter, llama-server, TEI.
@@ -401,7 +404,8 @@ pub struct BootstrapConfig {
     pub max_chars_by_client: HashMap<String, usize>,
     /// At or above this cosine, a digest candidate restates a row already chosen and gives up its
     /// slot to the next one. 1.0 turns the pass off. Decision 0025 has the reasoning.
-    pub dedup_cosine: f64,
+    /// `BOOTSTRAP_DEDUP_COSINE`, set or not. Unset, the model's table value applies (decision 0029).
+    pub dedup_cosine: Option<f64>,
 }
 
 impl BootstrapConfig {
@@ -418,7 +422,11 @@ pub struct SearchConfig {
     /// cost. Both are design targets set from two observations on 25 August 2026, which is not a
     /// calibration; `domain::routing` publishes the signals behind every verdict so a run over real
     /// questions can move them.
-    pub graph_route: crate::domain::routing::Thresholds,
+    /// Follows `SEARCH_FUSION`. The two route values come from the unit's model table unless
+    /// `GRAPH_ROUTE_MAX_TOP` or `GRAPH_ROUTE_MAX_SPREAD` is set (decision 0029).
+    pub graph_route_scale: crate::domain::routing::Scale,
+    pub route_max_top: Option<f64>,
+    pub route_max_spread: Option<f64>,
     pub vector_weight: f64,
     pub lexical_weight: f64,
     pub include_all_projects: bool,
@@ -487,10 +495,12 @@ pub struct CryptoConfig {
 pub struct QualityConfig {
     /// At or above: collapse into the existing row. Starts at 0.97 and must not stay a guess; the
     /// calibration procedure is in the Phase 4 spec §2.
-    pub dedupe_threshold: f64,
+    /// `DEDUPE_THRESHOLD`, set or not. Unset, the model's table value applies (decision 0029).
+    pub dedupe_threshold: Option<f64>,
     /// At or above, and below the dedupe threshold: store, and hand the caller the older row as a
     /// possible conflict.
-    pub conflict_threshold: f64,
+    /// `CONFLICT_THRESHOLD`, set or not. Unset, the model's table value applies (decision 0029).
+    pub conflict_threshold: Option<f64>,
     /// How many conflict candidates a write returns.
     pub conflict_limit: i64,
     /// Deprecated and ignored. It bounded the conflicts self-join, and conflicts now come from
@@ -534,6 +544,23 @@ impl IngestConfig {
 }
 
 impl Config {
+    /// The old single threshold variables that are set. Each overrides its key for the one
+    /// configured model; beside a second model the server refuses them. The fork appends its
+    /// dreaming ones.
+    pub fn legacy_thresholds(&self) -> Vec<crate::domain::similarity::Legacy> {
+        use crate::domain::similarity::{self as s, Legacy};
+        [
+            (s::DEDUPE, self.quality.dedupe_threshold, "DEDUPE_THRESHOLD"),
+            (s::CONFLICT, self.quality.conflict_threshold, "CONFLICT_THRESHOLD"),
+            (s::BOOTSTRAP_DEDUP, self.bootstrap.dedup_cosine, "BOOTSTRAP_DEDUP_COSINE"),
+            (s::ROUTE_MAX_TOP, self.search.route_max_top, "GRAPH_ROUTE_MAX_TOP"),
+            (s::ROUTE_MAX_SPREAD, self.search.route_max_spread, "GRAPH_ROUTE_MAX_SPREAD"),
+        ]
+        .into_iter()
+        .filter_map(|(key, value, variable)| value.map(|value| Legacy { key, value, variable }))
+        .collect()
+    }
+
     pub fn mode_str(&self) -> &'static str {
         self.auth.mode.as_str()
     }
@@ -593,6 +620,16 @@ fn env_num<T: std::str::FromStr>(key: &str, fallback: T) -> Result<T> {
             .parse()
             .map_err(|_| DomainError::validation(format!("{key} is not a valid number: {v:?}"))),
         _ => Ok(fallback),
+    }
+}
+
+/// `None` for unset or empty, so "unset" and "set to the old default" stay apart.
+fn env_num_opt<T: std::str::FromStr>(key: &str) -> Result<Option<T>> {
+    match std::env::var(key) {
+        Ok(v) if !v.trim().is_empty() => v.trim().parse().map(Some).map_err(|_| {
+            DomainError::validation(format!("{key} is not a valid number: {v:?}"))
+        }),
+        _ => Ok(None),
     }
 }
 
@@ -959,6 +996,8 @@ pub fn load() -> Result<Config> {
                 },
                 timeout_secs: env_num("EMBED_TIMEOUT_SECS", 60u64)?,
             },
+            thresholds: crate::domain::similarity::parse_overrides(&env("EMBED_THRESHOLDS", ""))
+                .map_err(|e| DomainError::validation(format!("EMBED_THRESHOLDS: {e}")))?,
         },
         bootstrap: BootstrapConfig {
             cache_ms: env_num("BOOTSTRAP_CACHE_MS", 30_000u64)?,
@@ -969,7 +1008,7 @@ pub fn load() -> Result<Config> {
             registry_limit: env_num("BOOTSTRAP_REGISTRY_LIMIT", 25i64)?,
             max_chars: env_num("BOOTSTRAP_MAX_CHARS", 6000usize)?,
             max_chars_by_client: parse_client_budgets(&env("BOOTSTRAP_MAX_CHARS_BY_CLIENT", ""))?,
-            dedup_cosine: env_num("BOOTSTRAP_DEDUP_COSINE", DEFAULT_BOOTSTRAP_DEDUP_COSINE)?,
+            dedup_cosine: env_num_opt("BOOTSTRAP_DEDUP_COSINE")?,
         },
         search: SearchConfig {
             default_limit: env_num("SEARCH_DEFAULT_LIMIT", 8i64)?,
@@ -979,16 +1018,14 @@ pub fn load() -> Result<Config> {
             include_all_projects: env_bool("SEARCH_INCLUDE_ALL_PROJECTS", true),
             other_project_penalty: env_num("SEARCH_OTHER_PROJECT_PENALTY", 0.85f64)?,
             usage_weight: env_num("SEARCH_USAGE_WEIGHT", 0.05f64)?,
-            graph_route: crate::domain::routing::Thresholds {
-                // Follows the blend rather than being set beside it. The thresholds are cosine
-                // values, and under rank fusion they would call every question weak and flat.
-                scale: match parse_fusion(&env("SEARCH_FUSION", "linear"))? {
-                    Fusion::Linear => crate::domain::routing::Scale::Cosine,
-                    Fusion::Rrf => crate::domain::routing::Scale::Ranked,
-                },
-                max_top: env_num("GRAPH_ROUTE_MAX_TOP", 0.65f64)?,
-                max_spread: env_num("GRAPH_ROUTE_MAX_SPREAD", 0.08f64)?,
+            // Follows the blend rather than being set beside it. The thresholds are cosine values,
+            // and under rank fusion they would call every question weak and flat.
+            graph_route_scale: match parse_fusion(&env("SEARCH_FUSION", "linear"))? {
+                Fusion::Linear => crate::domain::routing::Scale::Cosine,
+                Fusion::Rrf => crate::domain::routing::Scale::Ranked,
             },
+            route_max_top: env_num_opt("GRAPH_ROUTE_MAX_TOP")?,
+            route_max_spread: env_num_opt("GRAPH_ROUTE_MAX_SPREAD")?,
             fusion: parse_fusion(&env("SEARCH_FUSION", "linear"))?,
             rrf_k: env_num("SEARCH_RRF_K", DEFAULT_RRF_K)?,
         },
@@ -1025,8 +1062,8 @@ pub fn load() -> Result<Config> {
             std::env::var("RECALL_EVENT_RETENTION_DAYS").ok().as_deref(),
         )?,
         quality: QualityConfig {
-            dedupe_threshold: env_num("DEDUPE_THRESHOLD", 0.97f64)?,
-            conflict_threshold: env_num("CONFLICT_THRESHOLD", 0.90f64)?,
+            dedupe_threshold: env_num_opt("DEDUPE_THRESHOLD")?,
+            conflict_threshold: env_num_opt("CONFLICT_THRESHOLD")?,
             conflict_limit: env_num("CONFLICT_LIMIT", 3i64)?,
             conflict_scan_max: env_num("CONFLICT_SCAN_MAX", 2_000i64)?,
             conflict_sweep_secs: env_num("CONFLICT_SWEEP_SECS", 60u64)?,
@@ -1200,11 +1237,12 @@ fn validate_bootstrap(b: &BootstrapConfig) -> Result<()> {
     // Zero or below calls every pair of rows that points the same general way a duplicate, so each
     // section prints one row and says nothing about why. NaN parses and then loses every
     // comparison, which reads as "dedup on" while doing nothing.
-    if !(b.dedup_cosine.is_finite() && b.dedup_cosine > 0.0 && b.dedup_cosine <= 1.0) {
+    let Some(dedup_cosine) = b.dedup_cosine else { return Ok(()) };
+    if !(dedup_cosine.is_finite() && dedup_cosine > 0.0 && dedup_cosine <= 1.0) {
         return Err(DomainError::validation(format!(
-            "BOOTSTRAP_DEDUP_COSINE must be above 0 and at most 1, got {}. It is a cosine; 1 turns \
-             near-duplicate collapse off and {DEFAULT_BOOTSTRAP_DEDUP_COSINE} is the default.",
-            b.dedup_cosine
+            "BOOTSTRAP_DEDUP_COSINE must be above 0 and at most 1, got {dedup_cosine}. It is a \
+             cosine; 1 turns near-duplicate collapse off and {DEFAULT_BOOTSTRAP_DEDUP_COSINE} is \
+             bge-base-en-v1.5's value.",
         )));
     }
     Ok(())
@@ -1390,7 +1428,10 @@ fn validate(cfg: &Config) -> Result<()> {
         ));
     }
 
-    if cfg.quality.conflict_threshold > cfg.quality.dedupe_threshold {
+    if matches!(
+        (cfg.quality.conflict_threshold, cfg.quality.dedupe_threshold),
+        (Some(conflict), Some(dedupe)) if conflict > dedupe
+    ) {
         return Err(DomainError::validation(
             "CONFLICT_THRESHOLD must be at or below DEDUPE_THRESHOLD, otherwise the band that \
              produces conflict candidates is empty and corrections silently collapse into the row \
@@ -1429,9 +1470,10 @@ fn validate(cfg: &Config) -> Result<()> {
     // reports itself as switched on. Both are cosine values, so anything outside 0..=1 is a
     // threshold that can never be crossed in one direction or is always crossed in the other.
     for (name, value) in [
-        ("GRAPH_ROUTE_MAX_TOP", cfg.search.graph_route.max_top),
-        ("GRAPH_ROUTE_MAX_SPREAD", cfg.search.graph_route.max_spread),
+        ("GRAPH_ROUTE_MAX_TOP", cfg.search.route_max_top),
+        ("GRAPH_ROUTE_MAX_SPREAD", cfg.search.route_max_spread),
     ] {
+        let Some(value) = value else { continue };
         if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
             return Err(DomainError::validation(format!(
                 "{name} must be a finite number between 0 and 1, got {value}. It is compared \
@@ -1711,8 +1753,8 @@ mod tests {
     /// Quality settings that pass, so each sweep test below changes exactly one thing.
     fn valid_quality() -> QualityConfig {
         QualityConfig {
-            dedupe_threshold: 0.97,
-            conflict_threshold: 0.90,
+            dedupe_threshold: Some(0.97),
+            conflict_threshold: Some(0.90),
             conflict_limit: 3,
             conflict_scan_max: 2_000,
             conflict_sweep_secs: 60,
@@ -1916,7 +1958,7 @@ mod tests {
             registry_limit: 1,
             max_chars: 6000,
             max_chars_by_client: parse_client_budgets("chatgpt=3000").unwrap(),
-            dedup_cosine: DEFAULT_BOOTSTRAP_DEDUP_COSINE,
+            dedup_cosine: Some(DEFAULT_BOOTSTRAP_DEDUP_COSINE),
         };
         assert_eq!(cfg.budget_for("chatgpt"), 3000);
         assert_eq!(cfg.budget_for("hermes"), 6000);
@@ -1932,8 +1974,22 @@ mod tests {
             registry_limit: 25,
             max_chars: 6000,
             max_chars_by_client: HashMap::new(),
-            dedup_cosine,
+            dedup_cosine: Some(dedup_cosine),
         }
+    }
+
+    /// The constant survives only for the boot error's text, which names bge's value. If the
+    /// table moves, the message would quote a number no model runs on.
+    #[test]
+    fn the_bootstrap_default_names_the_bge_table_value() {
+        let t = crate::domain::similarity::ENGINE_FAMILIES
+            .iter()
+            .find(|f| f.family == crate::domain::similarity::BGE_BASE)
+            .and_then(|f| {
+                f.values.iter().find(|v| v.key == crate::domain::similarity::BOOTSTRAP_DEDUP)
+            })
+            .map(|v| v.value);
+        assert_eq!(t, Some(DEFAULT_BOOTSTRAP_DEDUP_COSINE));
     }
 
     #[test]

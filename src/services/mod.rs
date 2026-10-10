@@ -11,6 +11,7 @@ pub mod bootstrap;
 pub mod cleanup;
 pub mod conflicts;
 pub mod currency;
+pub mod embedders;
 pub mod eval;
 pub mod export;
 pub mod forget;
@@ -37,7 +38,7 @@ use crate::crypto::kek::KeyProvider;
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::types::{Invocation, Memory, Principal};
 use crate::ports::{
-    Embedder, MemoryRepository, RegistryRepository, SealedRepository, ToolCallRepository,
+    MemoryRepository, RegistryRepository, SealedRepository, ToolCallRepository,
 };
 
 /// The ciphertext of rows the caller is already holding, so this layer can open what it may read.
@@ -91,7 +92,9 @@ pub struct Repos {
 pub struct Ctx {
     pub cfg: Arc<Config>,
     pub repos: Repos,
-    pub embedder: Arc<dyn Embedder>,
+    /// The slot, embedder and thresholds a request uses come from `embedders.for_unit`, never
+    /// from config: thresholds belong to the model (decision 0029).
+    pub embedders: Arc<crate::services::embedders::EmbedderSet>,
     /// `None` when KEK_PROVIDER=none. A write at `private` is then refused rather than stored in
     /// plaintext, which is the only safe reading of a missing key.
     pub keys: Option<Arc<dyn KeyProvider>>,
