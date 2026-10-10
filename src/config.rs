@@ -352,6 +352,37 @@ pub struct EmbedConfig {
     pub model: String,
     pub cache_dir: String,
     pub allow_fallback: bool,
+    /// Read only when the provider is `openai`.
+    pub remote: RemoteEmbedConfig,
+}
+
+/// An OpenAI-compatible `/embeddings` endpoint: Workers AI, OpenRouter, llama-server, TEI.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteEmbedConfig {
+    /// Up to and including `/v1`. The adapter appends `/embeddings`.
+    pub base_url: String,
+    pub api_key: Option<String>,
+    /// The API carries no task field, so an asymmetric model's instructions travel inside the
+    /// text. Defaults follow the model name; see `default_embed_prefixes`.
+    pub query_prefix: String,
+    pub document_prefix: String,
+    /// The server counts tokens and the engine cannot, so this caps characters. llama-server
+    /// refuses an input past its window outright rather than truncating it.
+    pub max_input_chars: Option<usize>,
+    pub timeout_secs: u64,
+}
+
+/// The prefixes a model was trained with, by name. An unknown model gets none, which is right for
+/// a symmetric model and costs an asymmetric one some precision rather than failing.
+pub fn default_embed_prefixes(model: &str) -> (&'static str, &'static str) {
+    let m = model.to_ascii_lowercase();
+    if m.contains("embeddinggemma") {
+        ("task: search result | query: ", "title: none | text: ")
+    } else if m.contains("bge-") && m.contains("-en") {
+        ("Represent this sentence for searching relevant passages: ", "")
+    } else {
+        ("", "")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -581,6 +612,81 @@ fn env_list(key: &str, fallback: &[&str]) -> Vec<String> {
             v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
         }
         _ => fallback.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+// ---- remote embedder settings ----
+
+/// `EMBED_QUERY_PREFIX` or `EMBED_DOCUMENT_PREFIX` as read, never trimmed: a prefix such as
+/// "query: " ends in a space the model was trained with, and `env_opt` would glue the text to the
+/// colon. Set and empty means no prefix, which is how an operator turns a model default off. Unset
+/// means the model default. Compose's `${VAR:-}` hands the server an empty value for an unset one,
+/// so a compose file has to pass these through bare for the default to survive.
+fn embed_prefix(raw: Option<String>, default: &str) -> String {
+    raw.unwrap_or_else(|| default.to_string())
+}
+
+/// `EMBED_BASE_URL` parsed at boot. A typo here otherwise surfaces as a failed write long after the
+/// deploy, and the API key travels to whatever host this names.
+fn check_embed_base_url(raw: &str) -> Result<()> {
+    let refuse = |why: &str| {
+        DomainError::validation(format!(
+            "EMBED_BASE_URL {raw:?} {why}. Give the endpoint up to and including /v1, as \
+             http://host:port/v1 or https://host/v1"
+        ))
+    };
+    // The parser already refuses an http or https URL with no host ("http://" is EmptyHost), so the
+    // scheme is the one thing left to check.
+    let url =
+        url::Url::parse(raw).map_err(|e| refuse(&format!("does not parse as a URL ({e})")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(refuse(&format!(
+            "has the scheme {:?}; only http and https work",
+            url.scheme()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod embed_settings {
+    use super::*;
+
+    #[test]
+    fn a_prefix_override_keeps_its_trailing_space() {
+        assert_eq!(embed_prefix(Some("query: ".into()), "default: "), "query: ");
+        assert_eq!(embed_prefix(Some("  lead".into()), ""), "  lead");
+    }
+
+    #[test]
+    fn an_empty_prefix_switches_the_default_off_and_an_unset_one_keeps_it() {
+        assert_eq!(embed_prefix(Some(String::new()), "task: search result | query: "), "");
+        assert_eq!(
+            embed_prefix(None, "task: search result | query: "),
+            "task: search result | query: "
+        );
+    }
+
+    #[test]
+    fn an_http_or_https_base_url_with_a_host_passes() {
+        for ok in ["http://127.0.0.1:8080/v1", "https://api.example.com/v1", "http://llama:8080"] {
+            assert!(check_embed_base_url(ok).is_ok(), "{ok} should pass");
+        }
+    }
+
+    #[test]
+    fn a_base_url_without_a_scheme_a_host_or_http_is_refused() {
+        for bad in [
+            "127.0.0.1:8080/v1",
+            "localhost:8080/v1",
+            "ftp://host/v1",
+            "file:///tmp/x",
+            "http://",
+            "not a url",
+        ] {
+            let e = check_embed_base_url(bad).expect_err(bad);
+            assert!(e.client_message().contains("EMBED_BASE_URL"), "{bad}: {}", e.client_message());
+        }
     }
 }
 
@@ -853,6 +959,7 @@ pub fn load() -> Result<Config> {
     // somebody edits one of them, and the two things it decides are the ranking and whether the
     // router's cosine thresholds mean anything at all.
     let fusion = parse_fusion(&env("SEARCH_FUSION", "linear"))?;
+    let embed_model = env("EMBED_MODEL", "Xenova/bge-base-en-v1.5");
 
     let cfg = Config {
         public_url: public_url.clone(),
@@ -896,9 +1003,26 @@ pub fn load() -> Result<Config> {
         embed: EmbedConfig {
             provider,
             dim: env_num("EMBED_DIM", 768usize)?,
-            model: env("EMBED_MODEL", "Xenova/bge-base-en-v1.5"),
+            model: embed_model.clone(),
             cache_dir: env("MODEL_CACHE_DIR", "/models"),
             allow_fallback: env_bool("EMBED_ALLOW_FALLBACK", false),
+            remote: RemoteEmbedConfig {
+                base_url: env("EMBED_BASE_URL", "").trim_end_matches('/').to_string(),
+                api_key: env_opt("EMBED_API_KEY"),
+                query_prefix: embed_prefix(
+                    std::env::var("EMBED_QUERY_PREFIX").ok(),
+                    default_embed_prefixes(&embed_model).0,
+                ),
+                document_prefix: embed_prefix(
+                    std::env::var("EMBED_DOCUMENT_PREFIX").ok(),
+                    default_embed_prefixes(&embed_model).1,
+                ),
+                max_input_chars: match env_num("EMBED_MAX_INPUT_CHARS", 0usize)? {
+                    0 => None,
+                    n => Some(n),
+                },
+                timeout_secs: env_num("EMBED_TIMEOUT_SECS", 60u64)?,
+            },
         },
         bootstrap: BootstrapConfig {
             cache_ms: env_num("BOOTSTRAP_CACHE_MS", 30_000u64)?,
@@ -1322,6 +1446,15 @@ fn validate(cfg: &Config) -> Result<()> {
 
     if cfg.embed.dim < 8 {
         return Err(DomainError::validation("EMBED_DIM looks wrong"));
+    }
+
+    if cfg.embed.provider == EmbedProvider::Openai && cfg.embed.remote.base_url.is_empty() {
+        return Err(DomainError::validation(
+            "EMBED_PROVIDER=openai needs EMBED_BASE_URL, the endpoint up to and including /v1",
+        ));
+    }
+    if cfg.embed.provider == EmbedProvider::Openai {
+        check_embed_base_url(&cfg.embed.remote.base_url)?;
     }
 
     if cfg.quality.conflict_threshold > cfg.quality.dedupe_threshold {

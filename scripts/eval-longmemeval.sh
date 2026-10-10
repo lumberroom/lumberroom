@@ -19,11 +19,27 @@
 #   --isolate         delete each question's haystack once it is scored, so the next question meets
 #                       an empty store. This is the configuration comparable to a published run
 #                       that built a fresh index per question, and it says the least about scale.
-#   --corpus-wide     search without the namespace filter, so every question competes against every
-#                       session in the corpus. The hardest of the three and the most realistic.
-#   --keep            leave the lumberroom_eval database in place after the run. Without this flag the
+#   --corpus-wide     write every unique session once into one namespace before the first search,
+#                       then search all of it for every question. The hardest of the three and the
+#                       most realistic. --resume does not apply.
+#   --embed-model NAME  the server's EMBED_MODEL. Default all-MiniLM-L6-v2, the embedder agentmemory's
+#                       published run used. Any other model measures the embedder as well as the stack.
+#   --db NAME         the scratch database. Default lumberroom_eval. Two runs at once need two names,
+#                       two --port values and two LUMBERROOM_EVAL_SERVER_NAME values. The name must
+#                       match ^lumberroom_eval[a-z0-9_]*$ and differ from POSTGRES_DB, because the
+#                       eval server migrates and writes into it and the exit trap drops it.
+#   --keep            leave the scratch database in place after the run. Without this flag the
 #                     script drops it on exit; with it, drop it later with:
-#                       docker compose exec db dropdb -U <POSTGRES_USER> lumberroom_eval
+#                       docker compose exec db dropdb -U <POSTGRES_USER> <NAME>
+#
+# LUMBERROOM_EVAL_EMBED_PROVIDER=openai with LUMBERROOM_EVAL_EMBED_BASE_URL, _API_KEY and
+# _MAX_INPUT_CHARS points the scratch server at an OpenAI-compatible embeddings endpoint. They are
+# not the server's own EMBED_* names because this script sources .env, which sets those.
+# _MAX_INPUT_CHARS caps characters. No setting here caps tokens: to run a model at a smaller token
+# window, start the embedding server with that window and the adapter cuts on its refusal.
+#
+# LUMBERROOM_TIMEOUT_MS reaches the harness either way. The client's default is 15 s per call, which
+# a search over a large pool can outrun.
 #
 # LUMBERROOM_CLI, if set, is a path to an already-built lumberroom binary and the harness runs on the host
 # through it, talking to the scratch server's mapped port. Unset, the harness runs inside the
@@ -42,9 +58,12 @@ REPO_DIR="$PWD"
 USAGE="usage: eval-longmemeval.sh [--dataset PATH] [--protocol session-as-document|chunked]
                             [--limit N] [--isolate] [--corpus-wide]
                             [--resume] [--out PATH] [--port N] [--keep]
+                            [--embed-model NAME] [--db NAME]
 
 Runs LongMemEval-S against a scratch server on port 8788 (default) and a scratch database
-named lumberroom_eval, both torn down or dropped on exit unless --keep is given. Never touches
+named lumberroom_eval, both torn down or dropped on exit unless --keep is given. --db names
+another scratch database; it must match ^lumberroom_eval[a-z0-9_]*$ and differ from
+POSTGRES_DB, and anything else is refused before any database is touched. Never touches
 127.0.0.1:8787 or the lumberroom database. See the top of this file for the full flag reference."
 
 PORT="${LUMBERROOM_EVAL_PORT:-8788}"
@@ -64,7 +83,9 @@ DATES_IN_TEXT=0
 ONLY_TYPE=""
 # linear adds the two arms' raw scores, which is what ships. rrf fuses their ranks.
 FUSION=""
+EMBED_MODEL="all-MiniLM-L6-v2"
 KEEP=0
+EVAL_DB="lumberroom_eval"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -79,7 +100,9 @@ while [ $# -gt 0 ]; do
     --type) ONLY_TYPE="$2"; shift 2 ;;
     --fusion) FUSION="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
+    --embed-model) EMBED_MODEL="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
+    --db) EVAL_DB="$2"; shift 2 ;;
     -h|--help)
       echo "$USAGE"
       exit 0
@@ -91,6 +114,27 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+# The eval server migrates this database and writes into it, and the exit trap drops it. A name
+# reaching the owner's store, the dev database or the test database would lose it, so only the
+# scratch prefix passes, checked before any docker call. The character class also keeps the name
+# safe inside the SQL literal and the quoted identifier below. Spelled out rather than a-z because
+# a bracket range in a shell pattern follows the locale.
+refuse_db() {
+  echo "refusing --db $1: $2" >&2
+  echo "$USAGE" >&2
+  exit 1
+}
+case "$EVAL_DB" in
+  lumberroom_eval*) ;;
+  *) refuse_db "\"$EVAL_DB\"" "a scratch database name starts with lumberroom_eval" ;;
+esac
+case "${EVAL_DB#lumberroom_eval}" in
+  *[!abcdefghijklmnopqrstuvwxyz0123456789_]*)
+    refuse_db "\"$EVAL_DB\"" "only lowercase letters, digits and _ may follow lumberroom_eval" ;;
+esac
+[ "$EVAL_DB" != "${POSTGRES_DB:-}" ] ||
+  refuse_db "\"$EVAL_DB\"" "it is POSTGRES_DB, the store this checkout's server uses"
 
 [ -f "$DATASET" ] || {
   echo "dataset not found at $DATASET" >&2
@@ -145,11 +189,11 @@ until compose exec -T db pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; do
   sleep 1
 done
 
-echo "creating database lumberroom_eval inside the existing postgres container, if absent..."
+echo "creating database $EVAL_DB inside the existing postgres container, if absent..."
 exists=$(compose exec -T db psql -U "$POSTGRES_USER" -d postgres -tAc \
-  "SELECT 1 FROM pg_database WHERE datname = 'lumberroom_eval'")
+  "SELECT 1 FROM pg_database WHERE datname = '$EVAL_DB'")
 if [ "$exists" != "1" ]; then
-  compose exec -T db psql -U "$POSTGRES_USER" -d postgres -c "CREATE DATABASE lumberroom_eval" >/dev/null
+  compose exec -T db psql -U "$POSTGRES_USER" -d postgres -c "CREATE DATABASE \"$EVAL_DB\"" >/dev/null
 fi
 
 # A fresh credential per run, generated here and never read from the owner's .env. The compact
@@ -169,11 +213,11 @@ cleanup() {
   echo "tearing down the eval server..."
   docker rm -f "$SERVER_NAME" >/dev/null 2>&1 || true
   if [ "$KEEP" -eq 1 ]; then
-    echo "left lumberroom_eval in place for inspection. Drop it with:"
-    echo "  docker compose exec db dropdb -U $POSTGRES_USER lumberroom_eval"
+    echo "left $EVAL_DB in place for inspection. Drop it with:"
+    echo "  docker compose exec db dropdb -U $POSTGRES_USER $EVAL_DB"
   else
-    echo "dropping database lumberroom_eval..."
-    compose exec -T db psql -U "$POSTGRES_USER" -d postgres -c "DROP DATABASE IF EXISTS lumberroom_eval" >/dev/null 2>&1 || true
+    echo "dropping database $EVAL_DB..."
+    compose exec -T db psql -U "$POSTGRES_USER" -d postgres -c "DROP DATABASE IF EXISTS \"$EVAL_DB\"" >/dev/null 2>&1 || true
   fi
   exit "$status"
 }
@@ -201,10 +245,11 @@ trap cleanup EXIT INT TERM
 #     crates/lumberroom/src/eval/mod.rs). Leaving this at the server default of true would let one
 #     question's search see every other question's sessions, which is not what a per-question
 #     recall number is supposed to measure.
-#   PUBLIC_URL=http://<container>:<port>
-#     rmcp validates the Host header against an allowlist derived from this, defaulting to loopback
-#     only. The harness reaches the server by container name, so without this every tool call comes
-#     back 403 while /healthz and /readyz answer normally.
+#   PUBLIC_URL=http://127.0.0.1:<port>
+#     rmcp validates the Host header against an allowlist derived from this. The harness reaches the
+#     server on loopback, from the host through the published port or from a container sharing the
+#     server's network namespace, because the client sends its token over plain HTTP to loopback
+#     alone. Reached by container name, it drops the header and every call comes back 401.
 #
 #   AUTH_MODE=token
 #     The eval has no need for OAuth, and a static token keeps the run's own authorization out of
@@ -220,12 +265,15 @@ docker run -d --name "$SERVER_NAME" --network "$NETWORK" \
   -e PORT="$PORT" \
   -e HOST=0.0.0.0 \
   -e TENANT_ID=eval \
-  -e DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/lumberroom_eval" \
-  -e PUBLIC_URL="http://${SERVER_NAME}:${PORT}" \
+  -e DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${EVAL_DB}" \
+  -e PUBLIC_URL="http://127.0.0.1:${PORT}" \
   -e AUTH_MODE=token \
   -e "AUTH_TOKENS=$AUTH_TOKENS_JSON" \
-  -e EMBED_PROVIDER=local \
-  -e EMBED_MODEL=all-MiniLM-L6-v2 \
+  -e EMBED_PROVIDER="${LUMBERROOM_EVAL_EMBED_PROVIDER:-local}" \
+  -e EMBED_BASE_URL="${LUMBERROOM_EVAL_EMBED_BASE_URL:-}" \
+  -e EMBED_API_KEY="${LUMBERROOM_EVAL_EMBED_API_KEY:-}" \
+  -e EMBED_MAX_INPUT_CHARS="${LUMBERROOM_EVAL_EMBED_MAX_INPUT_CHARS:-0}" \
+  -e EMBED_MODEL="$EMBED_MODEL" \
   -e EMBED_DIM=768 \
   -e SENSITIVITY_TRIPWIRE=false \
   -e WRITE_MAX_CONTENT_CHARS=200000 \
@@ -277,14 +325,15 @@ else
     MOUNTS="$MOUNTS -v $OUT_DIR:$OUT_DIR"
   fi
   # shellcheck disable=SC2086
-  docker run --rm --network "$NETWORK" \
+  docker run --rm --network "container:$SERVER_NAME" \
     -v "$REPO_DIR:/app" \
     -v lumberroom-cargo:/usr/local/cargo/registry \
     $MOUNTS \
     -w /app \
     -e CARGO_TERM_COLOR=never \
-    -e LUMBERROOM_URL="http://${SERVER_NAME}:${PORT}/mcp" \
+    -e LUMBERROOM_URL="http://127.0.0.1:${PORT}/mcp" \
     -e LUMBERROOM_TOKEN="$TOKEN" \
+    -e LUMBERROOM_TIMEOUT_MS="${LUMBERROOM_TIMEOUT_MS:-}" \
     -e BUILDER_UID="$(id -u)" -e BUILDER_GID="$(id -g)" \
     lumberroom-builder cargo run --release -p lumberroom -- "$@"
 fi

@@ -179,6 +179,16 @@ services:
       EMBED_MODEL: ${EMBED_MODEL:-Xenova/bge-base-en-v1.5}
       EMBED_DIM: ${EMBED_DIM:-768}
       EMBED_ALLOW_FALLBACK: ${EMBED_ALLOW_FALLBACK:-false}
+      # EMBED_PROVIDER=openai only. Compose hands the server an explicit map, so a remote embedder
+      # set in .env reaches the server only through these lines.
+      EMBED_BASE_URL: ${EMBED_BASE_URL:-}
+      EMBED_API_KEY: ${EMBED_API_KEY:-}
+      # Bare keys: unset in .env leaves the model's default prefix, and an empty value switches it
+      # off. ${VAR:-} would always pass an empty value.
+      EMBED_QUERY_PREFIX:
+      EMBED_DOCUMENT_PREFIX:
+      EMBED_MAX_INPUT_CHARS: ${EMBED_MAX_INPUT_CHARS:-}
+      EMBED_TIMEOUT_SECS: ${EMBED_TIMEOUT_SECS:-}
       # Sensitivity axis (Phase 3).
       #
       # Blank here means the server reads the `sensitivity_default` table instead, which migration
@@ -394,6 +404,16 @@ services:
       EMBED_MODEL: ${EMBED_MODEL:-Xenova/bge-base-en-v1.5}
       EMBED_DIM: ${EMBED_DIM:-768}
       EMBED_ALLOW_FALLBACK: ${EMBED_ALLOW_FALLBACK:-false}
+      # EMBED_PROVIDER=openai only. Compose hands the server an explicit map, so a remote embedder
+      # set in .env reaches the server only through these lines.
+      EMBED_BASE_URL: ${EMBED_BASE_URL:-}
+      EMBED_API_KEY: ${EMBED_API_KEY:-}
+      # Bare keys: unset in .env leaves the model's default prefix, and an empty value switches it
+      # off. ${VAR:-} would always pass an empty value.
+      EMBED_QUERY_PREFIX:
+      EMBED_DOCUMENT_PREFIX:
+      EMBED_MAX_INPUT_CHARS: ${EMBED_MAX_INPUT_CHARS:-}
+      EMBED_TIMEOUT_SECS: ${EMBED_TIMEOUT_SECS:-}
       MODEL_CACHE_DIR: /models
       SENSITIVITY_DEFAULTS: ${SENSITIVITY_DEFAULTS:-}
       SENSITIVITY_TRIPWIRE: ${SENSITIVITY_TRIPWIRE:-}

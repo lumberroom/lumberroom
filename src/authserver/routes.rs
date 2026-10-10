@@ -2471,6 +2471,7 @@ mod tests {
                     model: "test".into(),
                     cache_dir: String::new(),
                     allow_fallback: true,
+                    remote: Default::default(),
                 },
                 bootstrap: BootstrapConfig {
                     cache_ms: 0,
