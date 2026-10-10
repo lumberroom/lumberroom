@@ -80,7 +80,6 @@ pub struct AppState {
     /// rename and cannot record it has noticed nothing anyone can use.
     pub aliases: Arc<dyn crate::ports::AliasRepository>,
     pub embedder: Arc<dyn Embedder>,
-    pub degraded_embedder: bool,
     /// `None` when KEK_PROVIDER=none. A write at `private` is then refused rather than stored in
     /// plaintext.
     pub keys: Option<Arc<dyn KeyProvider>>,

@@ -198,10 +198,12 @@ The `caddy_data` volume also holds `/data/access.log`, with query redaction on f
 `next` and `state`. That volume sits outside `deploy/backup.sh`, which dumps Postgres, so restoring
 a backup does not bring the access log back.
 
-`/readyz` returns `ok: true` only when Postgres answers, the schema dimension matches the
-configured one, and the embedder has produced a real vector. It needs no credential and describes
-the deployment: Postgres reachability, the configured vector dimension, and embedder health. Keep
-it behind the proxy or restrict it if that shape of information should not be public. `/admin/whoami`,
+`/readyz` returns `ok: true` only when Postgres answers and the schema dimension matches the
+configured one. It needs no credential and describes the deployment: Postgres reachability, the
+configured vector dimension, and the embedder's name. It does not call the embedder. A local model
+that fails to load stops the boot, but a remote endpoint (`EMBED_PROVIDER=openai`) that is down
+shows up only as an error on each write and search, so check it with a `memory_search` or a `curl`
+to the endpoint. Keep it behind the proxy or restrict it if that shape of information should not be public. `/admin/whoami`,
 called with any credential, reports what that credential resolves to: client, read and write lists
 with their ceilings, the registry-write flag, and the auth mode that produced them. It reads from
 the code path that enforces the grant, so it is the answer rather than a reconstruction of one.
@@ -503,9 +505,15 @@ type and rebuilds the HNSW index, then set `EMBED_DIM` to match.
 
 ## Troubleshooting
 
-**`/readyz` returns 503 with `embedder_degraded: true`.** The model failed to load and
-`EMBED_ALLOW_FALLBACK` sent it to the hash embedder. Anything written meanwhile retrieves badly.
-Check `docker compose logs server`, fix the cause, restart, and rewrite those rows.
+**The server exits at boot naming the embedder.** With `EMBED_PROVIDER=local` the model failed to
+load. No fallback embedder exists (decision 0028), so the server stops rather than write vectors
+nothing else can be compared with. Check `docker compose logs server`, fix the cause and start it
+again.
+
+**Writes and searches fail with an embedding error while `/readyz` is green.** With
+`EMBED_PROVIDER=openai` the boot does not call the endpoint and `/readyz` checks only the database.
+Test the endpoint with a `memory_search` or a `curl` to its `/embeddings` route, then fix
+`EMBED_BASE_URL`, `EMBED_API_KEY` or the embedder itself. No restart is needed once it answers.
 
 **The server will not start in oauth mode.** It names the setting. The three it refuses without are
 `OWNER_PASSWORD_HASH`, `OAUTH_COOKIE_SECRET` and an `https` or loopback `PUBLIC_URL`. A hash mangled

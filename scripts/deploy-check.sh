@@ -125,7 +125,7 @@ say "2/7 it is ready, and its key is the one this store was sealed with"
 if [ "$(get /readyz "$WORK/ready.json")" = 200 ]; then
   pass "readyz: $(cat "$WORK/ready.json")"
   [ "$(field "$WORK/ready.json" ok)" = "true" ] \
-    && pass "ok: true, so Postgres answers and the embedder has produced a real vector" \
+    && pass "ok: true, so Postgres answers and the schema dimension matches (the embedder is not called)" \
     || fail "ok is not true"
   # `|| true` because `field` exits 1 on a key that is not there, and under `set -e` a bare
   # assignment from it ends the run right here with no message at all. An older server that
@@ -140,9 +140,6 @@ if [ "$(get /readyz "$WORK/ready.json")" = 200 ]; then
     fail "KEK_PROVIDER=$KEK and kek_verified is false. The server is up and refusing every private \
 write. Check the boot log for the fingerprint mismatch before writing anything."
   fi
-  [ "$(field "$WORK/ready.json" embedder_degraded)" = "false" ] \
-    && pass "the embedder is the configured one, not a fallback" \
-    || warn "embedder_degraded is true: search quality is not what the eval measured"
 else
   fail "readyz did not answer 200"
 fi

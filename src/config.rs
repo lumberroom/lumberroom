@@ -351,7 +351,6 @@ pub struct EmbedConfig {
     pub dim: usize,
     pub model: String,
     pub cache_dir: String,
-    pub allow_fallback: bool,
     /// Read only when the provider is `openai`.
     pub remote: RemoteEmbedConfig,
 }
@@ -719,6 +718,22 @@ fn parse_fusion(raw: &str) -> Result<Fusion> {
     }
 }
 
+/// `EMBED_ALLOW_FALLBACK`, refused when set to anything but an "off" spelling. Decision 0028.
+///
+/// The off spellings match what `env_bool` accepted (false, 0, no, off, any case), so a stale `.env`
+/// that says `FALSE` keeps booting. Any other value stops the boot.
+fn refuse_embed_fallback(raw: Option<&str>) -> Result<()> {
+    let v = raw.map(str::trim).unwrap_or("");
+    if v.is_empty() || ["false", "0", "no", "off"].iter().any(|o| v.eq_ignore_ascii_case(o)) {
+        return Ok(());
+    }
+    Err(DomainError::validation(
+        "EMBED_ALLOW_FALLBACK was removed (decision 0028): a fallback embedder writes vectors \
+         that cannot be compared with the rest of the store. Unset it; a model that fails to \
+         load now stops the boot.",
+    ))
+}
+
 /// `WRITE_MIN_OCCURRED_AGE_SECS`, refused at boot at both ends.
 ///
 /// A free function for `parse_fusion`'s reason: the refusal is testable without two tests racing
@@ -960,6 +975,7 @@ pub fn load() -> Result<Config> {
     // router's cosine thresholds mean anything at all.
     let fusion = parse_fusion(&env("SEARCH_FUSION", "linear"))?;
     let embed_model = env("EMBED_MODEL", "Xenova/bge-base-en-v1.5");
+    refuse_embed_fallback(env_opt("EMBED_ALLOW_FALLBACK").as_deref())?;
 
     let cfg = Config {
         public_url: public_url.clone(),
@@ -1005,7 +1021,6 @@ pub fn load() -> Result<Config> {
             dim: env_num("EMBED_DIM", 768usize)?,
             model: embed_model.clone(),
             cache_dir: env("MODEL_CACHE_DIR", "/models"),
-            allow_fallback: env_bool("EMBED_ALLOW_FALLBACK", false),
             remote: RemoteEmbedConfig {
                 base_url: env("EMBED_BASE_URL", "").trim_end_matches('/').to_string(),
                 api_key: env_opt("EMBED_API_KEY"),
@@ -2090,6 +2105,22 @@ mod tests {
         let err = parse_fusion("reciprocal").unwrap_err().to_string();
         assert!(err.contains("linear|rrf"), "the message has to name what to write: {err}");
         assert!(parse_fusion("RRF").is_err(), "the other enums here match lowercase only");
+    }
+
+    /// An operator who still sets `EMBED_ALLOW_FALLBACK=true` must learn at boot that it is gone,
+    /// not meet a setting that does nothing. Every spelling of "off" the old `env_bool` accepted
+    /// stays legal, in any case, so a stale `.env` that says `FALSE` or `off` keeps booting.
+    #[test]
+    fn config_refuses_embed_allow_fallback() {
+        for on in ["true", "TRUE", "1", "yes", "on", "enabled", "tru"] {
+            assert!(refuse_embed_fallback(Some(on)).is_err(), "{on:?} must stop the boot");
+        }
+        let err = refuse_embed_fallback(Some("true")).unwrap_err().to_string();
+        assert!(err.contains("EMBED_ALLOW_FALLBACK") && err.contains("0028"), "{err}");
+        assert!(refuse_embed_fallback(None).is_ok());
+        for off in ["", "  ", "false", "False", "FALSE", "0", "no", "No", "off", "OFF", " off "] {
+            assert!(refuse_embed_fallback(Some(off)).is_ok(), "{off:?} must boot");
+        }
     }
 
     #[test]

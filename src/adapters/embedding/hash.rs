@@ -1,8 +1,8 @@
 //! Deterministic hashing embedder. No weights, no network, no cost.
 //!
-//! Two jobs: make tests fast and hermetic, and keep writes working if the real model dies.
-//! Retrieval quality is word overlap only, so it is never a production setting, and readiness
-//! reports the degradation when it is in use.
+//! Its job is to make tests fast and hermetic. It is never a fallback for a failed model (decision
+//! 0028): retrieval quality is word overlap only, and its vector is a token sketch that stays
+//! readable in the stored row, so it never suits private content.
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};

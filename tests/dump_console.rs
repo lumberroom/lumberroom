@@ -16,7 +16,6 @@ fn health() -> Health {
         key_verified: true,
         keys_configured: true,
         embedder: "Xenova/bge-base-en-v1.5".into(),
-        degraded_embedder: false,
         last_write: Some(Utc::now() - chrono::Duration::minutes(7)),
         now: Utc::now(),
     }

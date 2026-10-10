@@ -320,7 +320,6 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
         oauth: Arc::clone(&oauth),
         ingest: Arc::new(postgres::PgIngestRepository::new(pool.clone())),
         embedder: Arc::clone(&ctx.embedder),
-        degraded_embedder: false,
         keys: ctx.keys.clone(),
         kek_verified: ctx.kek_verified,
         // The engine ships no proposal source of its own; "canned" is this suite's test double,

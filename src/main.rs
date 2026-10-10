@@ -103,8 +103,8 @@ async fn run() -> Result<()> {
     let keys = key_provider(&cfg);
     let kek_verified = verify_kek_at_boot(&pool, &cfg, keys.as_ref()).await?;
 
-    let (embedder, degraded) = warm_embedder(&cfg).await?;
-    tracing::info!(id = %embedder.id(), degraded, "embedder ready");
+    let embedder = warm_embedder(&cfg).await?;
+    tracing::info!(id = %embedder.id(), "embedder ready");
 
     // The concrete memory repository is kept so it can be handed up as two handles: the port the
     // services read through, and the ciphertext reader they decrypt through. One object, because a
@@ -140,7 +140,6 @@ async fn run() -> Result<()> {
         ingest,
         cleanup: Arc::clone(&cleanup),
         embedder,
-        degraded_embedder: degraded,
         keys,
         kek_verified,
         proposals: Vec::new(),
@@ -601,33 +600,17 @@ async fn verify_kek_command() -> Result<()> {
     }
 }
 
-/// With EMBED_ALLOW_FALLBACK the server degrades to the hash embedder rather than refusing to
-/// start, and readiness reports the degradation. Mixed embedders in one table hurt recall, which
-/// is why the default is to fail loudly instead.
-async fn warm_embedder(cfg: &config::Config) -> Result<(Arc<dyn Embedder>, bool)> {
+/// A model that fails to load stops the boot. Falling back to another embedder would write vectors
+/// that no existing row can be compared with (decision 0028).
+async fn warm_embedder(cfg: &config::Config) -> Result<Arc<dyn Embedder>> {
     if cfg.embed.provider != EmbedProvider::Local {
-        return Ok((adapters::embedding::create(cfg)?, false));
+        return adapters::embedding::create(cfg);
     }
-
     let started = std::time::Instant::now();
-    match LocalEmbedder::new(&cfg.embed.model, cfg.embed.dim, &cfg.embed.cache_dir) {
-        Ok(local) => match local.warm().await {
-            Ok(()) => {
-                tracing::info!(ms = started.elapsed().as_millis(), "embedder loaded");
-                Ok((Arc::new(local), false))
-            }
-            Err(e) if cfg.embed.allow_fallback => {
-                tracing::error!(error = %e.log_message(), "embedder failed to warm, falling back to hash");
-                Ok((Arc::new(adapters::embedding::HashEmbedder::new(cfg.embed.dim)), true))
-            }
-            Err(e) => Err(e),
-        },
-        Err(e) if cfg.embed.allow_fallback => {
-            tracing::error!(error = %e.log_message(), "embedder failed to load, falling back to hash");
-            Ok((Arc::new(adapters::embedding::HashEmbedder::new(cfg.embed.dim)), true))
-        }
-        Err(e) => Err(e),
-    }
+    let local = LocalEmbedder::new(&cfg.embed.model, cfg.embed.dim, &cfg.embed.cache_dir)?;
+    local.warm().await?;
+    tracing::info!(ms = started.elapsed().as_millis(), "embedder loaded");
+    Ok(Arc::new(local))
 }
 
 fn init_tracing() {
