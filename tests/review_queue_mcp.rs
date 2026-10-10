@@ -278,7 +278,7 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
     let ctx = Ctx {
         cfg: cfg.clone(),
         repos: repos.clone(),
-        embedder: Arc::new(HashEmbedder::new(768)),
+        embedders: common::test_embedders(Arc::new(HashEmbedder::new(768)), &cfg),
         keys: Some(keys.clone()),
         kek_verified,
         principal: owner(),
@@ -319,7 +319,7 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
         repos: repos.clone(),
         oauth: Arc::clone(&oauth),
         ingest: Arc::new(postgres::PgIngestRepository::new(pool.clone())),
-        embedder: Arc::clone(&ctx.embedder),
+        embedders: Arc::clone(&ctx.embedders),
         keys: ctx.keys.clone(),
         kek_verified: ctx.kek_verified,
         // The engine ships no proposal source of its own; "canned" is this suite's test double,
@@ -401,7 +401,11 @@ async fn sweep_pairs(ctx: &Ctx) {
     let report = conflicts::sweep(
         ctx.repos.memories.as_ref(),
         ctx.tenant(),
-        ctx.cfg.quality.conflict_threshold,
+        ctx.embedders
+            .for_unit(ctx.tenant())
+            .unwrap()
+            .thresholds
+            .get(lumberroom_server::domain::similarity::CONFLICT),
         std::time::Duration::from_secs(10),
     )
     .await
@@ -556,7 +560,7 @@ async fn confirm_through_the_mcp_tool_clears_the_stale_row_from_the_next_page() 
 
 #[tokio::test]
 async fn keep_both_through_the_mcp_tool_dismisses_the_pair_and_raises_the_count() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "kb1").await;
     let key = format!("conflict:{older}:{newer}");
 
@@ -591,7 +595,7 @@ async fn keep_both_through_the_mcp_tool_dismisses_the_pair_and_raises_the_count(
 
 #[tokio::test]
 async fn a_verdict_the_item_never_offered_is_refused_by_its_own_code() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     let (older, newer) = conflict_pair(&h.ctx, &h.pool, "global", "vs1").await;
     let key = format!("conflict:{older}:{newer}");
 
@@ -606,7 +610,7 @@ async fn a_verdict_the_item_never_offered_is_refused_by_its_own_code() {
 /// the queue answers with: a row the sweeper has not scanned yet is the gap a short list hides.
 #[tokio::test]
 async fn the_legacy_conflicts_route_carries_conflicts_pending() {
-    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = 0.0);
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.conflict_threshold = Some(0.0));
     conflict_pair(&h.ctx, &h.pool, "global", "lg1").await;
     write_at(&h.ctx, &format!("a fact waiting for its scan {}", nonce("lg2")), "global").await;
 

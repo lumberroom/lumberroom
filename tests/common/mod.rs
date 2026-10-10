@@ -43,3 +43,21 @@ pub async fn lock_database(url: &str) -> Option<DbGuard> {
     sqlx::query("SELECT pg_advisory_lock($1)").bind(SUITE_LOCK).execute(&mut conn).await.ok()?;
     Some(DbGuard { conn: Some(conn) })
 }
+
+/// The embedder set a test Ctx uses: the engine registry resolved for `embedder`'s id with the
+/// config's overrides and old single variables, so a test that sets `conflict_threshold` still
+/// moves the floor. It mirrors the boot path in `src/main.rs` without its refusals, because a test
+/// that wants a refusal asserts on the registry directly.
+#[allow(dead_code)]
+pub fn test_embedders(
+    embedder: std::sync::Arc<dyn lumberroom_server::ports::Embedder>,
+    cfg: &lumberroom_server::config::Config,
+) -> std::sync::Arc<lumberroom_server::services::embedders::EmbedderSet> {
+    use lumberroom_server::domain::similarity::Registry;
+    let t =
+        Registry::engine().resolve(&embedder.id(), &cfg.embed.thresholds, &cfg.legacy_thresholds());
+    std::sync::Arc::new(lumberroom_server::services::embedders::EmbedderSet::single(
+        std::sync::Arc::clone(&embedder),
+        std::collections::HashMap::from([(embedder.id(), std::sync::Arc::new(t))]),
+    ))
+}

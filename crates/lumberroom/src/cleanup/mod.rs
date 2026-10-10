@@ -276,6 +276,19 @@ pub async fn dispatch(c: &Client, args: &Args, sub: &str) -> Result<()> {
     }
 }
 
+/// An empty value sends no floor, so the server applies the unit's model value. Compose passes
+/// `--min-similarity ${CLEANUP_MIN_SIMILARITY:-}`, and an unset variable must not pin bge's 0.65
+/// on a store that runs another model (decision 0029).
+fn min_similarity(args: &Args) -> Result<Option<f64>> {
+    match args.value("min-similarity").map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(raw) => raw
+            .parse()
+            .map(Some)
+            .map_err(|_| err(format!("--min-similarity takes a number, got {raw:?}"))),
+    }
+}
+
 async fn run(c: &Client, args: &Args) -> Result<()> {
     let cadence = args.value("cadence").unwrap_or("hourly").to_string();
     let namespace = args.value("namespace").map(str::to_string);
@@ -285,10 +298,7 @@ async fn run(c: &Client, args: &Args) -> Result<()> {
     if let Some(ns) = &namespace {
         body["namespace"] = json!(ns);
     }
-    if let Some(raw) = args.value("min-similarity") {
-        let f: f64 = raw
-            .parse()
-            .map_err(|_| err(format!("--min-similarity takes a number, got {raw:?}")))?;
+    if let Some(f) = min_similarity(args)? {
         body["min_similarity"] = json!(f);
     }
     let (status, response) =
@@ -578,6 +588,16 @@ async fn unreject(c: &Client, args: &Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_min_similarity_sends_no_floor() {
+        let parse = |argv: &[&str]| min_similarity(&Args::parse(argv.iter().copied()));
+        assert_eq!(parse(&["daemon", "--min-similarity", ""]).unwrap(), None);
+        assert_eq!(parse(&["daemon", "--min-similarity", "  "]).unwrap(), None);
+        assert_eq!(parse(&["daemon"]).unwrap(), None);
+        assert_eq!(parse(&["daemon", "--min-similarity", "0.7"]).unwrap(), Some(0.7));
+        assert!(parse(&["daemon", "--min-similarity", "high"]).is_err());
+    }
 
     fn pair() -> Pair {
         Pair {

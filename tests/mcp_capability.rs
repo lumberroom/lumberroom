@@ -273,8 +273,9 @@ async fn setup() -> Option<Harness> {
     let kek_verified = !matches!(check, postgres::KekCheck::Mismatch { .. });
 
     let memories = Arc::new(postgres::PgMemoryRepository::new(pool.clone()));
+    let cfg = Arc::new(cfg);
     let ctx = Ctx {
-        cfg: Arc::new(cfg),
+        cfg: Arc::clone(&cfg),
         repos: Repos {
             aliases: Arc::new(postgres::PgAliasRepository::new(pool.clone())),
             memories: memories.clone(),
@@ -284,7 +285,7 @@ async fn setup() -> Option<Harness> {
             ciphertext: Some(memories),
             oauth: None,
         },
-        embedder: Arc::new(HashEmbedder::new(768)),
+        embedders: common::test_embedders(Arc::new(HashEmbedder::new(768)), &cfg),
         keys: Some(keys),
         kek_verified,
         principal: owner(),
@@ -301,7 +302,7 @@ async fn setup() -> Option<Harness> {
         repos: ctx.repos.clone(),
         oauth: Arc::clone(&oauth),
         ingest: Arc::new(postgres::PgIngestRepository::new(pool.clone())),
-        embedder: Arc::clone(&ctx.embedder),
+        embedders: Arc::clone(&ctx.embedders),
         keys: ctx.keys.clone(),
         kek_verified: ctx.kek_verified,
         proposals: Vec::new(),

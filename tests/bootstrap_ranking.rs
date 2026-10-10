@@ -20,6 +20,10 @@ use lumberroom_server::services::bootstrap::{self, Digest};
 use lumberroom_server::services::{Ctx, Repos};
 use sqlx::{AssertSqlSafe, PgPool};
 
+// These tests own their database and never take the suite lock, so most of the module is unused.
+#[allow(dead_code)]
+mod common;
+
 const DIMS: usize = 768;
 const PROJECT: &str = "alpha";
 
@@ -101,8 +105,9 @@ impl Store {
         cfg.bootstrap.cache_ms = 0;
         tune(&mut cfg);
         let memories = Arc::new(postgres::PgMemoryRepository::new(self.pool.clone()));
+        let cfg = Arc::new(cfg);
         Ctx {
-            cfg: Arc::new(cfg),
+            cfg: Arc::clone(&cfg),
             repos: Repos {
                 aliases: Arc::new(postgres::PgAliasRepository::new(self.pool.clone())),
                 memories: memories.clone(),
@@ -112,7 +117,7 @@ impl Store {
                 ciphertext: Some(memories),
                 oauth: None,
             },
-            embedder: Arc::new(HashEmbedder::new(DIMS)),
+            embedders: common::test_embedders(Arc::new(HashEmbedder::new(DIMS)), &cfg),
             keys: None,
             kek_verified: false,
             principal: reader("mac", NamespaceGrant::everything()),
@@ -348,7 +353,7 @@ async fn a_dedup_cosine_of_one_turns_the_pass_off() {
     let ns = format!("project:{PROJECT}");
     let newer = s.put(&ns, "deploys go through make cloud-up", &[], Some(axis(0)), 1.0).await;
     let older = s.put(&ns, "deploy with make cloud-up", &[], Some(axis(0)), 2.0).await;
-    let ctx = s.ctx(|c| c.bootstrap.dedup_cosine = 1.0);
+    let ctx = s.ctx(|c| c.bootstrap.dedup_cosine = Some(1.0));
 
     let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
     assert_eq!(ids(&d.project_context), vec![newer, older]);
@@ -411,11 +416,11 @@ async fn a_pair_at_the_threshold_collapses_and_one_just_below_does_not() {
     let newer = s.put(&ns, "first wording", &[], Some(a), 1.0).await;
     let older = s.put(&ns, "second wording", &[], Some(b), 2.0).await;
 
-    let at = s.ctx(|c| c.bootstrap.dedup_cosine = 0.96);
+    let at = s.ctx(|c| c.bootstrap.dedup_cosine = Some(0.96));
     let d = bootstrap::run(&at, Some(PROJECT)).await.unwrap();
     assert_eq!(ids(&d.project_context), vec![newer.clone()], "cosine 0.96 at threshold 0.96");
 
-    let above = s.ctx(|c| c.bootstrap.dedup_cosine = 0.960_000_1);
+    let above = s.ctx(|c| c.bootstrap.dedup_cosine = Some(0.960_000_1));
     let d = bootstrap::run(&above, Some(PROJECT)).await.unwrap();
     assert_eq!(ids(&d.project_context), vec![newer, older], "cosine 0.96 under 0.9600001");
     s.drop().await;

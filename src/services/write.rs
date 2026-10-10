@@ -28,7 +28,7 @@ use super::Ctx;
 use crate::adapters::auth::{assert_writable, can_read, can_write};
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::types::{ConflictCandidate, Memory, Sensitivity, WriteOutcome};
-use crate::domain::{namespaces, policy, tripwire};
+use crate::domain::{namespaces, policy, similarity, tripwire};
 use crate::ports::{NeighbourQuery, NewMemory};
 
 /// The default, kept as a name so callers and tests have one. The effective limit is
@@ -269,22 +269,35 @@ async fn run_inner(
         }
     }
 
-    let mut vectors = ctx.embedder.embed_documents(vec![content.to_string()]).await?;
+    // One unit for the vector, its model id and the dedupe bands: a band read from another model's
+    // values would fold or keep rows on a scale the vector does not use.
+    let u = ctx.embedders.for_unit(ctx.tenant())?;
+    let mut vectors = u.embedder.embed_documents(vec![content.to_string()]).await?;
     let embedding =
         vectors.pop().ok_or_else(|| DomainError::internal("embedder returned no vector"))?;
 
     // (f) The dedupe bands. One query at the lower threshold; the bands are split here.
     let mut possible_conflicts = Vec::new();
     if supersedes_id.is_none() {
-        let neighbours = neighbours(ctx, &namespace, &embedding).await?;
+        let floor = u.thresholds.get(similarity::CONFLICT);
+        let neighbours = neighbours(ctx, &namespace, &embedding, floor).await?;
         for (candidate, row) in resolve_candidates(ctx, neighbours).await? {
-            let above_dedupe = candidate.similarity >= ctx.cfg.quality.dedupe_threshold;
+            let above_dedupe = candidate.similarity >= u.thresholds.get(similarity::DEDUPE);
             let block = collapse_block(content, &candidate.content);
 
             if above_dedupe && block.is_none() {
                 if let Some(id) =
                     collapse_target(ctx, &candidate, content, resolved, row.as_ref()).await?
                 {
+                    // The only trace a fold leaves. Decision 0029 set EmbeddingGemma 2's dedupe from
+                    // a snapshot that cannot show folded corrections; this line can.
+                    tracing::info!(
+                        namespace = %namespace,
+                        similarity = candidate.similarity,
+                        existing = %id,
+                        model = %u.embedder.id(),
+                        "collapsed a near-identical write"
+                    );
                     confirm(ctx, &id.to_string()).await;
                     return Ok(WriteOutcome {
                         id: id.to_string(),
@@ -352,7 +365,7 @@ async fn run_inner(
             tags,
             supersedes: supersedes_id,
             source_client: ctx.principal.client.clone(),
-            embedding_model: ctx.embedder.id(),
+            embedding_model: u.embedder.id(),
             sensitivity: resolved,
             sealed: sealed.map(|(_, s)| s),
         })
@@ -424,6 +437,7 @@ async fn neighbours(
     ctx: &Ctx,
     namespace: &str,
     embedding: &[f32],
+    floor: f64,
 ) -> Result<Vec<ConflictCandidate>> {
     let Some(ceiling) = policy::ceiling(&ctx.principal.read, namespace) else {
         return Ok(vec![]);
@@ -434,7 +448,7 @@ async fn neighbours(
             tenant_id: ctx.cfg.tenant_id.clone(),
             namespace: namespace.to_string(),
             embedding: embedding.to_vec(),
-            min_similarity: ctx.cfg.quality.conflict_threshold,
+            min_similarity: floor,
             limit: ctx.cfg.quality.conflict_limit,
             max_sensitivity: ceiling,
         })

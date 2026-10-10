@@ -81,7 +81,8 @@ pub async fn measure(ctx: &Ctx, sample: i64, k: i64) -> Result<RecallReport> {
         });
     }
 
-    let vectors = ctx.embedder.embed_documents(probes.clone()).await?;
+    let u = ctx.embedders.for_unit(ctx.tenant())?;
+    let vectors = u.embedder.embed_documents(probes.clone()).await?;
     let mut scores: Vec<WorstCase> = Vec::with_capacity(probes.len());
     let mut top_one_misses = 0usize;
     let mut index_ms = 0u128;

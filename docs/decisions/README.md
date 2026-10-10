@@ -38,6 +38,7 @@ carries a marker pointing here.
 | [0026](0026-the-date-review-joins-the-queue.md) | `review_queue` lists undated rows whose text names a past day as an opt-in `undated` source, and `review_decide` fills one with `fill_date` under the existing checks | 6 Oct 2026 | decided by the owner; implemented on `feat/undated-review-source`, not merged |
 | [0025](0025-the-digest-ranks-by-recency.md) | The digest ranks profile and project by recency alone, drops the tag-first rule, and uses embeddings only to drop the older of two near-duplicates at `BOOTSTRAP_DEDUP_COSINE` | 6 Oct 2026 | decided by the owner; implemented on `feat/digest-ranking`, not merged |
 | [0028](0028-no-embedding-fallback.md) | The server never embeds with a model other than the configured one: a model that fails to load stops the boot, and `EMBED_ALLOW_FALLBACK` is refused | 10 Oct 2026 | accepted, implemented; `cargo check` and a scratch-crate run of the config refusal only, suite not run, not merged |
+| [0029](0029-thresholds-belong-to-the-model.md) | Each embedding model reads its cosine thresholds from a per-family table with a basis per value; `EMBED_THRESHOLDS` overrides one model's keys, and an unlisted model boots on bge-base-en-v1.5's values with a warning | 10 Oct 2026 | accepted; implementation in progress on `feat/embedder-set`, not merged |
 
 **On "verified".** All four gates ran against a live server on 20 August 2026 and passed. An OAuth
 flow completed end to end, a private row was encrypted and read back, and a replayed refresh token

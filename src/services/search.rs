@@ -27,6 +27,7 @@
 
 use serde::Serialize;
 
+use super::embedders::UnitEmbedding;
 use super::Ctx;
 use crate::adapters::auth::filter_readable;
 use crate::domain::errors::{DomainError, Result};
@@ -152,6 +153,25 @@ pub async fn run_tagged(
     as_of: Option<chrono::DateTime<chrono::Utc>>,
     tags: &[String],
 ) -> Result<SearchResult> {
+    let u = ctx.embedders.for_unit(ctx.tenant())?;
+    run_with(ctx, &u, query, requested, limit, project, include_superseded, as_of, tags).await
+}
+
+/// `run_tagged` on a unit the caller already resolved. A caller that judges the scores against
+/// thresholds passes its own `u`, so the vector and the values come from one model even if the
+/// unit's slot moves between two resolutions.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_with(
+    ctx: &Ctx,
+    u: &UnitEmbedding,
+    query: &str,
+    requested: Option<Vec<String>>,
+    limit: Option<i64>,
+    project: Option<&str>,
+    include_superseded: Option<bool>,
+    as_of: Option<chrono::DateTime<chrono::Utc>>,
+    tags: &[String],
+) -> Result<SearchResult> {
     // The capability check has to live here. A repository holds no principal, so the as-of statement
     // will hand retired rows to anything that sets the field, and a grant over live rows is not a
     // grant over the history behind them.
@@ -219,7 +239,7 @@ pub async fn run_tagged(
     };
 
     let limit = limit.unwrap_or(ctx.cfg.search.default_limit).min(ctx.cfg.search.max_limit);
-    let embedding = ctx.embedder.embed_query(query).await?;
+    let embedding = u.embedder.embed_query(query).await?;
 
     let mut hits = ctx
         .repos
@@ -437,5 +457,42 @@ mod tests {
         let secondary = vec![ceiling("project:other", Sensitivity::Open)];
         assert!(admitted(&[], &secondary, "project:other", Sensitivity::Open));
         assert!(!admitted(&[], &secondary, "project:other", Sensitivity::Private));
+    }
+
+    /// Thresholds belong to the model that made the vectors (decision 0029), so a service that
+    /// embeds through `ctx` or reads a threshold from config can compare one model's vectors
+    /// against another model's values. Each needle is split with `concat!` so this file's own
+    /// source does not match it.
+    #[test]
+    fn no_service_reads_ctx_embedder() {
+        let files = [
+            ("write.rs", include_str!("write.rs")),
+            ("search.rs", include_str!("search.rs")),
+            ("forget.rs", include_str!("forget.rs")),
+            ("archive.rs", include_str!("archive.rs")),
+            ("recall.rs", include_str!("recall.rs")),
+            ("graph.rs", include_str!("graph.rs")),
+            ("bootstrap.rs", include_str!("bootstrap.rs")),
+            ("review_queue.rs", include_str!("review_queue.rs")),
+        ];
+        // The cosine needle starts at the dot: `DigestQuery` keeps a field of the bare name, and
+        // bootstrap.rs has to fill it.
+        let needles = [
+            concat!("ctx.embedder", "."),
+            concat!("quality.dedupe", "_threshold"),
+            concat!("quality.conflict", "_threshold"),
+            concat!(".dedup", "_cosine"),
+            concat!("search.route", "_max_"),
+        ];
+        let found: Vec<String> = files
+            .iter()
+            .flat_map(|(name, src)| {
+                needles.iter().filter(|n| src.contains(*n)).map(move |n| format!("{name}: {n}"))
+            })
+            .collect();
+        assert!(
+            found.is_empty(),
+            "services read the embedder or a threshold outside the unit: {found:?}"
+        );
     }
 }

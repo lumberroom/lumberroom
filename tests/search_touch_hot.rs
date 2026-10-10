@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use lumberroom_server::adapters::postgres;
 use lumberroom_server::config::{Fusion, SearchConfig, DEFAULT_RRF_K};
 use lumberroom_server::domain::policy::NamespaceCeiling;
-use lumberroom_server::domain::routing::{Scale, Thresholds};
+use lumberroom_server::domain::routing::Scale;
 use lumberroom_server::domain::types::Sensitivity;
 use lumberroom_server::ports::{MemoryRepository, SearchQuery, Weights};
 use sqlx::{AssertSqlSafe, PgPool};
@@ -69,7 +69,9 @@ fn search_config(fusion: Fusion) -> SearchConfig {
     SearchConfig {
         default_limit: 8,
         max_limit: 50,
-        graph_route: Thresholds { scale: Scale::Cosine, max_top: 0.65, max_spread: 0.08 },
+        graph_route_scale: Scale::Cosine,
+        route_max_top: Some(0.65),
+        route_max_spread: Some(0.08),
         vector_weight: 1.0,
         lexical_weight: 0.35,
         include_all_projects: true,

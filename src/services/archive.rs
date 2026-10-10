@@ -42,6 +42,7 @@ use lumberroom_archive::{
     RegistryRecord, SealedItemRecord, Source,
 };
 
+use super::embedders::UnitEmbedding;
 use super::Ctx;
 use crate::adapters::auth::assert_writable;
 use crate::domain::errors::{DomainError, Result};
@@ -572,6 +573,8 @@ async fn restore(
     // cannot be survived by a cached key; a restore is one unit of work, and fifty thousand file
     // reads for one key is the wrong trade.
     let mut kek: Option<crate::crypto::kek::Kek> = None;
+    // Resolved once for the job, so every restored row carries vectors from one model.
+    let u = ctx.embedders.for_unit(ctx.tenant())?;
 
     for (rec, (namespace, resolved)) in archive.memories.iter().zip(classified) {
         if report.id_map.contains_key(&rec.id) {
@@ -582,7 +585,7 @@ async fn restore(
             report.applied += 1;
             continue;
         }
-        let row = restore_row(ctx, rec, namespace, resolved, &mut kek).await?;
+        let row = restore_row(ctx, &u, rec, namespace, resolved, &mut kek).await?;
         ctx.repos.memories.restore_row(row).await?;
         report.applied += 1;
         // The id is the archive's own. The map is still written so an interrupted restore resumes
@@ -659,6 +662,7 @@ fn restorable_shape(rec: &MemoryRecord) -> Result<()> {
 /// what restore is for.
 async fn restore_row(
     ctx: &Ctx,
+    u: &UnitEmbedding,
     rec: &MemoryRecord,
     namespace: String,
     resolved: Sensitivity,
@@ -668,7 +672,7 @@ async fn restore_row(
         .map_err(|_| DomainError::validation("a restored row needs a uuid for an id"))?;
     let content = rec.content.trim();
 
-    let mut vectors = ctx.embedder.embed_documents(vec![content.to_string()]).await?;
+    let mut vectors = u.embedder.embed_documents(vec![content.to_string()]).await?;
     let embedding =
         vectors.pop().ok_or_else(|| DomainError::internal("embedder returned no vector"))?;
 
@@ -701,7 +705,7 @@ async fn restore_row(
         embedding,
         tags: rec.tags.clone(),
         source_client: rec.source_client.clone(),
-        embedding_model: ctx.embedder.id(),
+        embedding_model: u.embedder.id(),
         sensitivity: resolved,
         sealed,
         // Both links are foreign keys into this table and neither is deferrable, so binding them

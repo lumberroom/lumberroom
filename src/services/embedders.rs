@@ -27,8 +27,10 @@ pub struct EmbedderSet {
 }
 
 impl EmbedderSet {
-    pub fn single(current: Arc<dyn Embedder>,
-                  thresholds: HashMap<String, Arc<SimilarityThresholds>>) -> Self {
+    pub fn single(
+        current: Arc<dyn Embedder>,
+        thresholds: HashMap<String, Arc<SimilarityThresholds>>,
+    ) -> Self {
         Self { current, thresholds }
     }
 

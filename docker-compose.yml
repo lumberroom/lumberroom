@@ -188,6 +188,8 @@ services:
       EMBED_TIMEOUT_SECS: ${EMBED_TIMEOUT_SECS:-}
       # Removed in decision 0028. Forwarded for one release only so the boot can refuse a stale value.
       EMBED_ALLOW_FALLBACK: ${EMBED_ALLOW_FALLBACK:-}
+      # Per-key overrides of this model's similarity table (decision 0029).
+      EMBED_THRESHOLDS: ${EMBED_THRESHOLDS:-}
       # Sensitivity axis (Phase 3).
       #
       # Blank here means the server reads the `sensitivity_default` table instead, which migration
@@ -305,7 +307,8 @@ services:
       - --model
       - ${CLEANUP_MODEL:-qwen/qwen3.7-flash}
       - --min-similarity
-      - ${CLEANUP_MIN_SIMILARITY:-0.65}
+      # Empty leaves the floor to the store's model (decision 0029).
+      - ${CLEANUP_MIN_SIMILARITY:-}
 
   caddy:
     image: caddy:2-alpine
@@ -412,6 +415,8 @@ services:
       EMBED_TIMEOUT_SECS: ${EMBED_TIMEOUT_SECS:-}
       # Removed in decision 0028. Forwarded for one release only so the boot can refuse a stale value.
       EMBED_ALLOW_FALLBACK: ${EMBED_ALLOW_FALLBACK:-}
+      # Per-key overrides of this model's similarity table (decision 0029).
+      EMBED_THRESHOLDS: ${EMBED_THRESHOLDS:-}
       MODEL_CACHE_DIR: /models
       SENSITIVITY_DEFAULTS: ${SENSITIVITY_DEFAULTS:-}
       SENSITIVITY_TRIPWIRE: ${SENSITIVITY_TRIPWIRE:-}

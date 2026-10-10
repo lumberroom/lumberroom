@@ -158,6 +158,7 @@ mod tests {
                 model: "test".into(),
                 cache_dir: String::new(),
                 remote: Default::default(),
+                thresholds: vec![],
             },
             bootstrap: BootstrapConfig {
                 cache_ms: 0,
@@ -168,10 +169,12 @@ mod tests {
                 registry_limit: 1,
                 max_chars: 100,
                 max_chars_by_client: std::collections::HashMap::new(),
-                dedup_cosine: crate::config::DEFAULT_BOOTSTRAP_DEDUP_COSINE,
+                dedup_cosine: None,
             },
             search: SearchConfig {
-                graph_route: crate::domain::routing::Thresholds::default(),
+                graph_route_scale: crate::domain::routing::Scale::Cosine,
+                route_max_top: None,
+                route_max_spread: None,
                 default_limit: 8,
                 max_limit: 50,
                 vector_weight: 1.0,
@@ -198,8 +201,8 @@ mod tests {
                 require_verified_kek: true,
             },
             quality: QualityConfig {
-                dedupe_threshold: 0.97,
-                conflict_threshold: 0.90,
+                dedupe_threshold: None,
+                conflict_threshold: None,
                 conflict_limit: 3,
                 conflict_scan_max: 2_000,
                 conflict_sweep_secs: 60,

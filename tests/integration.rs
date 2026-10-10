@@ -139,8 +139,9 @@ async fn setup_with(
     // port the services read through and the ciphertext reader they decrypt through. A test that
     // built these separately would not exercise the seam the private read path depends on.
     let memories = Arc::new(postgres::PgMemoryRepository::new(pool.clone()));
+    let cfg = Arc::new(cfg);
     let ctx = Ctx {
-        cfg: Arc::new(cfg),
+        cfg: Arc::clone(&cfg),
         repos: Repos {
             aliases: Arc::new(postgres::PgAliasRepository::new(pool.clone())),
             memories: memories.clone(),
@@ -150,7 +151,7 @@ async fn setup_with(
             ciphertext: Some(memories),
             oauth: None,
         },
-        embedder: Arc::new(HashEmbedder::new(768)),
+        embedders: common::test_embedders(Arc::new(HashEmbedder::new(768)), &cfg),
         keys: Some(keys),
         kek_verified,
         principal: owner_like("mac"),
@@ -506,7 +507,11 @@ async fn a_supersedes_retry_reuses_the_row_the_first_call_stored() {
     let swept = conflicts::sweep(
         ctx.repos.memories.as_ref(),
         ctx.tenant(),
-        ctx.cfg.quality.conflict_threshold,
+        ctx.embedders
+            .for_unit(ctx.tenant())
+            .unwrap()
+            .thresholds
+            .get(lumberroom_server::domain::similarity::CONFLICT),
         std::time::Duration::from_secs(10),
     )
     .await
@@ -4499,7 +4504,7 @@ async fn a_tagged_search_drops_a_text_match_that_lacks_the_tag() {
         postgres::PgMemoryRepository::new(pool.clone()),
         postgres::PgMemoryRepository::new(pool.clone()).with_search(&rrf_cfg),
     ];
-    let embedding = ctx.embedder.embed_query(q).await.unwrap();
+    let embedding = ctx.embedders.current().embed_query(q).await.unwrap();
     let readable = |ns: &str| NamespaceCeiling { namespace: ns.into(), max: Sensitivity::Sealed };
     for (i, repo) in repos.iter().enumerate() {
         for (as_of, include_superseded) in [(None, false), (None, true), (Some(later), false)] {

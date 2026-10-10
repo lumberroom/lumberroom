@@ -626,9 +626,11 @@ fn env_num<T: std::str::FromStr>(key: &str, fallback: T) -> Result<T> {
 /// `None` for unset or empty, so "unset" and "set to the old default" stay apart.
 fn env_num_opt<T: std::str::FromStr>(key: &str) -> Result<Option<T>> {
     match std::env::var(key) {
-        Ok(v) if !v.trim().is_empty() => v.trim().parse().map(Some).map_err(|_| {
-            DomainError::validation(format!("{key} is not a valid number: {v:?}"))
-        }),
+        Ok(v) if !v.trim().is_empty() => v
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| DomainError::validation(format!("{key} is not a valid number: {v:?}"))),
         _ => Ok(None),
     }
 }

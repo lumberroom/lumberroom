@@ -37,9 +37,7 @@ use crate::crypto::envelope::SealedContent;
 use crate::crypto::kek::KeyProvider;
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::types::{Invocation, Memory, Principal};
-use crate::ports::{
-    MemoryRepository, RegistryRepository, SealedRepository, ToolCallRepository,
-};
+use crate::ports::{MemoryRepository, RegistryRepository, SealedRepository, ToolCallRepository};
 
 /// The ciphertext of rows the caller is already holding, so this layer can open what it may read.
 ///

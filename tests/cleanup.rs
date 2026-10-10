@@ -193,8 +193,9 @@ async fn setup() -> Option<Harness> {
     let kek_verified = !matches!(check, postgres::KekCheck::Mismatch { .. });
 
     let memories = Arc::new(postgres::PgMemoryRepository::new(pool.clone()));
+    let cfg = Arc::new(cfg);
     let ctx = Ctx {
-        cfg: Arc::new(cfg),
+        cfg: Arc::clone(&cfg),
         repos: Repos {
             aliases: Arc::new(postgres::PgAliasRepository::new(pool.clone())),
             memories: memories.clone(),
@@ -204,7 +205,7 @@ async fn setup() -> Option<Harness> {
             ciphertext: Some(memories),
             oauth: None,
         },
-        embedder: Arc::new(HashEmbedder::new(768)),
+        embedders: common::test_embedders(Arc::new(HashEmbedder::new(768)), &cfg),
         keys: Some(keys),
         kek_verified,
         principal: owner_like("mac"),
@@ -225,7 +226,7 @@ async fn setup() -> Option<Harness> {
         repos: ctx.repos.clone(),
         oauth: Arc::clone(&oauth),
         ingest: Arc::new(postgres::PgIngestRepository::new(pool.clone())),
-        embedder: Arc::clone(&ctx.embedder),
+        embedders: Arc::clone(&ctx.embedders),
         keys: ctx.keys.clone(),
         kek_verified: ctx.kek_verified,
         proposals: Vec::new(),
@@ -289,7 +290,8 @@ async fn put_private(h: &Harness, namespace: &str, content: &str) -> String {
 /// one.
 async fn put_raw(h: &Harness, namespace: &str, content: &str) -> String {
     let id = uuid::Uuid::new_v4();
-    let vectors = h.ctx.embedder.embed_documents(vec![content.to_string()]).await.unwrap();
+    let vectors =
+        h.ctx.embedders.current().embed_documents(vec![content.to_string()]).await.unwrap();
     let embedding = pgvector::Vector::from(vectors[0].clone());
     sqlx::query(
         "INSERT INTO memory (id, tenant_id, namespace, content, embedding, source_client,
@@ -338,10 +340,17 @@ async fn two_identical_rows_become_one_proposal_and_the_oldest_survives() {
     let second = put_raw(&h, "user:me", "The deploy runbook lives in DEPLOY.md  ").await;
     assert_ne!(first, second);
 
-    let (report, _) =
-        cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None)
-            .await
-            .unwrap();
+    let (report, _) = cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(report.exact_groups, 1, "case and spacing should not make two rows distinct");
     // One finding, not two. Identical text also sits at a cosine of 1.0, so the same pair would
     // otherwise arrive again as a paraphrase under a different cluster key.
@@ -363,14 +372,29 @@ async fn a_second_run_over_the_same_window_queues_nothing() {
     put_raw(&h, "user:me", "the builder image carries g++").await;
     put_raw(&h, "user:me", "the builder image carries g++").await;
 
-    let (first, _) = cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None)
-        .await
-        .unwrap();
+    let (first, _) = cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     assert!(first.queued >= 1);
-    let (second, _) =
-        cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None)
-            .await
-            .unwrap();
+    let (second, _) = cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(second.queued, 0, "the same cluster was queued twice");
     assert!(second.already_known >= 1, "and it was not counted as known either");
 }
@@ -384,9 +408,17 @@ async fn the_exact_query_still_groups_an_old_row_once_the_watermark_has_passed_i
     backdate(&h, &old, 30).await;
     put_raw(&h, "user:me", "an unrelated fact that moves the watermark").await;
 
-    let (first, _) = cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None)
-        .await
-        .unwrap();
+    let (first, _) = cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     let mark = first.through.expect("a run that found nothing still has to advance its watermark");
     let old_created: chrono::DateTime<Utc> =
         sqlx::query_scalar("SELECT created_at FROM memory WHERE id = $1")
@@ -397,10 +429,17 @@ async fn the_exact_query_still_groups_an_old_row_once_the_watermark_has_passed_i
     assert!(old_created < mark, "the fixture did not put the old row outside the window");
 
     let restated = put_raw(&h, "user:me", "the  ACCEPTANCE gates run  against a live server").await;
-    let (report, _) =
-        cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None)
-            .await
-            .unwrap();
+    let (report, _) = cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
 
     let rows = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
     let found = rows.iter().any(|p| {
@@ -449,7 +488,17 @@ async fn applying_retires_through_supersession_so_the_old_text_is_still_readable
     let first = put_raw(&h, "user:me", "the CLI is dependency-free JavaScript").await;
     let second = put_raw(&h, "user:me", "The CLI is dependency-free JavaScript").await;
 
-    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+    cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     let rows = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
     let p = rows
         .iter()
@@ -490,7 +539,17 @@ async fn a_member_edited_since_the_pass_read_it_makes_apply_refuse() {
     put_raw(&h, "user:me", "migrations are forward-only").await;
     let second = put_raw(&h, "user:me", "Migrations are forward-only").await;
 
-    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+    cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     let rows = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
     let p = rows
         .iter()
@@ -519,7 +578,17 @@ async fn a_finding_the_owner_answered_by_hand_closes_itself() {
     let first = put_raw(&h, "user:me", "the eval fixture lives under ~/.config/lumberroom").await;
     let second = put_raw(&h, "user:me", "The eval fixture lives under ~/.config/lumberroom").await;
 
-    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+    cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     let rows = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
     let p = rows
         .iter()
@@ -544,10 +613,17 @@ async fn a_private_row_never_reaches_the_list_handed_to_a_model() {
     put_private(&h, "personal:finance", "the household budget review is the first Sunday").await;
     put_private(&h, "personal:finance", "The household budget review is the first Sunday").await;
 
-    let (report, for_model) =
-        cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None)
-            .await
-            .unwrap();
+    let (report, for_model) = cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     assert!(
         for_model.is_empty(),
         "a private row was handed to the model path: {for_model:?} (report {report:?})"
@@ -590,10 +666,17 @@ async fn the_scheduled_pass_needs_no_principal_and_writes_proposals() {
     put_raw(&h, "user:me", "the scratch server refuses port 8787").await;
     put_raw(&h, "user:me", "The scratch server refuses port 8787  ").await;
 
-    let (report, _) =
-        cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None)
-            .await
-            .expect("a pass with no principal should run");
+    let (report, _) = cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .expect("a pass with no principal should run");
     assert_eq!(report.queued, 1, "the scheduled pass wrote nothing: {report:?}");
 }
 
@@ -610,7 +693,17 @@ async fn a_survivor_that_became_true_first_is_swapped_before_the_proposal_is_que
     set_occurred(&h, &older_fact, "2026-08-14T12:55:45Z").await;
     set_occurred(&h, &newer_fact, "2026-08-14T12:54:08Z").await;
 
-    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+    cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     let rows = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
     let p = rows
         .iter()
@@ -637,7 +730,17 @@ async fn a_cluster_with_no_valid_time_is_left_alone() {
     let first = put_raw(&h, "user:me", "the recall monitor compares two scans").await;
     put_raw(&h, "user:me", "The recall monitor compares two scans  ").await;
 
-    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+    cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     let rows = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
     let p = rows
         .iter()
@@ -722,10 +825,17 @@ async fn a_private_pair_in_the_model_band_is_withheld_rather_than_failing_the_ru
     put_private(&h, "personal:finance", "the mortgage renews in March").await;
     put_private(&h, "personal:finance", "the car loan ends in June").await;
 
-    let (report, for_model) =
-        cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, Some(0.0))
-            .await
-            .expect("a private pair in the band must not fail the pass");
+    let (report, for_model) = cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        Some(0.0),
+    )
+    .await
+    .expect("a private pair in the band must not fail the pass");
     assert!(for_model.is_empty(), "a private row reached the model list: {for_model:?}");
     assert!(report.withheld_from_model >= 1, "the withheld pair was not counted: {report:?}");
 }
@@ -739,7 +849,17 @@ async fn the_queue_shows_a_narrow_client_only_proposals_it_could_have_produced()
     put_raw(&h, "user:me", "The backup runs at 02:00  ").await;
     put_raw(&h, "project:lumberroom", "the console listens on 8787").await;
     put_raw(&h, "project:lumberroom", "The console listens on 8787  ").await;
-    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+    cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
 
     let everything = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
     assert_eq!(everything.len(), 2, "the fixture should have queued one finding per namespace");
@@ -902,10 +1022,17 @@ async fn the_scheduled_pass_stays_inside_one_namespace_and_names_no_poster() {
 
     // Two rows, one per namespace, identical text. With the floor at zero the only thing keeping
     // them apart is the join.
-    let (report, for_model) =
-        cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, Some(0.0))
-            .await
-            .unwrap();
+    let (report, for_model) = cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        Some(0.0),
+    )
+    .await
+    .unwrap();
     assert_eq!(report.exact_groups, 0, "exact groups are per namespace: {report:?}");
     assert_eq!(report.queued, 0, "a cross-namespace pair was queued: {report:?}");
     assert!(for_model.is_empty(), "a cross-namespace pair reached the model band: {for_model:?}");
@@ -1050,7 +1177,17 @@ async fn a_member_carries_when_it_was_written_its_reads_and_its_source() {
         .await
         .unwrap();
 
-    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+    cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     let rows = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
     let p = rows.iter().find(|p| p.members.iter().any(|m| m.memory_id == first)).unwrap();
     let keep = p.members.iter().find(|m| m.memory_id == first).unwrap();
@@ -1090,7 +1227,17 @@ async fn a_gone_member_carries_none_of_the_row_facts() {
     let h = harness_or_skip!();
     let first = put_raw(&h, "user:me", "the nightly export lands in s3://lr-exports").await;
     let second = put_raw(&h, "user:me", "The nightly export lands in s3://lr-exports").await;
-    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+    cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
 
     let mut conn = h.pool.acquire().await.unwrap();
     sqlx::query("SET session_replication_role = replica").execute(&mut *conn).await.unwrap();
@@ -1120,7 +1267,17 @@ async fn a_near_duplicate_rationale_is_a_sentence_with_no_score() {
     let older = put_raw(&h, "user:me", "the archive mailer relays through port 2525").await;
     let newer = put_raw(&h, "user:me", "the archive mailer relays through port 2525.").await;
 
-    cleanup::run(&h.ctx.cfg.tenant_id, h.repo.as_ref(), None, "hourly", 500, None).await.unwrap();
+    cleanup::run(
+        &h.ctx.cfg.tenant_id,
+        h.repo.as_ref(),
+        &h.ctx.embedders,
+        None,
+        "hourly",
+        500,
+        None,
+    )
+    .await
+    .unwrap();
     let rows = cleanup::list(&h.ctx, h.repo.as_ref(), Some("proposed"), 50).await.unwrap();
     let p = rows
         .iter()
