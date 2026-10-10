@@ -61,7 +61,9 @@ impl RemoteEmbedder {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
             .build()
-            .map_err(|e| DomainError::internal("could not build the embedding client").with_source(e))?;
+            .map_err(|e| {
+                DomainError::internal("could not build the embedding client").with_source(e)
+            })?;
         Ok(Self {
             http,
             url: format!("{}/embeddings", cfg.base_url),
@@ -84,7 +86,11 @@ impl RemoteEmbedder {
                     // Five percent under the reported ratio, because characters per token is not
                     // constant along a text and the head that survives may be denser.
                     let keep = ratio.map(|r| r * 0.95).unwrap_or(BLIND_SHRINK);
-                    tracing::warn!(attempt, keep, "embedding input over the server's window, cutting it");
+                    tracing::warn!(
+                        attempt,
+                        keep,
+                        "embedding input over the server's window, cutting it"
+                    );
                     inputs = texts
                         .iter()
                         .zip(&inputs)
@@ -95,12 +101,10 @@ impl RemoteEmbedder {
                         })
                         .collect();
                 }
-                Err(Failure::TooLong(_)) => {
-                    return Err(DomainError::unavailable(
-                        "the embedding server refused the input as too long even after cutting it; \
+                Err(Failure::TooLong(_)) => return Err(DomainError::unavailable(
+                    "the embedding server refused the input as too long even after cutting it; \
                          lower EMBED_MAX_INPUT_CHARS",
-                    ))
-                }
+                )),
                 Err(Failure::Other(e)) => return Err(e),
             }
         }
@@ -118,12 +122,15 @@ impl RemoteEmbedder {
     }
 
     async fn post(&self, inputs: &[String]) -> std::result::Result<Vec<Item>, Failure> {
-        let mut req = self.http.post(&self.url).json(&json!({ "model": self.model, "input": inputs }));
+        let mut req =
+            self.http.post(&self.url).json(&json!({ "model": self.model, "input": inputs }));
         if let Some(key) = &self.cfg.api_key {
             req = req.bearer_auth(key);
         }
         let resp = req.send().await.map_err(|e| {
-            Failure::Other(DomainError::unavailable("the embedding server is unreachable").with_source(e))
+            Failure::Other(
+                DomainError::unavailable("the embedding server is unreachable").with_source(e),
+            )
         })?;
         let status = resp.status();
         if !status.is_success() {
@@ -131,7 +138,10 @@ impl RemoteEmbedder {
             // llama-server answers "input (N tokens) is too large to process" or "... is larger
             // than the max context size"; OpenAI says "maximum context length".
             let lower = body.to_ascii_lowercase();
-            if lower.contains("too large") || lower.contains("context size") || lower.contains("context length") {
+            if lower.contains("too large")
+                || lower.contains("context size")
+                || lower.contains("context length")
+            {
                 return Err(Failure::TooLong(window_ratio(&lower)));
             }
             let snippet: String = body.chars().take(300).collect();
@@ -140,7 +150,9 @@ impl RemoteEmbedder {
             ))));
         }
         let parsed: Response = resp.json().await.map_err(|e| {
-            Failure::Other(DomainError::internal("the embedding server's answer did not parse").with_source(e))
+            Failure::Other(
+                DomainError::internal("the embedding server's answer did not parse").with_source(e),
+            )
         })?;
         Ok(parsed.data)
     }
@@ -245,7 +257,8 @@ mod tests {
 
     #[test]
     fn a_refusal_that_names_both_counts_cuts_to_the_window() {
-        let batch = "input (16255 tokens) is too large to process. increase the physical batch size \
+        let batch =
+            "input (16255 tokens) is too large to process. increase the physical batch size \
                      (current batch size: 8192)";
         let ratio = window_ratio(batch).unwrap();
         assert!((ratio - 8192.0 / 16255.0).abs() < 1e-9);
