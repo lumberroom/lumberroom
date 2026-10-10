@@ -1112,7 +1112,7 @@ mod tests {
             "rollback: unavailable",
             "thresholds openai:google/embeddinggemma-2:",
             "  dedupe 0.995 (study)",
-            "  route_max_top 0.65 (carried)",
+            "  route_max_top 0.76 (sweep)",
             "thresholds openai:BAAI/bge-base-en-v1.5:",
             "  dedupe 0.97 (shipped)",
             "next: nothing to do",

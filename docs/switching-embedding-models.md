@@ -267,8 +267,9 @@ Each model reads its own cosine thresholds. The server ships a table:
 | `route_max_spread` | no | 0.08 | 0.08 |
 
 A model matches a row when its id contains the family name. `status` prints every value with its
-source: `override` (your line), `legacy` (an old single variable), `shipped`, `study`, `carried`
-(bge's value, unmeasured for this model) or `guessed`. Decision 0029 explains each.
+source: `override` (your line), `legacy` (an old single variable), `shipped`, `study`, `sweep`
+(measured by the LongMemEval fusion sweep), `carried` (bge's value, unmeasured for this model) or
+`guessed`. Decision 0029 explains each.
 
 - **A model with no entry runs on bge's values,** marked `guessed`, and the boot log names every
   guessed key. An acting key (`dedupe`, `conflict`, `cleanup_near_certain`) changes or merges data
