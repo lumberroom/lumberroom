@@ -59,6 +59,32 @@ fn a_search_hit_carries_id_namespace_content_and_score() {
     assert_eq!(hit.id, "9f1c2b4e-0000-4a1b-8c3d-1122334455aa");
 }
 
+/// A server with `SEARCH_DEBUG_SCORES` off sends no `scores` key, and the hit still parses.
+#[test]
+fn a_search_hit_without_debug_scores_parses_with_none() {
+    let r: SearchResult = serde_json::from_value(fixture("memory_search.json")).unwrap();
+    assert!(r.hits[0].scores.is_none());
+}
+
+/// `domain::types::ScoreParts`, as a debug-scored hit carries it. The optional parts are skipped
+/// by the server when absent, so a linear hit names three keys.
+#[test]
+fn a_debug_scored_hit_carries_its_parts() {
+    let r: SearchResult = serde_json::from_value(serde_json::json!({
+        "hits": [
+            {"id": "a", "namespace": "project:x", "content": "c", "score": 0.9,
+             "scores": {"cosine": 0.8, "keyword": 0.2, "fused": 0.87}},
+            {"id": "b", "namespace": "project:x", "content": "c", "score": 0.5,
+             "scores": {"cosine": 0.7, "keyword": 0.0, "fused": 0.5, "cosine_norm": 0.5}}
+        ]
+    }))
+    .unwrap();
+    let linear = r.hits[0].scores.unwrap();
+    assert_eq!((linear.cosine, linear.keyword, linear.fused), (0.8, 0.2, 0.87));
+    assert_eq!(linear.cosine_norm, None);
+    assert_eq!(r.hits[1].scores.unwrap().cosine_norm, Some(0.5));
+}
+
 /// `domain::types::WriteOutcome`. `superseded` and `possible_conflicts` are skipped when empty, so
 /// the fixture omits them and this must still parse.
 #[test]

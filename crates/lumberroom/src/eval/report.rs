@@ -37,9 +37,10 @@ pub fn render(report: &RunReport) -> String {
 
 fn header(report: &RunReport) -> String {
     format!(
-        "LongMemEval-S · {} questions · {} · embedder {} · depth {} · {}s\n",
+        "LongMemEval-S · {} questions · {}{} · embedder {} · depth {} · {}s\n",
         report.overall.questions,
         report.protocol,
+        if report.search_only { " · search-only" } else { "" },
         report.embedding_model,
         report.retrieve_depth,
         report.wall_seconds,
@@ -212,6 +213,7 @@ mod tests {
             protocol: "session-as-document".into(),
             mode: "scoped".into(),
             rows_at_end: 159,
+            search_only: false,
             embedding_model: "hash-768".into(),
             retrieve_depth: 20,
             overall: aggregate(&results),

@@ -60,6 +60,14 @@ pub enum Fusion {
     Linear,
     /// Weighted sum of `1 / (k + rank)` over each arm.
     Rrf,
+    /// The linear blend over a cosine rescaled to 0..1 across each query's candidate set.
+    ///
+    /// An embedder that packs every neighbour into a narrow band near 0.8 leaves the cosine term
+    /// spread over a few hundredths, and a fixed lexical weight then means something different per
+    /// model. Min-max puts the best and worst candidate cosine at 1 and 0 for every query, so the
+    /// keyword weight argues against the same spread whatever the embedder. Experimental: no
+    /// measurement on this store backs it yet.
+    LinearMinmax,
 }
 
 impl Fusion {
@@ -67,6 +75,7 @@ impl Fusion {
         match self {
             Self::Linear => "linear",
             Self::Rrf => "rrf",
+            Self::LinearMinmax => "linear_minmax",
         }
     }
 }
@@ -435,6 +444,10 @@ pub struct SearchConfig {
     pub fusion: Fusion,
     /// The `k` in `1 / (k + rank)`. Larger flattens the difference between the top ranks.
     pub rrf_k: f64,
+    /// Attach each hit's cosine, keyword score and fused score to `memory_search` answers. For a
+    /// retrieval harness on a scratch server. Off, a response carries exactly the keys it always
+    /// did and the repository runs the statements it always ran.
+    pub debug_scores: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -638,9 +651,25 @@ fn parse_fusion(raw: &str) -> Result<Fusion> {
     match raw.trim() {
         "linear" | "" => Ok(Fusion::Linear),
         "rrf" => Ok(Fusion::Rrf),
-        other => {
-            Err(DomainError::validation(format!("SEARCH_FUSION must be linear|rrf, got {other:?}")))
-        }
+        "linear_minmax" => Ok(Fusion::LinearMinmax),
+        other => Err(DomainError::validation(format!(
+            "SEARCH_FUSION must be linear|linear_minmax|rrf, got {other:?}"
+        ))),
+    }
+}
+
+/// `SEARCH_DEBUG_SCORES`, refused at boot when it is not a boolean spelling.
+///
+/// Stricter than `env_bool`, which reads any unknown word as false. An operator who typed
+/// `SEARCH_DEBUG_SCORES=ture` for a sweep would otherwise get a harness run with no scores in it
+/// and learn so only after the run.
+fn parse_debug_scores(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        other => Err(DomainError::validation(format!(
+            "SEARCH_DEBUG_SCORES must be true|false, got {other:?}"
+        ))),
     }
 }
 
@@ -969,13 +998,16 @@ pub fn load() -> Result<Config> {
                 // values, and under rank fusion they would call every question weak and flat.
                 scale: match parse_fusion(&env("SEARCH_FUSION", "linear"))? {
                     Fusion::Linear => crate::domain::routing::Scale::Cosine,
-                    Fusion::Rrf => crate::domain::routing::Scale::Ranked,
+                    // A rescaled cosine puts the top hit at 1.0 on every query, so a 0.65 ceiling
+                    // on it is never crossed and the router has to stand down here too.
+                    Fusion::Rrf | Fusion::LinearMinmax => crate::domain::routing::Scale::Ranked,
                 },
                 max_top: env_num("GRAPH_ROUTE_MAX_TOP", 0.65f64)?,
                 max_spread: env_num("GRAPH_ROUTE_MAX_SPREAD", 0.08f64)?,
             },
             fusion: parse_fusion(&env("SEARCH_FUSION", "linear"))?,
             rrf_k: env_num("SEARCH_RRF_K", DEFAULT_RRF_K)?,
+            debug_scores: parse_debug_scores(&env("SEARCH_DEBUG_SCORES", ""))?,
         },
         policy: PolicyConfig {
             // Parsed here so a malformed pair fails at boot rather than at the first write, but the
@@ -2001,13 +2033,51 @@ mod tests {
         assert_eq!(parse_fusion(" rrf ").unwrap(), Fusion::Rrf);
     }
 
+    /// The rescaled blend is reached only by its own spelling. An empty value, the shipped
+    /// default, still means the plain linear blend.
+    #[test]
+    fn the_rescaled_blend_is_opt_in_and_spelled_one_way() {
+        assert_eq!(parse_fusion("linear_minmax").unwrap(), Fusion::LinearMinmax);
+        assert_eq!(parse_fusion(" linear_minmax ").unwrap(), Fusion::LinearMinmax);
+        assert_eq!(parse_fusion("").unwrap(), Fusion::Linear);
+        for typo in ["minmax", "linear-minmax", "LINEAR_MINMAX", "linear_min_max"] {
+            assert!(parse_fusion(typo).is_err(), "{typo:?} must stop the boot");
+        }
+    }
+
     /// A typo must stop the boot rather than pick a ranking. Silently falling back to linear would
     /// make an operator's rank-fusion rollout look like a result.
     #[test]
-    fn refuses_a_fusion_it_does_not_implement_and_names_both_spellings() {
+    fn refuses_a_fusion_it_does_not_implement_and_names_every_spelling() {
         let err = parse_fusion("reciprocal").unwrap_err().to_string();
-        assert!(err.contains("linear|rrf"), "the message has to name what to write: {err}");
+        assert!(
+            err.contains("linear|linear_minmax|rrf"),
+            "the message has to name what to write: {err}"
+        );
         assert!(parse_fusion("RRF").is_err(), "the other enums here match lowercase only");
+    }
+
+    /// Off unless asked, so a deployment that never heard of the setting answers searches with the
+    /// keys it always did.
+    #[test]
+    fn debug_scores_stay_off_until_an_operator_asks() {
+        assert!(!parse_debug_scores("").unwrap());
+        for off in ["false", "0", "no", "off", " FALSE "] {
+            assert!(!parse_debug_scores(off).unwrap(), "{off:?}");
+        }
+        for on in ["true", "1", "yes", "on", " True "] {
+            assert!(parse_debug_scores(on).unwrap(), "{on:?}");
+        }
+    }
+
+    /// `env_bool` reads an unknown word as false. A sweep that asked for scores with a typo would
+    /// run to the end with none, so this one refuses instead.
+    #[test]
+    fn debug_scores_refuse_a_word_that_is_not_a_boolean() {
+        for typo in ["ture", "enabled", "2", "y"] {
+            let err = parse_debug_scores(typo).unwrap_err().to_string();
+            assert!(err.contains("SEARCH_DEBUG_SCORES"), "{err}");
+        }
     }
 
     #[test]
@@ -2043,6 +2113,7 @@ mod tests {
     fn the_fusion_names_round_trip() {
         assert_eq!(parse_fusion(Fusion::Linear.as_str()).unwrap(), Fusion::Linear);
         assert_eq!(parse_fusion(Fusion::Rrf.as_str()).unwrap(), Fusion::Rrf);
+        assert_eq!(parse_fusion(Fusion::LinearMinmax.as_str()).unwrap(), Fusion::LinearMinmax);
     }
 
     /// The shipped default has to pass its own check, and a day is the number the tool description

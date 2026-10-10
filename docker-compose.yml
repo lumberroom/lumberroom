@@ -222,6 +222,8 @@ services:
       # reaches the container however the operator sets it. Empty parses as linear.
       SEARCH_FUSION: ${SEARCH_FUSION:-}
       SEARCH_RRF_K: ${SEARCH_RRF_K:-}
+      # Per-hit score parts on memory_search answers, for a retrieval harness. Empty means off.
+      SEARCH_DEBUG_SCORES: ${SEARCH_DEBUG_SCORES:-}
       # The in-server cleanup pass, which also enforces the recall log's retention. Empty means
       # the config.rs default: every 3600 s, 500 rows, every namespace.
       CLEANUP_INTERVAL_SECS: ${CLEANUP_INTERVAL_SECS:-}

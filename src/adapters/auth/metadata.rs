@@ -182,6 +182,7 @@ mod tests {
                 usage_weight: 0.05,
                 fusion: crate::config::Fusion::Linear,
                 rrf_k: 60.0,
+                debug_scores: false,
             },
             policy: PolicyConfig {
                 defaults: crate::domain::policy::SensitivityDefaults::default(),

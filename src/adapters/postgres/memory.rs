@@ -25,7 +25,7 @@ use crate::config::{Fusion, SearchConfig, DEFAULT_RRF_K};
 use crate::crypto::envelope::SealedContent;
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::policy::{NamespaceCeiling, NamespaceGrant};
-use crate::domain::types::{ConflictCandidate, Memory, SearchHit, Sensitivity};
+use crate::domain::types::{ConflictCandidate, Memory, ScoreParts, SearchHit, Sensitivity};
 use crate::ports::memory::{
     ChainEdits, ChainLink, ChainNeighbours, DeleteOutcome, DeletePlan, GraphEdge, PairCounts,
     RestoreRow, Retired, Superseded, Timeline, WalkBounds,
@@ -44,11 +44,13 @@ pub struct PgMemoryRepository {
     /// option rather than the old behaviour.
     fusion: Fusion,
     rrf_k: f64,
+    /// Run the `_SCORED` sibling where one exists and hand back each hit's score parts.
+    debug_scores: bool,
 }
 
 impl PgMemoryRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, fusion: Fusion::Linear, rrf_k: DEFAULT_RRF_K }
+        Self { pool, fusion: Fusion::Linear, rrf_k: DEFAULT_RRF_K, debug_scores: false }
     }
 
     /// Take the ranking settings from the boot configuration.
@@ -59,6 +61,7 @@ impl PgMemoryRepository {
     pub fn with_search(mut self, search: &SearchConfig) -> Self {
         self.fusion = search.fusion;
         self.rrf_k = search.rrf_k;
+        self.debug_scores = search.debug_scores;
         self
     }
 
@@ -200,6 +203,10 @@ macro_rules! select_memory {
 /// contain. That matters more than it looks: `row_number()` puts a WindowAgg above the vector arm's
 /// ordered index scan, and the plan that arm gets is what pgvector's iterative scan depends on.
 ///
+/// The last literal, `$scored`, extends the final select list for `SEARCH_DEBUG_SCORES`. Every
+/// statement a deployment runs passes an empty string there, so its text is what it was before the
+/// slot existed; only the three `_SCORED` siblings fill it.
+///
 /// Everything after this point is `concat!` over literals: no runtime string building reaches the
 /// query text.
 macro_rules! search_sql {
@@ -208,7 +215,8 @@ macro_rules! search_sql {
         $vec_rank:literal,
         $lex_rank:literal,
         $merged_ranks:literal,
-        $score:literal
+        $score:literal,
+        $scored:expr
     ) => {
         concat!(
             r#"
@@ -294,7 +302,7 @@ macro_rules! search_sql {
                    m.occurred_at, m.occurred_until,
                    g.similarity::float8 AS similarity,
                    (m.namespace = ANY($2)) AS is_primary,
-                   "#, $score, r#" AS score
+                   "#, $score, r#" AS score"#, $scored, r#"
               FROM merged g
               JOIN memory m ON m.id = g.id
              ORDER BY score DESC, m.created_at DESC
@@ -311,6 +319,9 @@ macro_rules! search_sql {
 /// weight 1.0. The lexical arm supplies candidates and hardly reorders them.
 macro_rules! linear_search_sql {
     ($live:expr) => {
+        linear_search_sql!($live, "")
+    };
+    ($live:expr, $scored:expr) => {
         search_sql!(
             $live,
             "",
@@ -324,7 +335,8 @@ macro_rules! linear_search_sql {
                    ((g.similarity * $9 + g.lexical * $10
                        + LEAST(ln(1 + m.access_count::float8) / ln(11::float8), 1.0) * $13)
                      * (CASE WHEN m.namespace = ANY($2)
-                             THEN 1.0::float8 ELSE $11::float8 END))::float8"#
+                             THEN 1.0::float8 ELSE $11::float8 END))::float8"#,
+            $scored
         )
     };
 }
@@ -338,6 +350,9 @@ macro_rules! linear_search_sql {
 /// This variant binds a fourteenth parameter, `k`.
 macro_rules! rrf_search_sql {
     ($live:expr) => {
+        rrf_search_sql!($live, "")
+    };
+    ($live:expr, $scored:expr) => {
         search_sql!(
             $live,
             r#",
@@ -369,7 +384,53 @@ macro_rules! rrf_search_sql {
                         * LEAST(ln(1 + m.access_count::float8) / ln(11::float8), 1.0::float8))
                     -- The cross-namespace penalty keeps the shape it already had.
                     * (CASE WHEN m.namespace = ANY($2)
-                            THEN 1.0::float8 ELSE $11::float8 END))::float8"#
+                            THEN 1.0::float8 ELSE $11::float8 END))::float8"#,
+            $scored
+        )
+    };
+}
+
+/// The linear blend over a min-max rescaled cosine, behind `SEARCH_FUSION=linear_minmax`.
+///
+/// The rescale runs over the pool the linear statement already scores, the `merged` rows, and only
+/// over the rows that carry a cosine. A row the lexical arm alone returned scores a cosine of 0
+/// under the linear blend and scores 0 here: the vector arm returns the top candidates by cosine,
+/// so a row it left out sits at or below the arm's minimum, which is where 0 lands. Folding those
+/// zeros into the minimum instead would make the rescale a division by the maximum whenever the
+/// lexical arm found one extra row.
+///
+/// The windows sit in `merged`, above the full join, and never inside an arm. A window in the
+/// vector arm puts a WindowAgg over its ordered index scan, which is the plan pgvector's iterative
+/// scan resumes from.
+///
+/// Binds what the linear blend binds, numbered the same way, so the as-of and tag siblings reuse
+/// the linear parameter numbers.
+macro_rules! minmax_search_sql {
+    ($live:expr) => {
+        minmax_search_sql!($live, "")
+    };
+    ($live:expr, $scored:expr) => {
+        search_sql!(
+            $live,
+            "",
+            "",
+            r#",
+                       -- One candidate, or every candidate at the same cosine, leaves max equal to
+                       -- min and the division undefined. Each such row is the best the arm found,
+                       -- so it takes the top of the range rather than a NULL that would swallow
+                       -- the score and sort the row by created_at.
+                       CASE WHEN v.similarity IS NULL THEN 0.0::float8
+                            WHEN max(v.similarity) OVER () > min(v.similarity) OVER ()
+                            THEN ((v.similarity - min(v.similarity) OVER ())
+                                  / (max(v.similarity) OVER () - min(v.similarity) OVER ()))::float8
+                            ELSE 1.0::float8
+                       END AS cosine_norm"#,
+            r#"-- The linear blend term for term, with the rescaled cosine in place of the raw one.
+                   ((g.cosine_norm * $9 + g.lexical * $10
+                       + LEAST(ln(1 + m.access_count::float8) / ln(11::float8), 1.0) * $13)
+                     * (CASE WHEN m.namespace = ANY($2)
+                             THEN 1.0::float8 ELSE $11::float8 END))::float8"#,
+            $scored
         )
     };
 }
@@ -452,7 +513,75 @@ const SEARCH_RRF_AS_OF_TAGGED: &str = rrf_search_sql!(
                    AND m.tags @> $16::text[]"#
 );
 
-/// Which of the twelve search statements answers this question.
+/// The six shapes again under `SEARCH_FUSION=linear_minmax`.
+///
+/// Numbered as the linear six are: as-of on `$14`, the tag array on `$14`, or on `$15` beside an
+/// instant. `search` binds `k` for rank fusion alone, so these take the linear bind order as is.
+const SEARCH_MINMAX_LIVE: &str = minmax_search_sql!(live!());
+const SEARCH_MINMAX_ALL: &str = minmax_search_sql!("true");
+const SEARCH_MINMAX_AS_OF: &str = minmax_search_sql!(
+    r#"(COALESCE(m.occurred_at, m.created_at) <= $14
+                   AND (m.occurred_until IS NULL OR m.occurred_until >  $14))"#
+);
+const SEARCH_MINMAX_LIVE_TAGGED: &str =
+    minmax_search_sql!(concat!(live!(), " AND m.tags @> $14::text[]"));
+const SEARCH_MINMAX_ALL_TAGGED: &str = minmax_search_sql!("m.tags @> $14::text[]");
+const SEARCH_MINMAX_AS_OF_TAGGED: &str = minmax_search_sql!(
+    r#"(COALESCE(m.occurred_at, m.created_at) <= $14
+                   AND (m.occurred_until IS NULL OR m.occurred_until >  $14))
+                   AND m.tags @> $15::text[]"#
+);
+
+/// The columns `SEARCH_DEBUG_SCORES` adds, one literal per blend.
+///
+/// Siblings of the three live, untagged statements and nothing more: that is the shape a retrieval
+/// harness runs, and eighteen more constants to cover history, as-of and tags would buy scores
+/// nobody reads. Every other shape answers without them. Each sibling differs from the statement
+/// it shadows in the final select list alone, so the score and the order are the same rows in the
+/// same order.
+macro_rules! linear_scored {
+    () => {
+        r#",
+                   g.lexical AS keyword_score"#
+    };
+}
+macro_rules! rrf_scored {
+    () => {
+        r#",
+                   g.lexical AS keyword_score,
+                   g.rank_vec AS vector_rank,
+                   g.rank_lex AS keyword_rank"#
+    };
+}
+macro_rules! minmax_scored {
+    () => {
+        r#",
+                   g.lexical AS keyword_score,
+                   g.cosine_norm AS cosine_norm"#
+    };
+}
+const SEARCH_LIVE_SCORED: &str = linear_search_sql!(live!(), linear_scored!());
+const SEARCH_RRF_LIVE_SCORED: &str = rrf_search_sql!(live!(), rrf_scored!());
+const SEARCH_MINMAX_LIVE_SCORED: &str = minmax_search_sql!(live!(), minmax_scored!());
+
+/// The scored sibling for a live, untagged search, and `None` for every other shape.
+fn scored_statement(
+    fusion: Fusion,
+    as_of: bool,
+    include_superseded: bool,
+    tagged: bool,
+) -> Option<&'static str> {
+    if as_of || include_superseded || tagged {
+        return None;
+    }
+    Some(match fusion {
+        Fusion::Linear => SEARCH_LIVE_SCORED,
+        Fusion::Rrf => SEARCH_RRF_LIVE_SCORED,
+        Fusion::LinearMinmax => SEARCH_MINMAX_LIVE_SCORED,
+    })
+}
+
+/// Which of the eighteen search statements answers this question.
 ///
 /// `as_of` decides before `include_superseded`: the period predicate already reaches retired rows,
 /// which is the whole reason to ask, so the flag says nothing under it.
@@ -463,6 +592,12 @@ fn search_statement(
     tagged: bool,
 ) -> &'static str {
     match (fusion, as_of, include_superseded, tagged) {
+        (Fusion::LinearMinmax, true, _, false) => SEARCH_MINMAX_AS_OF,
+        (Fusion::LinearMinmax, false, false, false) => SEARCH_MINMAX_LIVE,
+        (Fusion::LinearMinmax, false, true, false) => SEARCH_MINMAX_ALL,
+        (Fusion::LinearMinmax, true, _, true) => SEARCH_MINMAX_AS_OF_TAGGED,
+        (Fusion::LinearMinmax, false, false, true) => SEARCH_MINMAX_LIVE_TAGGED,
+        (Fusion::LinearMinmax, false, true, true) => SEARCH_MINMAX_ALL_TAGGED,
         (Fusion::Linear, true, _, false) => SEARCH_AS_OF,
         (Fusion::Rrf, true, _, false) => SEARCH_RRF_AS_OF,
         (Fusion::Linear, false, false, false) => SEARCH_LIVE,
@@ -1789,7 +1924,13 @@ impl MemoryRepository for PgMemoryRepository {
         let candidates = (q.limit * 4).max(20);
 
         let tagged = !q.tags.is_empty();
-        let sql = search_statement(self.fusion, q.as_of.is_some(), q.include_superseded, tagged);
+        let scored = match self.debug_scores {
+            true => scored_statement(self.fusion, q.as_of.is_some(), q.include_superseded, tagged),
+            false => None,
+        };
+        let sql = scored.unwrap_or_else(|| {
+            search_statement(self.fusion, q.as_of.is_some(), q.include_superseded, tagged)
+        });
         let mut stmt = sqlx::query(sql)
             .bind(&q.tenant_id)
             .bind(&primary_ns)
@@ -1831,6 +1972,25 @@ impl MemoryRepository for PgMemoryRepository {
                 score: round4(r.get::<f64, _>("score")),
                 similarity: round4(r.get::<f64, _>("similarity")),
                 primary: r.get("is_primary"),
+                // Unrounded, unlike the two fields above. A harness comparing blends needs to see
+                // two hits that tie at four decimals and which way the order broke.
+                scores: scored.map(|_| ScoreParts {
+                    cosine: r.get("similarity"),
+                    keyword: r.get("keyword_score"),
+                    fused: r.get("score"),
+                    cosine_norm: match self.fusion {
+                        Fusion::LinearMinmax => Some(r.get("cosine_norm")),
+                        Fusion::Linear | Fusion::Rrf => None,
+                    },
+                    vector_rank: match self.fusion {
+                        Fusion::Rrf => r.get("vector_rank"),
+                        Fusion::Linear | Fusion::LinearMinmax => None,
+                    },
+                    keyword_rank: match self.fusion {
+                        Fusion::Rrf => r.get("keyword_rank"),
+                        Fusion::Linear | Fusion::LinearMinmax => None,
+                    },
+                }),
             })
             .collect())
     }
@@ -3826,6 +3986,159 @@ mod tests {
                 want,
                 "{fusion:?} as_of={as_of} include_superseded={superseded} tagged={tagged}"
             );
+        }
+    }
+
+    // -- the min-max blend and the scored siblings ------------------------------------------------
+
+    /// The six `linear_minmax` statements with the parameter number each must stop at.
+    const MINMAX_SQL: [(&str, &str); 6] = [
+        (SEARCH_MINMAX_LIVE, "$14"),
+        (SEARCH_MINMAX_ALL, "$14"),
+        (SEARCH_MINMAX_AS_OF, "$15"),
+        (SEARCH_MINMAX_LIVE_TAGGED, "$15"),
+        (SEARCH_MINMAX_ALL_TAGGED, "$15"),
+        (SEARCH_MINMAX_AS_OF_TAGGED, "$16"),
+    ];
+
+    #[test]
+    fn the_minmax_blend_keeps_every_policy_filter_the_linear_blend_has() {
+        for (sql, past_last) in MINMAX_SQL.into_iter().chain([(SEARCH_MINMAX_LIVE_SCORED, "$14")]) {
+            assert_eq!(sql.matches("<= rg.max_rank").count(), 2);
+            assert_eq!(sql.matches("m.namespace = ANY($2 || $4)").count(), 2);
+            assert!(sql.contains("m.sensitivity = 'open'"));
+            assert_eq!(sql.matches("AND $10::float8 > 0").count(), 1);
+            assert!(!sql.contains(past_last), "binds the linear count, never {past_last}");
+        }
+        for sql in [SEARCH_MINMAX_LIVE, SEARCH_MINMAX_LIVE_TAGGED, SEARCH_MINMAX_LIVE_SCORED] {
+            assert_eq!(sql.matches(live!()).count(), 2, "the vector arm and the lexical arm");
+        }
+        for sql in [SEARCH_MINMAX_ALL, SEARCH_MINMAX_AS_OF, SEARCH_MINMAX_AS_OF_TAGGED] {
+            assert!(!sql.contains("superseded_by IS NULL"));
+        }
+        assert_eq!(SEARCH_MINMAX_LIVE_TAGGED.matches("m.tags @> $14::text[]").count(), 2);
+        assert_eq!(SEARCH_MINMAX_AS_OF_TAGGED.matches("m.tags @> $15::text[]").count(), 2);
+        assert!(!SEARCH_MINMAX_LIVE.contains("m.tags @>"));
+    }
+
+    /// The rescale reads the candidate pool, so its windows live in `merged`. One in the vector arm
+    /// would put a WindowAgg over the ordered index scan pgvector's iterative scan resumes from.
+    #[test]
+    fn the_minmax_windows_sit_above_the_arms_and_the_guard_is_in_place() {
+        for (sql, _) in MINMAX_SQL {
+            let arms = &sql[..sql.find("merged AS (").unwrap()];
+            assert!(!arms.contains("OVER"), "a window reached an arm");
+            let merged = &sql[sql.find("merged AS (").unwrap()..sql.rfind("SELECT m.id,").unwrap()];
+            assert_eq!(merged.matches("OVER ()").count(), 5, "two in the test, three in the ratio");
+            assert!(merged.contains("WHEN v.similarity IS NULL THEN 0.0::float8"));
+            assert!(merged.contains("WHEN max(v.similarity) OVER () > min(v.similarity) OVER ()"));
+            assert!(merged.contains("ELSE 1.0::float8"), "max equal to min takes the top");
+            assert!(sql.contains("g.cosine_norm * $9 + g.lexical * $10"));
+            assert!(!sql.contains("g.similarity * $9"), "the raw cosine left the blend");
+            assert!(!sql.contains("row_number"));
+        }
+    }
+
+    /// A scored sibling is its statement plus columns, so debug scores cannot reorder a result.
+    #[test]
+    fn a_scored_sibling_differs_from_its_statement_by_the_select_list_alone() {
+        for (scored, plain, extra) in [
+            (SEARCH_LIVE_SCORED, SEARCH_LIVE, linear_scored!()),
+            (SEARCH_RRF_LIVE_SCORED, SEARCH_RRF_LIVE, rrf_scored!()),
+            (SEARCH_MINMAX_LIVE_SCORED, SEARCH_MINMAX_LIVE, minmax_scored!()),
+        ] {
+            assert_eq!(scored.matches(extra).count(), 1);
+            assert_eq!(scored.replacen(extra, "", 1), plain);
+            let tail = &scored[scored.find(" AS score").unwrap()..];
+            assert!(tail.starts_with(&format!(" AS score{extra}")), "after the score, not inside");
+        }
+        for sql in [SEARCH_LIVE, SEARCH_RRF_LIVE, SEARCH_MINMAX_LIVE] {
+            assert!(!sql.contains("keyword_score"), "a plain statement gained a debug column");
+        }
+    }
+
+    #[test]
+    fn only_a_live_untagged_search_has_a_scored_sibling() {
+        use Fusion::{Linear, LinearMinmax, Rrf};
+        assert_eq!(scored_statement(Linear, false, false, false), Some(SEARCH_LIVE_SCORED));
+        assert_eq!(scored_statement(Rrf, false, false, false), Some(SEARCH_RRF_LIVE_SCORED));
+        assert_eq!(
+            scored_statement(LinearMinmax, false, false, false),
+            Some(SEARCH_MINMAX_LIVE_SCORED)
+        );
+        for fusion in [Linear, Rrf, LinearMinmax] {
+            for (as_of, history, tagged) in
+                [(true, false, false), (false, true, false), (false, false, true)]
+            {
+                assert_eq!(scored_statement(fusion, as_of, history, tagged), None);
+            }
+        }
+    }
+
+    #[test]
+    fn the_minmax_blend_has_a_statement_for_every_shape() {
+        use Fusion::LinearMinmax as M;
+        let cases = [
+            ((false, false, false), SEARCH_MINMAX_LIVE),
+            ((false, true, false), SEARCH_MINMAX_ALL),
+            ((true, false, false), SEARCH_MINMAX_AS_OF),
+            ((true, true, false), SEARCH_MINMAX_AS_OF),
+            ((false, false, true), SEARCH_MINMAX_LIVE_TAGGED),
+            ((false, true, true), SEARCH_MINMAX_ALL_TAGGED),
+            ((true, false, true), SEARCH_MINMAX_AS_OF_TAGGED),
+        ];
+        for ((as_of, history, tagged), want) in cases {
+            assert_eq!(search_statement(M, as_of, history, tagged), want);
+        }
+    }
+
+    /// The rescale in Rust, mirroring the `cosine_norm` CASE in `minmax_search_sql!`. The text
+    /// assertions above tie it to the statement; this settles what the formula does.
+    fn min_max(cosine: Option<f64>, pool: &[Option<f64>]) -> f64 {
+        let seen: Vec<f64> = pool.iter().flatten().copied().collect();
+        let lo = seen.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = seen.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        match cosine {
+            None => 0.0,
+            Some(c) if hi > lo => (c - lo) / (hi - lo),
+            Some(_) => 1.0,
+        }
+    }
+
+    #[test]
+    fn the_rescale_maps_the_pool_onto_zero_to_one() {
+        let pool = [Some(0.81), Some(0.84), Some(0.87), None];
+        assert_eq!(min_max(Some(0.87), &pool), 1.0);
+        assert_eq!(min_max(Some(0.81), &pool), 0.0);
+        assert!((min_max(Some(0.84), &pool) - 0.5).abs() < 1e-12);
+        assert_eq!(min_max(None, &pool), 0.0, "a lexical-only row scores the floor");
+    }
+
+    /// A lexical-only row stays out of the minimum. Counted as a zero, it would turn the rescale
+    /// into a division by the maximum and leave a 0.81 to 0.87 pool squeezed into 0.93 to 1.
+    #[test]
+    fn a_row_with_no_cosine_does_not_drag_the_minimum_down() {
+        let with = [Some(0.81), Some(0.87), None];
+        let without = [Some(0.81), Some(0.87)];
+        assert_eq!(min_max(Some(0.81), &with), min_max(Some(0.81), &without));
+        assert_eq!(min_max(Some(0.81), &with), 0.0);
+    }
+
+    #[test]
+    fn a_pool_with_no_spread_takes_the_top_rather_than_dividing_by_zero() {
+        assert_eq!(min_max(Some(0.8), &[Some(0.8)]), 1.0);
+        assert_eq!(min_max(Some(0.8), &[Some(0.8), Some(0.8), None]), 1.0);
+        assert!(min_max(Some(0.8), &[Some(0.8)]).is_finite());
+    }
+
+    /// Two embedders that order the pool the same give the same rescaled cosines, however
+    /// differently they spread it. That is the property the blend exists for.
+    #[test]
+    fn the_rescale_ignores_where_an_embedder_puts_its_band() {
+        let narrow = [Some(0.80), Some(0.82), Some(0.84)];
+        let wide = [Some(0.40), Some(0.60), Some(0.80)];
+        for i in 0..3 {
+            assert!((min_max(narrow[i], &narrow) - min_max(wide[i], &wide)).abs() < 1e-9);
         }
     }
 

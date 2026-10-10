@@ -43,6 +43,23 @@ pub struct Hit {
     pub namespace: String,
     pub content: String,
     pub score: f64,
+    /// Present only on a server run with `SEARCH_DEBUG_SCORES=true`.
+    #[serde(default)]
+    pub scores: Option<HitScores>,
+}
+
+/// `domain::types::ScoreParts`. The LongMemEval harness copies it into its per-hit log.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+pub struct HitScores {
+    pub cosine: f64,
+    pub keyword: f64,
+    pub fused: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cosine_norm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vector_rank: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyword_rank: Option<i64>,
 }
 
 /// `memory_write`'s structured content, from `domain::types::WriteOutcome`.

@@ -90,6 +90,96 @@ of these is set on that scratch server:
   harness writes under. The eval has no need for OAuth, and a static token keeps the run's own
   authorization out of the variables being measured.
 - `EMBED_MODEL=all-MiniLM-L6-v2`. See below.
+- `SEARCH_DEBUG_SCORES=true`. Each hit carries its cosine, keyword score and fused score, which the
+  harness copies into the per-hit log. The setting runs a sibling statement that adds columns to the
+  final select list and changes nothing above it, so the order is the order a deployment gets.
+  `tests/search_minmax.rs` compares the two orders on a real Postgres; that file has not run yet.
+
+## Reusing one corpus across blends
+
+A fusion sweep changes how search combines its two arms and nothing about what is stored. Writing
+the corpus again for each blend embeds every session again, so the script writes each corpus once
+and reruns only the searches.
+
+Write once, per model and per mode, and keep the database:
+
+```bash
+./scripts/eval-longmemeval.sh --db lme_gemma_scoped --keep --out gemma-scoped-linear035.json
+./scripts/eval-longmemeval.sh --db lme_gemma_corpus --corpus-wide --keep \
+  --out gemma-corpus-linear035.json
+```
+
+Then search the kept database once per blend:
+
+```bash
+./scripts/eval-longmemeval.sh --db lme_gemma_scoped --search-only --lexical-weight 0.2 \
+  --out gemma-scoped-linear020.json
+./scripts/eval-longmemeval.sh --db lme_gemma_scoped --search-only --fusion linear_minmax \
+  --out gemma-scoped-minmax035.json
+```
+
+Each run starts a fresh scratch server with that run's `SEARCH_*` settings: `--fusion` sets
+`SEARCH_FUSION` (`linear`, `linear_minmax` or `rrf`), `--lexical-weight` sets
+`SEARCH_LEXICAL_WEIGHT` and `--rrf-k` sets `SEARCH_RRF_K`. Unset, each keeps the server default:
+linear, 0.35 and 60. The script reads them from its flags alone and never from `.env`.
+
+`--search-only` writes no memory and deletes none. It refuses a database that does not exist, refuses
+`--isolate` (which deletes each haystack), refuses `--resume`, and stops before the first search if
+any namespace it needs holds no rows. Scoped mode needs every `project:lme-qNNNN` namespace the
+writing run filled, so pass the same `--limit`, `--type` and `--protocol`. The database survives the
+run whatever `--keep` says.
+
+Two things differ from a writing run, and the report carries both:
+
+- **The access counters reset first.** Every search raises `access_count` on the rows it returns,
+  and the use boost (`SEARCH_USAGE_WEIGHT`, 0.05) reads it. Without a reset each blend would rank
+  against the reads of every blend before it. The script sets `access_count` to 0 and
+  `last_accessed_at` to NULL on every row before the server starts, which is where the writing run's
+  rows stood when it searched them.
+- **The map from rows to sessions comes from the store.** A writing run records which session each
+  write landed on from the id the server returned. A search-only run reads every row through
+  `/admin/export` and matches it by the session id the harness put in its tags, then by exact text.
+  A session whose write collapsed into a near-identical row matches neither and counts in
+  `sessions_never_stored`, where the writing run scored it through the other row. A nonzero count in a
+  search-only report against a zero in the writing run's report is that difference, and it is the
+  same in every blend run from one corpus.
+
+## The per-hit log
+
+A run given `--out` writes one JSON line per question beside the report: `report.json` gets
+`report.hits.jsonl`. A run with no `--out` writes neither file. Lines are flushed as they are
+written, so an interrupted run keeps the questions it finished.
+
+```json
+{"question_id": "e47becba", "question_type": "single-session-user",
+ "gold_session_ids": ["answer_280352e9"],
+ "hits": [
+   {"rank": 1, "memory_id": "9f1c...", "session_ids": ["answer_280352e9"], "score": 1.0319,
+    "cosine": 0.8123, "keyword": 0.0911, "fused": 1.031885, "cosine_norm": 1.0, "gold": true}
+ ]}
+```
+
+`rank` is the hit's position in the store's answer, before hits fold into sessions. `score` is the
+rounded score `memory_search` always returns. `cosine`, `keyword` and `fused` are the unrounded
+parts, null when the server ran without `SEARCH_DEBUG_SCORES`. A row only the keyword arm found
+has `cosine` 0, and a row only the vector arm found has `keyword` 0. `cosine_norm` appears under
+`linear_minmax`, and `vector_rank` and `keyword_rank` under `rrf`. `gold` is true when any session
+the hit maps to is in the gold set; a hit that maps to no session lists none and is never gold.
+
+## The min-max blend
+
+`SEARCH_FUSION=linear_minmax` scores `cosine_norm * SEARCH_VECTOR_WEIGHT + keyword *
+SEARCH_LEXICAL_WEIGHT`, plus the use boost and namespace penalty the linear blend applies.
+`cosine_norm` rescales each query's candidate cosines to 0..1: the best becomes 1 and the worst 0.
+The candidates are the rows the linear statement already scores, the union of the two arms. Only
+rows the vector arm returned set the minimum and maximum; a row the keyword arm alone found scores 0,
+as it scores a cosine of 0 under the linear blend. A pool whose cosines are all equal, one row
+included, scores 1 rather than dividing by zero.
+
+The reason to try it: an embedder that packs neighbours into a narrow band (EmbeddingGemma 2's
+neighbour median sits at 0.807 against bge-base's 0.745) leaves the cosine term spread over a few
+hundredths, so a keyword weight tuned on one model means something else on another. No run has
+measured it yet.
 
 ## What is being compared, and what is not
 

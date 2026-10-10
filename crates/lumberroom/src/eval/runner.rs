@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::client::{err, Client, Result};
+use crate::eval::hitlog::{self, HitLog};
+use crate::eval::store::{self, ExpectedSession, StoredRow};
 use crate::eval::{corpus, dataset};
 use crate::eval::{Protocol, Question, QuestionResult, RunReport};
 use crate::wire;
@@ -27,6 +29,10 @@ pub struct EvalArgs {
     /// store. Reproduces agentmemory's fresh-index-per-question and measures ranking with the rest
     /// of the corpus taken away.
     pub isolate: bool,
+    /// Write nothing. Search a corpus an earlier run left in the store, and rebuild the map from
+    /// memory ids to sessions out of the stored rows. One corpus then serves every blend in a
+    /// sweep, and each blend costs a search pass rather than an embedding pass per session.
+    pub search_only: bool,
     /// Prepend each session's dataset date to its text. A deviation from the published protocol,
     /// which carried no dates, and the cheap way to learn whether a temporal signal matters here.
     pub dates_in_text: bool,
@@ -255,10 +261,16 @@ async fn write_corpus(
 }
 
 /// One corpus-wide question: search the shared pool, map hits through the corpus-wide owners, score.
-async fn search_corpus(c: &Client, q: &Question, corpus: &SharedCorpus) -> Result<QuestionResult> {
+async fn search_corpus(
+    c: &Client,
+    q: &Question,
+    corpus: &SharedCorpus,
+    log: &mut HitLog,
+) -> Result<QuestionResult> {
     let started = Instant::now();
     let hits = search(c, &q.question, CORPUS_NAMESPACE, crate::eval::RETRIEVE_DEPTH).await?;
     let latency_ms = started.elapsed().as_millis() as u64;
+    log.write(&hitlog::question_line(q, &hits, &corpus.owners))?;
 
     let hit_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
     let (retrieved, unmapped) = sessions_in_rank_order(&hit_ids, &corpus.owners);
@@ -285,6 +297,113 @@ async fn search_corpus(c: &Client, q: &Question, corpus: &SharedCorpus) -> Resul
     Ok(result)
 }
 
+/// The sessions a scoped question wrote, as `corpus::build` rendered them.
+fn expected_for(q: &Question, args: &EvalArgs) -> Vec<ExpectedSession> {
+    q.haystack_session_ids
+        .iter()
+        .zip(q.haystack_sessions.iter())
+        .enumerate()
+        .map(|(i, (id, turns))| ExpectedSession {
+            id: id.clone(),
+            pieces: corpus::session_pieces(
+                turns,
+                args.protocol,
+                args.chunk_chars,
+                q.haystack_dates.get(i).map(String::as_str).filter(|_| args.dates_in_text),
+            ),
+        })
+        .collect()
+}
+
+/// Every unique session in the dataset, first occurrence winning, the selected questions first.
+///
+/// `write_corpus` takes a session's date from its first occurrence among the selected questions,
+/// so the selected ones lead here and the text matches what was written. The rest follow because
+/// an earlier run may have written a wider selection, and a row whose session is unknown here
+/// would read as an orphan hit.
+fn expected_corpus(
+    selected: &[(usize, &Question)],
+    all: &[Question],
+    args: &EvalArgs,
+) -> Vec<ExpectedSession> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out: Vec<ExpectedSession> = Vec::new();
+    for q in selected.iter().map(|(_, q)| *q).chain(all.iter()) {
+        for (i, id) in q.haystack_session_ids.iter().enumerate() {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            let turns = q.haystack_sessions.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            out.push(ExpectedSession {
+                id: id.clone(),
+                pieces: corpus::session_pieces(
+                    turns,
+                    args.protocol,
+                    args.chunk_chars,
+                    q.haystack_dates.get(i).map(String::as_str).filter(|_| args.dates_in_text),
+                ),
+            });
+        }
+    }
+    out
+}
+
+/// One scoped question against a namespace an earlier run filled. Nothing is written or deleted.
+async fn search_stored(
+    c: &Client,
+    q: &Question,
+    index: usize,
+    args: &EvalArgs,
+    rows: &[&StoredRow],
+    log: &mut HitLog,
+) -> Result<QuestionResult> {
+    let namespace = crate::eval::question_namespace(index);
+    let rebuilt = store::owners_from_store(&expected_for(q, args), rows);
+    let mut failures: Vec<String> = rebuilt
+        .missing
+        .iter()
+        .map(|id| format!("{MISSING_SESSION}{id} ({})", store::NOT_IN_STORE))
+        .collect();
+
+    let started = Instant::now();
+    let hits = search(c, &q.question, &namespace, crate::eval::RETRIEVE_DEPTH).await?;
+    let latency_ms = started.elapsed().as_millis() as u64;
+    log.write(&hitlog::question_line(q, &hits, &rebuilt.owners))?;
+
+    let hit_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+    let (retrieved, unmapped) = sessions_in_rank_order(&hit_ids, &rebuilt.owners);
+    for id in &unmapped {
+        failures.push(format!("{UNMAPPED_HIT}{id}"));
+    }
+    let mut result = QuestionResult::score(
+        q.question_id.clone(),
+        q.question_type.clone(),
+        q.answer_session_ids.clone(),
+        retrieved,
+    );
+    result.write_failures = failures;
+    result.rows_written = 0;
+    result.latency_ms = latency_ms;
+    Ok(result)
+}
+
+/// Refuse a search-only run whose flags would write, delete or skip.
+fn check_search_only(args: &EvalArgs) -> Result<()> {
+    if args.isolate {
+        return Err(err(
+            "--search-only cannot run with --isolate: isolation deletes each haystack once it is \
+             scored, which destroys the corpus the next blend in the sweep needs",
+        ));
+    }
+    if args.resume {
+        return Err(err(
+            "--search-only and --resume do not combine: search-only already writes nothing and \
+             reads every question's rows from the store",
+        ));
+    }
+    Ok(())
+}
+
 /// What configuration produced a report. Printed at the top of it, because a parity number and a
 /// scale number look identical on the page and mean different things.
 pub fn mode_name(args: &EvalArgs) -> String {
@@ -303,6 +422,7 @@ pub async fn run_question(
     q: &Question,
     index: usize,
     args: &EvalArgs,
+    log: &mut HitLog,
 ) -> Result<QuestionResult> {
     let namespace = crate::eval::question_namespace(index);
 
@@ -343,6 +463,7 @@ pub async fn run_question(
         let hits = search(c, &q.question, &namespace, crate::eval::RETRIEVE_DEPTH).await?;
         (hits, started.elapsed().as_millis() as u64)
     };
+    log.write(&hitlog::question_line(q, &hits, &owners))?;
 
     let hit_ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
     let (retrieved, unmapped) = sessions_in_rank_order(&hit_ids, &owners);
@@ -432,10 +553,68 @@ pub async fn run(c: &Client, args: &EvalArgs) -> Result<RunReport> {
              rerun it whole against a fresh database",
         ));
     }
-    let shared = match corpus_wide {
-        true => Some(write_corpus(c, &selected, args).await?),
-        false => None,
+
+    // Read before anything is searched, so an empty namespace stops the run at the start rather
+    // than at question 300 after a long wait.
+    let stored: Vec<StoredRow> = match args.search_only {
+        true => {
+            check_search_only(args)?;
+            let rows = store::read_store(c).await?;
+            crate::out(&format!("search-only: {} rows in the store", rows.len()));
+            rows
+        }
+        false => Vec::new(),
     };
+    let grouped = store::by_namespace(&stored);
+    let mut stored_rows: Option<usize> = None;
+    if args.search_only {
+        let wanted: Vec<String> = match corpus_wide {
+            true => vec![CORPUS_NAMESPACE.to_string()],
+            false => selected.iter().map(|(i, _)| crate::eval::question_namespace(*i)).collect(),
+        };
+        let empty = store::empty_namespaces(wanted.iter().map(String::as_str), &grouped);
+        if !empty.is_empty() {
+            let shown: Vec<&str> = empty.iter().take(5).map(String::as_str).collect();
+            return Err(err(format!(
+                "--search-only found {} of {} namespaces empty ({}{}). Write the corpus first \
+                 with the same mode, protocol and selection, and --keep the database.",
+                empty.len(),
+                wanted.len(),
+                shown.join(", "),
+                if empty.len() > shown.len() { ", ..." } else { "" }
+            )));
+        }
+        stored_rows =
+            Some(wanted.iter().map(|ns| grouped.get(ns.as_str()).map_or(0, Vec::len)).sum());
+    }
+
+    let shared = match (corpus_wide, args.search_only) {
+        (true, false) => Some(write_corpus(c, &selected, args).await?),
+        (true, true) => {
+            let rows = grouped.get(CORPUS_NAMESPACE).cloned().unwrap_or_default();
+            let rebuilt =
+                store::owners_from_store(&expected_corpus(&selected, &questions, args), &rows);
+            Some(SharedCorpus {
+                owners: rebuilt.owners,
+                rows_written: 0,
+                missing: rebuilt
+                    .missing
+                    .into_iter()
+                    .map(|id| (id, store::NOT_IN_STORE.to_string()))
+                    .collect(),
+            })
+        }
+        (false, _) => None,
+    };
+
+    // Beside the report, so only when a report is written. See `HitLog`.
+    let mut log = match &args.out {
+        Some(out) => HitLog::create(hitlog::hits_path(std::path::Path::new(out)))?,
+        None => HitLog::off(),
+    };
+    if let Some(path) = log.path() {
+        crate::out(&format!("per-hit log: {}", path.display()));
+    }
 
     let mut results: Vec<QuestionResult> = Vec::with_capacity(selected.len());
     let mut hits_at_5 = 0.0f64;
@@ -444,8 +623,13 @@ pub async fn run(c: &Client, args: &EvalArgs) -> Result<RunReport> {
         // error is not a retrieval miss and averaging it in would quietly lower the number. The
         // haystacks already written stay in the store, so `--resume` picks the run back up.
         let result = match &shared {
-            Some(corpus) => search_corpus(c, q, corpus).await?,
-            None => run_question(c, q, index, args).await?,
+            Some(corpus) => search_corpus(c, q, corpus, &mut log).await?,
+            None if args.search_only => {
+                let ns = crate::eval::question_namespace(index);
+                let rows = grouped.get(ns.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+                search_stored(c, q, index, args, rows, &mut log).await?
+            }
+            None => run_question(c, q, index, args, &mut log).await?,
         };
         hits_at_5 += result.recall_any_at_5;
         results.push(result);
@@ -481,7 +665,9 @@ pub async fn run(c: &Client, args: &EvalArgs) -> Result<RunReport> {
         .filter(|f| f.starts_with(MISSING_SESSION))
         .count();
 
-    let rows_at_end = if let Some(corpus) = &shared {
+    let rows_at_end = if let Some(n) = stored_rows {
+        n
+    } else if let Some(corpus) = &shared {
         corpus.rows_written
     } else if args.isolate {
         // Isolation deletes each haystack once it is scored, so the store never holds more than
@@ -495,6 +681,7 @@ pub async fn run(c: &Client, args: &EvalArgs) -> Result<RunReport> {
         protocol: args.protocol.as_str().to_string(),
         mode: mode_name(args),
         rows_at_end,
+        search_only: args.search_only,
         embedding_model,
         retrieve_depth: crate::eval::RETRIEVE_DEPTH,
         overall: crate::eval::aggregate(&results),
@@ -637,6 +824,7 @@ mod tests {
             json: false,
             resume: false,
             isolate: false,
+            search_only: false,
             scoped: true,
             dates_in_text: false,
             only_type: None,
@@ -672,6 +860,7 @@ mod resume_mapping {
             namespace: "project:lme-q0000".into(),
             content: content.into(),
             score: 1.0,
+            scores: None,
         }
     }
 

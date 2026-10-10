@@ -77,6 +77,7 @@ fn search_config(fusion: Fusion) -> SearchConfig {
         usage_weight: 0.05,
         fusion,
         rrf_k: DEFAULT_RRF_K,
+        debug_scores: false,
     }
 }
 
@@ -103,7 +104,7 @@ async fn search_ids(repo: &impl MemoryRepository, lexical: f64) -> Vec<String> {
     .collect()
 }
 
-/// Weight zero turns the lexical arm off, under both blends. A row only that arm can find drops out
+/// Weight zero turns the lexical arm off, under every blend. A row only that arm can find drops out
 /// of the result at zero and comes back at the default weight, which proves the arm ran nothing
 /// rather than scoring a row nobody would rank.
 ///
@@ -116,7 +117,7 @@ async fn a_zero_lexical_weight_skips_the_lexical_arm() {
     let vector_hit = insert(&pool, "the harbour office opens at nine", true).await;
     let lexical_only = insert(&pool, "the kestrel host moved to port 5433", false).await;
 
-    for fusion in [Fusion::Linear, Fusion::Rrf] {
+    for fusion in [Fusion::Linear, Fusion::Rrf, Fusion::LinearMinmax] {
         let repo =
             postgres::PgMemoryRepository::new(pool.clone()).with_search(&search_config(fusion));
 

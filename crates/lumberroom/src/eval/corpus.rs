@@ -155,6 +155,38 @@ fn split_turn(role: &str, content: &str, budget: usize) -> Vec<String> {
     pieces
 }
 
+/// The text of every row one session becomes, exactly as `build` writes it.
+///
+/// One function for the write and for a search-only run that matches stored rows back to sessions
+/// by their text. Two copies would agree until somebody edited one, and every row the other then
+/// failed to recognise would read as a session the store never held.
+pub fn session_pieces(
+    turns: &[Turn],
+    protocol: Protocol,
+    chunk_chars: usize,
+    date: Option<&str>,
+) -> Vec<String> {
+    let pieces = match protocol {
+        Protocol::SessionAsDocument => {
+            let text = render_session(turns);
+            match text.is_empty() {
+                true => vec![],
+                false => vec![text],
+            }
+        }
+        Protocol::Chunked => chunk_session(turns, chunk_chars),
+    };
+    // A published run rendered `role: content` and nothing else, and declared the session dates
+    // in its types without ever reading them. Prepending the date is therefore an advantage over
+    // that protocol rather than a match for it, so it stays behind a flag and the report names
+    // it. It exists to answer one question cheaply: does a temporal signal move retrieval at all,
+    // before anybody migrates a schema to carry one.
+    match date {
+        Some(d) => pieces.into_iter().map(|p| format!("date: {d}\n{p}")).collect(),
+        None => pieces,
+    }
+}
+
 /// Record one accepted write.
 ///
 /// `memory_write` deduplicates, so two sessions holding the same text come back as one id and that
@@ -193,34 +225,16 @@ pub async fn build(
             ));
             continue;
         };
-        let pieces = match protocol {
-            Protocol::SessionAsDocument => {
-                let text = render_session(turns);
-                match text.is_empty() {
-                    true => vec![],
-                    false => vec![text],
-                }
-            }
-            Protocol::Chunked => chunk_session(turns, chunk_chars),
+        let date = match dates_in_text {
+            true => q.haystack_dates.get(index).map(String::as_str),
+            false => None,
         };
+        let pieces = session_pieces(turns, protocol, chunk_chars, date);
         if pieces.is_empty() {
             corpus.missing_sessions.push(session_id.clone());
             continue;
         }
-        // A published run rendered `role: content` and nothing else, and declared the session
-        // dates in its types without ever reading them. Prepending the date is therefore an
-        // advantage over that protocol rather than a match for it, so it stays behind a flag and
-        // the report names it. It exists to answer one question cheaply: does a temporal signal
-        // move retrieval at all, before anybody migrates a schema to carry one.
-        let stamp = match dates_in_text {
-            true => q.haystack_dates.get(index).map(|d| format!("date: {d}\n")),
-            false => None,
-        };
         for content in pieces {
-            let content = match &stamp {
-                Some(prefix) => format!("{prefix}{content}"),
-                None => content,
-            };
             jobs.push(Job { session_id: session_id.clone(), content });
         }
     }

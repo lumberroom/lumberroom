@@ -33,7 +33,7 @@ use crate::domain::errors::{DomainError, Result};
 use crate::domain::namespaces;
 use crate::domain::policy::NamespaceCeiling;
 use crate::domain::tags;
-use crate::domain::types::Sensitivity;
+use crate::domain::types::{ScoreParts, Sensitivity};
 use crate::ports::{Emission, SearchQuery, Weights};
 
 /// The name this tool records its emissions under, and the same string `recall_emission.tool`
@@ -80,6 +80,10 @@ pub struct Hit {
     pub occurred_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occurred_until: Option<String>,
+    /// The blend's parts, under `SEARCH_DEBUG_SCORES` alone. Off, the key is absent and the answer
+    /// is the one every client already parses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scores: Option<ScoreParts>,
 }
 
 /// Namespaces holding the same subject under an earlier name.
@@ -291,6 +295,7 @@ pub async fn run_tagged(
             similarity: hit.similarity,
             primary: hit.primary,
             superseded_by: hit.memory.superseded_by,
+            scores: hit.scores,
         });
     }
 

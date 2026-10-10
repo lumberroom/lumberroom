@@ -24,8 +24,10 @@
 
 pub mod corpus;
 pub mod dataset;
+pub mod hitlog;
 pub mod report;
 pub mod runner;
+pub mod store;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -148,8 +150,12 @@ pub struct RunReport {
     /// that built a fresh index per question, and it is the one that says least about scale.
     pub mode: String,
     /// Rows the store held when the last question searched. The whole point of the two harder
-    /// modes, and meaningless in `isolated`, where it is one question's haystack.
+    /// modes, and meaningless in `isolated`, where it is one question's haystack. A search-only run
+    /// counts the rows it found in the searched namespaces, where a writing run counts accepted
+    /// writes, collapses included.
     pub rows_at_end: usize,
+    /// True when this run wrote nothing and searched a corpus an earlier run left in the store.
+    pub search_only: bool,
     pub embedding_model: String,
     pub retrieve_depth: i64,
     pub overall: Aggregate,
@@ -328,6 +334,7 @@ pub async fn dispatch(
         json: args.present("json"),
         resume: args.present("resume"),
         isolate: args.present("isolate"),
+        search_only: args.present("search-only"),
         dates_in_text: args.present("dates-in-text"),
         only_type: args.value("type").map(str::to_string),
         // Scoped by default. `--corpus-wide` is the hard configuration.

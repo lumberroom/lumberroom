@@ -100,8 +100,9 @@ pub struct Verdict {
 pub enum Scale {
     /// Absolute cosine, the linear blend. What the numbers below were measured against.
     Cosine,
-    /// Rank fusion. Scores are near `1/(k + rank)` and share no scale with the above, so the router
-    /// stands down rather than comparing across scales.
+    /// Rank fusion, or the linear blend over a min-max rescaled cosine. Rank fusion scores sit near
+    /// `1/(k + rank)`, and the rescaled blend puts the top hit at 1.0 on every query. Neither shares
+    /// a scale with the above, so the router stands down rather than comparing across scales.
     Ranked,
 }
 

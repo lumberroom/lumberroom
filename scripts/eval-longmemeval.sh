@@ -7,6 +7,11 @@
 #   ./scripts/eval-longmemeval.sh --protocol session-as-document --limit 20 --out report.json
 #   ./scripts/eval-longmemeval.sh --dataset /path/to/longmemeval_s_cleaned.json --resume
 #
+# A fusion sweep writes each corpus once and reruns only the searches for each blend:
+#   ./scripts/eval-longmemeval.sh --db lme_gemma_scoped --keep --out gemma-linear035.json
+#   ./scripts/eval-longmemeval.sh --db lme_gemma_scoped --search-only --lexical-weight 0.2 \
+#     --out gemma-linear020.json
+#
 # Flags, all optional:
 #   --dataset PATH   the LongMemEval-S JSON file. Default: ./longmemeval_s_cleaned.json,
 #                     the name the fetch command below leaves it under.
@@ -14,6 +19,20 @@
 #                     or chunked (not comparable; see docs/eval-longmemeval.md).
 #   --limit N         stop after N questions, for a smoke run before the full 500.
 #   --resume          skip a question whose namespace already holds rows.
+#   --search-only     write nothing. Search the corpus an earlier --keep run left in --db, under
+#                       whatever blend this run's flags set. The database must already exist; it is
+#                       never dropped on exit, whatever --keep says. Scoped mode searches the
+#                       per-question namespaces that run wrote, so pair it with the same --limit,
+#                       --type and --protocol, and never with --isolate, which deleted them.
+#                       Before the server starts, every row's access_count and last_accessed_at go
+#                       back to 0 and NULL: each search raises them and the use boost reads them, so
+#                       without the reset each blend would rank against the reads of the one before.
+#                       The writing run searched rows that started at 0, so the reset matches it.
+#                       Sessions the store cannot trace by tag or exact text still count in
+#                       sessions_never_stored.
+#   --fusion NAME     the server's SEARCH_FUSION: linear (default), linear_minmax or rrf.
+#   --lexical-weight W  the server's SEARCH_LEXICAL_WEIGHT. Unset leaves the default, 0.35.
+#   --rrf-k K         the server's SEARCH_RRF_K. Unset leaves the default, 60.
 #   --out PATH        where the JSON report is written.
 #   --port N          the scratch server's port. Default 8788, never 8787.
 #   --isolate         delete each question's haystack once it is scored, so the next question meets
@@ -31,6 +50,18 @@
 #   --keep            leave the scratch database in place after the run. Without this flag the
 #                     script drops it on exit; with it, drop it later with:
 #                       docker compose exec db dropdb -U <POSTGRES_USER> <NAME>
+#
+# Every run sets SEARCH_DEBUG_SCORES=true on the scratch server, so each hit carries its cosine,
+# keyword score and fused score. That changes the select list and never the order. With --out, the
+# harness writes them, one JSON line per question, beside the report: report.json gets
+# report.hits.jsonl.
+#
+# LUMBERROOM_EVAL_DB_CONTAINER names an already-running Postgres container to use instead of the
+# compose `db` service. Set, the script never runs `docker compose up`, and every pg_isready, psql,
+# create and drop goes through `docker exec -i <container>`. LUMBERROOM_EVAL_DB_HOST is then the
+# host the scratch server reaches it at, the container's name on LUMBERROOM_DOCKER_NETWORK
+# (default `db`, the compose service). The container takes POSTGRES_USER and POSTGRES_PASSWORD
+# from .env, as the compose one does.
 #
 # LUMBERROOM_EVAL_EMBED_PROVIDER=openai with LUMBERROOM_EVAL_EMBED_BASE_URL, _API_KEY and
 # _MAX_INPUT_CHARS points the scratch server at an OpenAI-compatible embeddings endpoint. They are
@@ -55,7 +86,9 @@ REPO_DIR="$PWD"
 
 USAGE="usage: eval-longmemeval.sh [--dataset PATH] [--protocol session-as-document|chunked]
                             [--limit N] [--isolate] [--corpus-wide]
-                            [--resume] [--out PATH] [--port N] [--keep]
+                            [--resume] [--out PATH] [--port N] [--keep] [--db NAME]
+                            [--search-only] [--fusion linear|linear_minmax|rrf]
+                            [--lexical-weight W] [--rrf-k K]
                             [--embed-model NAME] [--embed-max-tokens N]
 
 Runs LongMemEval-S against a scratch server on port 8788 (default) and a scratch database
@@ -77,8 +110,14 @@ CORPUS_WIDE=0
 # Prepending each session's date is a deviation from the published protocol, which carried none.
 DATES_IN_TEXT=0
 ONLY_TYPE=""
-# linear adds the two arms' raw scores, which is what ships. rrf fuses their ranks.
+# linear adds the two arms' raw scores, which is what ships. rrf fuses their ranks. linear_minmax
+# rescales each query's candidate cosines to 0..1 before the linear sum.
 FUSION=""
+# Read from flags alone, never from .env, which this script sources: a weight left in the owner's
+# .env would otherwise move every run without appearing on its command line.
+LEXICAL_WEIGHT=""
+RRF_K=""
+SEARCH_ONLY=0
 EMBED_MODEL="all-MiniLM-L6-v2"
 EMBED_MAX_TOKENS=""
 KEEP=0
@@ -96,6 +135,9 @@ while [ $# -gt 0 ]; do
     --dates-in-text) DATES_IN_TEXT=1; shift ;;
     --type) ONLY_TYPE="$2"; shift 2 ;;
     --fusion) FUSION="$2"; shift 2 ;;
+    --lexical-weight) LEXICAL_WEIGHT="$2"; shift 2 ;;
+    --rrf-k) RRF_K="$2"; shift 2 ;;
+    --search-only) SEARCH_ONLY=1; shift ;;
     --port) PORT="$2"; shift 2 ;;
     --embed-model) EMBED_MODEL="$2"; shift 2 ;;
     --embed-max-tokens) EMBED_MAX_TOKENS="$2"; shift 2 ;;
@@ -127,11 +169,30 @@ echo "dataset: $DATASET"
 }
 POSTGRES_USER="${POSTGRES_USER:-lumberroom}"
 NETWORK="${LUMBERROOM_DOCKER_NETWORK:-lumberroom_default}"
+DB_CONTAINER="${LUMBERROOM_EVAL_DB_CONTAINER:-}"
+DB_HOST="${LUMBERROOM_EVAL_DB_HOST:-db}"
+
+if [ "$SEARCH_ONLY" -eq 1 ]; then
+  [ "$ISOLATE" -eq 0 ] || {
+    echo "--search-only cannot run with --isolate: isolation deletes the corpus it searches" >&2
+    exit 1
+  }
+  # The corpus is the input here, so dropping it on exit would cost the next blend a full write.
+  KEEP=1
+fi
 SERVER_NAME="${LUMBERROOM_EVAL_SERVER_NAME:-lumberroom-eval-server}"
 # A function rather than a `docker compose -f ...` string in a variable: POSIX sh has no arrays,
 # so a multi-word command stored as a plain string breaks the moment REPO_DIR has a space in it.
 compose() {
   docker compose -f "$REPO_DIR/docker-compose.yml" "$@"
+}
+# Every command that runs inside the Postgres container, whichever container that is.
+db_exec() {
+  if [ -n "$DB_CONTAINER" ]; then
+    docker exec -i "$DB_CONTAINER" "$@"
+  else
+    compose exec -T db "$@"
+  fi
 }
 
 docker image inspect lumberroom-builder >/dev/null 2>&1 || {
@@ -152,12 +213,21 @@ abs_path() {
 DATASET="$(abs_path "$DATASET")"
 [ -z "$OUT" ] || OUT="$(abs_path "$OUT")"
 
-echo "bringing up the compose database (reusing it if already running)..."
-compose up -d db >/dev/null
+if [ -n "$DB_CONTAINER" ]; then
+  # Never started or recreated from here: the container is the caller's, configured elsewhere.
+  [ "$(docker inspect -f '{{.State.Running}}' "$DB_CONTAINER" 2>/dev/null)" = "true" ] || {
+    echo "LUMBERROOM_EVAL_DB_CONTAINER=$DB_CONTAINER is not a running container" >&2
+    exit 1
+  }
+  echo "using the postgres container $DB_CONTAINER at host $DB_HOST on network $NETWORK"
+else
+  echo "bringing up the compose database (reusing it if already running)..."
+  compose up -d db >/dev/null
+fi
 
 echo "waiting for postgres..."
 i=0
-until compose exec -T db pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; do
+until db_exec pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; do
   i=$((i + 1))
   if [ "$i" -ge 60 ]; then
     echo "postgres did not become ready within 60s" >&2
@@ -166,11 +236,21 @@ until compose exec -T db pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; do
   sleep 1
 done
 
-echo "creating database $EVAL_DB inside the existing postgres container, if absent..."
-exists=$(compose exec -T db psql -U "$POSTGRES_USER" -d postgres -tAc \
+exists=$(db_exec psql -U "$POSTGRES_USER" -d postgres -tAc \
   "SELECT 1 FROM pg_database WHERE datname = '$EVAL_DB'")
-if [ "$exists" != "1" ]; then
-  compose exec -T db psql -U "$POSTGRES_USER" -d postgres -c "CREATE DATABASE \"$EVAL_DB\"" >/dev/null
+if [ "$SEARCH_ONLY" -eq 1 ]; then
+  [ "$exists" = "1" ] || {
+    echo "--search-only needs the corpus database $EVAL_DB, and it does not exist." >&2
+    echo "write the corpus first with --db $EVAL_DB --keep" >&2
+    exit 1
+  }
+  echo "resetting access counts in $EVAL_DB so this blend starts where the writing run did..."
+  db_exec psql -U "$POSTGRES_USER" -d "$EVAL_DB" -v ON_ERROR_STOP=1 -tAc \
+    "UPDATE memory SET access_count = 0, last_accessed_at = NULL
+      WHERE access_count <> 0 OR last_accessed_at IS NOT NULL" >/dev/null
+elif [ "$exists" != "1" ]; then
+  echo "creating database $EVAL_DB inside the existing postgres container..."
+  db_exec psql -U "$POSTGRES_USER" -d postgres -c "CREATE DATABASE \"$EVAL_DB\"" >/dev/null
 fi
 
 # A fresh credential per run, generated here and never read from the owner's .env. The compact
@@ -191,10 +271,14 @@ cleanup() {
   docker rm -f "$SERVER_NAME" >/dev/null 2>&1 || true
   if [ "$KEEP" -eq 1 ]; then
     echo "left $EVAL_DB in place for inspection. Drop it with:"
-    echo "  docker compose exec db dropdb -U $POSTGRES_USER $EVAL_DB"
+    if [ -n "$DB_CONTAINER" ]; then
+      echo "  docker exec $DB_CONTAINER dropdb -U $POSTGRES_USER $EVAL_DB"
+    else
+      echo "  docker compose exec db dropdb -U $POSTGRES_USER $EVAL_DB"
+    fi
   else
     echo "dropping database $EVAL_DB..."
-    compose exec -T db psql -U "$POSTGRES_USER" -d postgres -c "DROP DATABASE IF EXISTS \"$EVAL_DB\"" >/dev/null 2>&1 || true
+    db_exec psql -U "$POSTGRES_USER" -d postgres -c "DROP DATABASE IF EXISTS \"$EVAL_DB\"" >/dev/null 2>&1 || true
   fi
   exit "$status"
 }
@@ -242,7 +326,7 @@ docker run -d --name "$SERVER_NAME" --network "$NETWORK" \
   -e PORT="$PORT" \
   -e HOST=0.0.0.0 \
   -e TENANT_ID=eval \
-  -e DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${EVAL_DB}" \
+  -e DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${DB_HOST}:5432/${EVAL_DB}" \
   -e PUBLIC_URL="http://127.0.0.1:${PORT}" \
   -e AUTH_MODE=token \
   -e "AUTH_TOKENS=$AUTH_TOKENS_JSON" \
@@ -257,6 +341,9 @@ docker run -d --name "$SERVER_NAME" --network "$NETWORK" \
   -e WRITE_MAX_CONTENT_CHARS=200000 \
   -e SEARCH_INCLUDE_ALL_PROJECTS=false \
   -e SEARCH_FUSION="$FUSION" \
+  -e SEARCH_LEXICAL_WEIGHT="$LEXICAL_WEIGHT" \
+  -e SEARCH_RRF_K="$RRF_K" \
+  -e SEARCH_DEBUG_SCORES=true \
   -e KEK_PROVIDER=none \
   -e MODEL_CACHE_DIR=/models \
   -e BUILDER_UID="$(id -u)" -e BUILDER_GID="$(id -g)" \
@@ -284,6 +371,7 @@ set -- eval-longmemeval --dataset "$DATASET"
 [ "$RESUME" -eq 1 ] && set -- "$@" --resume
 [ "$ISOLATE" -eq 1 ] && set -- "$@" --isolate
 [ "$CORPUS_WIDE" -eq 1 ] && set -- "$@" --corpus-wide
+[ "$SEARCH_ONLY" -eq 1 ] && set -- "$@" --search-only
 [ "$DATES_IN_TEXT" -eq 1 ] && set -- "$@" --dates-in-text
 [ -z "$ONLY_TYPE" ] || set -- "$@" --type "$ONLY_TYPE"
 

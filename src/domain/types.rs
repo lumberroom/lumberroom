@@ -137,6 +137,30 @@ pub struct SearchHit {
     pub similarity: f64,
     /// False when the row came from outside the primary namespace set.
     pub primary: bool,
+    /// What the blend added up, present only under `SEARCH_DEBUG_SCORES` on a live, untagged
+    /// search. Absent, the hit serialises with the keys it always had.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scores: Option<ScoreParts>,
+}
+
+/// The parts of one hit's score, for a retrieval harness comparing blends.
+///
+/// `cosine` and `keyword` are the two arms as the blend read them: the raw cosine, 0 for a row only
+/// the lexical arm returned, and `ts_rank` capped at 1, 0 for a row only the vector arm returned.
+/// `fused` is the score the order was sorted on, use boost and namespace penalty included.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ScoreParts {
+    pub cosine: f64,
+    pub keyword: f64,
+    pub fused: f64,
+    /// The rescaled cosine `linear_minmax` blends in place of `cosine`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cosine_norm: Option<f64>,
+    /// Each arm's own rank under rank fusion, absent where that arm did not return the row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_rank: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyword_rank: Option<i64>,
 }
 
 /// A live row close enough to a new write to be worth showing the caller.
