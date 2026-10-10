@@ -19,12 +19,14 @@ of default values per model family in `src/domain/similarity.rs`, and each value
   the model `EMBED_*` names and for no other. Boot refuses a key no table registers.
 - **The old single variables stay legal with one block.** `DEDUPE_THRESHOLD`,
   `CONFLICT_THRESHOLD`, `BOOTSTRAP_DEDUP_COSINE`, `GRAPH_ROUTE_MAX_TOP` and `GRAPH_ROUTE_MAX_SPREAD`
-  override their key for the one configured model, as before. Beside a second block, config
-  refuses them, names each with its value, and says to move it into the override for the model it
-  was tuned on.
+  override their key for the one configured model, as before. Boot warns once for each one whose
+  value differs from the model's table value, and names the variable, both values and the model.
+  The dual-model change (decision 0027, the next PR) will refuse them beside a second block, name
+  each with its value, and say to move it into the override for the model it was tuned on.
 - **An unlisted model boots on guesses.** Each key it lacks takes bge-base-en-v1.5's value, and boot
-  logs one warning per model naming every guessed key. A unit flips onto a model only when none of
-  its acting keys (`dedupe`, `conflict`, `cleanup_near_certain`) is guessed.
+  logs one warning per model naming every guessed key. The dual-model change will flip a unit onto
+  a model only when none of its acting keys (`dedupe`, `conflict`, `cleanup_near_certain`) is
+  guessed.
 - **Cross-key checks run per model.** `conflict` at or below `dedupe`, and `cleanup_worth_asking`
   below `cleanup_near_certain`. Boot refuses a resolved model that fails one and names the model and
   both values.
@@ -61,7 +63,9 @@ side, each unit reads with one of them, and each comparison must use the values 
 produced its vectors.
 
 The two models score on different scales. A threshold study on a production store, aggregates only,
-ran on 10 October 2026. It took 1,999 anchor rows, scored each anchor's 20 nearest rows in its own
+ran on 10 October 2026
+([`docs/results/2026-10-threshold-study.md`](../results/2026-10-threshold-study.md) carries every
+figure below with the output key it came from). It took 1,999 anchor rows, scored each anchor's 20 nearest rows in its own
 namespace under both models, and pooled 39,574 scores per model. The pool's median score was 0.807
 under EmbeddingGemma 2 against 0.745 under bge, and the bge range 0.65 to 0.97 lands at 0.754 to
 0.987. A bge value read against Gemma vectors sits at a different point of the distribution.
@@ -115,7 +119,8 @@ The table carries measured values for the two models in use, and overrides cover
 
 **One value for every model.** The old single variables applied to whatever model ran. During a
 switch that hands a bge-tuned 0.97 to EmbeddingGemma 2, where the study puts the same key at 0.995.
-Config now refuses them while two blocks are configured.
+Boot now warns when one departs from the model's table, and the dual-model change will refuse them
+while two blocks are configured.
 
 **Keys by exact embedder id.** The same weights reach the server under several ids:
 `Xenova/bge-base-en-v1.5@q8` in process, `openai:BAAI/bge-base-en-v1.5` through an endpoint. An

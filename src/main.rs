@@ -629,7 +629,21 @@ fn embedder_set(cfg: &config::Config, embedder: Arc<dyn Embedder>) -> Result<Arc
             registry.keys().iter().map(|k| k.key).collect::<Vec<_>>().join(", ")
         )));
     }
-    let t = registry.resolve(&embedder.id(), &cfg.embed.thresholds, &cfg.legacy_thresholds());
+    let legacy = cfg.legacy_thresholds();
+    let t = registry.resolve(&embedder.id(), &cfg.embed.thresholds, &legacy);
+    // Installer deployments copied an .env.example that set DEDUPE_THRESHOLD=0.97 and its
+    // siblings. Those beat the family table, so a store that switches models keeps bge's scale
+    // with no other sign. Before the check, so a refusal the old value caused arrives explained.
+    for (l, table) in registry.legacy_departures(&t.model, &cfg.embed.thresholds, &legacy) {
+        tracing::warn!(
+            variable = l.variable,
+            value = l.value,
+            table_value = table,
+            model = %t.model,
+            "an old single threshold variable overrides this model's table value; clear it unless \
+             it was tuned on this model, or move it into EMBED_THRESHOLDS"
+        );
+    }
     let problems = registry.check(&t);
     if !problems.is_empty() {
         return Err(DomainError::validation(problems.join("; ")));

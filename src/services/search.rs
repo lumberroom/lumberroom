@@ -474,6 +474,8 @@ mod tests {
             ("graph.rs", include_str!("graph.rs")),
             ("bootstrap.rs", include_str!("bootstrap.rs")),
             ("review_queue.rs", include_str!("review_queue.rs")),
+            ("cleanup.rs", include_str!("cleanup.rs")),
+            ("conflicts.rs", include_str!("conflicts.rs")),
         ];
         // The cosine needle starts at the dot: `DigestQuery` keeps a field of the bare name, and
         // bootstrap.rs has to fill it.
@@ -494,5 +496,41 @@ mod tests {
             found.is_empty(),
             "services read the embedder or a threshold outside the unit: {found:?}"
         );
+    }
+
+    /// `current()` hands back the configured model whatever the unit reads. A service that embeds
+    /// through it writes or queries a vector the unit's slot may not hold, so every service file is
+    /// scanned, including ones that embed nothing today.
+    #[test]
+    fn no_service_embeds_through_the_current_model() {
+        let files = [
+            ("alias.rs", include_str!("alias.rs")),
+            ("archive.rs", include_str!("archive.rs")),
+            ("bootstrap.rs", include_str!("bootstrap.rs")),
+            ("cleanup.rs", include_str!("cleanup.rs")),
+            ("conflicts.rs", include_str!("conflicts.rs")),
+            ("currency.rs", include_str!("currency.rs")),
+            ("embedders.rs", include_str!("embedders.rs")),
+            ("eval.rs", include_str!("eval.rs")),
+            ("export.rs", include_str!("export.rs")),
+            ("forget.rs", include_str!("forget.rs")),
+            ("graph.rs", include_str!("graph.rs")),
+            ("history.rs", include_str!("history.rs")),
+            ("ingest.rs", include_str!("ingest.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            ("recall.rs", include_str!("recall.rs")),
+            ("recall_events.rs", include_str!("recall_events.rs")),
+            ("registry.rs", include_str!("registry.rs")),
+            ("review.rs", include_str!("review.rs")),
+            ("review_queue.rs", include_str!("review_queue.rs")),
+            ("search.rs", include_str!("search.rs")),
+            ("sources.rs", include_str!("sources.rs")),
+            ("supersession.rs", include_str!("supersession.rs")),
+            ("write.rs", include_str!("write.rs")),
+        ];
+        let needle = concat!("embedders.current()", ".embed_");
+        let found: Vec<&str> =
+            files.iter().filter(|(_, src)| src.contains(needle)).map(|(name, _)| *name).collect();
+        assert!(found.is_empty(), "services embed through the current model: {found:?}");
     }
 }

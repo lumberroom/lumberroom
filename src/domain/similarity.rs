@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Copy)]
 pub struct KeySpec {
     pub key: &'static str,
-    /// Changes or merges data with no person reading it first. A unit flips onto a model only when
-    /// none of that model's acting keys is guessed.
+    /// Changes or merges data with no person reading it first. The dual-model change (decision
+    /// 0027, the next PR) will flip a unit onto a model only when none of its acting keys is guessed.
     pub acts: bool,
 }
 
@@ -30,7 +30,8 @@ pub const ENGINE_KEYS: &[KeySpec] = &[
     KeySpec { key: ROUTE_MAX_SPREAD, acts: false },
 ];
 
-/// Why a table value is what it is. The status page prints it beside the value.
+/// Why a table value is what it is. The status page will print it beside the value once the
+/// dual-model change (decision 0027) lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Basis {
@@ -80,10 +81,12 @@ pub const ENGINE_FAMILIES: &[Family] = &[
     Family {
         family: EMBEDDINGGEMMA_2,
         values: &[
-            // Threshold study, 10 October 2026, on a production store, aggregates only. dedupe and
-            // cleanup_near_certain come from labelled pairs (every human-judged must-not-merge pair
-            // sits below 0.9902) and carry low confidence; the rest match the share of neighbour
-            // scores at or above bge's value.
+            // Threshold study, 10 October 2026, on a production store, aggregates only
+            // (docs/results/2026-10-threshold-study.md). dedupe and cleanup_near_certain come from
+            // labelled pairs (the highest human-judged must-not-merge pair sits at 0.9902) and
+            // carry low confidence. conflict was chosen to reproduce the share of client
+            // corrections bge flags (71.0% against 69.9%). bootstrap_dedup and
+            // cleanup_worth_asking match the share of neighbour scores at or above bge's value.
             FamilyValue { key: DEDUPE, value: 0.995, basis: Basis::Study },
             FamilyValue { key: CONFLICT, value: 0.91, basis: Basis::Study },
             FamilyValue { key: BOOTSTRAP_DEDUP, value: 0.919, basis: Basis::Study },
@@ -153,7 +156,8 @@ pub struct Legacy {
 pub type Check = fn(&SimilarityThresholds) -> Result<(), String>;
 
 /// `conflict` above `dedupe` empties the band that yields conflict candidates, and corrections then
-/// fold into the row they correct (the rule `src/config.rs:1378-1384` held for the single settings).
+/// fold into the row they correct. `validate` in `src/config.rs` applies the same rule to
+/// `CONFLICT_THRESHOLD` and `DEDUPE_THRESHOLD`.
 pub fn conflict_at_or_below_dedupe(t: &SimilarityThresholds) -> Result<(), String> {
     let (conflict, dedupe) = (t.get(CONFLICT), t.get(DEDUPE));
     if conflict > dedupe {
@@ -279,6 +283,27 @@ impl Registry {
         }
     }
 
+    /// Each legacy value that decides its key for `model_id` and differs from the value the key
+    /// would take without it, paired with that value. An `.env` copied from an older
+    /// `.env.example` carries bge's values in the old variables, and they hold any other model on
+    /// bge's scale with nothing in the log.
+    pub fn legacy_departures<'a>(
+        &self,
+        model_id: &str,
+        overrides: &[(String, f64)],
+        legacy: &'a [Legacy],
+    ) -> Vec<(&'a Legacy, f64)> {
+        let without = self.resolve(model_id, overrides, &[]);
+        legacy
+            .iter()
+            .filter(|l| !overrides.iter().any(|(k, _)| k == l.key))
+            .filter_map(|l| {
+                let table = without.values.get(l.key)?.value;
+                (table != l.value).then_some((l, table))
+            })
+            .collect()
+    }
+
     /// Every check's error for `t`, each prefixed with `t.model`.
     pub fn check(&self, t: &SimilarityThresholds) -> Vec<String> {
         self.checks.iter().filter_map(|c| c(t).err()).map(|e| format!("{}: {e}", t.model)).collect()
@@ -303,8 +328,10 @@ impl Registry {
     }
 }
 
-/// Parses `key=value,key=value`. Each value must satisfy `0 < v <= 1`. Errors name the bad pair.
-/// Unknown keys are checked by `Registry::unknown_keys`, because the fork registers more keys.
+/// Parses `key=value,key=value`. Each value must satisfy `0 <= v <= 1`. `DEDUPE_THRESHOLD` and
+/// `CONFLICT_THRESHOLD` accept 0, and moving one of them into an override must not be refused.
+/// Errors name the bad pair. Unknown keys are checked by `Registry::unknown_keys`, because the fork registers more
+/// keys.
 pub fn parse_overrides(raw: &str) -> Result<Vec<(String, f64)>, String> {
     let mut out = Vec::new();
     for item in raw.split(',').map(str::trim).filter(|i| !i.is_empty()) {
@@ -320,8 +347,8 @@ pub fn parse_overrides(raw: &str) -> Result<Vec<(String, f64)>, String> {
             .parse()
             .map_err(|_| format!("threshold override {item:?} has a value that is not a number"))?;
         // Written as a positive test so NaN fails it.
-        if !(v > 0.0 && v <= 1.0) {
-            return Err(format!("threshold override {item:?} is outside 0 < value <= 1"));
+        if !(0.0..=1.0).contains(&v) {
+            return Err(format!("threshold override {item:?} is outside 0 <= value <= 1"));
         }
         out.push((key.to_string(), v));
     }
@@ -352,11 +379,12 @@ mod tests {
         );
         assert_eq!(parse_overrides("").unwrap(), vec![]);
         assert_eq!(parse_overrides(" , ").unwrap(), vec![]);
+        // DEDUPE_THRESHOLD takes 0, so the override that replaces it must too.
+        assert_eq!(parse_overrides("dedupe=0").unwrap(), ov(&[("dedupe", 0.0)]));
         for bad in [
             "dedupe",
             "=0.5",
             "dedupe=abc",
-            "dedupe=0",
             "dedupe=-0.1",
             "dedupe=1.01",
             "dedupe=NaN",
@@ -382,6 +410,16 @@ mod tests {
         let t = r.resolve(GEMMA, &[], &[legacy(CONFLICT, 0.8)]);
         assert_eq!(t.values[CONFLICT], Resolved { value: 0.8, source: Source::Legacy });
         assert_eq!(t.values[DEDUPE].source, Source::Study);
+    }
+
+    #[test]
+    fn a_legacy_value_off_the_table_is_named_with_the_table_value() {
+        let r = Registry::engine();
+        let l = [legacy(DEDUPE, 0.97), legacy(CONFLICT, 0.90)];
+        assert!(r.legacy_departures(BGE_Q8, &[], &l).is_empty());
+        assert_eq!(r.legacy_departures(GEMMA, &[], &l), vec![(&l[0], 0.995), (&l[1], 0.91)]);
+        // An override decides its key, so the legacy value changes nothing there.
+        assert_eq!(r.legacy_departures(GEMMA, &ov(&[(DEDUPE, 0.99)]), &l), vec![(&l[1], 0.91)]);
     }
 
     #[test]

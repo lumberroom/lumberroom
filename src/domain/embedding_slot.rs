@@ -1,4 +1,8 @@
 //! Which of the two vector columns a unit reads. A slot keeps its model from naming until retire.
+//!
+//! The schema holds slot A only. The dual-model change (decision 0027, the next PR) adds the
+//! migration that creates `memory.embedding_b` and `embedding_state`; the names below are the
+//! ones that migration will use.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -6,7 +10,7 @@ pub enum VectorSlot {
     /// `memory.embedding`.
     #[default]
     A,
-    /// `memory.embedding_b`.
+    /// `memory.embedding_b`, which the dual-model change will create.
     B,
 }
 
@@ -26,7 +30,7 @@ impl VectorSlot {
         }
     }
 
-    /// The value `embedding_state.active_slot` stores.
+    /// The value `embedding_state.active_slot` will store once the dual-model change creates it.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::A => "a",

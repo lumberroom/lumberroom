@@ -296,6 +296,10 @@ services:
       # Written where a container can, and never read: `resolve` refuses a config file group or
       # other can read, and the environment is where these keys actually come from.
       LUMBERROOM_CONFIG: /tmp/lumberroom-cleanup.json
+      # Empty leaves the floor to the store's model (decision 0029). A variable, never a flag,
+      # because the 0.5.0 client refuses `--min-similarity ""`. That client ignores the variable
+      # and sends no floor, so a number set here takes effect from the next client release.
+      CLEANUP_MIN_SIMILARITY: ${CLEANUP_MIN_SIMILARITY:-}
     command:
       - lumberroom
       - cleanup
@@ -306,9 +310,6 @@ services:
       - ${CLEANUP_PROVIDER:-openrouter}
       - --model
       - ${CLEANUP_MODEL:-qwen/qwen3.7-flash}
-      - --min-similarity
-      # Empty leaves the floor to the store's model (decision 0029).
-      - ${CLEANUP_MIN_SIMILARITY:-}
 
   caddy:
     image: caddy:2-alpine

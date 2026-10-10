@@ -16,7 +16,7 @@ use lumberroom_server::adapters::postgres;
 use lumberroom_server::config::{self, Config};
 use lumberroom_server::domain::errors::{DomainError, Result as DomainResult};
 use lumberroom_server::domain::policy::NamespaceGrant;
-use lumberroom_server::domain::similarity::{self, Registry, Source as Basis};
+use lumberroom_server::domain::similarity::{self, Source as Basis};
 use lumberroom_server::domain::types::{Invocation, Principal};
 use lumberroom_server::ports::Embedder;
 use lumberroom_server::services::review_queue::{self, QueueQuery, Source};
@@ -354,9 +354,10 @@ async fn an_override_moves_one_model_only() {
     assert!(!second.deduplicated, "dedupe=0.99 keeps a pair at 0.98 apart: {second:?}");
     assert_ne!(second.id, first.id);
 
-    // EMBED_THRESHOLDS belongs to the block that configures bge. Gemma's block carries no override,
-    // so the same registry resolves Gemma's id to its study value.
-    let gemma = Registry::engine().resolve(GEMMA_ID, &[], &h.ctx.cfg.legacy_thresholds());
-    assert_eq!(gemma.values[similarity::DEDUPE].value, 0.995);
-    assert_eq!(gemma.values[similarity::DEDUPE].source, Basis::Study);
+    // EMBED_THRESHOLDS belongs to the block that configures bge. The registry applies an override
+    // list to whatever id it is handed, so what keeps the override off Gemma is the set: it resolves
+    // that block for bge's id and holds nothing for any other.
+    let held: Vec<&str> = bge.embedders.all_thresholds().keys().map(String::as_str).collect();
+    assert_eq!(held, vec![BGE_ID]);
+    assert!(bge.embedders.thresholds_for(GEMMA_ID).is_err(), "bge's set holds no Gemma values");
 }

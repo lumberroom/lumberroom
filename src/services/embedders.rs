@@ -38,7 +38,8 @@ impl EmbedderSet {
         Arc::clone(&self.current)
     }
 
-    /// Every configured model's values, for the status page.
+    /// Every configured model's values. The status page will read them once the dual-model change
+    /// (decision 0027, the next PR) lands; nothing calls this yet.
     pub fn all_thresholds(&self) -> &HashMap<String, Arc<SimilarityThresholds>> {
         &self.thresholds
     }

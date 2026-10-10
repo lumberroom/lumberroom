@@ -545,8 +545,8 @@ impl IngestConfig {
 
 impl Config {
     /// The old single threshold variables that are set. Each overrides its key for the one
-    /// configured model; beside a second model the server refuses them. The fork appends its
-    /// dreaming ones.
+    /// configured model. The dual-model change (decision 0027, the next PR) will refuse them beside
+    /// a second model. The fork appends its dreaming ones.
     pub fn legacy_thresholds(&self) -> Vec<crate::domain::similarity::Legacy> {
         use crate::domain::similarity::{self as s, Legacy};
         [
