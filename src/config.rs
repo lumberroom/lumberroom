@@ -352,6 +352,37 @@ pub struct EmbedConfig {
     pub model: String,
     pub cache_dir: String,
     pub allow_fallback: bool,
+    /// Read only when the provider is `openai`.
+    pub remote: RemoteEmbedConfig,
+}
+
+/// An OpenAI-compatible `/embeddings` endpoint: Workers AI, OpenRouter, llama-server, TEI.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteEmbedConfig {
+    /// Up to and including `/v1`. The adapter appends `/embeddings`.
+    pub base_url: String,
+    pub api_key: Option<String>,
+    /// The API carries no task field, so an asymmetric model's instructions travel inside the
+    /// text. Defaults follow the model name; see `default_embed_prefixes`.
+    pub query_prefix: String,
+    pub document_prefix: String,
+    /// The server counts tokens and the engine cannot, so this caps characters. llama-server
+    /// refuses an input past its window outright rather than truncating it.
+    pub max_input_chars: Option<usize>,
+    pub timeout_secs: u64,
+}
+
+/// The prefixes a model was trained with, by name. An unknown model gets none, which is right for
+/// a symmetric model and costs an asymmetric one some precision rather than failing.
+pub fn default_embed_prefixes(model: &str) -> (&'static str, &'static str) {
+    let m = model.to_ascii_lowercase();
+    if m.contains("embeddinggemma") {
+        ("task: search result | query: ", "title: none | text: ")
+    } else if m.contains("bge-") && m.contains("-en") {
+        ("Represent this sentence for searching relevant passages: ", "")
+    } else {
+        ("", "")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -853,6 +884,7 @@ pub fn load() -> Result<Config> {
     // somebody edits one of them, and the two things it decides are the ranking and whether the
     // router's cosine thresholds mean anything at all.
     let fusion = parse_fusion(&env("SEARCH_FUSION", "linear"))?;
+    let embed_model = env("EMBED_MODEL", "Xenova/bge-base-en-v1.5");
 
     let cfg = Config {
         public_url: public_url.clone(),
@@ -896,9 +928,22 @@ pub fn load() -> Result<Config> {
         embed: EmbedConfig {
             provider,
             dim: env_num("EMBED_DIM", 768usize)?,
-            model: env("EMBED_MODEL", "Xenova/bge-base-en-v1.5"),
+            model: embed_model.clone(),
             cache_dir: env("MODEL_CACHE_DIR", "/models"),
             allow_fallback: env_bool("EMBED_ALLOW_FALLBACK", false),
+            remote: RemoteEmbedConfig {
+                base_url: env("EMBED_BASE_URL", "").trim_end_matches('/').to_string(),
+                api_key: env_opt("EMBED_API_KEY"),
+                query_prefix: env_opt("EMBED_QUERY_PREFIX")
+                    .unwrap_or_else(|| default_embed_prefixes(&embed_model).0.to_string()),
+                document_prefix: env_opt("EMBED_DOCUMENT_PREFIX")
+                    .unwrap_or_else(|| default_embed_prefixes(&embed_model).1.to_string()),
+                max_input_chars: match env_num("EMBED_MAX_INPUT_CHARS", 0usize)? {
+                    0 => None,
+                    n => Some(n),
+                },
+                timeout_secs: env_num("EMBED_TIMEOUT_SECS", 60u64)?,
+            },
         },
         bootstrap: BootstrapConfig {
             cache_ms: env_num("BOOTSTRAP_CACHE_MS", 30_000u64)?,
@@ -1322,6 +1367,12 @@ fn validate(cfg: &Config) -> Result<()> {
 
     if cfg.embed.dim < 8 {
         return Err(DomainError::validation("EMBED_DIM looks wrong"));
+    }
+
+    if cfg.embed.provider == EmbedProvider::Openai && cfg.embed.remote.base_url.is_empty() {
+        return Err(DomainError::validation(
+            "EMBED_PROVIDER=openai needs EMBED_BASE_URL, the endpoint up to and including /v1",
+        ));
     }
 
     if cfg.quality.conflict_threshold > cfg.quality.dedupe_threshold {
