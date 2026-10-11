@@ -46,12 +46,11 @@ Each path that stores content, and the cap it answers to:
 
 ## Context
 
-On the hosted fork's production store, read on 10 October 2026, the median live row ran 570
-characters, 751 of 4,941 rows ran past 1,000 and 55 past 2,000. Rows over 1,000 characters had a
-same-namespace neighbour at cosine 0.90 or above more than twice as often as shorter rows. Agents
-were storing session narrative as memories, and the long rows were the ones that repeated each
-other. Those figures come from the fork's PR #135; this repository has no production store of its
-own to measure.
+A length study on a production store, aggregates only, ran on 10 October 2026. The median live
+row ran 570 characters, 15.2% of rows ran past 1,000 and 1.1% past 2,000. Rows over 1,000
+characters had a same-namespace neighbour at cosine 0.90 or above more than twice as often as
+shorter rows. Agents were storing session narrative as memories, and the long rows were the ones
+that repeated each other.
 
 The fork set 2000 in its own deploy file. The owner ruled the same day that the engine takes the
 same default, because agents write bloated memories on any deployment, not only the hosted one.
@@ -64,8 +63,8 @@ a person approving a queue row to make `memory_write` calls.
 ## What lost
 
 **Loosening dedupe instead.** Folding near-duplicates at a lower cosine would shrink the repeats.
-The fork measured it at 0.97 on EmbeddingGemma and found it would fold 162 corrections into the
-rows they correct. Collapsing a correction into its predecessor destroys data with nothing in the
+On the same production store, a threshold of 0.97 on EmbeddingGemma would fold 162 corrections
+into the rows they correct. Collapsing a correction into its predecessor destroys data with nothing in the
 store saying so, which is the bias `services::write` states at its top.
 
 **Advice in the shared message.** One string is simpler. It lost because five of its six readers
@@ -73,8 +72,8 @@ cannot act on it: the console, an ingest approval, the ingest post, a review mer
 merge. Only `memory_write` can.
 
 **A length check in the MCP layer ahead of the service.** It let the tool add advice without an
-error code. It lost because it ran before the tripwire and the grant: a long private key got split
-advice instead of the tripwire refusal, and a long write to `credentials:*` was never sent to
+error code. It lost because it ran before the tripwire and the grant: a long private key written at
+open got split advice instead of the tripwire refusal, and a long write to `credentials:*` was never sent to
 `lumberroom seal`.
 
 **No cap on archive merges.** An exemption would let an archive written with a 200000 setting load
@@ -101,8 +100,14 @@ knowing. Refusal tells the caller and costs one retry.
   post, not reinforcement. The upsert is the only lookup that finds that proposal, and it inserts
   when it finds nothing. The row stays stored; the source row and the reinforcement count are lost.
 - `lumberroom import --submit --delete-source` keeps the dump when any line was refused under a
-  rule an edit can fix, `content_too_long` among them, and says so. A tripwire refusal alone does
-  not keep the file.
+  rule other than a tripwire rule, `content_too_long` and any rule the CLI does not know among
+  them, and says so. Only tripwire refusals let the file go, because keeping it keeps the
+  credential on disk.
+- Restating a stored row longer than the cap through `memory_write` is refused with split advice.
+  The length check runs before the exact-match lookup that would confirm the row. The ingest post
+  checks length after its echo lookup and confirms the same restatement.
+- The transcript ingest CLI drops a fact refused for length at post. The watermark moves past it,
+  so the fact comes back only when the owner re-extracts that part of the transcript.
 - An archive merge dry run does not predict a length refusal. It never did; the carried floor
   keeps that gap where it was, at 8000.
 - `lumberroom ingest` prints the new rule with its count and drops `detail`, because the CLI's wire

@@ -244,6 +244,9 @@ async fn setup_with(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
     );
     std::env::set_var("EMBED_PROVIDER", "hash");
     std::env::set_var(TEST_KEK_VAR, TEST_KEK_HEX);
+    // Cleared under SERIAL like the rest, so every case loads the default cap. A case that wants
+    // another cap tunes the loaded struct; `an_unset_write_cap_loads_as_2000` reads the default.
+    std::env::remove_var("WRITE_MAX_CONTENT_CHARS");
 
     // Before the truncate below, and before anything reads. Every other binary
     // targeting this database waits here.
@@ -904,8 +907,7 @@ async fn a_long_write_outside_the_grant_is_refused_on_the_grant() {
 /// pins the number; this one proves `load` falls back to it.
 #[tokio::test]
 async fn an_unset_write_cap_loads_as_2000() {
-    // No other case in this binary sets the variable; each one tunes the loaded struct instead.
-    std::env::remove_var("WRITE_MAX_CONTENT_CHARS");
+    // `setup_with` clears the variable while it holds SERIAL.
     let h = harness_or_skip!();
     assert_eq!(h.ctx.cfg.policy.max_content_chars, 2000);
     let write = listed_description(&h, "memory_write").await;
