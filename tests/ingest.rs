@@ -610,6 +610,60 @@ async fn an_approval_over_the_write_cap_is_refused_with_only_the_numbers() {
     assert!(outcome.memory_id.is_none());
 }
 
+/// A long credential reports as a credential. The length rule would hide the reason the content
+/// can never be stored, and the run report counts refusals by rule.
+#[tokio::test]
+async fn a_credential_over_the_write_cap_reports_the_tripwire_rule() {
+    let h = harness_or_skip!();
+    let run = open_run(&h).await;
+    let content = format!("{CREDENTIAL} {}", prose("study", 2500));
+    assert!(content.chars().count() > 2000);
+
+    let report = ingest::post(
+        &capped(&h),
+        h.repo.as_ref(),
+        "agent:claude-code",
+        vec![fact(&content, "main_model", source("/p/a.jsonl", "e1", "main_model", run))],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        report.outcomes[0],
+        ingest::FactOutcome::Refused { rule: "connection_string_password", detail: None }
+    );
+}
+
+/// A stored row written under a looser cap and handed out by the store, then restated by a
+/// transcript, is an echo. The length rule is about what may enter the queue, and an echo never
+/// does.
+#[tokio::test]
+async fn an_echo_of_a_stored_row_over_the_cap_is_a_confirmation() {
+    let h = harness_or_skip!();
+    let run = open_run(&h).await;
+    let content = prose("study", 3000);
+
+    let mut loose = (*h.ctx.cfg).clone();
+    loose.policy.max_content_chars = 8000;
+    let loose = Ctx { cfg: Arc::new(loose), ..h.ctx.clone() };
+    let written = write::run(&loose, &content, "user:me", None, None, None, None).await.unwrap();
+    let memory_id = uuid::Uuid::parse_str(&written.id).unwrap();
+    ingest::record_emission(&h.ctx, h.repo.as_ref(), &content, memory_id, "context_bootstrap")
+        .await
+        .unwrap();
+
+    let report = ingest::post(
+        &capped(&h),
+        h.repo.as_ref(),
+        "agent:claude-code",
+        vec![fact(&content, "main_model", source("/p/a.jsonl", "e1", "main_model", run))],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.outcomes[0], ingest::FactOutcome::Confirmed { memory_id });
+}
+
 #[tokio::test]
 async fn a_credential_hiding_in_the_quote_is_refused_with_the_content_clean() {
     let h = harness_or_skip!();

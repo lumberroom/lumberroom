@@ -260,10 +260,21 @@ async fn memory_dump(c: &Client, args: &Args) -> Result<()> {
     // the only copy of a dump they still have to fix and retry.
     if delete_source {
         let landed = posted.proposals_new + posted.proposals_reinforced + posted.confirmations;
+        let fixable = fixable_refusals(&posted.outcomes);
         if landed == 0 {
             out("");
             out(&format!(
                 "Kept {path}: nothing reached the queue, so the file is still the only copy."
+            ));
+        } else if !fixable.is_empty() {
+            let rules: Vec<String> =
+                fixable.iter().map(|(rule, n)| format!("{rule} x{n}")).collect();
+            out("");
+            out(&format!(
+                "Kept {path}: the server refused lines an edit can fix ({}), and the file is the \
+                 only copy of them. Fix those lines and import the file again; the lines that \
+                 landed come back as reinforced or already known.",
+                rules.join(", ")
             ));
         } else {
             match std::fs::remove_file(&path) {
@@ -281,6 +292,28 @@ async fn memory_dump(c: &Client, args: &Args) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Server refusal rules an edit to the line can clear, as the server names them in
+/// `services::ingest`. A line refused under one of these exists only in the source file.
+///
+/// A tripwire rule is left out on purpose. Its line holds a credential, no edit makes it
+/// storable, and keeping the file for it keeps the credential on disk.
+const FIXABLE_RULES: [&str; 4] =
+    ["content_too_long", "invalid_namespace", "namespace_outside_grant", "supersedes_not_writable"];
+
+/// Each fixable refusal rule in a post's outcomes with its count, in rule order. Empty means
+/// nothing the owner could fix and retry was refused.
+fn fixable_refusals(outcomes: &[api::FactOutcome]) -> Vec<(String, usize)> {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for outcome in outcomes {
+        if let api::FactOutcome::Refused { rule } = outcome {
+            if FIXABLE_RULES.contains(&rule.as_str()) {
+                *counts.entry(rule.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    counts.into_iter().collect()
 }
 
 /// Whether this run deletes the file when it is done, or refuses the combination outright.
@@ -398,7 +431,41 @@ async fn assess(args: &Args, plan: &mut plan::PlanReport, policy: junk::Policy) 
 
 #[cfg(test)]
 mod tests {
-    use super::deletes_source;
+    use super::{deletes_source, fixable_refusals};
+    use crate::ingest::api::FactOutcome;
+
+    fn refused(rule: &str) -> FactOutcome {
+        FactOutcome::Refused { rule: rule.into() }
+    }
+
+    /// A line over the server's length cap is refused at post and exists nowhere else, so the file
+    /// has to survive for the owner to shorten it and post again.
+    #[test]
+    fn a_line_over_the_length_cap_keeps_the_source() {
+        let kept = fixable_refusals(&[refused("content_too_long"), refused("content_too_long")]);
+        assert_eq!(kept, vec![("content_too_long".to_string(), 2)]);
+    }
+
+    #[test]
+    fn every_rule_an_edit_can_fix_keeps_the_source() {
+        for rule in [
+            "content_too_long",
+            "invalid_namespace",
+            "namespace_outside_grant",
+            "supersedes_not_writable",
+        ] {
+            assert!(!fixable_refusals(&[refused(rule)]).is_empty(), "{rule} would delete the file");
+        }
+    }
+
+    /// A tripwire refusal means the line holds a credential. Keeping the file for it keeps the
+    /// credential on disk, and no edit to the line makes it storable.
+    #[test]
+    fn a_tripwire_refusal_alone_lets_the_source_go() {
+        assert!(
+            fixable_refusals(&[refused("pem_private_key"), refused("aws_access_key")]).is_empty()
+        );
+    }
 
     #[test]
     fn deleting_the_source_needs_a_submit_and_says_why() {

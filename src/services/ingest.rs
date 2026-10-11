@@ -67,7 +67,7 @@ pub const REFUSAL_SUPERSEDES_TARGET: &str = "supersedes_not_writable";
 
 /// The rule name a fact is refused under when it is longer than `WRITE_MAX_CONTENT_CHARS`. The
 /// approval would refuse it, and a queue row nobody can approve is one the owner reads for nothing.
-pub const REFUSAL_TOO_LONG: &str = "content_too_long";
+pub const REFUSAL_TOO_LONG: &str = super::write::CONTENT_TOO_LONG;
 
 /// The caller's grant and the classification table, for the query to apply.
 pub fn reader(ctx: &Ctx) -> ReadGrant {
@@ -245,17 +245,6 @@ pub async fn post(
                 continue;
             }
         }
-        // The approval writes through the configured cap, so the post checks the same number.
-        // After the tripwire, so a long credential reports as a credential.
-        if let Some(refusal) =
-            super::write::length_refusal(&fact.content, ctx.cfg.policy.max_content_chars)
-        {
-            report
-                .outcomes
-                .push(FactOutcome::Refused { rule: REFUSAL_TOO_LONG, detail: Some(refusal) });
-            report.refused += 1;
-            continue;
-        }
         if let Some(target) = fact.supersedes {
             // Checked here and again at approval. Approval runs the full rule (head of chain,
             // valid time); this pass exists because the proposal row references the target from
@@ -310,6 +299,23 @@ pub async fn post(
             true => fact.quote.clone(),
             false => None,
         };
+
+        // The approval writes through the configured cap, so the post checks the same number,
+        // here and no earlier. After the tripwire, so a long credential reports as a credential,
+        // and after the echo lookup, so a transcript quoting a long row the store handed out is
+        // still a confirmation. A restatement of a long proposal already `written` still lands
+        // here: the upsert is the only thing that would find it, and it inserts when it finds
+        // nothing.
+        if let Some(refusal) =
+            super::write::length_refusal(&fact.content, ctx.cfg.policy.max_content_chars)
+        {
+            report.outcomes.push(FactOutcome::Refused {
+                rule: REFUSAL_TOO_LONG,
+                detail: Some(refusal.client_message().to_string()),
+            });
+            report.refused += 1;
+            continue;
+        }
 
         let upsert = repo
             .insert_proposal(

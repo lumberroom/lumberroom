@@ -67,23 +67,31 @@ fn cap_chars(cap: Cap, configured: usize) -> usize {
     }
 }
 
+/// The code the length refusal carries. `memory_write` matches on it to add split advice, so the
+/// wording of the message can change without the advice going missing.
+pub const CONTENT_TOO_LONG: &str = "content_too_long";
+
 /// The length refusal, with both numbers and nothing else.
 ///
-/// The console, an ingest approval, a review merge and an archive merge all read it, and none of
-/// them can act on advice to split into `memory_write` calls. The MCP layer adds that advice for
-/// the one caller that can.
+/// The console, an ingest approval, a review merge, an archive merge and the ingest post all read
+/// it, and none of them can act on advice to split into `memory_write` calls. The MCP layer adds
+/// that advice for the one caller that can.
 fn too_long_message(chars: usize, max_chars: usize) -> String {
     format!("content is {chars} chars and the limit is {max_chars}.")
 }
 
 /// The length check every write runs, for a caller that has to refuse before it reaches one.
 ///
-/// It counts characters after the trim, as the write does, so a caller that checks here first
-/// refuses exactly what the write would. The ingest post runs it so an over-long fact never
-/// reaches the queue, and the MCP layer runs it to add its split advice.
-pub fn length_refusal(content: &str, max_chars: usize) -> Option<String> {
+/// It counts characters after the trim, as the write does, so a caller that checks here refuses
+/// exactly what the write would. The ingest post runs it so an over-long fact never reaches the
+/// queue. A caller runs it after its own tripwire and grant checks, as `run_inner` does: a refusal
+/// on length tells the caller to split, and a split credential or a split write to a namespace it
+/// may not touch is the wrong outcome.
+pub fn length_refusal(content: &str, max_chars: usize) -> Option<DomainError> {
     let chars = content.trim().chars().count();
-    (chars > max_chars).then(|| too_long_message(chars, max_chars))
+    (chars > max_chars).then(|| {
+        DomainError::validation(too_long_message(chars, max_chars)).with_code(CONTENT_TOO_LONG)
+    })
 }
 
 /// Whether the near-now fence runs on this write.
@@ -204,10 +212,6 @@ async fn run_inner(
     if content.is_empty() {
         return Err(DomainError::validation("content cannot be empty"));
     }
-    if let Some(refusal) = length_refusal(content, cap_chars(cap, ctx.cfg.policy.max_content_chars))
-    {
-        return Err(DomainError::validation(refusal));
-    }
 
     let namespace = namespaces::normalize(namespace)?;
     // The personal namespace is reserved before anything is resolved on the write's behalf. A
@@ -280,6 +284,16 @@ async fn run_inner(
                 finding.rule
             )));
         }
+    }
+
+    // (d0) The length cap. After the grant and the tripwire, because its refusal tells the caller
+    // to split the content. A 3072-bit PEM key runs past 2000 characters, and its body without the
+    // header line passes the tripwire's base64 exclusion: told to split, a caller stores the key at
+    // open one piece at a time. A credentials namespace and a missing grant have their own answers
+    // for the same reason. Ahead of the fence, which stays last for the reason (d1) gives.
+    if let Some(refusal) = length_refusal(content, cap_chars(cap, ctx.cfg.policy.max_content_chars))
+    {
+        return Err(refusal);
     }
 
     // (d1) The near-now fence, rule D1. Refuse an `occurred_at` this store would learn nothing
@@ -1417,11 +1431,16 @@ mod tests {
 
     #[test]
     fn content_at_the_limit_passes_and_one_character_past_it_is_refused() {
-        assert_eq!(length_refusal(&"a".repeat(2000), 2000), None);
-        assert_eq!(
-            length_refusal(&"a".repeat(2001), 2000).as_deref(),
-            Some("content is 2001 chars and the limit is 2000.")
-        );
+        assert!(length_refusal(&"a".repeat(2000), 2000).is_none());
+        let refusal = length_refusal(&"a".repeat(2001), 2000).expect("2001 is over 2000");
+        assert_eq!(refusal.client_message(), "content is 2001 chars and the limit is 2000.");
+    }
+
+    /// `memory_write` finds the refusal by this code, never by its text.
+    #[test]
+    fn the_length_refusal_carries_its_code() {
+        let refusal = length_refusal(&"a".repeat(2001), 2000).expect("2001 is over 2000");
+        assert_eq!(refusal.code(), Some(CONTENT_TOO_LONG));
     }
 
     /// The write path trims before it counts, and it counts characters. `é` is two bytes, so a byte
@@ -1429,7 +1448,7 @@ mod tests {
     #[test]
     fn the_length_counts_characters_after_the_trim() {
         let text = format!("  {}  ", "é".repeat(2000));
-        assert_eq!(length_refusal(&text, 2000), None);
+        assert!(length_refusal(&text, 2000).is_none());
     }
 
     #[test]

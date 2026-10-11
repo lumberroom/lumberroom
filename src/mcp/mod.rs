@@ -79,9 +79,19 @@ const SPLIT_ADVICE: &str = "Split it into separate memory_write calls, one durab
 leave out session narrative, reasoning and step-by-step history. To correct a longer row, set \
 supersedes on the call that restates it.";
 
-/// The length refusal a `memory_write` caller reads: the service's numbers, then [`SPLIT_ADVICE`].
-fn write_length_refusal(content: &str, max_chars: usize) -> Option<String> {
-    write::length_refusal(content, max_chars).map(|numbers| format!("{numbers} {SPLIT_ADVICE}"))
+/// The refusal a `memory_write` caller reads. The service's length refusal gains
+/// [`SPLIT_ADVICE`]; every other error passes through untouched.
+///
+/// Keyed on the code, and applied after the service has run every check it runs ahead of the
+/// length: a credential, a credentials namespace and a missing grant each keep their own refusal.
+fn with_split_advice(e: DomainError) -> DomainError {
+    match e.code() {
+        Some(code) if code == write::CONTENT_TOO_LONG => {
+            let message = format!("{} {SPLIT_ADVICE}", e.client_message());
+            DomainError::new(e.kind, message).with_code(code)
+        }
+        _ => e,
+    }
 }
 
 /// Shared, request-independent state.
@@ -353,13 +363,6 @@ and step-by-step history stay in the conversation.",
     ) -> Result<CallToolResult, McpError> {
         let namespace = Some(args.namespace.clone());
         self.run("memory_write", namespace, &rc, |ctx| async move {
-            // The same count `write::run` makes against the same setting, run first so the refusal
-            // can carry advice only this caller can follow.
-            if let Some(refusal) =
-                write_length_refusal(&args.content, ctx.cfg.policy.max_content_chars)
-            {
-                return Err(DomainError::validation(refusal));
-            }
             // Parsed here rather than before `self.run` so a malformed date travels the same
             // path as every other validation refusal and is recorded as a failed tool call.
             let occurred_at = match args.occurred_at.as_deref() {
@@ -375,7 +378,8 @@ and step-by-step history stay in the conversation.",
                 args.sensitivity.as_deref(),
                 occurred_at,
             )
-            .await?;
+            .await
+            .map_err(with_split_advice)?;
             let json = serde_json::to_value(&result).unwrap_or_default();
             Ok((serde_json::to_string_pretty(&json).unwrap_or_default(), json))
         })
@@ -635,22 +639,17 @@ mod tests {
         assert!(!d.contains("2000"), "{d}");
     }
 
-    /// The helper only helps if `list_tools` calls it. Split with `concat!` so this test's own text
-    /// is not the match. An integration test over `tools/list` is the stronger gate.
-    #[test]
-    fn list_tools_applies_the_configured_limit() {
-        let needle = concat!(
-            ".map(|t| with_configured",
-            "_limit(t, self.state.cfg.policy.max_content_chars))"
-        );
-        assert!(include_str!("mod.rs").contains(needle), "list_tools no longer applies the limit");
+    /// The service's length refusal, as `write::run` returns it for 3120 characters under 2000.
+    fn long_refusal() -> String {
+        let e = write::length_refusal(&"a".repeat(3120), 2000).expect("3120 is over 2000");
+        with_split_advice(e).client_message().to_string()
     }
 
     /// An agent reads the refusal once and retries, so it carries both numbers and the one fix
     /// that works: several short writes in place of one long one.
     #[test]
     fn a_long_memory_write_is_refused_with_the_numbers_and_the_split() {
-        let msg = write_length_refusal(&"a".repeat(3120), 2000).expect("3120 is over 2000");
+        let msg = long_refusal();
         assert!(msg.starts_with("content is 3120 chars and the limit is 2000."), "{msg}");
         assert!(msg.contains("separate memory_write calls"), "{msg}");
         assert!(msg.contains("one durable fact each"), "{msg}");
@@ -658,7 +657,7 @@ mod tests {
 
     #[test]
     fn the_split_advice_names_what_to_cut() {
-        let msg = write_length_refusal(&"a".repeat(3120), 2000).expect("3120 is over 2000");
+        let msg = long_refusal();
         for cut in ["session narrative", "reasoning", "step-by-step history"] {
             assert!(msg.contains(cut), "{cut} missing from {msg}");
         }
@@ -667,12 +666,21 @@ mod tests {
     /// Splitting a correction without `supersedes` leaves the old long row live beside the new ones.
     #[test]
     fn the_split_advice_tells_a_correction_where_supersedes_goes() {
-        let msg = write_length_refusal(&"a".repeat(3120), 2000).expect("3120 is over 2000");
-        assert!(msg.contains("supersedes"), "{msg}");
+        assert!(long_refusal().contains("supersedes"));
     }
 
+    /// The code survives the rewrite, so a transport that publishes codes still sees it.
     #[test]
-    fn a_memory_write_at_the_limit_draws_no_refusal() {
-        assert_eq!(write_length_refusal(&"a".repeat(2000), 2000), None);
+    fn the_advised_refusal_keeps_its_code() {
+        let e = write::length_refusal(&"a".repeat(3120), 2000).expect("3120 is over 2000");
+        assert_eq!(with_split_advice(e).code(), Some(write::CONTENT_TOO_LONG));
+    }
+
+    /// A tripwire refusal, or any other, reaches the caller as the service wrote it.
+    #[test]
+    fn a_refusal_without_the_length_code_passes_through() {
+        let e = DomainError::validation("this content matches the pem_private_key pattern");
+        let msg = with_split_advice(e).client_message().to_string();
+        assert_eq!(msg, "this content matches the pem_private_key pattern");
     }
 }

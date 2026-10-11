@@ -837,3 +837,77 @@ async fn tools_list_carries_no_cap_on_memory_search() {
     assert!(!search.contains("1500"), "{search}");
     assert!(!search.contains("characters is refused"), "{search}");
 }
+
+/// A 3072-bit RSA key in PEM runs past the cap. Refused on length first, its caller would be told
+/// to split it, and the body without its header passes the tripwire's base64 exclusion and stores
+/// at open. The tripwire has to answer first.
+fn long_pem() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let body: Vec<String> = (0..50)
+        .map(|row| (0..64).map(|col| ALPHABET[(row * 7 + col * 13) % 64] as char).collect())
+        .collect();
+    format!("-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----", body.join("\n"))
+}
+
+#[tokio::test]
+async fn a_long_private_key_meets_the_tripwire_and_not_the_length_cap() {
+    let h = capped_or_skip!();
+    let content = long_pem();
+    assert!(content.chars().count() > CAP, "the fixture is shorter than the cap");
+
+    let result = h
+        .tool_call(
+            OWNER_TOKEN,
+            "memory_write",
+            serde_json::json!({ "content": content, "namespace": "user:me" }),
+        )
+        .await;
+    let text = message(&result);
+    assert!(refused(&result), "a private key was stored: {text}");
+    assert!(text.contains("pem_private_key"), "{text}");
+    assert!(!text.contains("separate memory_write calls"), "{text}");
+}
+
+#[tokio::test]
+async fn a_long_write_to_a_credentials_namespace_is_sent_to_seal() {
+    let h = capped_or_skip!();
+    let result = h
+        .tool_call(
+            OWNER_TOKEN,
+            "memory_write",
+            serde_json::json!({ "content": prose(CAP + 500), "namespace": "credentials:ledger" }),
+        )
+        .await;
+    let text = message(&result);
+    assert!(refused(&result), "{text}");
+    assert!(text.contains("lumberroom seal"), "{text}");
+    assert!(!text.contains("chars and the limit is"), "{text}");
+}
+
+/// A client without the grant hears that, and never that its content was the one thing in the way.
+#[tokio::test]
+async fn a_long_write_outside_the_grant_is_refused_on_the_grant() {
+    let h = capped_or_skip!();
+    let result = h
+        .tool_call(
+            BARE_TOKEN,
+            "memory_write",
+            serde_json::json!({ "content": prose(CAP + 500), "namespace": "project:ledger" }),
+        )
+        .await;
+    let text = message(&result);
+    assert!(refused(&result), "{text}");
+    assert!(!text.contains("chars and the limit is"), "{text}");
+}
+
+/// The default as `config::load` reads it, with the variable unset. The constant's own unit test
+/// pins the number; this one proves `load` falls back to it.
+#[tokio::test]
+async fn an_unset_write_cap_loads_as_2000() {
+    // No other case in this binary sets the variable; each one tunes the loaded struct instead.
+    std::env::remove_var("WRITE_MAX_CONTENT_CHARS");
+    let h = harness_or_skip!();
+    assert_eq!(h.ctx.cfg.policy.max_content_chars, 2000);
+    let write = listed_description(&h, "memory_write").await;
+    assert!(write.ends_with("Content over 2000 characters is refused."), "{write}");
+}

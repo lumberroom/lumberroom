@@ -8,16 +8,26 @@
 moves.
 
 - **The shared refusal carries the numbers.** Every write path that refuses on length says
-  `content is N chars and the limit is M.` and nothing more. The console, an ingest approval, a
-  review merge and an archive merge read it, and none of them can split a row into tool calls.
-- **`memory_write` adds the fix.** The MCP layer checks the same count first and appends advice to
-  split into separate `memory_write` calls, one durable fact each, to leave out session narrative,
-  reasoning and step-by-step history, and to set `supersedes` when correcting a longer row.
+  `content is N chars and the limit is M.` and nothing more, under the code `content_too_long`.
+  The console, an ingest approval, a review merge, an archive merge and the ingest post read it,
+  and none of them can split a row into tool calls.
+- **Length is checked after the refusals that say something worse.** The write path runs the
+  namespace rules, the credentials-namespace refusal, the classification ceiling, the grant and
+  the credential tripwire first, and the length cap after them, ahead of the near-now fence. A
+  3072-bit PEM key runs past 2000 characters, and its body without the header line passes the
+  tripwire's base64 exclusion: refused on length, a caller told to split stores the key at open
+  piece by piece. The ingest post keeps the same order and checks length after the echo lookup too.
+- **`memory_write` adds the fix.** The tool appends advice to the service's refusal when, and only
+  when, the error carries `content_too_long`: split into separate `memory_write` calls, one durable
+  fact each, leave out session narrative, reasoning and step-by-step history, and set `supersedes`
+  when correcting a longer row. The tool runs no length check of its own.
 - **`tools/list` states the limit.** `memory_write`'s description ends with `Content over M
   characters is refused.`, where M is the configured value, and gains two sentences on one fact per
   call. A model that reads the number writes under it.
 - **Ingest refuses at post.** A fact over the limit gets `Refused { rule: "content_too_long" }` with
-  the shared message in `detail`, and never becomes a proposal.
+  the shared message in `detail`, and never becomes a proposal. The check runs after the tripwire,
+  so a long credential reports its tripwire rule, and after the echo lookup, so a transcript quoting
+  a long row the store handed out still confirms it.
 - **An archive merge answers to a carried cap**, the larger of the setting and 8000, through
   `write::run_restored`. The floor is its own constant, `CARRIED_MAX_CHARS`, so it cannot follow the
   default down.
@@ -58,8 +68,14 @@ The fork measured it at 0.97 on EmbeddingGemma and found it would fold 162 corre
 rows they correct. Collapsing a correction into its predecessor destroys data with nothing in the
 store saying so, which is the bias `services::write` states at its top.
 
-**Advice in the shared message.** One string is simpler. It lost because four of the five readers
-cannot act on it.
+**Advice in the shared message.** One string is simpler. It lost because five of its six readers
+cannot act on it: the console, an ingest approval, the ingest post, a review merge and an archive
+merge. Only `memory_write` can.
+
+**A length check in the MCP layer ahead of the service.** It let the tool add advice without an
+error code. It lost because it ran before the tripwire and the grant: a long private key got split
+advice instead of the tripwire refusal, and a long write to `credentials:*` was never sent to
+`lumberroom seal`.
 
 **No cap on archive merges.** An exemption would let an archive written with a 200000 setting load
 200000-character rows into a store that refuses them from every other path. The carried floor
@@ -78,8 +94,15 @@ knowing. Refusal tells the caller and costs one retry.
   refused at approval with the numbers. The owner rejects it or raises the setting.
 - A review merge of two long rows can exceed 2000. The merge is refused and the caller writes a
   shorter merged text.
-- The MCP layer counts the content once and the write path counts it again. The two read the same
-  setting through the same function, `write::length_refusal`, so they cannot disagree.
+- A long write that also fails the grant or the tripwire hears only that refusal. Fixed, it can
+  come back and meet the length cap on the next try: two round trips where one message could have
+  named both.
+- A restatement of a long fact whose proposal is already `written` reports `content_too_long` at
+  post, not reinforcement. The upsert is the only lookup that finds that proposal, and it inserts
+  when it finds nothing. The row stays stored; the source row and the reinforcement count are lost.
+- `lumberroom import --submit --delete-source` keeps the dump when any line was refused under a
+  rule an edit can fix, `content_too_long` among them, and says so. A tripwire refusal alone does
+  not keep the file.
 - An archive merge dry run does not predict a length refusal. It never did; the carried floor
   keeps that gap where it was, at 8000.
 - `lumberroom ingest` prints the new rule with its count and drops `detail`, because the CLI's wire

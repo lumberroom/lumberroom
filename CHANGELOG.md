@@ -30,11 +30,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **Memory content is capped at 2,000 characters by default, down from 8,000.** A `memory_write`,
   console write, ingest approval or review merge longer than `WRITE_MAX_CONTENT_CHARS` is refused
-  with `content is N chars and the limit is M.` `memory_write` adds advice to split the content into
-  separate calls, one durable fact each, and to set `supersedes` when correcting a long row.
+  with `content is N chars and the limit is M.` under the error code `content_too_long`. The length
+  check runs after the namespace, grant and credential tripwire checks, so a long private key still
+  gets the tripwire refusal and a long write to `credentials:*` is still sent to `lumberroom seal`.
+  `memory_write` adds advice to split the content into separate calls, one durable fact each, and
+  to set `supersedes` when correcting a long row, only to a refusal carrying that code.
   `tools/list` states the configured limit in `memory_write`'s description. `lumberroom ingest`
   facts over the limit are refused at post under rule `content_too_long`, with the same message in
-  `detail`, so they never reach the queue. Rows already stored are unaffected. An archive merge
+  `detail`, so they never reach the queue; a long credential still reports its tripwire rule, and a
+  transcript quoting a long row the store handed out still confirms it. `lumberroom import --submit
+  --delete-source` keeps the dump when a line was refused under a rule an edit can fix, and says
+  which. Rows already stored are unaffected. An archive merge
   imports rows up to 8,000 characters, or up to the setting when it is higher, and an archive
   restore has no length cap. To keep the old limit, set `WRITE_MAX_CONTENT_CHARS=8000` in `.env`;
   `docker-compose.yml` now forwards the variable. Decision 0030.
