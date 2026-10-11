@@ -714,6 +714,41 @@ async fn a_merge_with_a_future_date_is_refused_by_naming_the_future() {
     assert!(!message.contains("inside the last"), "{message}");
 }
 
+/// The merge path writes through the same cap as `memory_write` and reads the shared refusal. Its
+/// caller holds one merged text, so advice to split into `memory_write` calls is advice it cannot
+/// follow.
+#[tokio::test]
+async fn a_merge_over_the_write_cap_is_refused_with_only_the_numbers() {
+    let h = ctx_or_skip!(|c: &mut Config| {
+        c.quality.stale_days = 30;
+        c.policy.max_content_chars = 2000;
+    });
+    let id =
+        write_at(&h.ctx, &format!("the merge target still holds {}", nonce("c1")), "global").await;
+    make_stale(&h.pool, &id).await;
+    let merged = "The backup host rotates its nightly copy each week. ".repeat(40);
+    let chars = merged.trim().chars().count();
+    assert!(chars > 2000, "the fixture is {chars} characters");
+
+    let result = h
+        .call(
+            "review_decide",
+            serde_json::json!({
+                "key": format!("stale:{id}"),
+                "verdict": "merge",
+                "content": merged,
+            }),
+        )
+        .await;
+    assert!(refused(&result), "{result:?}");
+    let message = text(&result);
+    assert!(
+        message.contains(&format!("content is {chars} chars and the limit is 2000.")),
+        "{message}"
+    );
+    assert!(!message.contains("memory_write"), "{message}");
+}
+
 #[tokio::test]
 async fn a_proposal_decided_through_the_tool_without_a_reason_is_refused_reason_required() {
     let h = ctx_or_skip!(|_| {});

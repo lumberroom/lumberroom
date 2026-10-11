@@ -195,6 +195,10 @@ The facts themselves stay exactly where they are; only the expansion goes.
 reaches. The namespace field offers the namespaces the store already holds and still accepts one it
 has never seen.
 
+A fact longer than `WRITE_MAX_CONTENT_CHARS`, 2000 characters by default, is refused with its length
+and the limit. The same cap holds for `memory_write`, ingest approvals and review merges. An archive
+merge imports rows up to 8000 characters, or up to the setting when it is higher (decision 0030).
+
 "Became true on" is the field the console exists for. A person typing a date knows when a fact
 started holding; a model reads one out of context and invents it. A date inside the near-now fence,
 one day by default (`WRITE_MIN_OCCURRED_AGE_SECS`), is refused, because the store already stamps the

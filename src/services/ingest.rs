@@ -65,6 +65,10 @@ pub const REFUSAL_INVALID_NAMESPACE: &str = "invalid_namespace";
 /// mayIngest-only client which uuids are real, one probe at a time.
 pub const REFUSAL_SUPERSEDES_TARGET: &str = "supersedes_not_writable";
 
+/// The rule name a fact is refused under when it is longer than `WRITE_MAX_CONTENT_CHARS`. The
+/// approval would refuse it, and a queue row nobody can approve is one the owner reads for nothing.
+pub const REFUSAL_TOO_LONG: &str = super::write::CONTENT_TOO_LONG;
+
 /// The caller's grant and the classification table, for the query to apply.
 pub fn reader(ctx: &Ctx) -> ReadGrant {
     ReadGrant {
@@ -137,8 +141,16 @@ pub enum FactOutcome {
     /// The store handed this content out before the transcript recorded it, so it is an echo. The
     /// memory is confirmed and no proposal exists.
     Confirmed { memory_id: Uuid },
-    /// The tripwire, or the poster's grant, refused it before a row could exist. Rule name only.
-    Refused { rule: &'static str },
+    /// The tripwire, the poster's grant or the length cap refused it before a row could exist.
+    ///
+    /// `detail` carries the write path's own refusal for the length cap, which holds two numbers
+    /// and no content. The tripwire's refusal never fills it: a finding's detail stays in this
+    /// process. Skipped when absent, so a client that reads `rule` alone sees the old shape.
+    Refused {
+        rule: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -190,7 +202,9 @@ pub async fn post(
         else {
             // One bad namespace refuses one fact, not the batch. The write path would refuse it
             // at approval anyway; refusing here keeps it out of the queue.
-            report.outcomes.push(FactOutcome::Refused { rule: REFUSAL_INVALID_NAMESPACE });
+            report
+                .outcomes
+                .push(FactOutcome::Refused { rule: REFUSAL_INVALID_NAMESPACE, detail: None });
             report.refused += 1;
             continue;
         };
@@ -202,7 +216,9 @@ pub async fn post(
                 client = %ctx.principal.client,
                 "an ingested fact named a namespace outside the poster's grant"
             );
-            report.outcomes.push(FactOutcome::Refused { rule: REFUSAL_OUTSIDE_GRANT });
+            report
+                .outcomes
+                .push(FactOutcome::Refused { rule: REFUSAL_OUTSIDE_GRANT, detail: None });
             report.refused += 1;
             continue;
         }
@@ -224,7 +240,7 @@ pub async fn post(
                     namespace = %fact.namespace,
                     "credential tripwire refused an ingested fact before it became a proposal"
                 );
-                report.outcomes.push(FactOutcome::Refused { rule: finding.rule });
+                report.outcomes.push(FactOutcome::Refused { rule: finding.rule, detail: None });
                 report.refused += 1;
                 continue;
             }
@@ -239,7 +255,9 @@ pub async fn post(
                     client = %ctx.principal.client,
                     "an ingested fact named a supersession target outside the poster's grant"
                 );
-                report.outcomes.push(FactOutcome::Refused { rule: REFUSAL_SUPERSEDES_TARGET });
+                report
+                    .outcomes
+                    .push(FactOutcome::Refused { rule: REFUSAL_SUPERSEDES_TARGET, detail: None });
                 report.refused += 1;
                 continue;
             }
@@ -281,6 +299,23 @@ pub async fn post(
             true => fact.quote.clone(),
             false => None,
         };
+
+        // The approval writes through the configured cap, so the post checks the same number,
+        // here and no earlier. After the tripwire, so a long credential reports as a credential,
+        // and after the echo lookup, so a transcript quoting a long row the store handed out is
+        // still a confirmation. A restatement of a long proposal already `written` still lands
+        // here: the upsert is the only thing that would find it, and it inserts when it finds
+        // nothing.
+        if let Some(refusal) =
+            super::write::length_refusal(&fact.content, ctx.cfg.policy.max_content_chars)
+        {
+            report.outcomes.push(FactOutcome::Refused {
+                rule: REFUSAL_TOO_LONG,
+                detail: Some(refusal.client_message().to_string()),
+            });
+            report.refused += 1;
+            continue;
+        }
 
         let upsert = repo
             .insert_proposal(

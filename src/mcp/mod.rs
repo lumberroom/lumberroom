@@ -58,6 +58,42 @@ pub fn tool_definitions() -> Vec<rmcp::model::Tool> {
 /// `tools/list` for anyone else. Named here because both the filter and the guard read it.
 pub const FORGET_TOOL: &str = "memory_forget";
 
+/// A tool as `tools/list` serves it. `memory_write`'s description gains the configured length cap;
+/// every other tool passes through.
+fn with_configured_limit(mut tool: rmcp::model::Tool, max_chars: usize) -> rmcp::model::Tool {
+    if tool.name == "memory_write" {
+        tool.description = tool
+            .description
+            .map(|d| format!("{d} Content over {max_chars} characters is refused.").into());
+    }
+    tool
+}
+
+/// What `memory_write` adds to the shared length refusal in `services::write`.
+///
+/// Here and not in the service, because only a caller of this tool can act on it. The console, an
+/// ingest approval and a review merge read the same refusal and cannot split a row into tool
+/// calls. A correction gets its own sentence, because splitting without `supersedes` leaves the old
+/// row live.
+const SPLIT_ADVICE: &str = "Split it into separate memory_write calls, one durable fact each, and \
+leave out session narrative, reasoning and step-by-step history. To correct a longer row, set \
+supersedes on the call that restates it.";
+
+/// The refusal a `memory_write` caller reads. The service's length refusal gains
+/// [`SPLIT_ADVICE`]; every other error passes through untouched.
+///
+/// Keyed on the code, and applied after the service has run every check it runs ahead of the
+/// length: a credential, a credentials namespace and a missing grant each keep their own refusal.
+fn with_split_advice(e: DomainError) -> DomainError {
+    match e.code() {
+        Some(code) if code == write::CONTENT_TOO_LONG => {
+            let message = format!("{} {SPLIT_ADVICE}", e.client_message());
+            DomainError::new(e.kind, message).with_code(code)
+        }
+        _ => e,
+    }
+}
+
 /// Shared, request-independent state.
 pub struct AppState {
     pub cfg: Arc<Config>,
@@ -310,7 +346,9 @@ to the new one, and the new row is already stored either way. When one of them s
 version of the fact just written, a second call with the same content and supersedes set to that \
 memory's id retires it in favour of the row the first call stored, which leaves one live row for \
 the fact. The old row stays readable in memory_history. \
-possible_conflicts can also list a different fact that only sounds similar.",
+possible_conflicts can also list a different fact that only sounds similar. A row reads best as one \
+fact in a few sentences. Several facts belong in several calls, and session narrative, reasoning \
+and step-by-step history stay in the conversation.",
         annotations(
             title = "Save a memory",
             read_only_hint = false,
@@ -340,7 +378,8 @@ possible_conflicts can also list a different fact that only sounds similar.",
                 args.sensitivity.as_deref(),
                 occurred_at,
             )
-            .await?;
+            .await
+            .map_err(with_split_advice)?;
             let json = serde_json::to_value(&result).unwrap_or_default();
             Ok((serde_json::to_string_pretty(&json).unwrap_or_default(), json))
         })
@@ -550,6 +589,10 @@ impl ServerHandler for Lumberroom {
             .list_all()
             .into_iter()
             .filter(|t| principal.as_ref().is_some_and(|p| capability::permits(p, &t.name)))
+            // The write cap is a setting and the macro's description is a compile-time string. A
+            // model that reads the number here writes under it rather than learning it from a
+            // refusal.
+            .map(|t| with_configured_limit(t, self.state.cfg.policy.max_content_chars))
             .collect();
 
         // Cache hints landed in the 2026-07-28 revision. This list depends on the credential, so it
@@ -565,5 +608,79 @@ impl ServerHandler for Lumberroom {
             ttl_ms: hints.then_some(0),
             cache_scope: hints.then_some(CacheScope::Private),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listed(name: &str) -> String {
+        let tool = tool_definitions()
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is not registered"));
+        let tool = with_configured_limit(tool, 2000);
+        tool.description.unwrap_or_default().to_string()
+    }
+
+    /// The registered tool, not a string, so a rename of `memory_write` that missed the helper's
+    /// match fails here.
+    #[test]
+    fn the_listed_write_description_states_the_configured_limit() {
+        let d = listed("memory_write");
+        assert!(d.contains("Several facts belong in several calls"), "{d}");
+        assert!(d.ends_with("Content over 2000 characters is refused."), "{d}");
+    }
+
+    #[test]
+    fn other_listed_descriptions_carry_no_limit() {
+        let d = listed("memory_search");
+        assert!(!d.contains("2000"), "{d}");
+    }
+
+    /// The service's length refusal, as `write::run` returns it for 3120 characters under 2000.
+    fn long_refusal() -> String {
+        let e = write::length_refusal(&"a".repeat(3120), 2000).expect("3120 is over 2000");
+        with_split_advice(e).client_message().to_string()
+    }
+
+    /// An agent reads the refusal once and retries, so it carries both numbers and the one fix
+    /// that works: several short writes in place of one long one.
+    #[test]
+    fn a_long_memory_write_is_refused_with_the_numbers_and_the_split() {
+        let msg = long_refusal();
+        assert!(msg.starts_with("content is 3120 chars and the limit is 2000."), "{msg}");
+        assert!(msg.contains("separate memory_write calls"), "{msg}");
+        assert!(msg.contains("one durable fact each"), "{msg}");
+    }
+
+    #[test]
+    fn the_split_advice_names_what_to_cut() {
+        let msg = long_refusal();
+        for cut in ["session narrative", "reasoning", "step-by-step history"] {
+            assert!(msg.contains(cut), "{cut} missing from {msg}");
+        }
+    }
+
+    /// Splitting a correction without `supersedes` leaves the old long row live beside the new ones.
+    #[test]
+    fn the_split_advice_tells_a_correction_where_supersedes_goes() {
+        assert!(long_refusal().contains("supersedes"));
+    }
+
+    /// The code survives the rewrite, so a transport that publishes codes still sees it.
+    #[test]
+    fn the_advised_refusal_keeps_its_code() {
+        let e = write::length_refusal(&"a".repeat(3120), 2000).expect("3120 is over 2000");
+        assert_eq!(with_split_advice(e).code(), Some(write::CONTENT_TOO_LONG));
+    }
+
+    /// A tripwire refusal, or any other, reaches the caller as the service wrote it.
+    #[test]
+    fn a_refusal_without_the_length_code_passes_through() {
+        let e = DomainError::validation("this content matches the pem_private_key pattern");
+        let msg = with_split_advice(e).client_message().to_string();
+        assert_eq!(msg, "this content matches the pem_private_key pattern");
     }
 }

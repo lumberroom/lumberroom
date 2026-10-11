@@ -436,3 +436,84 @@ async fn an_import_refuses_to_start_when_the_tripwire_is_off() {
     assert!(err.to_string().contains("SENSITIVITY_TRIPWIRE"), "{err}");
     assert_eq!(h.rows().await, 0);
 }
+
+// -- the write cap -------------------------------------------------------------------------------
+
+/// `ID_FIRST` and the rest name a chain. These two rows stand alone.
+const ID_LONG: &str = "0195c0de-0000-7000-8000-000000000011";
+const ID_OVER: &str = "0195c0de-0000-7000-8000-000000000012";
+
+/// The harness context with `WRITE_MAX_CONTENT_CHARS` at 2000, set here so a `.env` that raises it
+/// cannot turn these cases into passes on a looser setting.
+fn capped(h: &Harness) -> Ctx {
+    let mut cfg = (*h.ctx.cfg).clone();
+    cfg.policy.max_content_chars = 2000;
+    Ctx { cfg: Arc::new(cfg), ..h.ctx.clone() }
+}
+
+/// Plain prose of exactly `chars` characters, ending on a full stop so the write path's trim
+/// changes nothing. `seed` keeps two rows apart, so the dedupe bands see two facts.
+fn prose(seed: &str, chars: usize) -> String {
+    let sentence = format!(
+        "The {seed} host keeps its nightly backup on the storage shelf and rotates it each week. "
+    );
+    let mut text: String =
+        sentence.repeat(chars / sentence.len() + 1).chars().take(chars).collect();
+    text.pop();
+    text.push('.');
+    text
+}
+
+/// An exported row was valid in the store that wrote it, under a default of 8000 until decision
+/// 0030. The cap of 2000 applied here would refuse it with a refusal about a fact the importer
+/// never wrote.
+#[tokio::test]
+async fn a_merge_under_a_2000_cap_stores_an_exported_row_of_five_thousand_chars() {
+    let h = harness_or_skip!();
+    let ctx = capped(&h);
+    let content = prose("study", 5000);
+    assert_eq!(content.chars().count(), 5000);
+    let archive = archive_of(&ctx, vec![memory(ID_LONG, &content, "open")]);
+
+    let report = archive::apply(&ctx, &archive, archive::Mode::Merge, false, &HashMap::new())
+        .await
+        .expect("the merge");
+
+    assert!(report.refused.is_empty(), "refusals: {:?}", report.refused);
+    assert_eq!(report.applied, 1);
+    let id = report.id_map.get(ID_LONG).expect("the long row landed");
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT content FROM memory WHERE tenant_id = $1 AND id = $2")
+            .bind(h.tenant())
+            .bind(uuid::Uuid::parse_str(id).unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some(content.as_str()), "the merge stored a different text");
+}
+
+/// The carried cap is a floor of 8000, not an exemption. A row past it is refused alone, with the
+/// numbers, and the merge carries on with the rest.
+#[tokio::test]
+async fn a_merge_under_a_2000_cap_refuses_an_exported_row_over_eight_thousand_chars() {
+    let h = harness_or_skip!();
+    let ctx = capped(&h);
+    let fits = prose("study", 5000);
+    let over = prose("garage", 8001);
+    assert_eq!(over.chars().count(), 8001);
+    let archive =
+        archive_of(&ctx, vec![memory(ID_LONG, &fits, "open"), memory(ID_OVER, &over, "open")]);
+
+    let report = archive::apply(&ctx, &archive, archive::Mode::Merge, false, &HashMap::new())
+        .await
+        .expect("the merge");
+
+    assert_eq!(report.applied, 1, "refusals: {:?}", report.refused);
+    assert!(report.id_map.contains_key(ID_LONG), "the row under the floor was dropped too");
+    assert!(!report.id_map.contains_key(ID_OVER), "the row past the floor landed");
+    assert_eq!(report.refused.len(), 1, "refusals: {:?}", report.refused);
+    let (id, reason) = &report.refused[0];
+    assert_eq!(id, ID_OVER);
+    assert_eq!(reason, "content is 8001 chars and the limit is 8000.");
+    assert_eq!(h.rows().await, 1);
+}

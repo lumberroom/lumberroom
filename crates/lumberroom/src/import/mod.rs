@@ -255,18 +255,29 @@ async fn memory_dump(c: &Client, args: &Args) -> Result<()> {
     ));
     out("Review them with: lumberroom ingest list --state proposed");
 
-    // Only after the post returned, and only when it landed something. A run that refused or blocked
-    // every line leaves the owner with nothing in the queue, and deleting the file then would take
-    // the only copy of a dump they still have to fix and retry.
+    // Only after the post returned, only when it landed something, and only when every refused line
+    // held a credential. Any other refusal leaves a line the owner may fix and retry, and the file
+    // is its only copy.
     if delete_source {
-        let landed = posted.proposals_new + posted.proposals_reinforced + posted.confirmations;
-        if landed == 0 {
-            out("");
-            out(&format!(
-                "Kept {path}: nothing reached the queue, so the file is still the only copy."
-            ));
-        } else {
-            match std::fs::remove_file(&path) {
+        match source_fate(&posted) {
+            SourceFate::KeepNothingLanded => {
+                out("");
+                out(&format!(
+                    "Kept {path}: nothing reached the queue, so the file is still the only copy."
+                ));
+            }
+            SourceFate::KeepRefused(kept) => {
+                let rules: Vec<String> =
+                    kept.iter().map(|(rule, n)| format!("{rule} x{n}")).collect();
+                out("");
+                out(&format!(
+                    "Kept {path}: the server refused lines for a reason an edit may fix ({}), \
+                     and the file is the only copy of them. Fix those lines and import the file \
+                     again; the lines that landed come back as reinforced or already known.",
+                    rules.join(", ")
+                ));
+            }
+            SourceFate::Delete => match std::fs::remove_file(&path) {
                 Ok(()) => {
                     out("");
                     out(&format!("Deleted {path}."));
@@ -277,10 +288,74 @@ async fn memory_dump(c: &Client, args: &Args) -> Result<()> {
                     out("");
                     out(&format!("Imported, but could not delete {path}: {e}"));
                 }
-            }
+            },
         }
     }
     Ok(())
+}
+
+/// The rule names `src/domain/tripwire.rs` in the server refuses a credential under. A line refused
+/// under one of these holds a credential: no edit makes it storable, and keeping the file for it
+/// keeps the credential on disk. `the_tripwire_list_matches_the_server_scanner` pins the copy.
+///
+/// Every other refusal keeps the file, a rule this binary has never seen among them. The list
+/// fails closed: a new server rule costs a file the owner deletes by hand, never a lost line.
+const TRIPWIRE_RULES: [&str; 19] = [
+    "anthropic_api_key",
+    "aws_access_key_id",
+    "connection_string_password",
+    "digitalocean_token",
+    "github_token",
+    "gitlab_token",
+    "google_api_key",
+    "hex_credential",
+    "high_entropy_token",
+    "huggingface_token",
+    "jwt",
+    "npm_token",
+    "openai_api_key",
+    "pem_private_key",
+    "sendgrid_api_key",
+    "shopify_access_token",
+    "slack_token",
+    "stripe_restricted_key",
+    "stripe_secret_key",
+];
+
+/// What `--delete-source` does with the file after a post.
+#[derive(Debug, PartialEq, Eq)]
+enum SourceFate {
+    Delete,
+    KeepNothingLanded,
+    /// Each refusal rule that keeps the file, with its count, in rule order.
+    KeepRefused(Vec<(String, usize)>),
+}
+
+fn source_fate(posted: &api::PostReport) -> SourceFate {
+    let landed = posted.proposals_new + posted.proposals_reinforced + posted.confirmations;
+    if landed == 0 {
+        return SourceFate::KeepNothingLanded;
+    }
+    let mut kept: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut listed = 0;
+    for outcome in &posted.outcomes {
+        if let api::FactOutcome::Refused { rule } = outcome {
+            listed += 1;
+            if !TRIPWIRE_RULES.contains(&rule.as_str()) {
+                *kept.entry(rule.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    // A server that counts refusals without naming each one leaves their rules unknown.
+    let unnamed = usize::try_from(posted.refused).unwrap_or(0).saturating_sub(listed);
+    if unnamed > 0 {
+        *kept.entry("unnamed".to_string()).or_insert(0) += unnamed;
+    }
+    if kept.is_empty() {
+        SourceFate::Delete
+    } else {
+        SourceFate::KeepRefused(kept.into_iter().collect())
+    }
 }
 
 /// Whether this run deletes the file when it is done, or refuses the combination outright.
@@ -398,7 +473,96 @@ async fn assess(args: &Args, plan: &mut plan::PlanReport, policy: junk::Policy) 
 
 #[cfg(test)]
 mod tests {
-    use super::deletes_source;
+    use super::{deletes_source, source_fate, SourceFate, TRIPWIRE_RULES};
+    use crate::ingest::api::{FactOutcome, PostReport};
+
+    fn refused(rule: &str) -> FactOutcome {
+        FactOutcome::Refused { rule: rule.into() }
+    }
+
+    /// A post that landed one line and refused the given rules, with `refused` counted from them.
+    fn landed_one_and_refused(rules: &[&str]) -> PostReport {
+        let mut outcomes = vec![FactOutcome::Proposed { id: uuid::Uuid::nil(), auto: false }];
+        outcomes.extend(rules.iter().map(|r| refused(r)));
+        PostReport {
+            outcomes,
+            proposals_new: 1,
+            refused: rules.len() as i32,
+            ..PostReport::default()
+        }
+    }
+
+    /// A line over the server's length cap is refused at post and exists nowhere else, so the file
+    /// has to survive for the owner to shorten it and post again.
+    #[test]
+    fn a_line_over_the_length_cap_keeps_the_source() {
+        let fate = source_fate(&landed_one_and_refused(&[
+            "content_too_long",
+            "pem_private_key",
+            "content_too_long",
+        ]));
+        assert_eq!(fate, SourceFate::KeepRefused(vec![("content_too_long".to_string(), 2)]));
+    }
+
+    /// A tripwire refusal means the line holds a credential. Keeping the file for it keeps the
+    /// credential on disk, and no edit to the line makes it storable.
+    #[test]
+    fn tripwire_refusals_alone_let_the_source_go() {
+        let fate = source_fate(&landed_one_and_refused(&["pem_private_key", "aws_access_key_id"]));
+        assert_eq!(fate, SourceFate::Delete);
+    }
+
+    /// A rule this binary has never heard of may be one an edit fixes. Deleting on a guess loses
+    /// the only copy of the line.
+    #[test]
+    fn a_rule_the_cli_does_not_know_keeps_the_source() {
+        let fate = source_fate(&landed_one_and_refused(&["a_rule_added_next_year"]));
+        assert_eq!(fate, SourceFate::KeepRefused(vec![("a_rule_added_next_year".to_string(), 1)]));
+    }
+
+    /// A server that counts refusals without listing them leaves the rules unknown.
+    #[test]
+    fn refusals_without_outcomes_keep_the_source() {
+        let posted = PostReport { proposals_new: 3, refused: 2, ..PostReport::default() };
+        assert!(matches!(source_fate(&posted), SourceFate::KeepRefused(_)));
+    }
+
+    #[test]
+    fn nothing_landed_keeps_the_source() {
+        let posted =
+            PostReport { refused: 1, outcomes: vec![refused("jwt")], ..PostReport::default() };
+        assert_eq!(source_fate(&posted), SourceFate::KeepNothingLanded);
+    }
+
+    #[test]
+    fn a_clean_post_deletes_the_source() {
+        assert_eq!(source_fate(&landed_one_and_refused(&[])), SourceFate::Delete);
+    }
+
+    /// The list is a copy of the rule names in the server's `src/domain/tripwire.rs`, which this
+    /// crate cannot depend on. A rule added there and missed here keeps the file, which is safe,
+    /// but a rule renamed there and left here would never match. Read the source and compare.
+    #[test]
+    fn the_tripwire_list_matches_the_server_scanner() {
+        let source = include_str!("../../../../src/domain/tripwire.rs");
+        let body = &source[..source.find("#[cfg(test)]").expect("tripwire.rs has a test module")];
+        let mut found = std::collections::BTreeSet::new();
+        for marker in ["rule: \"", "Finding::new(\""] {
+            for (at, _) in body.match_indices(marker) {
+                let rest = &body[at + marker.len()..];
+                found.insert(&rest[..rest.find('"').expect("closing quote")]);
+            }
+        }
+        // `Finding::new(` can break its first argument onto the next line.
+        for (at, _) in body.match_indices("Finding::new(\n") {
+            let rest = body[at + "Finding::new(\n".len()..].trim_start();
+            if let Some(rest) = rest.strip_prefix('"') {
+                found.insert(&rest[..rest.find('"').expect("closing quote")]);
+            }
+        }
+        let listed: std::collections::BTreeSet<&str> = TRIPWIRE_RULES.iter().copied().collect();
+        assert_eq!(listed, found);
+    }
 
     #[test]
     fn deleting_the_source_needs_a_submit_and_says_why() {

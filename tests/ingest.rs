@@ -501,7 +501,7 @@ async fn the_tripwire_refuses_a_credential_before_a_proposal_exists() {
     assert_eq!(report.proposals_new, 0);
     assert_eq!(
         report.outcomes[0],
-        ingest::FactOutcome::Refused { rule: "connection_string_password" }
+        ingest::FactOutcome::Refused { rule: "connection_string_password", detail: None }
     );
 
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM ingest_proposal")
@@ -509,6 +509,159 @@ async fn the_tripwire_refuses_a_credential_before_a_proposal_exists() {
         .await
         .unwrap();
     assert_eq!(rows, 0);
+}
+
+// -- the write cap -------------------------------------------------------------------------------
+
+/// The harness context with `WRITE_MAX_CONTENT_CHARS` at 2000, set here so a `.env` that raises it
+/// cannot turn these cases into passes on a looser setting.
+fn capped(h: &Harness) -> Ctx {
+    let mut cfg = (*h.ctx.cfg).clone();
+    cfg.policy.max_content_chars = 2000;
+    Ctx { cfg: Arc::new(cfg), ..h.ctx.clone() }
+}
+
+/// Plain prose of exactly `chars` characters, ending on a full stop so the write path's trim
+/// changes nothing. `seed` keeps two facts apart, so their fingerprints differ.
+fn prose(seed: &str, chars: usize) -> String {
+    let sentence = format!(
+        "The {seed} host keeps its nightly backup on the storage shelf and rotates it each week. "
+    );
+    let mut text: String =
+        sentence.repeat(chars / sentence.len() + 1).chars().take(chars).collect();
+    text.pop();
+    text.push('.');
+    text
+}
+
+/// A fact the approval would refuse never becomes a proposal. Refused at post, the extractor's run
+/// report says so; refused at approval, the owner reads a queue row nobody can approve.
+#[tokio::test]
+async fn a_fact_over_the_write_cap_is_refused_at_post_with_both_numbers() {
+    let h = harness_or_skip!();
+    let ctx = capped(&h);
+    let run = open_run(&h).await;
+    let over = prose("study", 2001);
+    let at = prose("garage", 2000);
+
+    let report = ingest::post(
+        &ctx,
+        h.repo.as_ref(),
+        "agent:claude-code",
+        vec![
+            fact(&over, "main_model", source("/p/a.jsonl", "e1", "main_model", run)),
+            fact(&at, "main_model", source("/p/a.jsonl", "e2", "main_model", run)),
+        ],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.refused, 1, "{:?}", report.outcomes);
+    assert_eq!(report.proposals_new, 1, "one long fact refused the batch: {:?}", report.outcomes);
+    assert_eq!(
+        report.outcomes[0],
+        ingest::FactOutcome::Refused {
+            rule: ingest::REFUSAL_TOO_LONG,
+            detail: Some("content is 2001 chars and the limit is 2000.".into()),
+        }
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM ingest_proposal WHERE content = $1")
+        .bind(&over)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "the long fact reached the queue");
+}
+
+/// A proposal queued under a looser setting meets the cap at approval. The owner reads this refusal
+/// in the queue, where advice to split into `memory_write` calls names a tool he is not using.
+#[tokio::test]
+async fn an_approval_over_the_write_cap_is_refused_with_only_the_numbers() {
+    let h = harness_or_skip!();
+    let run = open_run(&h).await;
+    let long = prose("study", 2001);
+
+    let seeded = h
+        .repo
+        .insert_proposal(
+            h.ctx.tenant(),
+            NewProposal {
+                fingerprint: ingest::fingerprint(&h.ctx, &long).await.unwrap(),
+                content: long.clone(),
+                namespace: "user:me".into(),
+                tags: vec![],
+                supersedes: None,
+                speaker: "main_model".into(),
+                quote: None,
+                auto: false,
+                extractor: "agent:claude-code".into(),
+                posted_by: "mac".into(),
+                source: source("/p/a.jsonl", "e1", "main_model", run),
+            },
+        )
+        .await
+        .unwrap();
+
+    let outcome =
+        ingest::approve(&capped(&h), h.repo.as_ref(), seeded.proposal().id).await.unwrap();
+    let refusal = outcome.refused.expect("a 2001-character proposal is over the cap");
+    assert!(refusal.contains("content is 2001 chars and the limit is 2000."), "{refusal}");
+    assert!(!refusal.contains("memory_write"), "{refusal}");
+    assert!(outcome.memory_id.is_none());
+}
+
+/// A long credential reports as a credential. The length rule would hide the reason the content
+/// can never be stored, and the run report counts refusals by rule.
+#[tokio::test]
+async fn a_credential_over_the_write_cap_reports_the_tripwire_rule() {
+    let h = harness_or_skip!();
+    let run = open_run(&h).await;
+    let content = format!("{CREDENTIAL} {}", prose("study", 2500));
+    assert!(content.chars().count() > 2000);
+
+    let report = ingest::post(
+        &capped(&h),
+        h.repo.as_ref(),
+        "agent:claude-code",
+        vec![fact(&content, "main_model", source("/p/a.jsonl", "e1", "main_model", run))],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        report.outcomes[0],
+        ingest::FactOutcome::Refused { rule: "connection_string_password", detail: None }
+    );
+}
+
+/// A stored row written under a looser cap and handed out by the store, then restated by a
+/// transcript, is an echo. The length rule is about what may enter the queue, and an echo never
+/// does.
+#[tokio::test]
+async fn an_echo_of_a_stored_row_over_the_cap_is_a_confirmation() {
+    let h = harness_or_skip!();
+    let run = open_run(&h).await;
+    let content = prose("study", 3000);
+
+    let mut loose = (*h.ctx.cfg).clone();
+    loose.policy.max_content_chars = 8000;
+    let loose = Ctx { cfg: Arc::new(loose), ..h.ctx.clone() };
+    let written = write::run(&loose, &content, "user:me", None, None, None, None).await.unwrap();
+    let memory_id = uuid::Uuid::parse_str(&written.id).unwrap();
+    ingest::record_emission(&h.ctx, h.repo.as_ref(), &content, memory_id, "context_bootstrap")
+        .await
+        .unwrap();
+
+    let report = ingest::post(
+        &capped(&h),
+        h.repo.as_ref(),
+        "agent:claude-code",
+        vec![fact(&content, "main_model", source("/p/a.jsonl", "e1", "main_model", run))],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(report.outcomes[0], ingest::FactOutcome::Confirmed { memory_id });
 }
 
 #[tokio::test]

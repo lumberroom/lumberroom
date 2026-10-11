@@ -92,7 +92,7 @@ honest comparison to their 95.2% is the session-as-document column at 88.0%.
 Chunking is worth +8 recall@5 because the median rendered session runs 10,506 characters and the
 embedder's window covers roughly the first 2,000. That finding applies to transcript ingestion,
 which is where long text enters this system. It does not apply to the fact store, whose rows are
-single sentences under an 8,000-character cap.
+single sentences under a 2,000-character cap (8,000 before decision 0030).
 
 ### Phase 7, and what rank fusion is worth at full scale
 

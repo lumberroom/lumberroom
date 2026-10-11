@@ -225,6 +225,8 @@ services:
       SENSITIVITY_DEFAULTS: ${SENSITIVITY_DEFAULTS:-}
       SENSITIVITY_TRIPWIRE: ${SENSITIVITY_TRIPWIRE:-}
       MAX_WRITE_SENSITIVITY: ${MAX_WRITE_SENSITIVITY:-}
+      # Longest memory content in characters. Blank means the server default, 2000 (decision 0030).
+      WRITE_MAX_CONTENT_CHARS: ${WRITE_MAX_CONTENT_CHARS:-}
       # Key-encryption key. KEK_PATH matches the bind mount target below, which is populated
       # regardless of whether KEK_PROVIDER=file is actually chosen (see the note at the top of
       # this file).
@@ -470,6 +472,7 @@ services:
       SENSITIVITY_DEFAULTS: ${SENSITIVITY_DEFAULTS:-}
       SENSITIVITY_TRIPWIRE: ${SENSITIVITY_TRIPWIRE:-}
       MAX_WRITE_SENSITIVITY: ${MAX_WRITE_SENSITIVITY:-}
+      WRITE_MAX_CONTENT_CHARS: ${WRITE_MAX_CONTENT_CHARS:-}
       KEK_PROVIDER: ${KEK_PROVIDER:-none}
       KEK_ENV_VAR: ${KEK_ENV_VAR:-LUMBERROOM_KEK}
       LUMBERROOM_KEK: ${LUMBERROOM_KEK:-}
