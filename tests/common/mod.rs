@@ -1,8 +1,8 @@
 //! What every database test shares: one lock, and the rule for when a test may skip.
 //!
 //! Every integration binary here truncates `lumberroom_rust_test`, and each carries its own
-//! `static SERIAL` mutex. A mutex serialises threads inside one process, and these are six
-//! processes, so nothing stopped `tests/console_cleanup` truncating the table `tests/cleanup` was
+//! `static SERIAL` mutex. A mutex serialises threads inside one process, and each binary is its own
+//! process, so nothing stopped `tests/console_cleanup` truncating the table `tests/cleanup` was
 //! part way through asserting against.
 //!
 //! It fails the way shared state always does: every file passes on its own and two of them fail in
@@ -38,10 +38,25 @@ macro_rules! step {
     };
 }
 
+/// The switch `scripts/cargo.sh` and `.github/workflows/ci.yml` set by name.
+pub const REQUIRE_DB_VAR: &str = "LUMBERROOM_TEST_REQUIRE_DB";
+
 /// Whether a test with no database must fail rather than skip. A laptop with Docker stopped may
 /// still skip; `scripts/cargo.sh test`, `test-fast` and CI attach a database and set this.
 pub fn db_required() -> bool {
-    std::env::var("LUMBERROOM_TEST_REQUIRE_DB").is_ok_and(|v| !v.is_empty() && v != "0")
+    requires_db(std::env::var(REQUIRE_DB_VAR).ok().as_deref())
+}
+
+/// The switch's reading of its value: unset, empty and `0` leave a skip allowed.
+pub fn requires_db(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// For a test's own skip arm, after setup returned `None`. Setup has already printed why; this is a
+/// backstop for a setup path that returns `None` without going through `skip_or_fail`.
+pub fn skipping() {
+    assert!(!db_required(), "setup returned None while {REQUIRE_DB_VAR} is set");
+    eprintln!("skipping: no database reachable");
 }
 
 /// Panics when `required`, otherwise prints the reason and returns `None` so the caller skips.
@@ -57,9 +72,10 @@ pub fn skip_or_fail<T>(required: bool, what: &str, why: impl std::fmt::Debug) ->
 /// The admin pool `DATABASE_URL` names and the URL with its database part cut off, or `None` on a
 /// machine with no database.
 ///
-/// A refused or timed-out connection may skip. A connection the server answered with an error,
-/// such as a wrong password or a missing database, panics: something is listening, so the run
-/// is broken rather than absent.
+/// Only an I/O failure (refused, unresolvable host) or a connect timeout may skip, since those are
+/// the errors of a server that never answered. Every other error panics: a wrong password or a
+/// missing database is a server answering, and a malformed URL, a TLS refusal or a protocol error
+/// is a broken run rather than an absent database.
 pub async fn connect_admin() -> Option<(PgPool, String)> {
     let url = match std::env::var("DATABASE_URL") {
         Ok(url) => url,
@@ -71,10 +87,10 @@ pub async fn connect_admin() -> Option<(PgPool, String)> {
     };
     match PgPool::connect(&url).await {
         Ok(admin) => Some((admin, base.to_string())),
-        Err(e @ sqlx::Error::Database(_)) => {
-            panic!("connecting to the admin database failed: {e:?}")
+        Err(e @ (sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut)) => {
+            skip_or_fail(db_required(), "connecting to the admin database", e)
         }
-        Err(e) => skip_or_fail(db_required(), "connecting to the admin database", e),
+        Err(e) => panic!("connecting to the admin database failed: {e:?}"),
     }
 }
 

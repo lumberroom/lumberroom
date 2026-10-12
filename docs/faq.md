@@ -138,7 +138,8 @@ and what the number does not say. `./scripts/eval-longmemeval.sh` is the standin
 **How do I run the tests?**
 `./scripts/cargo.sh test -j 1`. The `-j 1` is not optional: linking two test binaries at once gets
 the linker OOM-killed in the container, and it reads as a compile error. Under `cargo.sh` a missing or
-broken database fails the run. Plain `cargo test` with no database skips, so read the count there.
+broken database fails the run. Plain `cargo test` with no database skips and counts each skip as passed; set
+`LUMBERROOM_TEST_REQUIRE_DB=1` to make that fail.
 [CONTRIBUTING.md](../CONTRIBUTING.md) has the rest.
 
 **What is known broken or missing?**

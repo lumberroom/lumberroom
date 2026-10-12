@@ -303,7 +303,7 @@ macro_rules! harness_or_skip {
         match setup().await {
             Some(h) => h,
             None => {
-                eprintln!("skipping: no database reachable");
+                common::skipping();
                 return;
             }
         }
@@ -722,7 +722,7 @@ macro_rules! capped_or_skip {
         match setup_with(|cfg| cfg.policy.max_content_chars = CAP).await {
             Some(h) => h,
             None => {
-                eprintln!("skipping: no database reachable");
+                common::skipping();
                 return;
             }
         }

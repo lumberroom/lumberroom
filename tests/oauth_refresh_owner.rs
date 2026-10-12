@@ -69,7 +69,7 @@ async fn seed_refresh(store: &postgres::PgOauthStore, hash: &str, ttl_secs: i64)
 #[tokio::test]
 async fn refresh_owner_answers_only_for_a_live_token() {
     let Some((pool, _guard)) = setup().await else {
-        eprintln!("skipping: no database reachable");
+        common::skipping();
         return;
     };
     let store = postgres::PgOauthStore::new(pool.clone());
@@ -98,7 +98,7 @@ async fn refresh_owner_answers_only_for_a_live_token() {
 #[tokio::test]
 async fn a_token_spent_by_rotate_refresh_stops_answering_for_its_owner() {
     let Some((pool, _guard)) = setup().await else {
-        eprintln!("skipping: no database reachable");
+        common::skipping();
         return;
     };
     let store = postgres::PgOauthStore::new(pool);

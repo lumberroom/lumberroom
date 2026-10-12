@@ -292,7 +292,7 @@ macro_rules! harness_or_skip {
         match setup($mode).await {
             Some(h) => h,
             None => {
-                eprintln!("skipping: no database reachable");
+                common::skipping();
                 return;
             }
         }

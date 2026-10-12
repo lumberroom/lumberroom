@@ -254,13 +254,15 @@ two throwaway volumes listed both for removal. Remove the container and the one 
 CONTRIBUTING.md shows. The suite moved off `db` for the same reason in the other direction: it
 truncates whatever `DATABASE_URL` names, and on `db` that sat one database name away from the store.
 
-**Plain `cargo test` with no database reachable skips rather than fails**, so a low count there is
-not a pass. `./scripts/cargo.sh test`, `test-fast` and CI set `LUMBERROOM_TEST_REQUIRE_DB=1`, which
-turns the skip into a failure.
+**Plain `cargo test` with no database reachable skips rather than fails**, and the count does not
+show it: a skipped test prints to stderr, which libtest captures, and returns, so it counts as
+passed. Set `LUMBERROOM_TEST_REQUIRE_DB=1` to make a missing database fail, or use
+`./scripts/cargo.sh test` or `test-fast`, which set it (so does CI). Without the switch, run with
+`-- --nocapture` and grep for "skipping".
 
-**A test database another checkout migrated used to skip the whole suite.** Every engine worktree,
-and a fork with its own migration band, shares `lumberroom_rust_test` on the testdb container. When
-it held a migration the current checkout lacked, sqlx failed `migrate` with `VersionMissing`, setup
+**A test database another checkout migrated used to skip the whole suite.** Every engine worktree
+shares `lumberroom_rust_test` on the testdb container, and a fork with its own migration band used
+it too. When it held a migration the current checkout lacked, sqlx failed `migrate` with `VersionMissing`, setup
 printed "skipping" and returned, and every integration test reported ok with nothing asserted. A
 mutation that should have failed a test passed on 24 September and again on 12 October 2026. Setup
 now panics on any failure after the database answers, through `step!` and `common::migrate` in

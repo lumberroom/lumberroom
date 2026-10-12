@@ -257,8 +257,8 @@ docker build -t lumberroom-builder -f Dockerfile.builder .   # again after any c
 `-j 1` is not optional: linking the lib-test and integration binaries at the same time gets the
 linker OOM-killed in the container, and it reads as a compile error rather than a memory limit. The
 suite runs against a real Postgres in its own database with the hash embedder. Under `cargo.sh` a
-missing or broken database fails the run; plain `cargo test` with none reachable skips, so read the
-count there.
+missing or broken database fails the run. Plain `cargo test` with none reachable skips and counts
+the skip as passed; set `LUMBERROOM_TEST_REQUIRE_DB=1` to make that fail.
 [CONTRIBUTING.md](CONTRIBUTING.md) carries the rest, and [docs/traps.md](docs/traps.md) carries what
 has already cost time.
 

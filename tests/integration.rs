@@ -135,7 +135,7 @@ macro_rules! ctx_or_skip {
             // this binary's threads; the DbGuard holds the advisory lock the other five wait on.
             Some((ctx, pool, guard, db)) => (ctx, pool, (guard, db)),
             None => {
-                eprintln!("skipping: no database reachable");
+                common::skipping();
                 return;
             }
         }
@@ -144,7 +144,7 @@ macro_rules! ctx_or_skip {
         match setup_with($tune).await {
             Some((ctx, pool, guard, db)) => (ctx, pool, (guard, db)),
             None => {
-                eprintln!("skipping: no database reachable");
+                common::skipping();
                 return;
             }
         }
@@ -4238,7 +4238,10 @@ async fn a_registry_value_at_open_goes_through_the_credential_tripwire() {
 /// `user:me`, and a guard that filtered that map on `n > 0` warned about neither.
 #[tokio::test]
 async fn the_stranded_namespace_query_sees_what_namespace_counts_misses() {
-    let Some((ctx, pool, _guard, _db)) = setup().await else { return };
+    let Some((ctx, pool, _guard, _db)) = setup().await else {
+        common::skipping();
+        return;
+    };
 
     let head = uuid::Uuid::new_v4();
     let retired = uuid::Uuid::new_v4();
@@ -4301,7 +4304,10 @@ async fn the_stranded_namespace_query_sees_what_namespace_counts_misses() {
 /// window: the statement has not ended, so even a row it already bumped is invisible here.
 #[tokio::test]
 async fn an_access_bump_skips_a_row_another_write_holds() {
-    let Some((ctx, pool, _guard, _db)) = setup().await else { return };
+    let Some((ctx, pool, _guard, _db)) = setup().await else {
+        common::skipping();
+        return;
+    };
 
     let held = uuid::Uuid::new_v4();
     let free = uuid::Uuid::new_v4();

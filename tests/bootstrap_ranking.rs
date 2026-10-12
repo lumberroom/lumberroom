@@ -173,7 +173,7 @@ macro_rules! store_or_skip {
         match Store::fresh($name).await {
             Some(s) => s,
             None => {
-                eprintln!("skipping: no database reachable");
+                common::skipping();
                 return;
             }
         }

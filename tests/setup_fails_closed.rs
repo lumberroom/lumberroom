@@ -42,6 +42,21 @@ fn a_database_that_never_answered_skips_unless_one_is_required() {
 }
 
 #[test]
+fn the_switch_reads_unset_empty_and_zero_as_off_and_anything_else_as_on() {
+    assert!(!common::requires_db(None));
+    assert!(!common::requires_db(Some("")));
+    assert!(!common::requires_db(Some("0")));
+    assert!(common::requires_db(Some("1")));
+}
+
+/// `scripts/cargo.sh` and CI set the switch by this literal name, and `scripts/cargo-sh-test.sh`
+/// pins the shell side. A rename here alone would leave both setting a variable nobody reads.
+#[test]
+fn the_switch_keeps_the_name_the_scripts_set() {
+    assert_eq!(common::REQUIRE_DB_VAR, "LUMBERROOM_TEST_REQUIRE_DB");
+}
+
+#[test]
 fn only_already_exists_and_a_catalog_collision_count_as_losing_the_create_race() {
     assert!(common::lost_creation_race(Some("42P04")), "duplicate_database");
     assert!(common::lost_creation_race(Some("23505")), "unique_violation on pg_database");
@@ -64,7 +79,7 @@ fn a_step_that_fails_after_the_database_answered_panics_rather_than_returning_no
 #[tokio::test]
 async fn a_migration_this_checkout_lacks_fails_the_test_and_names_the_fix() {
     let Some((admin, base)) = common::connect_admin().await else {
-        eprintln!("skipping: no database reachable");
+        common::skipping();
         return;
     };
     // DDL takes no bind parameter. Audited: PROBE_DB is a compile-time constant.

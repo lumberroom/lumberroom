@@ -4871,8 +4871,10 @@ mod tests {
     /// either has nothing to lose here. Every row carries a tenant no other suite uses, and setup
     /// deletes that tenant's rows rather than truncating the table.
     ///
-    /// Skipped when no database is reachable, so `cargo test` on a machine without one passes with
-    /// these tests never having run. A count of zero here is not a green run.
+    /// Skipped only when no database answers, and never under `LUMBERROOM_TEST_REQUIRE_DB`, which
+    /// `scripts/cargo.sh test` and CI set. A skipped test still counts as passed. Once a database
+    /// answers, every later failure panics, the rule `tests/common/mod.rs` holds for the
+    /// integration binaries; a lib unit test cannot reach that module, so the rule is restated here.
     mod timeline {
         use super::*;
         use sqlx::PgPool;
@@ -4884,37 +4886,73 @@ mod tests {
         /// lives as long as the test that holds it.
         static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+        /// Prints why and returns `None`, or panics when the switch says a database must exist.
+        fn skip<T>(what: &str, why: impl std::fmt::Debug) -> Option<T> {
+            let required = std::env::var("LUMBERROOM_TEST_REQUIRE_DB")
+                .is_ok_and(|v| !v.is_empty() && v != "0");
+            assert!(!required, "{what} failed: {why:?}\nLUMBERROOM_TEST_REQUIRE_DB is set");
+            eprintln!("skipping: {what} failed: {why:?}");
+            None
+        }
+
         async fn setup(
         ) -> Option<(PgMemoryRepository, PgPool, tokio::sync::MutexGuard<'static, ()>)> {
             let guard = SERIAL.lock().await;
-            let admin_url = std::env::var("DATABASE_URL").ok()?;
-            let base = admin_url.rsplit_once('/')?.0.to_string();
-            let admin = PgPool::connect(&admin_url).await.ok()?;
+            let admin_url = match std::env::var("DATABASE_URL") {
+                Ok(url) => url,
+                Err(e) => return skip("reading DATABASE_URL", e),
+            };
+            let base = admin_url.rsplit_once('/').expect("DATABASE_URL has no database part").0;
+            let admin = match PgPool::connect(&admin_url).await {
+                Ok(admin) => admin,
+                // Only a server that never answered may skip; see tests/common/mod.rs.
+                Err(e @ (sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut)) => {
+                    return skip("connecting to the admin database", e)
+                }
+                Err(e) => panic!("connecting to the admin database failed: {e:?}"),
+            };
             let exists: Option<i32> =
                 sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
                     .bind(TEST_DB)
                     .fetch_optional(&admin)
                     .await
-                    .ok()?;
+                    .expect("looking for the test database");
             if exists.is_none() {
                 // DDL takes no bind parameter, so this statement is built as a string and sqlx
                 // requires the audit to be written down. Audited: `TEST_DB` is a compile-time
                 // constant and no input of any kind reaches it.
-                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {TEST_DB}")))
-                    .execute(&admin)
-                    .await
-                    .ok()?;
+                let created =
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {TEST_DB}")))
+                        .execute(&admin)
+                        .await;
+                // 42P04 and 23505 mean a parallel run created it first, which is all this wanted.
+                if let Err(e) = created {
+                    let code = e.as_database_error().and_then(|d| d.code());
+                    assert!(
+                        matches!(code.as_deref(), Some("42P04" | "23505")),
+                        "creating {TEST_DB} failed: {e:?}"
+                    );
+                }
             }
             admin.close().await;
 
-            let pool =
-                crate::adapters::postgres::connect(&format!("{base}/{TEST_DB}")).await.ok()?;
-            crate::adapters::postgres::migrate(&pool).await.ok()?;
+            let pool = crate::adapters::postgres::connect(&format!("{base}/{TEST_DB}"))
+                .await
+                .expect("connecting to the test database");
+            if let Err(e) = crate::adapters::postgres::migrate(&pool).await {
+                panic!(
+                    "migrating {TEST_DB} failed: {e:?}\n\
+                     If that names VersionMissing or VersionMismatch, {TEST_DB} holds migrations \
+                     from another checkout. Drop it and the next run recreates it:\n  \
+                     docker exec lumberroom-testdb-1 psql -U lumberroom -d postgres \
+                     -c \"DROP DATABASE {TEST_DB} WITH (FORCE)\""
+                );
+            }
             sqlx::query("DELETE FROM memory WHERE tenant_id = $1")
                 .bind(TENANT)
                 .execute(&pool)
                 .await
-                .ok()?;
+                .expect("clearing the test tenant");
             Some((PgMemoryRepository::new(pool.clone()), pool, guard))
         }
 

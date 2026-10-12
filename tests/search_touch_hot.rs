@@ -122,7 +122,10 @@ async fn search_ids(repo: &impl MemoryRepository, lexical: f64) -> Vec<String> {
 #[tokio::test]
 async fn a_zero_lexical_weight_skips_the_lexical_arm() {
     const DB: &str = "lexical_off_probe";
-    let Some((pool, admin)) = fresh(DB).await else { return };
+    let Some((pool, admin)) = fresh(DB).await else {
+        common::skipping();
+        return;
+    };
     let vector_hit = insert(&pool, "the harbour office opens at nine", true).await;
     let lexical_only = insert(&pool, "the kestrel host moved to port 5433", false).await;
 
@@ -149,7 +152,10 @@ async fn a_zero_lexical_weight_skips_the_lexical_arm() {
 #[tokio::test]
 async fn no_index_on_memory_reads_the_access_columns() {
     const DB: &str = "touch_hot_catalog_probe";
-    let Some((pool, admin)) = fresh(DB).await else { return };
+    let Some((pool, admin)) = fresh(DB).await else {
+        common::skipping();
+        return;
+    };
     let offending: Vec<String> = sqlx::query_scalar(
         "SELECT pg_get_indexdef(i.indexrelid)
            FROM pg_index i
@@ -172,7 +178,10 @@ async fn no_index_on_memory_reads_the_access_columns() {
 #[tokio::test]
 async fn the_search_touch_is_a_hot_update() {
     const DB: &str = "touch_hot_probe";
-    let Some((pool, admin)) = fresh(DB).await else { return };
+    let Some((pool, admin)) = fresh(DB).await else {
+        common::skipping();
+        return;
+    };
     let mut ids = Vec::new();
     for i in 0..3 {
         ids.push(insert(&pool, &format!("touched row {i}"), true).await);
