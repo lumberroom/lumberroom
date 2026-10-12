@@ -91,8 +91,11 @@ refuses every command while `LUMBERROOM_DOMAIN` is unset; `cargo.sh` fills in a 
 own calls.
 
 The integration suite runs against that real Postgres in its own `lumberroom_rust_test` database with
-the hash embedder, so it downloads nothing. It **skips rather than fails** when no database is
-reachable, so a run reporting 0 tests is not a pass. Check the count. Tests serialise themselves on a Postgres
+the hash embedder, so it downloads nothing. A database that answers and then fails setup, such as a
+migration another branch left in `lumberroom_rust_test`, fails the test and names the fix. Under plain
+`cargo test` a test **skips rather than fails** when no database answers, so a run reporting 0 tests
+there is not a pass; `./scripts/cargo.sh test`, `test-fast` and CI set `LUMBERROOM_TEST_REQUIRE_DB=1`,
+which turns that skip into a failure too. Tests serialise themselves on a Postgres
 advisory lock, because each one truncates that database and six test binaries are six processes. A
 mutex serialises threads and would not do.
 

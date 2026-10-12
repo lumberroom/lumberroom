@@ -29,6 +29,7 @@ use sqlx::postgres::PgListener;
 use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
+#[macro_use]
 mod common;
 
 /// A database of its own rather than the suite's shared `lumberroom_rust_test`. Two assertions here
@@ -89,18 +90,6 @@ const SELF_JOIN_SQL: &str = "SELECT a.id AS older_id, b.id AS newer_id,
 /// and with it the pattern matched no function at all.
 const INSERTS_PAIRS_RE: &str = r"INSERT\s+INTO\s+(public\.)?memory_conflict\y";
 
-macro_rules! step {
-    ($what:expr, $result:expr) => {
-        match $result {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("skipping: {} failed: {e:?}", $what);
-                return None;
-            }
-        }
-    };
-}
-
 struct Harness {
     ctx: Ctx,
     pool: PgPool,
@@ -121,21 +110,8 @@ impl Harness {
 
 async fn setup() -> Option<Harness> {
     let guard = SERIAL.lock().await;
-    let admin_url = std::env::var("DATABASE_URL").ok()?;
-    let base_url = admin_url.rsplit_once('/')?.0.to_string();
-    let admin = step!("connecting to the admin database", PgPool::connect(&admin_url).await);
-    let exists: Result<Option<i32>, _> =
-        sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
-            .bind(TEST_DB)
-            .fetch_optional(&admin)
-            .await;
-    if step!("looking for the test database", exists).is_none() {
-        // Audited: TEST_DB is a compile-time constant with no external input.
-        let created = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {TEST_DB}")))
-            .execute(&admin)
-            .await;
-        step!("creating the test database", created);
-    }
+    let (admin, base_url) = common::connect_admin().await?;
+    common::create_database_if_missing(&admin, TEST_DB).await;
     admin.close().await;
 
     let url = format!("{base_url}/{TEST_DB}");
@@ -144,9 +120,9 @@ async fn setup() -> Option<Harness> {
     std::env::set_var("EMBED_PROVIDER", "hash");
     std::env::set_var(TEST_KEK_VAR, TEST_KEK_HEX);
 
-    let db_lock = common::lock_database(&url).await?;
+    let db_lock = common::lock_database(&url).await;
     let pool = step!("connecting to the test database", postgres::connect(&url).await);
-    step!("migrating the test database", postgres::migrate(&pool).await);
+    common::migrate(&pool, TEST_DB).await;
     // CASCADE reaches memory_conflict and memory_conflict_scan through their foreign keys.
     let truncated = sqlx::query(
         "TRUNCATE memory, registry, registry_history, entity_alias, sealed_item, tool_calls,

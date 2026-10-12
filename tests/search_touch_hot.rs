@@ -20,21 +20,28 @@ use lumberroom_server::domain::types::Sensitivity;
 use lumberroom_server::ports::{MemoryRepository, SearchQuery, Weights};
 use sqlx::{AssertSqlSafe, PgPool};
 
+#[macro_use]
+mod common;
+
 const TENANT: &str = "touch_hot";
 const DIMS: usize = 768;
 
 /// A migrated database of its own, dropped first if a crashed run left it behind.
 async fn fresh(name: &str) -> Option<(PgPool, PgPool)> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let base = url.rsplit_once('/')?.0.to_string();
-    let admin = PgPool::connect(&url).await.ok()?;
+    let (admin, base) = common::connect_admin().await?;
     // DDL takes no bind parameter. Audited: every caller passes a compile-time literal.
-    sqlx::raw_sql(AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")))
-        .execute(&admin)
-        .await
-        .ok()?;
-    sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await.ok()?;
-    let pool = postgres::connect(&format!("{base}/{name}")).await.ok()?;
+    step!(
+        "dropping a leftover database",
+        sqlx::raw_sql(AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")))
+            .execute(&admin)
+            .await
+    );
+    step!(
+        "creating the database",
+        sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await
+    );
+    let pool =
+        step!("connecting to the database", postgres::connect(&format!("{base}/{name}")).await);
     postgres::migrate(&pool).await.expect("migrations apply to an empty database");
     Some((pool, admin))
 }

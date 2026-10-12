@@ -22,8 +22,7 @@ use lumberroom_server::ports::{Emission, RecallCall, RecallEvent};
 use lumberroom_server::services::{bootstrap, forget, recall_events, search, write, Ctx, Repos};
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
-// These tests own their database and never take the suite lock, so most of the module is unused.
-#[allow(dead_code)]
+#[macro_use]
 mod common;
 
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
@@ -55,26 +54,10 @@ impl Probe {
     }
 }
 
-/// A setup step that may be missing, with the reason printed. A run that skips reports `ok`, so the
-/// printed line is the only thing that tells a skip from a pass.
-macro_rules! step {
-    ($what:expr, $result:expr) => {
-        match $result {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("skipping: {} failed: {e:?}", $what);
-                return None;
-            }
-        }
-    };
-}
-
 /// A migrated database of its own and a `Ctx` over it, built the way `main.rs` composes one.
 async fn probe(name: &'static str, tune: impl FnOnce(&mut Config)) -> Option<Probe> {
     let serial = SERIAL.lock().await;
-    let url = step!("reading DATABASE_URL", std::env::var("DATABASE_URL"));
-    let base = url.rsplit_once('/')?.0.to_string();
-    let admin = step!("connecting to the admin database", PgPool::connect(&url).await);
+    let (admin, base) = common::connect_admin().await?;
     // Audited: `name` is a compile-time literal at every call site.
     step!(
         "dropping a leftover probe database",

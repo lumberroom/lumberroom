@@ -56,6 +56,9 @@ jobs:
       # Points at the admin database. The integration suite creates and connects to
       # lumberroom_rust_test itself; see tests/integration.rs.
       DATABASE_URL: postgres://lumberroom:lumberroom@localhost:5432/lumberroom
+      # The service above always runs, so a database test that would skip fails instead. See
+      # tests/common/mod.rs.
+      LUMBERROOM_TEST_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@v7
       - name: install build dependencies
@@ -63,10 +66,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: server tests
+        # An explicit `shell: bash` is what adds pipefail. The default runs `bash -e` without it,
+        # so the step took tee's exit status and passed whatever cargo test reported.
+        shell: bash
         run: cargo test -j 1 --color never 2>&1 | tee /tmp/server-test.log
       - name: assert the integration suite actually ran
-        # A run with no reachable database skips rather than fails, so "0 tests run" reads as a
-        # pass unless something checks the count. cargo prints a "Running <path>" line before each
+        # LUMBERROOM_TEST_REQUIRE_DB already fails a test that cannot reach the database. This
+        # catches the other way to run nothing: a binary that reports 0 tests. cargo prints a "Running <path>" line before each
         # binary's own report; this takes the report that follows tests/integration.rs and reads
         # the "running N tests" header it opens with. --color never above keeps escape codes out of
         # the line, which is what broke the first version of this check.

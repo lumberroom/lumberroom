@@ -22,6 +22,7 @@ use lumberroom_server::ports::Embedder;
 use lumberroom_server::services::review_queue::{self, QueueQuery, Source};
 use lumberroom_server::services::{conflicts, write, Ctx, Repos};
 
+#[macro_use]
 mod common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
@@ -30,18 +31,6 @@ const BGE_ID: &str = "Xenova/bge-base-en-v1.5@q8";
 const GEMMA_ID: &str = "openai:google/embeddinggemma-2";
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-macro_rules! step {
-    ($what:expr, $result:expr) => {
-        match $result {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("skipping: {} failed: {e:?}", $what);
-                return None;
-            }
-        }
-    };
-}
 
 /// An embedder whose vectors the test chose. It refuses a text it was not given, so a write path
 /// that embeds something unexpected fails loudly instead of landing on an arbitrary vector.
@@ -107,23 +96,9 @@ impl Harness {
 /// cannot stand in for the table these tests read.
 async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
     let guard = SERIAL.lock().await;
-    let admin_url = std::env::var("DATABASE_URL").ok()?;
-    let base_url = admin_url.rsplit_once('/')?.0.to_string();
-    let admin = step!("connecting to the admin database", sqlx::PgPool::connect(&admin_url).await);
+    let (admin, base_url) = common::connect_admin().await?;
 
-    let exists: Result<Option<i32>, _> =
-        sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
-            .bind(TEST_DB)
-            .fetch_optional(&admin)
-            .await;
-    let exists = step!("looking for the test database", exists);
-    if exists.is_none() {
-        // Audited: TEST_DB is a compile-time constant with no external input.
-        let created = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {TEST_DB}")))
-            .execute(&admin)
-            .await;
-        step!("creating the test database", created);
-    }
+    common::create_database_if_missing(&admin, TEST_DB).await;
     admin.close().await;
 
     let url = format!("{base_url}/{TEST_DB}");
@@ -131,9 +106,9 @@ async fn setup(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
     std::env::set_var("AUTH_TOKENS", format!("mac:{}", "m".repeat(32)));
     std::env::set_var("EMBED_PROVIDER", "hash");
 
-    let db_lock = common::lock_database(&url).await?;
+    let db_lock = common::lock_database(&url).await;
     let pool = step!("connecting to the test database", postgres::connect(&url).await);
-    step!("migrating the test database", postgres::migrate(&pool).await);
+    common::migrate(&pool, TEST_DB).await;
     let truncated = sqlx::query(
         "TRUNCATE memory, registry, registry_history, entity_alias, sealed_item, tool_calls,
                   registry_alias, kek_state, memory_pair_dismissed,

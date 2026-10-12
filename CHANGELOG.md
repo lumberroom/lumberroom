@@ -30,8 +30,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - **`fastembed` 6.0.2 to 7.1.1**, which brings `tokenizers` 0.23. bge-base-en-v1.5 vectors come out
   bit-identical to 6.0.2 across 244 vectors from 61 texts on linux/arm64, so stored rows need no
-  re-embedding. Downloads of weights not yet cached now send `HF_TOKEN` or a saved
-  `huggingface-cli` login token, where 6.x downloaded anonymously.
+  re-embedding. Downloads of weights not yet cached now send `HF_TOKEN` when it is set, ahead of
+  the saved `huggingface-cli` login token, which 6.x already sent.
 - **Memory content is capped at 2,000 characters by default, down from 8,000.** A `memory_write`,
   console write, ingest approval or review merge longer than `WRITE_MAX_CONTENT_CHARS` is refused
   with `content is N chars and the limit is M.` under the error code `content_too_long`. The length
@@ -86,6 +86,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the ceiling. An overflowing digest caps the namespace and sealed lists at 20 percent and ends them
   with "and N more namespaces". A memory longer than its whole section prints shortened at a
   sentence, a word or a grapheme, with an ellipsis. The OpenWebUI filter cuts at whole lines (#109).
+- **A broken test database fails the test run.** Integration tests skipped and reported ok when
+  the database answered but a setup step failed, such as a migration from another branch or a fork
+  left in `lumberroom_rust_test`. Only a database that never answered may skip now, and
+  `LUMBERROOM_TEST_REQUIRE_DB=1` removes that too. `./scripts/cargo.sh test`, `test-fast` and CI
+  set it. A failed migration names the `DROP DATABASE` that clears it. CI's test step also takes
+  cargo's exit status now, where it used to take `tee`'s.
 
 ## [0.5.0] - 2026-10-04
 

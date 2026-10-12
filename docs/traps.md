@@ -254,8 +254,19 @@ two throwaway volumes listed both for removal. Remove the container and the one 
 CONTRIBUTING.md shows. The suite moved off `db` for the same reason in the other direction: it
 truncates whatever `DATABASE_URL` names, and on `db` that sat one database name away from the store.
 
-**The integration suite skips rather than fails with no database reachable**, so a run reporting a low
-count is not a pass. Check the split, not the exit code.
+**Plain `cargo test` with no database reachable skips rather than fails**, so a low count there is
+not a pass. `./scripts/cargo.sh test`, `test-fast` and CI set `LUMBERROOM_TEST_REQUIRE_DB=1`, which
+turns the skip into a failure.
+
+**A test database another checkout migrated used to skip the whole suite.** Every engine worktree,
+and a fork with its own migration band, shares `lumberroom_rust_test` on the testdb container. When
+it held a migration the current checkout lacked, sqlx failed `migrate` with `VersionMissing`, setup
+printed "skipping" and returned, and every integration test reported ok with nothing asserted. A
+mutation that should have failed a test passed on 24 September and again on 12 October 2026. Setup
+now panics on any failure after the database answers, through `step!` and `common::migrate` in
+`tests/common/mod.rs`, and the migrate panic names the `DROP DATABASE ... WITH (FORCE)` that clears
+it. A new test file reaches both through `#[macro_use] mod common;`; a local `.ok()?` in a setup
+function brings the trap back.
 
 **A test that works around the bug reads as coverage.** The alias test called `put_alias` once per
 namespace, which is the only way the old one-sided lookup answered from every side. A feature that
