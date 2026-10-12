@@ -364,6 +364,11 @@ fi
 if grep -q "POLICY-$NONCE" "$WORK/bootstrap-narrow.json"; then
   die "context_bootstrap's digest leaked the nonce to the narrow credential"
 fi
+# A brief digest leaves the rows out and a payload that lost its inventory would make every key
+# check below pass on an absent key. The existence check keeps those checks honest.
+if ! json_field "$WORK/bootstrap-narrow.json" inventory >/dev/null; then
+  die "the digest payload carries no inventory key, so the leak checks below would pass without checking anything"
+fi
 # Checked as a structured key, not a whole-output text search: a readable row whose own content
 # happens to mention "personal:finance" would false-fail a plain grep. What the Phase 1 bug
 # actually did was put the namespace's key in the inventory map, so that is what gets checked.

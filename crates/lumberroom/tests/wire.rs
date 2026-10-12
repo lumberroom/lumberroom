@@ -55,8 +55,24 @@ fn a_search_hit_carries_id_namespace_content_and_score() {
     let hit = &r.hits[0];
     assert_eq!(hit.namespace, "user:me");
     assert!(hit.content.starts_with("The owner runs lumberroom"));
-    assert!((hit.score - 0.81274).abs() < 1e-9);
+    assert!((hit.score.unwrap() - 0.81274).abs() < 1e-9);
     assert_eq!(hit.id, "9f1c2b4e-0000-4a1b-8c3d-1122334455aa");
+}
+
+/// A brief answer carries no `score`. An installed CLI that parses it as required would fail on
+/// every search the day a hook or `--invocation user` call reached the brief shape.
+#[test]
+fn a_brief_search_hit_parses_without_a_score() {
+    let r: SearchResult = serde_json::from_value(serde_json::json!({
+        "hits": [{
+            "id": "9f1c2b4e-0000-4a1b-8c3d-1122334455aa",
+            "namespace": "user:me",
+            "content": "a fact",
+            "created_at": "2026-08-19T11:02:31.442Z"
+        }]
+    }))
+    .unwrap();
+    assert_eq!(r.hits[0].score, None);
 }
 
 /// `domain::types::WriteOutcome`. `superseded` and `possible_conflicts` are skipped when empty, so
@@ -200,9 +216,19 @@ fn search_arguments_omit_what_was_not_asked_for() {
         limit: Some(5),
         project: Some("lumberroom".into()),
         as_of: None,
+        detail: None,
     })
     .unwrap();
     assert_eq!(keys(&v), set(&["query", "namespaces", "limit", "project"]));
+
+    let v = serde_json::to_value(SearchArgsRequest {
+        query: "q".into(),
+        detail: Some("full".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(keys(&v), set(&["query", "detail"]));
+    assert_eq!(v["detail"], "full");
 }
 
 /// `mcp::WriteArgs`.
@@ -244,8 +270,13 @@ fn registry_get_arguments_send_kind_and_key_at_minimum() {
 fn bootstrap_arguments_are_a_project_or_an_empty_object() {
     let v = serde_json::to_value(BootstrapArgsRequest::default()).unwrap();
     assert!(keys(&v).is_empty());
-    let v = serde_json::to_value(BootstrapArgsRequest { project: Some("/repo".into()) }).unwrap();
+    let v = serde_json::to_value(BootstrapArgsRequest { project: Some("/repo".into()), rows: None })
+        .unwrap();
     assert_eq!(keys(&v), set(&["project"]));
+    let v = serde_json::to_value(BootstrapArgsRequest { rows: Some(true), ..Default::default() })
+        .unwrap();
+    assert_eq!(keys(&v), set(&["rows"]));
+    assert_eq!(v["rows"], true);
 }
 
 /// `ExportBody` in `src/http/archive.rs`. Plaintext is a field the caller sets, so a request that

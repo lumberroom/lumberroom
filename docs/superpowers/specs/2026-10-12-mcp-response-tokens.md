@@ -394,9 +394,10 @@ with code `content_carries_fence` and the message "content holds a data fence li
 between the markers". The check lives in `domain::fence` (new, pure) and runs in `write::run_inner`
 (`src/services/write.rs:95`), which `run`, `run_observed` and the fork's `run_carried` all reach,
 so `memory_write`, the merge, ingest approval and dreaming are covered. The archive import is
-exempt: an archive carries rows as they were stored. It calls `run_observed`
-(`src/services/archive.rs:412`), as ingest does (`src/services/ingest.rs:506`), so it moves to a new
-`run_archived`, the same call with the fence-line check off. The G2 checker also fails any run that
+exempt: an archive carries rows as they were stored. The archive merge already writes through
+`write::run_restored`, which nothing else calls, so that entry point passes the fence-line check off
+and needs no new function. Ingest approval (`src/services/ingest.rs:506`) keeps the check. The G2
+checker also fails any run that
 writes content containing `----- data `.
 
 ## 5. Pinned contracts

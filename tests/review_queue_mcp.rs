@@ -459,47 +459,65 @@ async fn asking_the_engine_for_proposals_returns_the_configured_source() {
     );
 }
 
+/// `^----- data ([0-9a-f]{12}) -----\n(.*)\n----- end of data \1 -----$` in dotall mode, matched by
+/// hand: the engine takes no regex crate for one pattern.
+fn fenced(s: &str) -> Option<(String, String)> {
+    let rest = s.strip_prefix("----- data ")?;
+    if rest.len() < 12 {
+        return None;
+    }
+    let (nonce, rest) = rest.split_at(12);
+    if !nonce.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+        return None;
+    }
+    let body = rest.strip_prefix(" -----\n")?;
+    let body = body.strip_suffix(&format!("\n----- end of data {nonce} -----"))?;
+    Some((nonce.to_string(), body.to_string()))
+}
+
+// Decision 0031 supersedes 0019's clause that kept free text out of the structured copy. Claude
+// Code reads only that copy, so the text now travels there too, each value inside its own fence.
 #[tokio::test]
-async fn the_structured_copy_carries_no_row_or_proposal_free_text() {
+async fn the_structured_copy_fences_every_row_and_proposal_free_text() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
-    let id = write_at(
-        &h.ctx,
-        &format!("free text that must never leave the fence {}", nonce("s4")),
-        "global",
-    )
-    .await;
+    let content = format!("free text the fence carries {}", nonce("s4"));
+    let id = write_at(&h.ctx, &content, "global").await;
     make_stale(&h.pool, &id).await;
 
     let result = h.call("review_queue", serde_json::json!({})).await;
     assert!(!refused(&result), "{result:?}");
 
     let body = structured(&result);
-    let dump = serde_json::to_string(&body).unwrap();
-    assert!(
-        !dump.contains("free text that must never leave the fence"),
-        "row content reached the structured copy: {dump}"
-    );
-    assert!(
-        !dump.contains("what apply would write"),
-        "the canned proposal's proposed_content reached the structured copy: {dump}"
-    );
-
     let items = body["items"].as_array().cloned().unwrap_or_default();
     assert!(!items.is_empty(), "the page carries at least the stale row and the canned proposal");
+    let mut nonces = std::collections::HashSet::new();
+    let mut saw_row = false;
+    let mut saw_proposal = false;
     for item in &items {
-        if let Some(rows) = item["rows"].as_array() {
-            for row in rows {
-                assert!(row.get("content").is_none(), "a row kept its content: {row:?}");
-                assert!(row.get("id").is_some(), "a row lost its id: {row:?}");
+        for row in item["rows"].as_array().cloned().unwrap_or_default() {
+            assert!(row.get("id").is_some(), "a row lost its id: {row:?}");
+            let raw = row["content"].as_str().unwrap_or_else(|| panic!("no content: {row:?}"));
+            let (n, inner) = fenced(raw).unwrap_or_else(|| panic!("unfenced row text: {raw:?}"));
+            assert!(nonces.insert(n), "two values share a nonce: {body}");
+            if inner == content {
+                saw_row = true;
             }
         }
         if let Some(proposal) = item.get("proposal").filter(|p| !p.is_null()) {
-            assert!(proposal.get("proposed_content").is_none(), "{proposal:?}");
-            assert!(proposal.get("fields").is_none(), "{proposal:?}");
             assert!(proposal.get("id").is_some(), "a proposal lost its id: {proposal:?}");
             assert!(proposal.get("version").is_some(), "a proposal lost its version: {proposal:?}");
+            if let Some(raw) = proposal["proposed_content"].as_str() {
+                let (n, inner) =
+                    fenced(raw).unwrap_or_else(|| panic!("unfenced proposed_content: {raw:?}"));
+                assert!(nonces.insert(n), "two values share a nonce: {body}");
+                if inner == "what apply would write" {
+                    saw_proposal = true;
+                }
+            }
         }
     }
+    assert!(saw_row, "the stale row's text came back fenced: {body}");
+    assert!(saw_proposal, "the canned proposal's text came back fenced: {body}");
 }
 
 // ---------------------------------------------------------------------------------------------

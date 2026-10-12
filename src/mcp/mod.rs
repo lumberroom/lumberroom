@@ -289,7 +289,8 @@ path or slug, promotes that project's memory.",
         self.run("context_bootstrap", None, &rc, |ctx| async move {
             let digest = bootstrap::run(&ctx, args.project.as_deref()).await?;
             let text = digest.text.clone();
-            Ok((text, serde_json::to_value(&digest).unwrap_or_default()))
+            let rows = views::rows_for(ctx.invocation, args.rows);
+            Ok((text, views::digest(&digest, rows)))
         })
         .await
     }
@@ -333,8 +334,8 @@ that wrote it. tags keeps only facts carrying all of them.",
                 &args.tags.unwrap_or_default(),
             )
             .await?;
-            let json = serde_json::to_value(&result).unwrap_or_default();
-            Ok((serde_json::to_string_pretty(&json).unwrap_or_default(), json))
+            let json = views::search(&result, views::detail_for(ctx.invocation, args.detail));
+            Ok((views::compact(&json), json))
         })
         .await
     }
@@ -390,7 +391,7 @@ and step-by-step history stay in the conversation.",
             .await
             .map_err(with_split_advice)?;
             let json = serde_json::to_value(&result).unwrap_or_default();
-            Ok((serde_json::to_string_pretty(&json).unwrap_or_default(), json))
+            Ok((views::compact(&json), json))
         })
         .await
     }
@@ -425,7 +426,7 @@ source is the name of the app that wrote the value.",
             .await?;
             let view = views::registry_get(&ctx, result).await;
             let json = serde_json::to_value(&view).unwrap_or_default();
-            Ok((serde_json::to_string_pretty(&json).unwrap_or_default(), json))
+            Ok((views::compact(&json), json))
         })
         .await
     }

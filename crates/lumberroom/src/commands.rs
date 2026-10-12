@@ -189,6 +189,8 @@ pub async fn bootstrap(
         .unwrap_or_else(|| cwd.to_string());
     let req = wire::BootstrapArgsRequest {
         project: if project.is_empty() { None } else { Some(project) },
+        // Only `--json` reads the structured copy, and a brief digest leaves the rows out of it.
+        rows: if args.present("json") && !args.present("hook") { Some(true) } else { None },
     };
     let output = c.call_tool("context_bootstrap", serde_json::to_value(req).unwrap()).await?;
 
@@ -232,6 +234,7 @@ pub async fn search(c: &Client, args: &Args) -> Result<()> {
         limit: args.value("limit").and_then(crate::args::parse_int_prefix),
         project: args.value("project").map(str::to_string),
         as_of,
+        detail: Some("full".into()),
     };
     let output = c.call_tool("memory_search", serde_json::to_value(req).unwrap()).await?;
     if args.present("json") {
@@ -456,6 +459,7 @@ pub async fn forget(
         let req = wire::SearchArgsRequest {
             query: query.to_string(),
             limit: Some(args.int("limit", 20)),
+            detail: Some("full".into()),
             ..Default::default()
         };
         let output = c.call_tool("memory_search", serde_json::to_value(req).unwrap()).await?;
@@ -471,7 +475,7 @@ pub async fn forget(
                 id: h.id,
                 namespace: h.namespace,
                 content: h.content,
-                score: Some(h.score),
+                score: h.score,
             })
             .collect()
     };
@@ -1327,6 +1331,8 @@ pub async fn eval(c: &Client, args: &Args) -> Result<()> {
             limit: Some(LIMIT),
             project: None,
             as_of: None,
+            // Scored by rank, but the full shape keeps the request identical to a plain search.
+            detail: Some("full".into()),
         };
         let output = c.call_tool("memory_search", serde_json::to_value(req).unwrap()).await?;
         let found: wire::SearchResult = typed(&output.structured, "memory_search")?;

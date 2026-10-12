@@ -35,8 +35,13 @@ pub fn number(n: f64) -> String {
     }
 }
 
-pub fn search_line(score: f64, namespace: &str, content: &str) -> String {
-    format!("{score:.3}  [{namespace}] {content}")
+/// A brief hit has no score, so the line keeps the column width with a dash and the namespace
+/// stays where a script that splits on `[` expects it.
+pub fn search_line(score: Option<f64>, namespace: &str, content: &str) -> String {
+    match score {
+        Some(s) => format!("{s:.3}  [{namespace}] {content}"),
+        None => format!("-      [{namespace}] {content}"),
+    }
 }
 
 pub fn write_line(deduplicated: bool, id: &str, namespace: &str) -> String {
@@ -281,8 +286,16 @@ mod tests {
     #[test]
     fn a_search_hit_keeps_three_decimals_and_the_namespace_bracket() {
         assert_eq!(
-            search_line(0.8127, "user:me", "the owner prefers rust"),
+            search_line(Some(0.8127), "user:me", "the owner prefers rust"),
             "0.813  [user:me] the owner prefers rust"
+        );
+    }
+
+    #[test]
+    fn a_brief_hit_prints_a_dash_where_the_score_was_rather_than_an_invented_number() {
+        assert_eq!(
+            search_line(None, "user:me", "the owner prefers rust"),
+            "-      [user:me] the owner prefers rust"
         );
     }
 

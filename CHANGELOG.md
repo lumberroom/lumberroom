@@ -19,6 +19,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
+- **`tenant` leaves `context_bootstrap`**, on the brief answer and on `rows: true`. It named the
+  operator's tenant id to a model, and no consumer the spec surveyed read it. A script
+  that read `tenant` from `lumberroom bootstrap --json` gets no value. Decision 0031.
 - **`EMBED_ALLOW_FALLBACK` and the hash fallback.** The server no longer swaps in the hash embedder
   when the real one fails. A boot with the variable set to anything but `false`, `0`, `no` or `off`
   stops with a message that names the removal. Compose forwards it for one release so the refusal
@@ -28,6 +31,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **MCP answers carry what a model acts on, and the old shapes sit behind an opt-in.** Decision
+  0031 has the reasoning. Ranking, hit counts, the digest text and every service type the console,
+  HTTP routes and archive read stay as they were, and every timestamp keeps its microseconds.
+  - `context_bootstrap`'s structured copy holds `project`, `counts.memories`, `counts.registry`,
+    `inventory`, `sealed_inventory` and `text`. `left_out` adds every memory the text left out or
+    shortened, with its id and exact stored content, and `left_out_registry` every registry entry
+    it left out; both appear only when non-empty. `rows: true` returns the previous shape plus both
+    lists as ids. The `text` is unchanged byte for byte.
+  - `memory_search` hits drop `score` and `primary`, `sensitivity` when it is `open`, and `tags`
+    when empty. `detail: "full"` returns the previous shape.
+  - `memory_history` versions drop `embedding_model`, `access_count` and `last_accessed_at`, and
+    each chain field when it is null. `detail: "full"` returns them.
+  - `review_queue` with no `limit` reads `max(2, ceil(10 / n))` items from each of the `n` sources
+    it reads: 5 each from conflict and stale on a default call, 10 from one named source. An
+    explicit `limit` keeps its per-source meaning, and the HTTP route keeps its default of 50. When
+    more items wait, the structured copy carries `more` and the text ends with a `more:` line; the
+    hint names no offset, because each verdict moves the live queue. Rows drop `access_count` and
+    `last_accessed_at`, `sensitivity` when `open`, and `opened` when true.
+  - `review_queue`'s structured copy carries fact text again: each row's `content`,
+    `proposed_content`, and each proposal field's `label` and `value`, each inside its own data
+    fence with a fresh nonce. This supersedes the stripping clause of decision 0019. `key`,
+    `origin`, `kind`, `version` and `held_by` stay raw.
+  - Tools that sent pretty-printed JSON as text (`memory_search`, `memory_write`, `registry_get`,
+    `memory_history`, `registry_history`, `registry_set`, `alias_set`, `alias_list`,
+    `review_decide`) send it compact. The structured copy carries the same value.
+  - A call with `x-memory-invocation: cli` reads the full shape of `context_bootstrap`,
+    `memory_search` and `memory_history` when it names no `rows` or `detail`, so an installed CLI
+    that requires `score` still parses the answer. This release's CLI asks for `detail: "full"`, and
+    `rows: true` on `bootstrap --json`, itself, and reads `score` as optional.
+- **A write refuses content that holds a data fence line.** A line that is exactly
+  `----- data <12 hex> -----` or `----- end of data <12 hex> -----` fails `memory_write`, a review
+  merge or an ingest approval with code `content_carries_fence` and "content holds a data fence
+  line; send the text between the markers". A marker mid-sentence passes. An archive import
+  stores rows as they were exported. Decision 0031.
+- **Refresh the plugin tool snapshots with this release.** `tools-snapshot.json` in
+  lumberroom-claude-code, lumberroom-hermes and lumberroom-openclaw needs the new `rows` and
+  `detail` arguments and the new `review_queue` `limit` wording, and `scripts/sync-skills.sh`
+  carries the `lr-review` paging change into each plugin.
 - **`fastembed` 6.0.2 to 7.1.1**, which brings `tokenizers` 0.23. bge-base-en-v1.5 vectors come out
   bit-identical to 6.0.2 across 244 vectors from 61 texts on linux/arm64, so stored rows need no
   re-embedding. Downloads of weights not yet cached now send `HF_TOKEN` when it is set, ahead of

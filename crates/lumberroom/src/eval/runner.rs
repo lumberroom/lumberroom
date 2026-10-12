@@ -152,6 +152,9 @@ async fn search(c: &Client, query: &str, namespace: &str, limit: i64) -> Result<
         namespaces: Some(vec![namespace.to_string()]),
         limit: Some(limit),
         project: None,
+        // Scored by rank. The full shape keeps `score` on each hit, which the Option read below
+        // tolerates either way.
+        detail: Some("full".into()),
     };
     let output = c.call_tool("memory_search", serde_json::to_value(req).unwrap()).await?;
     let result: wire::SearchResult = serde_json::from_value(output.structured.clone())
@@ -774,7 +777,7 @@ mod resume_mapping {
             id: id.into(),
             namespace: "project:lme-q0000".into(),
             content: content.into(),
-            score: 1.0,
+            score: Some(1.0),
         }
     }
 

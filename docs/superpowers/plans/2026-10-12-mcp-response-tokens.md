@@ -113,7 +113,7 @@ have with not_done filled. The lead finishes the task directly and does not re-d
 | 2 | Search, history and digest views | `src/mcp/views.rs` | opus | 1 | bodies of `search`, `timeline_value`, `digest`; tests | scratch tests; lead runs `cargo test --lib mcp::views` |
 | 2b | `render_report` | `src/services/bootstrap.rs` | opus | 1 | `render_report` body; `run` fills the two `Digest` fields; tests | scratch tests; lead runs `cargo test --lib services::bootstrap` and `--test bootstrap_ranking` |
 | 3 | Review queue view, extra-tools handlers, `lr-review` | `src/mcp/review_view.rs`, `src/mcp/extra_tools.rs`, `client/skills/lr-review/SKILL.md` | opus | 1 | fenced brief queue, default limit, `more`, compact text, brief history wiring, skill paging text | scratch tests; lead runs `cargo test --lib mcp::review_view mcp::extra_tools` |
-| 3b | A write refuses fence lines | `src/domain/fence.rs`, `src/services/write.rs` (`run_inner`, new `run_archived`), `src/services/archive.rs:412` (one call) | opus | 1 | `carries_fence`, the refusal, the archive exemption, tests | scratch tests; lead runs `cargo test --lib domain::fence services::write services::archive` |
+| 3b | A write refuses fence lines | `src/domain/fence.rs`, `src/services/write.rs` (`run_inner`, `run_restored`), `src/services/archive.rs` (comment) | opus | 1 | `carries_fence`, the refusal, the archive exemption, tests | scratch tests; lead runs `cargo test --lib domain::fence services::write services::archive` |
 | 4 | CLI and policy test | `crates/lumberroom/src/wire.rs`, `crates/lumberroom/src/format.rs`, `crates/lumberroom/src/commands.rs`, `crates/lumberroom/src/eval/runner.rs`, `crates/lumberroom/src/eval/corpus.rs`, `crates/lumberroom/tests/wire.rs`, `scripts/policy-test.sh` | sonnet | 1 | `detail`, `rows`, optional `score`, the inventory existence check | lead runs `cargo test -p lumberroom` and `scripts/policy-test.sh` |
 | 5 | Wiring, integration tests, docs | `src/mcp/mod.rs` (handlers), `src/services/bootstrap.rs:22-23` (comment, after 2b), `tests/mcp_brief.rs` (new), `tests/review_queue_mcp.rs`, `tests/mcp_source.rs`, `tests/mcp_capability.rs`, `CHANGELOG.md`, `docs/decisions/0031-mcp-answers-carry-what-an-agent-acts-on.md` (new), `docs/decisions/0019-a-caller-corrects-a-proposal.md` (superseded note), `docs/decisions/README.md` | lead, opus | 2, 2b, 3, 3b, 4 | the full suite green | `./scripts/cargo.sh test`; `grep -rnP '\x{2014}'` clean on every touched file |
 | 5c | Corpus, templates, slots and probe on legolas | nothing in the repo; `~/lumberroom-gate/2026-10-mcp-response-tokens/` on legolas | lead; haiku runs commands | 0 | fork and engine templates, gate tokens, emptied queues, fixtures, probe record | hash matches; conversion diff empty; probe passes |
@@ -645,7 +645,7 @@ pub fn default_limit(sources_read: usize) -> i64 {
 
 ## Task 3b: A write refuses fence lines
 
-**Files:** `src/domain/fence.rs`, `src/services/write.rs` (the check in `run_inner`, `:95`, before the length check; `run_inner` gains a `FenceLines` argument, `Refuse` from `run` and `run_observed`, `Allow` from a new `pub(super) run_archived`), `src/services/archive.rs:412` (calls `run_archived` where it calls `run_observed`). Ingest approval (`src/services/ingest.rs:506`) keeps `run_observed` and the check.
+**Files:** `src/domain/fence.rs`, `src/services/write.rs` (the check in `run_inner`, `:95`, before the length check; `run_inner` gains a `FenceLines` argument, `Refuse` from `run` and `run_observed`, `Allow` from `run_restored`, which only the archive merge calls), `src/services/archive.rs` (comment only). Ingest approval (`src/services/ingest.rs:506`) keeps `run_observed` and the check.
 
 ```rust
 pub fn carries_fence(content: &str) -> bool {
@@ -675,7 +675,7 @@ fn a_fence_line_is_recognised_and_a_sentence_about_fences_is_not() {
 }
 ```
 
-  In `write.rs`'s tests: `run` and `run_observed` refuse fenced content with `CONTENT_CARRIES_FENCE`; `run_archived` stores it; the source-text test that keeps the exempt entry points away from the tool layer gains `run_archived`.
+  In `write.rs`'s tests: `run` and `run_observed` refuse fenced content with `CONTENT_CARRIES_FENCE`; `run_restored` stores it.
 - [ ] **Steps 2 to 5:** scratch fail, implement, scratch pass, report.
 
 ---
