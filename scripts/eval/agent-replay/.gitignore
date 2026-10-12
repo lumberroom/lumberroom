@@ -1,0 +1,15 @@
+# A backstop. Everything below carries store content and belongs under LR_GATE_ROOT, which defaults
+# to a directory outside any checkout. These patterns catch a file an operator wrote here by hand.
+runs/
+transcripts/
+judge/
+slots/
+probe/
+probe.json
+tasks.live.jsonl
+map-review-*.json
+frozen-queries.jsonl
+build-replay.md
+*.lumber
+*.dump
+__pycache__/
