@@ -806,6 +806,12 @@ mod tests {
         async fn seed(&self) -> Result<Vec<UnitState>> {
             unreachable!("the command never seeds")
         }
+        async fn seed_unit(&self, _unit: &str) -> Result<Option<UnitState>> {
+            unreachable!("the command never seeds")
+        }
+        async fn units_holding_vectors(&self, _units: &[String]) -> Result<Vec<String>> {
+            unreachable!("only the sweep probes units")
+        }
         async fn states(&self) -> Result<Vec<UnitState>> {
             Ok(self.states.clone())
         }

@@ -31,6 +31,18 @@ impl PgEmbeddingMigrationRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    /// True when the row landed. False when the unit already had one.
+    async fn seed_insert(&self, state: &UnitState) -> Result<bool> {
+        let done = sqlx::query(SEED_INSERT)
+            .bind(&state.unit)
+            .bind(state.active_slot.as_str())
+            .bind(state.model_a.as_deref())
+            .bind(state.model_b.as_deref())
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() == 1)
+    }
 }
 
 // ── seed ────────────────────────────────────────────────────────────────────────────────────────
@@ -44,6 +56,29 @@ const SEED_COUNTS_B: &str = "\
 SELECT tenant_id, embedding_b_model AS model, count(*) AS rows
   FROM memory WHERE embedding_b IS NOT NULL AND embedding_b_model IS NOT NULL
  GROUP BY tenant_id, embedding_b_model";
+
+/// ($1 unit). The sweep's seed. `tenant_id = $1` keeps the read on an index leading with
+/// `tenant_id`; the whole-store twins above scan every unit, which the sweep used to pay on every
+/// pass while any listed unit had no row.
+const SEED_UNIT_COUNTS_A: &str = "\
+SELECT tenant_id, embedding_model AS model, count(*) AS rows
+  FROM memory WHERE tenant_id = $1 AND embedding IS NOT NULL AND embedding_model IS NOT NULL
+ GROUP BY tenant_id, embedding_model";
+
+const SEED_UNIT_COUNTS_B: &str = "\
+SELECT tenant_id, embedding_b_model AS model, count(*) AS rows
+  FROM memory WHERE tenant_id = $1 AND embedding_b IS NOT NULL AND embedding_b_model IS NOT NULL
+ GROUP BY tenant_id, embedding_b_model";
+
+/// ($1 units). The predicate is the seed counts' own, so a unit named here always seeds a row; a
+/// looser one would send a unit with a vector but no model id to `seed_unit` on every pass.
+const UNITS_HOLDING_VECTORS: &str = "\
+SELECT u.unit FROM unnest($1::text[]) AS u(unit)
+ WHERE EXISTS (SELECT 1 FROM memory m
+                WHERE m.tenant_id = u.unit
+                  AND ((m.embedding IS NOT NULL AND m.embedding_model IS NOT NULL)
+                    OR (m.embedding_b IS NOT NULL AND m.embedding_b_model IS NOT NULL)))
+ ORDER BY u.unit";
 
 /// ($1 unit, $2 active_slot, $3 model_a, $4 model_b). A unit that gained a row since the counts
 /// keeps it: seeding never overwrites a state.
@@ -542,18 +577,29 @@ impl EmbeddingMigrationRepository for PgEmbeddingMigrationRepository {
         let b = sqlx::query(SEED_COUNTS_B).fetch_all(&self.pool).await?;
         let mut created = Vec::new();
         for state in seed_plan(&model_counts(&a)?, &model_counts(&b)?) {
-            let done = sqlx::query(SEED_INSERT)
-                .bind(&state.unit)
-                .bind(state.active_slot.as_str())
-                .bind(state.model_a.as_deref())
-                .bind(state.model_b.as_deref())
-                .execute(&self.pool)
-                .await?;
-            if done.rows_affected() == 1 {
+            if self.seed_insert(&state).await? {
                 created.push(state);
             }
         }
         Ok(created)
+    }
+
+    async fn seed_unit(&self, unit: &str) -> Result<Option<UnitState>> {
+        let a = sqlx::query(SEED_UNIT_COUNTS_A).bind(unit).fetch_all(&self.pool).await?;
+        let b = sqlx::query(SEED_UNIT_COUNTS_B).bind(unit).fetch_all(&self.pool).await?;
+        for state in seed_plan(&model_counts(&a)?, &model_counts(&b)?) {
+            if self.seed_insert(&state).await? {
+                return Ok(Some(state));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn units_holding_vectors(&self, units: &[String]) -> Result<Vec<String>> {
+        if units.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_scalar(UNITS_HOLDING_VECTORS).bind(units).fetch_all(&self.pool).await?)
     }
 
     async fn states(&self) -> Result<Vec<UnitState>> {
@@ -865,6 +911,7 @@ mod tests {
 
     const TWINS: &[(&str, &str, &str)] = &[
         ("SEED_COUNTS", SEED_COUNTS_A, SEED_COUNTS_B),
+        ("SEED_UNIT_COUNTS", SEED_UNIT_COUNTS_A, SEED_UNIT_COUNTS_B),
         ("NAME_SLOT", NAME_SLOT_A, NAME_SLOT_B),
         ("COUNTS_ACTIVE", COUNTS_ACTIVE_A, COUNTS_ACTIVE_B),
         ("NEXT", NEXT_A, NEXT_B),

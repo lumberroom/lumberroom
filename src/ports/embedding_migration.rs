@@ -13,6 +13,13 @@ pub trait EmbeddingMigrationRepository: Send + Sync {
     /// Creates a state row for every unit that has vectors and none: model_a and model_b from the
     /// majority id in each column, active_slot 'a' when model_a is set, else 'b'.
     async fn seed(&self) -> Result<Vec<UnitState>>;
+    /// `seed` for one unit, reading only that unit's rows. None when the unit holds no vector or
+    /// already has a state row. The sweep calls it; the boot keeps `seed`, which also reaches units
+    /// no listing names.
+    async fn seed_unit(&self, unit: &str) -> Result<Option<UnitState>>;
+    /// The units in `units` holding at least one vector `seed_unit` would count, sorted. One probe
+    /// per unit that stops at its first such row.
+    async fn units_holding_vectors(&self, units: &[String]) -> Result<Vec<String>>;
     async fn states(&self) -> Result<Vec<UnitState>>;
     async fn state(&self, unit: &str) -> Result<Option<UnitState>>;
     /// Names `slot`'s model when it is NULL and `slot` is inactive. False when nothing changed.
