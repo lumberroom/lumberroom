@@ -7,6 +7,11 @@ below or from the sweep's analysis files, and those paths are relative to the sw
 outputs (run reports, per-hit logs, analysis files) are not committed. Where a figure is derived
 from run data rather than read off a run, it says so.
 
+The harness flags and settings named below other than `--corpus-wide` and `--fusion rrf`
+(`--lexical-weight`, `--rrf-k`, `--search-only`, `--fusion linear_minmax`, `SEARCH_DEBUG_SCORES`)
+exist on `exp/fusion-sweep` only, as does the flag and per-hit log section of
+`docs/eval-longmemeval.md`. Engine main refuses to boot with `SEARCH_FUSION=linear_minmax`.
+
 These are LongMemEval-S **retrieval recall** numbers. No answer is generated and no judge runs.
 
 ## Setup
@@ -169,8 +174,10 @@ the per-question files to check whether the rankings match.
 Sources: `analysis/pairs/<model>-<mode>-<variant>-vs-lin035.json` (bge scoped lin020 is
 `bge-scoped-lin020-vs-bge-scoped-lin035.json`).
 
-Lowering the lexical weight or switching to minmax loses for both models. Only two results go the
-other way, both Gemma in corpus mode: rrf60 on R@10 and lin050 on NDCG@10 and MRR.
+lin010 loses for both models on NDCG@10 and MRR. minmax loses for bge in both modes and for Gemma
+scoped, and shows no significant change for Gemma in corpus mode. Three results clear the test in
+the other direction: Gemma corpus rrf60 on R@10, Gemma corpus lin050 on NDCG@10 and MRR, and bge
+scoped lin050 on NDCG@10.
 
 ## The search default
 
@@ -183,7 +190,7 @@ does not carry a default change.
 **EmbeddingGemma 2: keep `SEARCH_FUSION=linear` and keep 0.35 for now.**
 
 - rrf60's +3.60 pp on R@10 shows up in corpus mode alone, 18 times the drift row. Corpus mode pools
-  500 personas; scoped mode stands closer to one person's store, and there rrf60 loses 0.61 pp
+  500 questions' haystacks; scoped mode stands closer to one person's store, and there rrf60 loses 0.61 pp
   NDCG@10 [-1.24, -0.08]. rrf also stands the graph router down (next section).
 - lin050 leans positive. It gains NDCG@10 and MRR in corpus mode at 2.5 and 3.6 times the drift
   rows, and costs nothing scoped (NDCG@10 -0.01 [-0.07, +0.04], MRR +0.01 [-0.08, +0.10]). The
@@ -195,10 +202,12 @@ does not carry a default change.
 ## Router thresholds for EmbeddingGemma 2
 
 The graph router reads the fused search score of each hit (`src/services/graph.rs`), which under
-linear fusion is cosine plus `SEARCH_LEXICAL_WEIGHT` times the keyword score. It walks when the
-rank-1 score falls below `GRAPH_ROUTE_MAX_TOP` **and** rank 1 minus rank 5 falls below
-`GRAPH_ROUTE_MAX_SPREAD` (`src/domain/routing.rs`). bge's defaults are 0.65 and 0.08. Gemma packs
-neighbours into a higher, narrower band, so those values mean something else on it.
+linear fusion is cosine plus `SEARCH_LEXICAL_WEIGHT` times the keyword score, plus a use boost of
+at most `SEARCH_USAGE_WEIGHT` (0.05), times a penalty for hits from another project. It walks when
+the rank-1 score falls below `GRAPH_ROUTE_MAX_TOP` **and** rank 1 minus rank 5 falls below
+`GRAPH_ROUTE_MAX_SPREAD` (`src/domain/routing.rs`), unless the question names an entity, which
+this analysis does not model. bge's values are 0.65 and 0.08. Gemma packs neighbours into a higher,
+narrower band, so those values mean something else on it.
 
 **Method.** For each mode, take the share *s* of questions whose bge value sits at or above bge's
 threshold, then take the Gemma value at the (1 - *s*) quantile. The same share of questions then
@@ -232,11 +241,14 @@ Source: `analysis/keys/route_joint.json`. The mapped columns use (0.7559, 0.0665
 and 150 of 500 corpus (30.0%), against bge's 116 and 160 at (0.65, 0.08)
 (`analysis/keys/route_rounded_pair.json`).
 
-With bge's values, Gemma walks 0 of 500 corpus questions and 59 scoped against bge's 116. A Gemma
-deployment left on the defaults keeps the router from walking in corpus mode.
+With bge's values, Gemma walks 0 of 500 corpus questions and 59 scoped against bge's 116. Engine
+main does not leave Gemma on bge's values: `embeddinggemma-2` resolves to 0.76 and 0.07 from its
+model table in `src/domain/similarity.rs` (decision 0029), and `GRAPH_ROUTE_MAX_*` or
+`EMBED_THRESHOLDS` only override that.
 
 **rrf and linear_minmax stand the router down.** Both put scores on a scale the thresholds do not
-share, and the router declines to compare (`src/config.rs` maps them to `Scale::Ranked`). Under
+share, and the router declines to compare (`src/config.rs` maps them to `Scale::Ranked`; on main
+only `rrf` exists, and `linear_minmax` is on `exp/fusion-sweep` alone). Under
 either blend the two keys stop mattering.
 
 ## Not measured yet
