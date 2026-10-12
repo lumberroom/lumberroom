@@ -7,6 +7,7 @@ pub mod embedding_migration;
 pub mod embedding_phase;
 pub mod embedding_slot;
 pub mod errors;
+pub mod fence;
 pub mod namespaces;
 pub mod oauth;
 pub mod policy;

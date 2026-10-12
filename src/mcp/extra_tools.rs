@@ -35,6 +35,9 @@ pub struct MemoryHistoryArgs {
     /// namespace, so the walk crosses namespaces by design.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// 'full' adds the embedding model and read counters of each version.
+    #[serde(default)]
+    pub detail: Option<super::views::Detail>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -103,7 +106,8 @@ pub struct ReviewQueueArgs {
     /// named.
     #[serde(default)]
     pub source: Option<Vec<String>>,
-    /// Items to return from each source. Default 50, held between 1 and 200.
+    /// Items to read from each source. When absent, about 10 in all, split across the sources
+    /// read. Held between 1 and 200.
     #[serde(default)]
     pub limit: Option<i64>,
     /// Items to skip in each source, for paging. Default 0. A negative offset or one past 2000 is

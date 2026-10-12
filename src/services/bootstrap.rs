@@ -77,6 +77,27 @@ pub struct Digest {
     /// Rendered markdown, bounded by `max_chars`. Each stored row occupies one bullet: `one_line`
     /// is what keeps a body from opening a section of its own.
     pub text: String,
+    /// Memory ids the text left out or shortened. Skipped here so the service serialization stays
+    /// as it was; `mcp::views::digest` adds them to the MCP shapes.
+    #[serde(skip)]
+    pub left_out: Vec<String>,
+    /// `(namespace, kind, key)` of registry entries the text left out.
+    #[serde(skip)]
+    pub left_out_registry: Vec<(String, String, String)>,
+}
+
+/// What one render printed, and which rows it did not print whole.
+pub struct Rendered {
+    pub text: String,
+    /// Memory ids from profile, project_context and recent that the layout left out or shortened.
+    pub left_out: Vec<String>,
+    /// `(namespace, kind, key)` of registry entries the layout left out.
+    pub left_out_registry: Vec<(String, String, String)>,
+}
+
+pub fn render_report(d: &Digest, max_chars: usize) -> Rendered {
+    let _ = (d, max_chars);
+    todo!("task 2b")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,6 +265,8 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
         },
         cached: false,
         text: String::new(),
+        left_out: vec![],
+        left_out_registry: vec![],
     };
     digest.text = render(&digest, budget);
 
@@ -1013,6 +1036,8 @@ mod tests {
             counts: Counts { memories: 0, registry: 0, by_namespace: HashMap::new() },
             cached: false,
             text: String::new(),
+            left_out: vec![],
+            left_out_registry: vec![],
         }
     }
 

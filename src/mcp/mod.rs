@@ -35,6 +35,7 @@ use crate::services::{bootstrap, forget, registry, search, write, Ctx, Repos};
 
 pub mod capability;
 pub mod extra_tools;
+pub mod review_view;
 pub mod views;
 
 pub const SERVER_NAME: &str = "lumberroom";
@@ -143,6 +144,10 @@ pub struct BootstrapArgs {
     /// Absolute path or slug of the project you are working in, so its memory is promoted.
     #[serde(default)]
     pub project: Option<String>,
+    /// true adds every fact the digest drew from, with its id and exact text. The digest text
+    /// carries no ids.
+    #[serde(default)]
+    pub rows: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -158,7 +163,7 @@ pub struct SearchArgs {
     /// search. Namespaces the credential cannot read are left out either way.
     #[serde(default)]
     pub namespaces: Option<Vec<String>>,
-    /// Maximum rows. Default 8.
+    /// Maximum rows. Default 8, at most 50 unless the operator changed it.
     #[serde(default)]
     pub limit: Option<i64>,
     /// Slug or path of the current project. Its namespace joins the user namespace and global in
@@ -187,6 +192,10 @@ pub struct SearchArgs {
     /// something the store holds. Absent or empty, no tag filter applies.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// 'full' adds each hit's fused score and whether it came from the primary set. Results and
+    /// order are the same either way.
+    #[serde(default)]
+    pub detail: Option<views::Detail>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

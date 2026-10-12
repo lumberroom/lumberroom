@@ -14,11 +14,13 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::domain::types::{Memory, Provenance, Sensitivity};
+use crate::domain::types::{Invocation, Memory, Provenance, Sensitivity};
 use crate::ports::registry::RegistryVersion;
 use crate::ports::Timeline;
+use crate::services::bootstrap::Digest;
 use crate::services::forget::{Doomed, ForgetOutcome};
 use crate::services::registry::{RegistryGetResult, RegistryHistoryResult};
+use crate::services::search::SearchResult;
 use crate::services::{sources, Ctx};
 
 /// A stored `source_client` through the names `sources::labels` returned.
@@ -261,6 +263,53 @@ fn forget_view(f: ForgetOutcome, names: &HashMap<String, String>) -> ForgetView 
         text: f.text,
     }
 }
+
+/// How much of an answer a caller asked for. Brief is what a model reads unless it asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Detail {
+    #[default]
+    Brief,
+    Full,
+}
+
+/// An installed CLI parses `score` as required and cannot send `detail`, so a declared CLI call
+/// reads the full shape. Remove once a CLI that sends `detail` itself has shipped in two tags.
+pub fn detail_for(invocation: Invocation, asked: Option<Detail>) -> Detail {
+    asked.unwrap_or(if invocation == Invocation::Cli { Detail::Full } else { Detail::Brief })
+}
+
+/// `rows` for `context_bootstrap`, by the rule `detail_for` follows.
+pub fn rows_for(invocation: Invocation, asked: Option<bool>) -> bool {
+    asked.unwrap_or(invocation == Invocation::Cli)
+}
+
+/// The text channel's copy of a JSON answer.
+pub fn compact(json: &serde_json::Value) -> String {
+    serde_json::to_string(json).unwrap_or_default()
+}
+
+/// `memory_search`'s structured answer.
+pub fn search(result: &SearchResult, detail: Detail) -> serde_json::Value {
+    let _ = (result, detail);
+    todo!("task 2")
+}
+
+/// `memory_history`'s structured answer.
+pub fn timeline_value(t: &TimelineView, detail: Detail) -> serde_json::Value {
+    let _ = (t, detail);
+    todo!("task 2")
+}
+
+/// `context_bootstrap`'s structured answer. Brief carries the text, the counts and every row the
+/// text did not print whole; `rows` true is the `Digest` without `tenant`.
+pub fn digest(d: &Digest, rows: bool) -> serde_json::Value {
+    let _ = (d, rows);
+    todo!("task 2")
+}
+
+pub const DIGEST_MORE: &str =
+    "rows: true adds each printed fact's id and exact text; memory_search finds more";
 
 #[cfg(test)]
 mod tests {
