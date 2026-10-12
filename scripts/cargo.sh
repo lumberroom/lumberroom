@@ -211,6 +211,10 @@ fi
 # output that names its path survives in target/. The next recompile of ort-sys then fails with
 # "could not find native static library `onnxruntime`", which reads like a toolchain fault. A target volume that already holds the stale output needs
 # `./scripts/cargo.sh clean -p ort-sys` once, because the build script does not rerun on this variable.
+#
+# LUMBERROOM_TEST_REQUIRE_DB turns a database test that would skip into a failure. `test` and
+# `test-fast` always attach testdb, so a skip under them hides a broken run behind an ok. See
+# tests/common/mod.rs.
 docker run --rm --name "$NAME" \
   --label "lumberroom.cargo.owner=$$" \
   -e BUILDER_UID="$(id -u)" \
@@ -225,6 +229,7 @@ docker run --rm --name "$NAME" \
   -e RUST_BACKTRACE=1 \
   -e RUSTFLAGS="$RUSTFLAGS_MOLD" \
   ${TEST_FAST_JOBS:+-e TEST_FAST_JOBS="$TEST_FAST_JOBS"} \
+  ${TESTING:+-e LUMBERROOM_TEST_REQUIRE_DB=1} \
   lumberroom-builder "$@"
 status=$?
 

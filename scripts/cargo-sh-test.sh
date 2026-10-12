@@ -122,6 +122,14 @@ ran "DATABASE_URL=postgres://u:p@db:5432/lumberroom " && pass "check on db" || f
 ran "cargo check --all-targets" && pass "check gets no -j" || fail "check: $RUNLINE"
 logged "compose" && fail "check started testdb" || pass "check leaves testdb alone"
 
+say "a test run requires its database, so a failed setup fails the test"
+run FAKE_MEM=$((16 * GIB)) FAKE_TESTDB_HEALTH=healthy -- test
+ran "LUMBERROOM_TEST_REQUIRE_DB=1" && pass "test requires the database" || fail "test: $RUNLINE"
+run FAKE_MEM=$((16 * GIB)) FAKE_TESTDB_HEALTH=healthy -- test-fast
+ran "LUMBERROOM_TEST_REQUIRE_DB=1" && pass "test-fast requires the database" || fail "test-fast: $RUNLINE"
+run FAKE_MEM=$((16 * GIB)) -- check --all-targets
+ran "LUMBERROOM_TEST_REQUIRE_DB" && fail "check got the switch: $RUNLINE" || pass "check leaves it unset"
+
 say "LUMBERROOM_TEST_DATABASE_URL overrides, unless it names the store"
 run FAKE_MEM=$((16 * GIB)) LUMBERROOM_TEST_DATABASE_URL=postgres://a:b@elsewhere:5432/scratch -- test
 ran "DATABASE_URL=postgres://a:b@elsewhere:5432/scratch " && pass "override used" || fail "override: $RUNLINE"

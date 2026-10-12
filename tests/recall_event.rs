@@ -22,8 +22,7 @@ use lumberroom_server::ports::{Emission, RecallCall, RecallEvent};
 use lumberroom_server::services::{bootstrap, forget, recall_events, search, write, Ctx, Repos};
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
-// These tests own their database and never take the suite lock, so most of the module is unused.
-#[allow(dead_code)]
+#[macro_use]
 mod common;
 
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
@@ -55,26 +54,10 @@ impl Probe {
     }
 }
 
-/// A setup step that may be missing, with the reason printed. A run that skips reports `ok`, so the
-/// printed line is the only thing that tells a skip from a pass.
-macro_rules! step {
-    ($what:expr, $result:expr) => {
-        match $result {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("skipping: {} failed: {e:?}", $what);
-                return None;
-            }
-        }
-    };
-}
-
 /// A migrated database of its own and a `Ctx` over it, built the way `main.rs` composes one.
 async fn probe(name: &'static str, tune: impl FnOnce(&mut Config)) -> Option<Probe> {
     let serial = SERIAL.lock().await;
-    let url = step!("reading DATABASE_URL", std::env::var("DATABASE_URL"));
-    let base = url.rsplit_once('/')?.0.to_string();
-    let admin = step!("connecting to the admin database", PgPool::connect(&url).await);
+    let (admin, base) = common::connect_admin().await?;
     // Audited: `name` is a compile-time literal at every call site.
     step!(
         "dropping a leftover probe database",
@@ -210,7 +193,10 @@ async fn events(pool: &PgPool) -> Vec<EventRow> {
 /// Fails if `RECALL_EVENT_LOG` defaults on, or if the off path still writes events.
 #[tokio::test]
 async fn the_log_is_off_by_default_and_writes_nothing() {
-    let Some(p) = probe("recall_event_off_probe", |_| {}).await else { return };
+    let Some(p) = probe("recall_event_off_probe", |_| {}).await else {
+        common::skipping();
+        return;
+    };
     assert!(!p.ctx.cfg.recall_events.enabled, "RECALL_EVENT_LOG must default off in the engine");
     assert_eq!(p.ctx.cfg.recall_events.retention_days, 30);
 
@@ -232,7 +218,10 @@ async fn the_log_is_off_by_default_and_writes_nothing() {
 /// row goes unlogged.
 #[tokio::test]
 async fn a_search_logs_each_returned_row_with_its_rank_under_one_call_id() {
-    let Some(p) = probe("recall_event_search_probe", log_on).await else { return };
+    let Some(p) = probe("recall_event_search_probe", log_on).await else {
+        common::skipping();
+        return;
+    };
     for i in 0..4 {
         remember(&p.ctx, &format!("kestrel deploy note number {i}"), "project:alpha", &[]).await;
     }
@@ -281,7 +270,10 @@ async fn a_search_logs_each_returned_row_with_its_rank_under_one_call_id() {
 /// payload goes unlogged.
 #[tokio::test]
 async fn a_bootstrap_tags_each_row_with_its_section() {
-    let Some(p) = probe("recall_event_digest_probe", log_on).await else { return };
+    let Some(p) = probe("recall_event_digest_probe", log_on).await else {
+        common::skipping();
+        return;
+    };
     remember(&p.ctx, "Dana prefers TypeScript for tooling", "user:me", &["preference"]).await;
     remember(&p.ctx, "Dana reviews pull requests before lunch", "user:me", &[]).await;
     remember(&p.ctx, "alpha ships from the main branch", "project:alpha", &[]).await;
@@ -323,7 +315,10 @@ async fn a_bootstrap_tags_each_row_with_its_section() {
 /// an evaluation has to tell apart from new sessions.
 #[tokio::test]
 async fn a_cached_digest_logs_its_own_call() {
-    let Some(p) = probe("recall_event_cache_probe", log_on).await else { return };
+    let Some(p) = probe("recall_event_cache_probe", log_on).await else {
+        common::skipping();
+        return;
+    };
     remember(&p.ctx, "Dana prefers short commit subjects", "user:me", &["preference"]).await;
 
     let first = bootstrap::run(&p.ctx, None).await.expect("bootstrap");
@@ -343,7 +338,10 @@ async fn a_cached_digest_logs_its_own_call() {
 /// Fails if the event path inherits the emission path's encrypted-row filter.
 #[tokio::test]
 async fn a_private_row_is_logged_by_id_and_never_digested() {
-    let Some(p) = probe("recall_event_private_probe", log_on).await else { return };
+    let Some(p) = probe("recall_event_private_probe", log_on).await else {
+        common::skipping();
+        return;
+    };
     let tags = Some(vec![]);
     let out = write::run(
         &p.ctx,
@@ -381,7 +379,10 @@ async fn a_private_row_is_logged_by_id_and_never_digested() {
 /// statement and the live row's emission is lost with it.
 #[tokio::test]
 async fn an_event_for_a_deleted_row_does_not_cost_the_emissions() {
-    let Some(p) = probe("recall_event_gone_probe", log_on).await else { return };
+    let Some(p) = probe("recall_event_gone_probe", log_on).await else {
+        common::skipping();
+        return;
+    };
     let live = remember(&p.ctx, "the kestrel host is still here", "project:alpha", &[]).await;
     let gone = uuid::Uuid::new_v4();
     let event = |memory_id, rank| RecallEvent {
@@ -433,7 +434,10 @@ async fn aged_event(pool: &PgPool, tenant: &str, memory: uuid::Uuid, days_ago: i
 /// window it was given.
 #[tokio::test]
 async fn retention_deletes_old_events_and_keeps_new_ones() {
-    let Some(p) = probe("recall_event_retention_probe", log_on).await else { return };
+    let Some(p) = probe("recall_event_retention_probe", log_on).await else {
+        common::skipping();
+        return;
+    };
     let id = remember(&p.ctx, "an aged fact", "project:alpha", &[]).await;
     let tenant = p.ctx.tenant().to_string();
     for _ in 0..5 {
@@ -462,7 +466,10 @@ async fn retention_deletes_old_events_and_keeps_new_ones() {
 /// own.
 #[tokio::test]
 async fn retention_leaves_another_tenant_alone() {
-    let Some(p) = probe("recall_event_tenant_probe", log_on).await else { return };
+    let Some(p) = probe("recall_event_tenant_probe", log_on).await else {
+        common::skipping();
+        return;
+    };
     let mine = remember(&p.ctx, "kestrel tenancy probe", "project:alpha", &[]).await;
     let theirs = uuid::Uuid::new_v4();
     sqlx::query(
@@ -504,7 +511,10 @@ async fn retention_leaves_another_tenant_alone() {
 /// Fails if the foreign key loses its cascade: the delete is then refused, or leaves the events.
 #[tokio::test]
 async fn forgetting_a_memory_removes_its_events() {
-    let Some(p) = probe("recall_event_forget_probe", log_on).await else { return };
+    let Some(p) = probe("recall_event_forget_probe", log_on).await else {
+        common::skipping();
+        return;
+    };
     let doomed = remember(&p.ctx, "kestrel forget probe one", "project:alpha", &[]).await;
     let kept = remember(&p.ctx, "kestrel forget probe two", "project:alpha", &[]).await;
     search::run(&p.ctx, "kestrel forget probe", None, None, Some("alpha"), None, None)
@@ -526,7 +536,10 @@ async fn forgetting_a_memory_removes_its_events() {
 /// Fails on any column beyond these, including a content, hash or query column.
 #[tokio::test]
 async fn the_table_holds_ids_and_times_and_no_content() {
-    let Some(p) = probe("recall_event_schema_probe", |_| {}).await else { return };
+    let Some(p) = probe("recall_event_schema_probe", |_| {}).await else {
+        common::skipping();
+        return;
+    };
     let columns: Vec<String> = sqlx::query_scalar(
         "SELECT column_name::text FROM information_schema.columns
           WHERE table_schema = 'public' AND table_name = 'recall_event'
@@ -577,7 +590,10 @@ async fn latency_with_and_without_the_log() {
     // mirrored order lets that bias show up on both sides instead of flattering one.
     for on in [false, true, true, false] {
         let name = if on { "recall_event_latency_on" } else { "recall_event_latency_off" };
-        let Some(p) = probe(name, |c| c.recall_events.enabled = on).await else { return };
+        let Some(p) = probe(name, |c| c.recall_events.enabled = on).await else {
+            common::skipping();
+            return;
+        };
         for i in 0..ROWS {
             let ns = match i % 4 {
                 0 => "user:me",

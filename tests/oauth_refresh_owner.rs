@@ -14,6 +14,7 @@ use lumberroom_server::ports::oauth::{NewOauthClient, NewRefreshToken};
 use lumberroom_server::ports::OauthStore;
 use sqlx::PgPool;
 
+#[macro_use]
 mod common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
@@ -21,29 +22,19 @@ const CLIENT: &str = "client-owner-test";
 
 /// Returns None when no database is reachable.
 async fn setup() -> Option<(PgPool, common::DbGuard)> {
-    let admin_url = std::env::var("DATABASE_URL").ok()?;
-    let base_url = admin_url.rsplit_once('/')?.0.to_string();
-    let admin = PgPool::connect(&admin_url).await.ok()?;
-    let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
-        .bind(TEST_DB)
-        .fetch_optional(&admin)
-        .await
-        .ok()?;
-    if exists.is_none() {
-        // Audited: TEST_DB is a compile-time constant with no external input.
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {TEST_DB}")))
-            .execute(&admin)
-            .await
-            .ok()?;
-    }
+    let (admin, base_url) = common::connect_admin().await?;
+    common::create_database_if_missing(&admin, TEST_DB).await;
     admin.close().await;
 
     let url = format!("{base_url}/{TEST_DB}");
-    let guard = common::lock_database(&url).await?;
-    let pool = postgres::connect(&url).await.ok()?;
-    postgres::migrate(&pool).await.ok()?;
+    let guard = common::lock_database(&url).await;
+    let pool = step!("connecting to the test database", postgres::connect(&url).await);
+    common::migrate(&pool, TEST_DB).await;
     // Cascades to oauth_refresh, oauth_token and oauth_code through their foreign keys.
-    sqlx::query("TRUNCATE oauth_client CASCADE").execute(&pool).await.ok()?;
+    step!(
+        "truncating oauth_client",
+        sqlx::query("TRUNCATE oauth_client CASCADE").execute(&pool).await
+    );
     Some((pool, guard))
 }
 
@@ -78,7 +69,7 @@ async fn seed_refresh(store: &postgres::PgOauthStore, hash: &str, ttl_secs: i64)
 #[tokio::test]
 async fn refresh_owner_answers_only_for_a_live_token() {
     let Some((pool, _guard)) = setup().await else {
-        eprintln!("skipping: no database reachable");
+        common::skipping();
         return;
     };
     let store = postgres::PgOauthStore::new(pool.clone());
@@ -107,7 +98,7 @@ async fn refresh_owner_answers_only_for_a_live_token() {
 #[tokio::test]
 async fn a_token_spent_by_rotate_refresh_stops_answering_for_its_owner() {
     let Some((pool, _guard)) = setup().await else {
-        eprintln!("skipping: no database reachable");
+        common::skipping();
         return;
     };
     let store = postgres::PgOauthStore::new(pool);

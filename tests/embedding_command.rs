@@ -32,6 +32,7 @@ use lumberroom_server::services::row_opener::NoOpener;
 use sqlx::{Connection, PgPool, Row};
 use uuid::Uuid;
 
+#[macro_use]
 mod common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
@@ -59,18 +60,6 @@ UPDATE embedding_control
    SET generation = 0, target = NULL, flip = false, retire = NULL, verb = NULL,
        requested_at = NULL, applied_generation = 0, server_models = '{}',
        server_status = NULL, server_seen_at = NULL;";
-
-macro_rules! step {
-    ($what:expr, $result:expr) => {
-        match $result {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("skipping: {} failed: {e:?}", $what);
-                return None;
-            }
-        }
-    };
-}
 
 // ── the fakes ─────────────────────────────────────────────────────────────────────────────────
 
@@ -209,21 +198,8 @@ fn spec(model: &str) -> EmbedderSpec {
 async fn setup() -> Option<Harness> {
     let serial = SERIAL.lock().await;
     CLOCK_OFFSET_SECS.store(0, Ordering::SeqCst);
-    let admin_url = std::env::var("DATABASE_URL").ok()?;
-    let base_url = admin_url.rsplit_once('/')?.0.to_string();
-    let admin = step!("connecting to the admin database", PgPool::connect(&admin_url).await);
-    let exists: Result<Option<i32>, _> =
-        sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
-            .bind(TEST_DB)
-            .fetch_optional(&admin)
-            .await;
-    if step!("looking for the test database", exists).is_none() {
-        // Audited: TEST_DB is a compile-time constant with no external input.
-        let created = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {TEST_DB}")))
-            .execute(&admin)
-            .await;
-        step!("creating the test database", created);
-    }
+    let (admin, base_url) = common::connect_admin().await?;
+    common::create_database_if_missing(&admin, TEST_DB).await;
     admin.close().await;
 
     let url = format!("{base_url}/{TEST_DB}");
@@ -231,9 +207,9 @@ async fn setup() -> Option<Harness> {
     std::env::set_var("AUTH_TOKENS", format!("mac:{}", "m".repeat(32)));
     std::env::set_var("EMBED_PROVIDER", "hash");
 
-    let db = common::lock_database(&url).await?;
+    let db = common::lock_database(&url).await;
     let pool = step!("connecting to the test database", postgres::connect(&url).await);
-    step!("migrating the test database", postgres::migrate(&pool).await);
+    common::migrate(&pool, TEST_DB).await;
     let truncated = sqlx::query(
         "TRUNCATE memory, registry, registry_history, entity_alias, sealed_item, tool_calls,
                   registry_alias, kek_state, memory_pair_dismissed,
@@ -302,7 +278,7 @@ macro_rules! harness_or_skip {
         match setup().await {
             Some(h) => h,
             None => {
-                eprintln!("skipping: no database reachable");
+                common::skipping();
                 return;
             }
         }

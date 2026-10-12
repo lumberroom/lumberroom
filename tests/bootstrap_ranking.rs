@@ -20,8 +20,7 @@ use lumberroom_server::services::bootstrap::{self, Digest};
 use lumberroom_server::services::{Ctx, Repos};
 use sqlx::{AssertSqlSafe, PgPool};
 
-// These tests own their database and never take the suite lock, so most of the module is unused.
-#[allow(dead_code)]
+#[macro_use]
 mod common;
 
 const DIMS: usize = 768;
@@ -37,19 +36,20 @@ struct Store {
 impl Store {
     /// A migrated database of its own, dropped first if a crashed run left it behind.
     async fn fresh(name: &'static str) -> Option<Store> {
-        let url = std::env::var("DATABASE_URL").ok()?;
-        let base = url.rsplit_once('/')?.0.to_string();
-        let admin = PgPool::connect(&url).await.ok()?;
+        let (admin, base) = common::connect_admin().await?;
         // DDL takes no bind parameter. Audited: every caller passes a compile-time literal.
-        sqlx::raw_sql(AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")))
-            .execute(&admin)
-            .await
-            .ok()?;
-        sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {name}")))
-            .execute(&admin)
-            .await
-            .ok()?;
-        let pool = postgres::connect(&format!("{base}/{name}")).await.ok()?;
+        step!(
+            "dropping a leftover database",
+            sqlx::raw_sql(AssertSqlSafe(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)")))
+                .execute(&admin)
+                .await
+        );
+        step!(
+            "creating the database",
+            sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&admin).await
+        );
+        let pool =
+            step!("connecting to the database", postgres::connect(&format!("{base}/{name}")).await);
         postgres::migrate(&pool).await.expect("migrations apply to an empty database");
         Some(Store { pool, admin, name, tenant: "me".into() })
     }
@@ -173,7 +173,7 @@ macro_rules! store_or_skip {
         match Store::fresh($name).await {
             Some(s) => s,
             None => {
-                eprintln!("skipping: no database reachable");
+                common::skipping();
                 return;
             }
         }

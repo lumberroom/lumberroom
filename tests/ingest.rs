@@ -41,6 +41,7 @@ use lumberroom_server::ports::OauthStore;
 use lumberroom_server::services::{bootstrap, ingest, search, write, Ctx, Repos};
 use sqlx::PgPool;
 
+#[macro_use]
 mod common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
@@ -66,24 +67,6 @@ const CREDENTIAL: &str = "postgres://lumberroom:s3cr3tPassw0rd@db.internal:5432/
 /// relying on `--test-threads=1` being remembered. Cargo runs one test binary at a time, so this
 /// mutex and the ones in `integration.rs` and `console.rs` do not have to know about each other.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// A setup step that is allowed to be missing, with the reason printed rather than swallowed.
-///
-/// A laptop with no Postgres and a store whose migrations no longer match this binary both skip,
-/// and without the printed reason they skip with the same sentence. The suite skips rather than
-/// fails, which makes that sentence the only thing standing between a broken run and a run
-/// somebody reads as a pass.
-macro_rules! step {
-    ($what:expr, $result:expr) => {
-        match $result {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("skipping: {} failed: {e:?}", $what);
-                return None;
-            }
-        }
-    };
-}
 
 struct Harness {
     ctx: Ctx,
@@ -146,24 +129,9 @@ impl Harness {
 /// without one.
 async fn setup() -> Option<Harness> {
     let guard = SERIAL.lock().await;
-    let admin_url = std::env::var("DATABASE_URL").ok()?;
-    let base = admin_url.rsplit_once('/')?.0.to_string();
-    let admin = step!("connecting to the admin database", PgPool::connect(&admin_url).await);
+    let (admin, base) = common::connect_admin().await?;
 
-    let exists: Result<Option<i32>, _> =
-        sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
-            .bind(TEST_DB)
-            .fetch_optional(&admin)
-            .await;
-    let exists = step!("looking for the test database", exists);
-    if exists.is_none() {
-        // DDL cannot take a bind parameter, so this is the one statement here that has to be built
-        // as a string. Audited: TEST_DB is a compile-time constant with no external input.
-        let created = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {TEST_DB}")))
-            .execute(&admin)
-            .await;
-        step!("creating the test database", created);
-    }
+    common::create_database_if_missing(&admin, TEST_DB).await;
     admin.close().await;
 
     let url = format!("{base}/{TEST_DB}");
@@ -185,9 +153,9 @@ async fn setup() -> Option<Harness> {
 
     // Before the truncate below, and before anything reads. Every other binary
     // targeting this database waits here.
-    let db_lock = common::lock_database(&url).await?;
+    let db_lock = common::lock_database(&url).await;
     let pool = step!("connecting to the test database", postgres::connect(&url).await);
-    step!("migrating the test database", postgres::migrate(&pool).await);
+    common::migrate(&pool, TEST_DB).await;
     let truncated = sqlx::query(
         "TRUNCATE memory, registry, registry_history, entity_alias, sealed_item, tool_calls,
                   registry_alias, kek_state,
@@ -255,10 +223,11 @@ async fn setup() -> Option<Harness> {
         proposals: Vec::new(),
         embedding_status: None,
     });
-    let authenticator = auth::create(&ctx.cfg, Some(oauth)).ok()?;
+    let authenticator = step!("building the authenticator", auth::create(&ctx.cfg, Some(oauth)));
     let app = lumberroom_server::http::router(state, authenticator);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
-    let addr: SocketAddr = listener.local_addr().ok()?;
+    let listener =
+        step!("binding a local port", tokio::net::TcpListener::bind("127.0.0.1:0").await);
+    let addr: SocketAddr = step!("reading the bound address", listener.local_addr());
     tokio::spawn(async move {
         let _ = axum::serve(listener, app.into_make_service()).await;
     });
@@ -271,7 +240,7 @@ macro_rules! harness_or_skip {
         match setup().await {
             Some(h) => h,
             None => {
-                eprintln!("skipping: no database reachable");
+                common::skipping();
                 return;
             }
         }

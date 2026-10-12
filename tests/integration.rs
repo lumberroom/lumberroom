@@ -20,6 +20,7 @@ use lumberroom_server::services::{
 };
 use sqlx::{PgPool, Row};
 
+#[macro_use]
 mod common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
@@ -34,24 +35,6 @@ const TEST_KEK_ID: &str = "kek-test";
 /// serialise themselves rather than depending on `--test-threads=1` being remembered. The guard
 /// is held for the lifetime of the test.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// A setup step that is allowed to be missing, with the reason printed rather than swallowed.
-///
-/// Every fallible step below used to end in `.ok()?`, so a laptop with no Postgres and a container
-/// whose migrations no longer match the store both skipped with the same sentence. The suite
-/// already skips rather than fails, which makes the printed reason the only thing standing between
-/// a broken run and a run somebody reads as a pass.
-macro_rules! step {
-    ($what:expr, $result:expr) => {
-        match $result {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("skipping: {} failed: {e:?}", $what);
-                return None;
-            }
-        }
-    };
-}
 
 /// Returns None when no database is reachable, so the suite skips rather than fails on a machine
 /// without one.
@@ -68,26 +51,9 @@ async fn setup_with(
     tune: impl FnOnce(&mut Config),
 ) -> Option<(Ctx, PgPool, tokio::sync::MutexGuard<'static, ()>, common::DbGuard)> {
     let guard = SERIAL.lock().await;
-    let admin_url = std::env::var("DATABASE_URL").ok()?;
-    let base = admin_url.rsplit_once('/')?.0.to_string();
-    let admin = step!("connecting to the admin database", PgPool::connect(&admin_url).await);
+    let (admin, base) = common::connect_admin().await?;
 
-    let exists: Result<Option<i32>, _> =
-        sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
-            .bind(TEST_DB)
-            .fetch_optional(&admin)
-            .await;
-    let exists = step!("looking for the test database", exists);
-    if exists.is_none() {
-        // DDL cannot take a bind parameter, so this is the one statement in the codebase that
-        // must be built as a string. sqlx refuses that by default and requires the audit to be
-        // written down as `AssertSqlSafe`, which is a word that shows up in review. Audited:
-        // TEST_DB is a compile-time constant with no external input.
-        let created = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {TEST_DB}")))
-            .execute(&admin)
-            .await;
-        step!("creating the test database", created);
-    }
+    common::create_database_if_missing(&admin, TEST_DB).await;
     admin.close().await;
 
     let url = format!("{base}/{TEST_DB}");
@@ -98,9 +64,9 @@ async fn setup_with(
 
     // Before the truncate below, and before anything reads. Every other binary
     // targeting this database waits here.
-    let db_lock = common::lock_database(&url).await?;
+    let db_lock = common::lock_database(&url).await;
     let pool = step!("connecting to the test database", postgres::connect(&url).await);
-    step!("migrating the test database", postgres::migrate(&pool).await);
+    common::migrate(&pool, TEST_DB).await;
     // `kek_state` goes with the rows it describes. Every encrypted row is truncated here, so a
     // fingerprint recorded by an earlier run describes nothing and would only report this suite's
     // own key as a rotation.
@@ -169,7 +135,7 @@ macro_rules! ctx_or_skip {
             // this binary's threads; the DbGuard holds the advisory lock the other five wait on.
             Some((ctx, pool, guard, db)) => (ctx, pool, (guard, db)),
             None => {
-                eprintln!("skipping: no database reachable");
+                common::skipping();
                 return;
             }
         }
@@ -178,7 +144,7 @@ macro_rules! ctx_or_skip {
         match setup_with($tune).await {
             Some((ctx, pool, guard, db)) => (ctx, pool, (guard, db)),
             None => {
-                eprintln!("skipping: no database reachable");
+                common::skipping();
                 return;
             }
         }
@@ -4272,7 +4238,10 @@ async fn a_registry_value_at_open_goes_through_the_credential_tripwire() {
 /// `user:me`, and a guard that filtered that map on `n > 0` warned about neither.
 #[tokio::test]
 async fn the_stranded_namespace_query_sees_what_namespace_counts_misses() {
-    let Some((ctx, pool, _guard, _db)) = setup().await else { return };
+    let Some((ctx, pool, _guard, _db)) = setup().await else {
+        common::skipping();
+        return;
+    };
 
     let head = uuid::Uuid::new_v4();
     let retired = uuid::Uuid::new_v4();
@@ -4335,7 +4304,10 @@ async fn the_stranded_namespace_query_sees_what_namespace_counts_misses() {
 /// window: the statement has not ended, so even a row it already bumped is invisible here.
 #[tokio::test]
 async fn an_access_bump_skips_a_row_another_write_holds() {
-    let Some((ctx, pool, _guard, _db)) = setup().await else { return };
+    let Some((ctx, pool, _guard, _db)) = setup().await else {
+        common::skipping();
+        return;
+    };
 
     let held = uuid::Uuid::new_v4();
     let free = uuid::Uuid::new_v4();
