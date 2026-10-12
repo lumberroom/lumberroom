@@ -305,7 +305,16 @@ impl Sweep {
     }
 
     /// Step 2: the listed units in their order, then every other unit with a state row, sorted.
-    /// Seeds once when a walked unit has no state row, and reloads the request path's state map.
+    /// Seeds each walked unit that holds vectors and has no state row, and reloads the request
+    /// path's state map.
+    ///
+    /// A unit with no vector costs one probe a pass and gets no state row. A row seeded for it
+    /// would pin the model it would serve today, so the boot would then refuse a changed `EMBED_*`
+    /// on a store nobody has written to, and mid-migration each new unit would flip at once and
+    /// push the retire window back by `EMBED_ROLLBACK_DAYS`. Without a row it serves what
+    /// `EmbedderSet::for_unit` answers for a unit with none, the previous model in slot A while a
+    /// migration runs, so its first write lands the previous model's vector, and the current one's
+    /// unless the second embed times out, and the next pass seeds it from them.
     async fn units_to_walk(&self, listed: &[String]) -> crate::domain::errors::Result<Vec<String>> {
         let mut states = self.repo.states().await?;
         let mut walk: Vec<String> = Vec::new();
@@ -318,9 +327,16 @@ impl Sweep {
             states.iter().map(|s| s.unit.clone()).filter(|u| !walk.contains(u)).collect();
         rest.sort();
         walk.extend(rest);
-        if walk.iter().any(|u| !states.iter().any(|s| &s.unit == u)) {
-            self.repo.seed().await?;
-            states = self.repo.states().await?;
+        let missing: Vec<String> =
+            walk.iter().filter(|u| !states.iter().any(|s| &s.unit == *u)).cloned().collect();
+        if !missing.is_empty() {
+            let holding = self.repo.units_holding_vectors(&missing).await?;
+            for unit in &holding {
+                self.repo.seed_unit(unit).await?;
+            }
+            if !holding.is_empty() {
+                states = self.repo.states().await?;
+            }
         }
         self.embedders.set_states(states);
         Ok(walk)
@@ -335,7 +351,7 @@ impl Sweep {
     ) -> Result<(), Stop> {
         let Some(mut state) = self.repo.state(unit).await? else {
             // No vector yet, so nothing to move. Writes land on the model `for_unit` names, and
-            // the pass after the first one seeds the unit.
+            // the first pass after its first vector lands seeds the unit.
             if let Ok(u) = self.embedders.for_unit(unit) {
                 report.ready.push((unit.to_string(), u.embedder.id()));
             }
@@ -1113,6 +1129,37 @@ mod tests {
         /// commits mid-pass.
         bump_after_stores: Option<usize>,
         stores: usize,
+        /// Calls to the whole-store `seed`.
+        whole_seeds: usize,
+        /// Every unit `seed_unit` was asked for, in call order.
+        unit_seeds: Vec<String>,
+    }
+
+    impl Store {
+        /// The fake's seed rule for one unit: the majority id in each slot, slot A active when set.
+        fn plan(&self, unit: &str) -> Option<UnitState> {
+            let majority = |slot: VectorSlot| -> Option<String> {
+                let mut tally: BTreeMap<String, usize> = BTreeMap::new();
+                for r in self.rows.iter().filter(|r| r.unit == unit) {
+                    if let Some(m) = r.slot(slot) {
+                        *tally.entry(m.clone()).or_default() += 1;
+                    }
+                }
+                tally.into_iter().max_by_key(|(_, n)| *n).map(|(m, _)| m)
+            };
+            let (a, b) = (majority(VectorSlot::A), majority(VectorSlot::B));
+            if a.is_none() && b.is_none() {
+                return None;
+            }
+            let active = if a.is_some() { VectorSlot::A } else { VectorSlot::B };
+            Some(UnitState {
+                unit: unit.to_string(),
+                active_slot: active,
+                model_a: a,
+                model_b: b,
+                flipped_at: None,
+            })
+        }
     }
 
     #[derive(Default)]
@@ -1143,37 +1190,44 @@ mod tests {
     impl EmbeddingMigrationRepository for FakeRepo {
         async fn seed(&self) -> Result<Vec<UnitState>> {
             let mut s = self.store();
+            s.whole_seeds += 1;
             let units: Vec<String> = s.rows.iter().map(|r| r.unit.clone()).collect();
             let mut made = vec![];
             for unit in units {
                 if s.states.contains_key(&unit) {
                     continue;
                 }
-                let majority = |slot: VectorSlot| -> Option<String> {
-                    let mut tally: BTreeMap<String, usize> = BTreeMap::new();
-                    for r in s.rows.iter().filter(|r| r.unit == unit) {
-                        if let Some(m) = r.slot(slot) {
-                            *tally.entry(m.clone()).or_default() += 1;
-                        }
-                    }
-                    tally.into_iter().max_by_key(|(_, n)| *n).map(|(m, _)| m)
-                };
-                let (a, b) = (majority(VectorSlot::A), majority(VectorSlot::B));
-                if a.is_none() && b.is_none() {
-                    continue;
+                if let Some(st) = s.plan(&unit) {
+                    s.states.insert(unit, st.clone());
+                    made.push(st);
                 }
-                let active = if a.is_some() { VectorSlot::A } else { VectorSlot::B };
-                let st = UnitState {
-                    unit: unit.clone(),
-                    active_slot: active,
-                    model_a: a,
-                    model_b: b,
-                    flipped_at: None,
-                };
-                s.states.insert(unit, st.clone());
-                made.push(st);
             }
             Ok(made)
+        }
+        async fn seed_unit(&self, unit: &str) -> Result<Option<UnitState>> {
+            let mut s = self.store();
+            s.unit_seeds.push(unit.to_string());
+            if s.states.contains_key(unit) {
+                return Ok(None);
+            }
+            let made = s.plan(unit);
+            if let Some(st) = &made {
+                s.states.insert(unit.to_string(), st.clone());
+            }
+            Ok(made)
+        }
+        async fn units_holding_vectors(&self, units: &[String]) -> Result<Vec<String>> {
+            let s = self.store();
+            let mut holding: Vec<String> = units
+                .iter()
+                .filter(|u| {
+                    s.rows.iter().any(|r| &r.unit == *u && (r.a.is_some() || r.b.is_some()))
+                })
+                .cloned()
+                .collect();
+            holding.sort();
+            holding.dedup();
+            Ok(holding)
         }
         async fn states(&self) -> Result<Vec<UnitState>> {
             Ok(self.store().states.values().cloned().collect())
@@ -1701,6 +1755,45 @@ mod tests {
         sweep.pass(&me()).await;
         assert_eq!(r.repo.state_of("me").model_a.as_deref(), Some(P));
         assert_eq!(r.repo.row(1).b.as_deref(), Some(C));
+    }
+
+    // The hosted fork lists every active tenant, and a new one holds nothing. Each pass used to
+    // seed the whole store for it (review of 11 October 2026).
+    #[tokio::test]
+    async fn a_listed_unit_with_no_vector_is_never_seeded() {
+        let r =
+            rig(vec![row("me", 1, Some(C), None)], vec![state("me", VectorSlot::A, Some(C), None)]);
+        let sweep = r.sweep(Steer::Env(view(None)), knobs());
+        let listed = Listed(vec!["me".into(), "fresh".into()]);
+        sweep.pass(&listed).await;
+        sweep.pass(&listed).await;
+        let s = r.repo.store();
+        assert_eq!(s.whole_seeds, 0, "the sweep seeded the whole store");
+        assert!(s.unit_seeds.is_empty(), "an empty unit was seeded: {:?}", s.unit_seeds);
+        assert!(!s.states.contains_key("fresh"), "an empty unit gained a state row");
+    }
+
+    #[tokio::test]
+    async fn a_unit_is_seeded_once_after_its_first_vector_lands() {
+        let r = rig(vec![], vec![]);
+        let sweep = r.sweep(Steer::Env(view(None)), knobs());
+        sweep.pass(&me()).await;
+        r.repo.store().rows.push(row("me", 1, Some(C), None));
+        sweep.pass(&me()).await;
+        sweep.pass(&me()).await;
+        assert_eq!(r.repo.store().unit_seeds, vec!["me".to_string()]);
+        assert_eq!(r.repo.state_of("me").model_a.as_deref(), Some(C));
+    }
+
+    #[tokio::test]
+    async fn the_pass_seeds_only_a_walked_unit() {
+        let r = rig(vec![row("me", 1, Some(C), None), row("acme", 2, Some(C), None)], vec![]);
+        let sweep = r.sweep(Steer::Env(view(None)), knobs());
+        sweep.pass(&me()).await;
+        let s = r.repo.store();
+        assert_eq!(s.whole_seeds, 0, "the sweep seeded the whole store");
+        assert!(s.states.contains_key("me"));
+        assert!(!s.states.contains_key("acme"), "an unlisted unit's rows were seeded");
     }
 
     // ── flipped and retiring ──────────────────────────────────────────────────────────────────

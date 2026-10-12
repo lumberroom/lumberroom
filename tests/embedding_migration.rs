@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use lumberroom_server::adapters::postgres::{self, PgEmbeddingMigrationRepository};
 use lumberroom_server::config::{self, Config};
 use lumberroom_server::domain::embedding_migration::{
-    Blocked, Configured, FlipOutcome, FlipRequest, FlipScope, Intent, IntentChange, Phase,
-    Published, UnitState, UnitStatus, Verb,
+    Blocked, Configured, Counts, FlipOutcome, FlipRequest, FlipScope, Intent, IntentChange,
+    PendingRow, Phase, Published, UnitState, UnitStatus, Verb,
 };
 use lumberroom_server::domain::embedding_phase::boot_check;
 use lumberroom_server::domain::embedding_slot::VectorSlot;
@@ -29,7 +29,7 @@ use lumberroom_server::domain::similarity::{Registry, SimilarityThresholds};
 use lumberroom_server::domain::types::{Invocation, Principal, Sensitivity};
 use lumberroom_server::ports::{ChangeOutcome, Embedder, EmbeddingMigrationRepository, FreeSpace};
 use lumberroom_server::services::embedders::EmbedderSet;
-use lumberroom_server::services::embedding_migration::{Knobs, SingleUnit, Steer, Sweep};
+use lumberroom_server::services::embedding_migration::{Knobs, SingleUnit, Steer, Sweep, Units};
 use lumberroom_server::services::row_opener::{NoOpener, RowOpener};
 use lumberroom_server::services::{search, write, Ctx, Repos};
 use sqlx::{Connection, PgPool, Row};
@@ -699,6 +699,54 @@ async fn seed_names_each_slot_from_its_majority_and_never_overwrites_a_state() {
 }
 
 #[tokio::test]
+async fn seed_unit_reads_only_its_own_rows() {
+    let h = harness_or_skip!();
+    for n in 1..=3 {
+        open_row(&h.pool, n, Some(BGE), None).await;
+    }
+    insert(&h.pool, "acme", 4, Some("acme fact"), "open", Some(THIRD), Some(GEMMA)).await;
+    insert(&h.pool, "gamma", 5, Some("gamma fact"), "open", None, None).await;
+
+    let made = h.repo.seed_unit("acme").await.unwrap().expect("acme holds vectors");
+    assert_eq!(
+        (made.active_slot, made.model_a.as_deref(), made.model_b.as_deref()),
+        (VectorSlot::A, Some(THIRD), Some(GEMMA))
+    );
+    let units: Vec<String> = h.repo.states().await.unwrap().into_iter().map(|s| s.unit).collect();
+    assert_eq!(units, vec!["acme".to_string()], "seeding acme seeded another unit");
+
+    assert!(h.repo.seed_unit("gamma").await.unwrap().is_none(), "a unit with no vector");
+    assert!(h.repo.seed_unit("acme").await.unwrap().is_none(), "a second seed creates nothing");
+
+    put_state(&h.pool, VectorSlot::B, Some(GEMMA), Some(BGE), Some(0)).await;
+    assert!(h.repo.seed_unit(UNIT).await.unwrap().is_none());
+    assert_eq!(h.state().await.active_slot, VectorSlot::B, "seeding overwrote a state");
+}
+
+#[tokio::test]
+async fn units_holding_vectors_names_only_units_with_a_vector() {
+    let h = harness_or_skip!();
+    open_row(&h.pool, 1, Some(BGE), None).await;
+    insert(&h.pool, "acme", 2, Some("acme fact"), "open", None, Some(GEMMA)).await;
+    insert(&h.pool, "gamma", 3, Some("gamma fact"), "open", None, None).await;
+    // A vector with no model id is one the seed counts skip, so the probe must skip it too, or the
+    // unit goes to `seed_unit` on every pass and never gets a row.
+    let unnamed = insert(&h.pool, "delta", 4, Some("delta fact"), "open", Some(BGE), None).await;
+    sqlx::query("UPDATE memory SET embedding_model = NULL WHERE id = $1")
+        .bind(unnamed)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let asked: Vec<String> =
+        ["gamma", UNIT, "nobody", "delta", "acme"].iter().map(|u| u.to_string()).collect();
+    let holding = h.repo.units_holding_vectors(&asked).await.unwrap();
+    assert_eq!(holding, vec!["acme".to_string(), UNIT.to_string()]);
+    assert!(h.repo.seed_unit("delta").await.unwrap().is_none(), "the seed counts skip it too");
+    assert!(h.repo.units_holding_vectors(&[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn name_slot_names_only_an_empty_inactive_slot() {
     let h = harness_or_skip!();
     assert!(!h.repo.name_slot(UNIT, VectorSlot::B, GEMMA).await.unwrap(), "no state row");
@@ -1181,6 +1229,171 @@ async fn a_search_with_the_active_embedder_down_returns_the_embedder_error() {
 }
 
 // ── the sweep ─────────────────────────────────────────────────────────────────────────────────
+
+/// The real adapter with a count of every seed call, so a test can say what a pass seeded.
+struct CountingSeeds {
+    inner: Arc<PgEmbeddingMigrationRepository>,
+    whole: AtomicUsize,
+    units: Mutex<Vec<String>>,
+}
+
+impl CountingSeeds {
+    fn seeded_units(&self) -> Vec<String> {
+        self.units.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl EmbeddingMigrationRepository for CountingSeeds {
+    async fn seed(&self) -> DomainResult<Vec<UnitState>> {
+        self.whole.fetch_add(1, Ordering::SeqCst);
+        self.inner.seed().await
+    }
+    async fn seed_unit(&self, unit: &str) -> DomainResult<Option<UnitState>> {
+        self.units.lock().unwrap().push(unit.to_string());
+        self.inner.seed_unit(unit).await
+    }
+    async fn units_holding_vectors(&self, units: &[String]) -> DomainResult<Vec<String>> {
+        self.inner.units_holding_vectors(units).await
+    }
+    async fn states(&self) -> DomainResult<Vec<UnitState>> {
+        self.inner.states().await
+    }
+    async fn state(&self, unit: &str) -> DomainResult<Option<UnitState>> {
+        self.inner.state(unit).await
+    }
+    async fn name_slot(&self, unit: &str, slot: VectorSlot, model: &str) -> DomainResult<bool> {
+        self.inner.name_slot(unit, slot, model).await
+    }
+    async fn counts(
+        &self,
+        unit: &str,
+        state: &UnitState,
+        target: Option<&str>,
+        retire: Option<&str>,
+    ) -> DomainResult<Counts> {
+        self.inner.counts(unit, state, target, retire).await
+    }
+    async fn next_batch(
+        &self,
+        unit: &str,
+        slot: VectorSlot,
+        model: &str,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> DomainResult<Vec<PendingRow>> {
+        self.inner.next_batch(unit, slot, model, after, limit).await
+    }
+    async fn next_holes(
+        &self,
+        unit: &str,
+        slot: VectorSlot,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> DomainResult<Vec<PendingRow>> {
+        self.inner.next_holes(unit, slot, after, limit).await
+    }
+    async fn store(
+        &self,
+        unit: &str,
+        id: Uuid,
+        slot: VectorSlot,
+        model: &str,
+        vector: Vec<f32>,
+    ) -> DomainResult<bool> {
+        self.inner.store(unit, id, slot, model, vector).await
+    }
+    async fn flip(&self, req: &FlipRequest) -> DomainResult<FlipOutcome> {
+        self.inner.flip(req).await
+    }
+    async fn retire_batch(
+        &self,
+        unit: &str,
+        slot: VectorSlot,
+        model: &str,
+        limit: i64,
+    ) -> DomainResult<u64> {
+        self.inner.retire_batch(unit, slot, model, limit).await
+    }
+    async fn clear_slot(&self, unit: &str, slot: VectorSlot, model: &str) -> DomainResult<bool> {
+        self.inner.clear_slot(unit, slot, model).await
+    }
+    async fn control(&self) -> DomainResult<(Intent, Published)> {
+        self.inner.control().await
+    }
+    async fn generation(&self) -> DomainResult<i64> {
+        self.inner.generation().await
+    }
+    async fn change_intent(
+        &self,
+        decide: &(dyn for<'i, 's> Fn(
+            &'i Intent,
+            &'s [UnitState],
+        ) -> std::result::Result<Option<IntentChange>, String>
+              + Send
+              + Sync),
+    ) -> DomainResult<ChangeOutcome> {
+        self.inner.change_intent(decide).await
+    }
+    async fn publish(&self, published: &Published) -> DomainResult<()> {
+        self.inner.publish(published).await
+    }
+}
+
+/// The fork's shape: one listing that names more than the engine's single unit.
+struct Listed(Vec<String>);
+
+#[async_trait]
+impl Units for Listed {
+    async fn list(&self) -> Vec<String> {
+        self.0.clone()
+    }
+}
+
+// A listed unit with no vector used to start two scans of the whole `memory` table on every pass,
+// and the hosted fork lists every tenant, so one empty tenant kept them running (review of
+// 11 October 2026).
+#[tokio::test]
+async fn an_empty_unit_is_not_seeded_on_the_next_pass() {
+    let h = harness_or_skip!();
+    open_row(&h.pool, 1, Some(BGE), None).await;
+    put_state(&h.pool, VectorSlot::A, Some(BGE), None, None).await;
+    let counting = Arc::new(CountingSeeds {
+        inner: h.repo.clone(),
+        whole: AtomicUsize::new(0),
+        units: Mutex::new(Vec::new()),
+    });
+    let configured = view(BGE, None, FlipScope::All);
+    let set = h.set(configured.clone());
+    let sweep = Sweep::new(
+        counting.clone(),
+        Arc::clone(&set),
+        Arc::new(NoOpener),
+        knobs(0),
+        Steer::Env(configured),
+        false,
+        None,
+    );
+    let listed = Listed(vec![UNIT.to_string(), "fresh".to_string()]);
+
+    sweep.pass(&listed).await;
+    sweep.pass(&listed).await;
+    assert_eq!(counting.whole.load(Ordering::SeqCst), 0, "the sweep seeded the whole store");
+    assert!(counting.seeded_units().is_empty(), "seeded {:?}", counting.seeded_units());
+    assert!(h.repo.state("fresh").await.unwrap().is_none(), "an empty unit gained a state row");
+
+    insert(&h.pool, "fresh", 2, Some("fresh fact"), "open", Some(BGE), None).await;
+    sweep.pass(&listed).await;
+    sweep.pass(&listed).await;
+    assert_eq!(
+        counting.seeded_units(),
+        vec!["fresh".to_string()],
+        "seeded once, on its first vector"
+    );
+    let fresh = h.repo.state("fresh").await.unwrap().expect("seeded on its first vector");
+    assert_eq!((fresh.active_slot, fresh.model_a.as_deref()), (VectorSlot::A, Some(BGE)));
+    assert_eq!(counting.whole.load(Ordering::SeqCst), 0);
+}
 
 #[tokio::test]
 async fn the_sweep_names_the_other_slot_and_fills_it_to_held() {
