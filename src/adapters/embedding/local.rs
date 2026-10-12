@@ -6,7 +6,7 @@
 //! occupying an async worker. Doing either naively would serialise the whole server behind it.
 
 use async_trait::async_trait;
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::sync::{Arc, Mutex};
 
 use crate::domain::errors::{DomainError, Result};
@@ -51,7 +51,7 @@ impl LocalEmbedder {
             }
         };
 
-        let opts = InitOptions::new(variant)
+        let opts = TextInitOptions::new(variant)
             .with_cache_dir(cache_dir.into())
             .with_show_download_progress(false);
 

@@ -24,7 +24,7 @@ fn main() {
     let cache = std::env::var("MODEL_CACHE_DIR").unwrap_or_else(|_| "/models".into());
 
     let started = std::time::Instant::now();
-    let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::BGEBaseENV15Q)
+    let opts = fastembed::TextInitOptions::new(fastembed::EmbeddingModel::BGEBaseENV15Q)
         .with_cache_dir(cache.clone().into())
         .with_show_download_progress(false);
 

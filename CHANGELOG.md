@@ -28,6 +28,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`fastembed` 6.0.2 to 7.1.1**, which brings `tokenizers` 0.23. bge-base-en-v1.5 vectors come out
+  bit-identical to 6.0.2 across 244 vectors from 61 texts on linux/arm64, so stored rows need no
+  re-embedding. Downloads of weights not yet cached now send `HF_TOKEN` or a saved
+  `huggingface-cli` login token, where 6.x downloaded anonymously.
 - **Memory content is capped at 2,000 characters by default, down from 8,000.** A `memory_write`,
   console write, ingest approval or review merge longer than `WRITE_MAX_CONTENT_CHARS` is refused
   with `content is N chars and the limit is M.` under the error code `content_too_long`. The length
