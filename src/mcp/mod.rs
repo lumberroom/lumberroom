@@ -54,6 +54,30 @@ pub fn tool_definitions() -> Vec<rmcp::model::Tool> {
     (Lumberroom::tool_router() + Lumberroom::extra_tool_router()).list_all()
 }
 
+/// The `_meta` key Claude Code reads off a tool in `tools/list` for how long a text result may run
+/// before it saves the result to a file and hands the model a path. Undeclared, that threshold is
+/// 50,000 characters, and `MAX_MCP_OUTPUT_TOKENS` does not move it. An agent then searches again
+/// with narrower queries to get around the stub. The MCP schema types a tool's `_meta` as an open
+/// map (`{ [key: string]: unknown }`), and the spec reserves a prefix whose second label is `mcp`
+/// or `modelcontextprotocol`, such as `dev.mcp/`, so the single-label `anthropic/` is free for a
+/// vendor key. See https://code.claude.com/docs/en/mcp and decision 0032.
+pub const RESULT_SIZE_KEY: &str = "anthropic/maxResultSizeChars";
+
+/// The client's own ceiling. Every figure below it is one a declared read can pass: `review_queue`
+/// pages up to 200 items per source, a conflict item carries two rows, and two rows of 2,000
+/// characters each make 800,000 characters of fact text on one page before a single field name.
+/// `memory_history` walks up to 64 versions each way and `alias_list` has no row limit. An answer
+/// past this still goes to a file.
+pub const MAX_RESULT_CHARS: u32 = 500_000;
+
+/// `_meta` for a read whose answer can pass 50,000 characters. Writes answer with one row or one
+/// outcome and carry none.
+fn large_result() -> rmcp::model::MetaObject {
+    let mut meta = serde_json::Map::new();
+    meta.insert(RESULT_SIZE_KEY.into(), MAX_RESULT_CHARS.into());
+    rmcp::model::MetaObject(meta)
+}
+
 /// Registered only for a principal whose grant carries `may_delete`, so it does not appear in
 /// `tools/list` for anyone else. Named here because both the filter and the guard read it.
 pub const FORGET_TOOL: &str = "memory_forget";
@@ -270,7 +294,8 @@ path or slug, promotes that project's memory.",
             title = "Load session context",
             read_only_hint = true,
             open_world_hint = false
-        )
+        ),
+        meta = large_result()
     )]
     async fn context_bootstrap(
         &self,
@@ -293,7 +318,8 @@ past decision, a preference, a host, a credential location, or how something is 
 Queries retrieve best as full sentences. Superseded facts are excluded, so each hit is what is \
 believed now; include_superseded and as_of change that. Each hit's source is the name of the app \
 that wrote it. tags keeps only facts carrying all of them.",
-        annotations(title = "Search memory", read_only_hint = true, open_world_hint = false)
+        annotations(title = "Search memory", read_only_hint = true, open_world_hint = false),
+        meta = large_result()
     )]
     async fn memory_search(
         &self,

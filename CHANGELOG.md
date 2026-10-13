@@ -28,6 +28,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Large read answers reach Claude Code inline.** `context_bootstrap`, `memory_search`,
+  `memory_history`, `registry_history`, `alias_list` and `review_queue` declare
+  `_meta: {"anthropic/maxResultSizeChars": 500000}` in `tools/list`. Claude Code saves an undeclared
+  tool's text result to a file once it passes 50,000 characters and hands the model a path; a
+  limit-50 `memory_search` runs past that. The MCP schema types `_meta` as an open map
+  (`{ [key: string]: unknown }`), and the spec reserves only prefixes built on `mcp` or
+  `modelcontextprotocol`. Writes and `registry_get` declare nothing. Decision 0032.
 - **`fastembed` 6.0.2 to 7.1.1**, which brings `tokenizers` 0.23. bge-base-en-v1.5 vectors come out
   bit-identical to 6.0.2 across 244 vectors from 61 texts on linux/arm64, so stored rows need no
   re-embedding. Downloads of weights not yet cached now send `HF_TOKEN` when it is set, ahead of

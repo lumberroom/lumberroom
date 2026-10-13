@@ -794,6 +794,66 @@ async fn listed_description(h: &Harness, name: &str) -> String {
     tool["description"].as_str().unwrap_or_default().to_string()
 }
 
+/// The result size a client reads, off the wire. `tests/mcp_tool_annotations.rs` checks every tool
+/// on the router; only this one proves the key leaves the server under `_meta` and that the
+/// rest of each served entry matches the registered tool.
+#[tokio::test]
+async fn tools_list_serves_the_result_size_under_meta_and_the_rest_of_each_entry_unchanged() {
+    let h = harness_or_skip!();
+    let result = h.call(OWNER_TOKEN, "tools/list", serde_json::json!({})).await;
+    let served = result["tools"].as_array().expect("tools/list returns an array");
+    let by_name = |name: &str| {
+        served
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not listed: {result}"))
+            .clone()
+    };
+
+    let search = by_name("memory_search");
+    assert_eq!(
+        search["_meta"],
+        serde_json::json!({ "anthropic/maxResultSizeChars": 500_000 }),
+        "{search}"
+    );
+    let write = by_name("memory_write");
+    assert!(write.get("_meta").is_none(), "{write}");
+
+    // Walks what was served, not what is defined. A downstream server defines tools a credential
+    // without the right grant never sees, and a walk over the definitions would fail on each of
+    // them. That every defined tool reaches the owner is the capability-table test's job.
+    let defined = lumberroom_server::mcp::tool_definitions();
+    for entry in served {
+        let name = entry["name"].as_str().expect("a served tool has a name");
+        let tool = defined
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is served and not defined"));
+        let mut wanted = serde_json::to_value(tool).expect("a tool serializes");
+        let mut got = entry.clone();
+        // The one field list_tools rewrites, after the write cap. Its own tests cover it.
+        if name == "memory_write" {
+            wanted.as_object_mut().unwrap().remove("description");
+            got.as_object_mut().unwrap().remove("description");
+        }
+        assert_eq!(got, wanted, "{name} is served differently from its definition");
+    }
+
+    // Spelled out as in tests/mcp_tool_annotations.rs, so a read that loses its declaration fails
+    // on the wire too, where the walk above compares it only with its own definition.
+    for name in [
+        "context_bootstrap",
+        "memory_search",
+        "memory_history",
+        "registry_history",
+        "alias_list",
+        "review_queue",
+    ] {
+        let entry = by_name(name);
+        assert_eq!(entry["_meta"]["anthropic/maxResultSizeChars"], 500_000, "{entry}");
+    }
+}
+
 #[tokio::test]
 async fn tools_list_states_the_configured_cap_on_memory_write() {
     let h = capped_or_skip!();
