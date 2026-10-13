@@ -36,9 +36,9 @@ import path, so each script puts its own directory back at the head of `sys.path
 | `slot.sh` | One slot: database, arm server, optional strip proxy. Templates, dump, reset and teardown |
 | `session.py` | One `claude -p` session, one run record. Holds the pure command builder and the `init` check |
 | `outcomes.py` | Stream-json parsing, the database diff and per-item outcomes |
-| `batch.py` | Expands a stage into jobs, resumes, interleaves arms, caps reruns |
+| `batch.py` | Expands a stage into jobs, resumes, interleaves arms, caps reruns, checks slots and stops on rate limit or low disk |
 | `strip_proxy.py` | The text channel: deletes `result.structuredContent`, changes nothing else |
-| `probe.py` | The two probe questions, before batch 1 |
+| `probe.py` | The `tools/list` size declaration check and the two probe questions, before batch 1 |
 | `retrieval_diff.py` | The build replay with no model, the consumer check, and `freeze` for the frozen queries |
 | `consumer_check.mjs` | The `JSON.stringify(structured ?? {})` half of the consumer check |
 | `compare.py` | The seven pass rules and the report |
@@ -97,6 +97,15 @@ channel, a tool result that carries a `structuredContent` key anywhere in its ev
 incomplete with reason `structured_on_text`: the proxy failed for that session, and the run would
 measure the structured channel under the text channel's name.
 
+A tool answer Claude Code saved to a file leaves a signature in the transcript. The tool result
+for the `mcp__lumberroom__*` call holds a short stub with a path under `tool-results/` in place of
+the answer, and the model then calls the built-in `Read` on that path. `check_event` rejects the
+`Read` with "tool use 'Read' is outside the slot's server", so the run records as `bad_init`.
+`outcomes.parse_stream` sets `file_stubbed` when it sees either half, the run record carries it, and
+the report counts stubbed sessions per arm. Claude Code writes the saved file under
+`~/.claude/projects/` even with `--no-session-persistence`, outside `LR_GATE_ROOT`, and it holds
+store content: delete those files with the rest of the run output.
+
 `--setting-sources project` does not load `~/.claude/CLAUDE.md`: in the probe on the gate host on
 12 October 2026, neither instruction listing repeated a line of it. Had it loaded, the gate would
 accept it, because every session of every arm would load the same file.
@@ -122,9 +131,12 @@ survives `env -i`. `probe.py` itself, `batch.py run` and `judge.py` have not run
 ## Slots
 
 One slot per arm and channel in use: A0, A1 and (later) A2, each on `structured` and `text`. A2 is
-a later branch build, scored against A1 with its own A1b noise arm. A
+a later branch build, scored against A1 with its own A1b noise arm. By default a
 noise arm shares its build's slot: A0b runs on A0's slots, A1b on A1's. `batch.py` finds a slot at
-`$LR_GATE_ROOT/slots/<arm>-<channel>`, so create each one there.
+`$LR_GATE_ROOT/slots/<slot>-<channel>`, where `<slot>` is the arm's name unless `--slot-of ARM=SLOT`
+says otherwise. The default is `A0b=A0 A1b=A1`. An arm with a build of its own gets its own slots
+with `--slot-of A1b=A1b`, and the slot check refuses a batch whose slot directory is missing, so a
+wrong mapping stops before any session runs.
 
 ```
 slot.sh up --dir "$LR_GATE_ROOT/slots/A1-structured" --name A1-structured --image IMG \
@@ -316,9 +328,27 @@ rows. The conflict and stale queries read no `occurred_at`, but the counts have 
 again. A different embedder or conflict threshold can move a pair across the line. After seeding,
 run `check --task` per template and reword a pair that is missing.
 
+## Every arm declares large answers inline
+
+Claude Code saves any MCP result over 50,000 characters to a file and hands the model a stub with
+the path. A tool raises that threshold by declaring `_meta` `anthropic/maxResultSizeChars` on its
+`tools/list` entry, and the engine's read tools declare 500,000 since decision 0032. An arm without
+the declaration gets file-stubbed answers wherever an answer passes 50,000 characters, a limit-50
+`memory_search` on a real store among them, and its agent searches differently: narrower queries
+and more calls to get around the stub. A comparison between an arm that declares and one that does
+not then measures the client's file threshold.
+
+So every arm runs a build at or after `1d7ac70`, the commit that merged decision 0032 (it lives in `src/mcp/mod.rs` as
+`RESULT_SIZE_KEY`). An older build needs a proxy in
+front of it that adds the declaration to each read tool's `tools/list` entry. `probe.py` and
+`batch.py run` both read `tools/list` through each slot's `mcp.json`, the URL Claude Code reads, and
+fail when `memory_search` lacks a declaration above 50,000. `batch.py run --allow-undeclared` skips
+the check, for an arm whose answers never pass the threshold.
+
 ## The probe
 
-`probe.py` runs before batch 1: two sessions per channel against A0 slots.
+`probe.py` runs before batch 1. It first reads both slots' `tools/list` and exits 1 when either
+lacks the size declaration above. Then it runs two sessions per channel against A0 slots.
 
 1. Asks the model to list every instruction it was given. The report states whether
    `~/.claude/CLAUDE.md` text appeared.
@@ -349,8 +379,19 @@ same task and repeat, so a model or quota change between windows lands on every 
 
 - *Resume.* A job with a complete record is skipped. A record appears only once it is whole: every
   writer goes through a temporary file and a rename.
+- *Slot check.* Before the first session, `run` checks every slot the queue uses: the directory
+  exists and its `tools/list` declares the size limit on `memory_search`. A failure starts no
+  session and exits 5.
 - *Usage limit.* The first `usage_limit` stops the queue. Sessions already running finish. Rerun
   the same command in the next window. A usage limit spends no attempt.
+- *Rate limit.* Claude Code prints a `rate_limit_event` in the stream, and the run record keeps the
+  last one's `rate_limit_info` as `rate_limit`. When its `status` reads anything other than
+  `allowed`, or its five-hour utilization (`unifiedWindows.five_hour.utilization`) passes
+  `--max-five-hour` (default 0.6), the queue stops starting sessions and exits 3, the same as a
+  usage limit. The run that reported it keeps its record.
+- *Disk.* Before each session `run` reads free space under the gate root. Below `--min-free-gb`
+  (default 5) it stops starting sessions and exits 4.
+- *Order.* `--keep-order` runs jobs in the batch file's order instead of interleaving the arms.
 - *Incomplete runs.* A session that ends on a refusal, an MCP error, a rejected `init`, a
   structured payload on the text channel, a 20-minute timeout or output it cannot parse is recorded
   as `incomplete` with the reason and kept out of every score. So is a job whose slot reset failed
@@ -361,7 +402,8 @@ same task and repeat, so a model or quota change between windows lands on every 
 A run record holds `stage`, `arm`, `channel`, `model`, `task`, `rep`, `status`,
 `incomplete_reason`, `calls` (each with `ok`), `received_keys`, `end_state`, `ignored_rows` (new
 rows another client wrote), `outcomes`, `answer`, `usage`, `transcript`, `finished_at` and
-`attempts`. `usage.input` is input plus cache-creation tokens, and `usage.cache_read` is separate.
+`attempts`, plus `file_stubbed` and `rate_limit`. `usage.input` is input plus cache-creation
+tokens, and `usage.cache_read` is separate.
 `end_state` lists rows written, superseded and deleted, the verdicts, and `registry_written`:
 registry entries the session added or rewrote, read from a snapshot of the `registry` table taken
 with the memory snapshot.
@@ -369,6 +411,22 @@ with the memory snapshot.
 An outcome is the verdict or write the agent made, `unseen` (never received the key and nothing
 touched its rows), `resolved_elsewhere` (never decided, but another verdict retired or rewrote its
 rows) or `left` (received and untouched). Only changes by the gate token's client count.
+
+A forget item reads the whole end state:
+
+| Outcome | End state |
+|---|---|
+| `deleted` | The target is deleted, and no other row is deleted or superseded |
+| `deleted:extra` | The target and other rows are deleted or superseded |
+| `wrong_row` | The target survives and another row is deleted |
+| `left` | Nothing is deleted |
+
+`compare.py` derives the forget outcome again from each record's `end_state`, so records written
+before this rule score the same way.
+
+The forget task asks for the delete and gives the go-ahead in the prompt. A headless
+session has nobody to confirm, so a prompt that asks the agent to show the match or confirm first
+only ever measures a dry run: in a gate run in October 2026, no forget session reached a delete.
 
 A vanished memory row counts as `deleted`. The table keeps no deleter, and the slot runs no
 cleanup job.
@@ -387,18 +445,24 @@ it never enters a repository. `run` reads it from there and writes its report to
 `run` sends both builds the same requests in the same order: each query bare, with `project` and
 with `namespaces`; `context_bootstrap` per project (text byte for byte, plus the count and bytes of
 `left_out` on the branch); `memory_history` for up to 50 ids that have predecessors;
-`review_queue` pages 0 to 3 per source and the default page, which holds max(2, ceil(10 / n))
-items per source for n sources read. Then it runs the consumer check (Python `json.dumps` and Node
+`review_queue` pages 0 to 3 per source and the default page. A call with no `limit` reads up to 50
+per source (decision 0031), so the check holds each source's default page to the first 50 keys of
+its full list, and expects `more` on the page exactly when some source holds more than 50. Then it runs the consumer check (Python `json.dumps` and Node
 `JSON.stringify` round trips against each consumer's fields) and `scripts/policy-test.sh` from the
 branch checkout. It exits 1 on any difference. A tool either build refuses is reported as a
-difference. `--n-sources` is 2 for the engine and 3 for the fork. `--template` resets from a named
-template.
+difference. `--sources` names the sources the default call reads: `conflict stale` for the engine,
+plus `proposal` for the fork. `--template` resets from a named template.
 
 ## Reading the report
 
 `compare.py --tasks tasks.jsonl [--arm A1] [--base A0] [--noise A0b] [--out report.md]` prints one
 section per stage and channel, with a row per rule and per task group, the failures, notes, and a
 token table (input plus cache read, and output, mean per run). It exits 1 when a rule fails.
+
+Each section also counts file-stubbed sessions per arm, over every run complete or not, because a
+stubbed session that tries `Read` ends as `bad_init`. A record without the `file_stubbed` field is read from
+its transcript; one with neither counts as unknown. The count fails nothing. An arm difference in it
+is a behaviour difference; check first that both arms carry the size declaration.
 
 The report fails closed: missing evidence fails the gate.
 
@@ -478,3 +542,10 @@ templates, `--extra-env`, `--archive-client`, the role and TOC handling in `load
 `retrieval_diff.py --template`, and any `claude -p` session under the `env -i` command. Not run
 at all: `probe.py`, `batch.py run`, `judge.py`, and the policy-test step of `retrieval_diff.py`.
 Those need the gate host and a Claude subscription login.
+
+Covered by pytest only, never run against a live slot or a live session: the `tools/list` size
+declaration check in `probe.py` and `batch.py run`, the rate-limit and disk stops, `--keep-order`,
+`--slot-of`, the file-stub count, the forget outcome rescoring, and the 50-per-source default page
+check in `retrieval_diff.py`. The `rate_limit_event` shape the stop reads was captured from one
+local Claude Code session on 13 October 2026; the stub signature was seen in transcripts from a
+gate run in October 2026, and the tests pin it with synthetic paths.

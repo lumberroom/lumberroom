@@ -1,6 +1,6 @@
 """Pure parts of the build replay and the consumer check."""
 from retrieval_diff import (
-    collect_ids, collect_keys, default_page_size, diff_lists, left_out_stats,
+    collect_ids, collect_keys, DEFAULT_PAGE, default_page_diffs, diff_lists, left_out_stats,
     check_search_fields, check_bootstrap_fields, split_by_source, sse_or_json,
 )
 
@@ -17,12 +17,44 @@ def test_review_keys_come_back_in_document_order():
     assert collect_keys(s) == ["conflict:1:2", "stale:3"]
 
 
-def test_the_default_page_is_ten_over_n_rounded_up_with_a_floor_of_two():
-    assert default_page_size(1) == 10
-    assert default_page_size(2) == 5
-    assert default_page_size(3) == 4
-    assert default_page_size(10) == 2
-    assert default_page_size(20) == 2
+def test_a_call_with_no_limit_reads_up_to_50_per_source():
+    # Decision 0031: an MCP call with no limit keeps the service default of 50 per source.
+    assert DEFAULT_PAGE == 50
+
+
+def keys(src, n):
+    return [f"{src}:{i}" for i in range(n)]
+
+
+def test_a_default_page_matching_the_first_50_per_source_with_no_more_passes():
+    full = {"conflict": keys("conflict", 12), "stale": keys("stale", 50)}
+    assert default_page_diffs(full, dict(full), has_more_hint=False) == []
+
+
+def test_a_default_page_cut_short_of_50_is_a_difference():
+    full = {"conflict": keys("conflict", 12), "stale": keys("stale", 30)}
+    short = {"conflict": full["conflict"], "stale": full["stale"][:10]}
+    names = [d["name"] for d in default_page_diffs(full, short, has_more_hint=False)]
+    assert names == ["review stale default page"]
+
+
+def test_a_default_page_past_50_in_one_source_is_a_size_difference():
+    full = {"conflict": keys("conflict", 60), "stale": keys("stale", 3)}
+    long = {"conflict": full["conflict"], "stale": full["stale"]}
+    diffs = default_page_diffs(full, long, has_more_hint=True)
+    assert [d["name"] for d in diffs] == ["review conflict default page size"]
+    assert diffs[0]["base"] == 50 and diffs[0]["branch"] == 60
+
+
+def test_more_must_appear_past_50_in_a_source_and_only_then():
+    over = {"conflict": keys("conflict", 51), "stale": []}
+    page = {"conflict": over["conflict"][:50], "stale": []}
+    assert default_page_diffs(over, page, has_more_hint=True) == []
+    missing = default_page_diffs(over, page, has_more_hint=False)
+    assert [d["name"] for d in missing] == ["review default page more"]
+    at = {"conflict": keys("conflict", 50), "stale": []}
+    extra = default_page_diffs(at, dict(at), has_more_hint=True)
+    assert [d["name"] for d in extra] == ["review default page more"]
 
 
 def test_diff_lists_reports_the_first_difference_and_nothing_for_equal_lists():

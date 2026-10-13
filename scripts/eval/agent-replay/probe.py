@@ -12,6 +12,11 @@ One session per channel against an A0 slot. Two questions.
    row text; the text block does. A structured session that cannot quote a stale row shows Claude
    Code fed the model the structured payload. A text session through the proxy that can quote it
    shows the proxy works. Both must hold.
+
+Before either session it reads each slot's `tools/list` through the slot's `mcp.json`, the URL
+Claude Code reads, and fails when `memory_search` lacks the `anthropic/maxResultSizeChars`
+declaration (decision 0032). Without it Claude Code saves a large answer to a file, and the arm
+searches differently for a reason outside the change under test.
 """
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ import argparse
 import json
 import re
 import sys
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python3 -I` drops the script dir
@@ -57,6 +63,81 @@ def loaded_user_instructions(answer, user_claude_md):
     return False
 
 
+RESULT_SIZE_KEY = "anthropic/maxResultSizeChars"
+# Claude Code's own threshold. A declaration at or under it changes nothing.
+CLIENT_DEFAULT_CHARS = 50_000
+# The read tools whose large answers must reach the model inline. Decision 0032 declares six;
+# memory_search is the one every task calls and the one a limit-50 answer pushes past 50,000.
+NEEDS_INLINE = ("memory_search",)
+
+
+def missing_result_size(tools):
+    """Names in NEEDS_INLINE whose `tools/list` entry lacks a size declaration above the client's
+    default. A tool absent from the list counts as missing."""
+    by_name = {t.get("name"): t for t in tools}
+    out = []
+    for name in NEEDS_INLINE:
+        meta = (by_name.get(name) or {}).get("_meta") or {}
+        v = meta.get(RESULT_SIZE_KEY)
+        if not isinstance(v, (int, float)) or v <= CLIENT_DEFAULT_CHARS:
+            out.append(name)
+    return out
+
+
+def mcp_endpoint(slot_dir):
+    """(url, token) from the slot's mcp.json: the proxy on the text channel, the arm on the other."""
+    cfg = json.loads((Path(slot_dir) / "mcp.json").read_text())["mcpServers"][session.SERVER]
+    return cfg["url"], cfg["headers"]["Authorization"].split(" ", 1)[1]
+
+
+def _body(text):
+    text = text.strip()
+    if text.startswith("{"):
+        return json.loads(text)
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            return json.loads(line[5:].strip())
+    raise ValueError("no JSON in the tools/list answer")
+
+
+def fetch_tools(slot_dir):
+    """Every `tools/list` entry the slot serves, following `nextCursor`."""
+    url, token = mcp_endpoint(slot_dir)
+    tools, cursor, n = [], None, 0
+    while True:
+        n += 1
+        params = {"cursor": cursor} if cursor else {}
+        req = urllib.request.Request(
+            url, method="POST",
+            data=json.dumps({"jsonrpc": "2.0", "id": n, "method": "tools/list", "params": params}).encode(),
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            msg = _body(r.read().decode())
+        if "error" in msg:
+            raise RuntimeError(f"tools/list: {msg['error']}")
+        tools += msg["result"].get("tools", [])
+        cursor = msg["result"].get("nextCursor")
+        if not cursor:
+            return tools
+
+
+def declaration_problems(slot_dirs, fetch=fetch_tools):
+    """One line per slot whose tools/list cannot be read or lacks the declaration."""
+    out = []
+    for d in slot_dirs:
+        try:
+            missing = missing_result_size(fetch(d))
+        except (OSError, ValueError, KeyError, RuntimeError) as e:
+            out.append(f"{Path(d).name}: tools/list unreadable ({e})")
+            continue
+        if missing:
+            out.append(f"{Path(d).name}: {', '.join(missing)} lacks _meta {RESULT_SIZE_KEY} above "
+                       f"{CLIENT_DEFAULT_CHARS}; build the arm at or after decision 0032, or put a "
+                       "proxy that adds it in front")
+    return out
+
+
 def verdict(structured_quotes, text_quotes):
     if structured_quotes:
         return {"pass": False, "reason": "the structured session quoted row text the structured "
@@ -84,6 +165,11 @@ def main(argv=None):
     ap.add_argument("--model", default="claude-sonnet-5-5")
     ap.add_argument("--root", type=Path, default=session.gate_root())
     a = ap.parse_args(argv)
+    problems = declaration_problems([a.structured_slot, a.text_slot])
+    if problems:
+        for line in problems:
+            print("FAIL:", line, file=sys.stderr)
+        return 1
     fx = json.loads(a.fixture.read_text())
     stale = [m["content"] for m in fx["memories"] if "stale" in m.get("tags", [])]
     user_file = Path.home() / ".claude" / "CLAUDE.md"

@@ -197,6 +197,30 @@ def test_supersede_and_forget_items_read_the_end_state():
     assert derive_outcomes(task, [], [], st2) == {"old": "left", "gone": "deleted"}
 
 
+FORGET = {"id": "forget-1", "items": [{"item": "gone", "kind": "forget", "target_id": B}]}
+
+
+def end(deleted=(), superseded=()):
+    return {"written": [], "superseded": list(superseded), "deleted": list(deleted), "verdicts": {}}
+
+
+def test_a_forget_that_deletes_the_target_alone_reads_deleted():
+    assert derive_outcomes(FORGET, [], [], end(deleted=[B])) == {"gone": "deleted"}
+
+
+def test_a_forget_that_also_deletes_or_supersedes_another_row_reads_deleted_extra():
+    assert derive_outcomes(FORGET, [], [], end(deleted=[B, C])) == {"gone": "deleted:extra"}
+    assert derive_outcomes(FORGET, [], [], end(deleted=[B], superseded=[A])) == {"gone": "deleted:extra"}
+
+
+def test_a_forget_that_deletes_another_row_and_spares_the_target_reads_wrong_row():
+    assert derive_outcomes(FORGET, [], [], end(deleted=[C])) == {"gone": "wrong_row"}
+
+
+def test_a_forget_that_deletes_nothing_reads_left():
+    assert derive_outcomes(FORGET, [], [], end()) == {"gone": "left"}
+
+
 # The text channel: a structuredContent that reaches the session means the strip proxy failed.
 
 def structured_result(i, where):
@@ -274,3 +298,53 @@ def test_the_text_channel_shape_parses_from_a_list_of_text_blocks():
     body = json.dumps({"items": [{"key": f"stale:{C}"}]})
     p = parse_stream(lines(INIT, call("1", "review_queue", {}), result("1", body), final()))
     assert p["received_keys"] == [f"stale:{C}"] and p["structured_results"] == 0
+
+
+# A tool answer Claude Code saved to a file. The model gets a stub with a path under tool-results/,
+# then tries the built-in Read on it, which check_event rejects.
+STUB_PATH = "~/.claude/projects/-tmp-lr-gate-abc/s1/tool-results/mcp-lumberroom-memory_search-1.txt"
+
+
+def read_call(i, path):
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": i, "name": "Read", "input": {"file_path": path}}]}}
+
+
+def test_a_lumberroom_answer_saved_to_a_file_marks_the_session_file_stubbed():
+    stub = f"Output too large (61.2KB). Full output saved to: {STUB_PATH}\n\nPreview (first 2KB): ..."
+    p = parse_stream(lines(INIT, call("1", "memory_search", {"query": "q", "limit": 50}),
+                           result("1", stub), final()))
+    assert p["file_stubbed"]
+
+
+def test_a_read_of_a_saved_answer_marks_the_session_file_stubbed():
+    p = parse_stream(lines(INIT, call("1", "memory_search", {"query": "q"}), result("1", "ok"),
+                           read_call("2", STUB_PATH), final()))
+    assert p["file_stubbed"]
+
+
+def test_an_inline_answer_is_not_file_stubbed():
+    body = json.dumps({"hits": [{"id": A, "content": "the tool-results table lists outputs"}]})
+    p = parse_stream(lines(INIT, call("1", "memory_search", {"query": "q"}), result("1", body), final()))
+    assert not p["file_stubbed"]
+
+
+def rate_event(status="allowed", five_hour=0.25):
+    # The shape Claude Code 2.1.x prints, with synthetic values.
+    return {"type": "rate_limit_event", "rate_limit_info": {
+        "status": status, "resetsAt": 1700000000, "rateLimitType": "five_hour",
+        "isUsingOverage": False,
+        "unifiedWindows": {"five_hour": {"utilization": five_hour, "resetsAt": 1700000000},
+                           "seven_day": {"utilization": 0.1, "resetsAt": 1700500000}}},
+        "uuid": "u", "session_id": "s"}
+
+
+def test_the_last_rate_limit_event_lands_in_the_parse():
+    p = parse_stream(lines(INIT, rate_event(five_hour=0.2), call("1", "memory_search", {}),
+                           result("1", "ok"), rate_event("allowed_warning", 0.7), final()))
+    assert p["rate_limit"]["status"] == "allowed_warning"
+    assert p["rate_limit"]["unifiedWindows"]["five_hour"]["utilization"] == 0.7
+
+
+def test_a_stream_with_no_rate_limit_event_parses_to_none():
+    assert parse_stream(lines(INIT, final()))["rate_limit"] is None

@@ -216,3 +216,64 @@ def test_an_interrupted_write_leaves_the_old_record_intact(tmp_path, monkeypatch
     except OSError:
         pass
     assert p.read_text().count('"a": 1') == 1
+
+
+# ---- run_session over a stand-in binary that prints a recorded stream -----------------------
+
+def fake_claude(tmp_path, events):
+    import json as _j
+    stream = tmp_path / "stream.jsonl"
+    stream.write_text("".join(_j.dumps(e) + "\n" for e in events))
+    exe = tmp_path / "claude"
+    exe.write_text(f"#!/bin/sh\ncat '{stream}'\n")
+    exe.chmod(0o755)
+    return str(exe)
+
+
+def stub_session(tmp_path, monkeypatch, events):
+    import session
+    monkeypatch.setattr(session, "snapshot", lambda slot: {"memory": {}, "registry": {}})
+    (tmp_path / "arm" / "client").mkdir(parents=True)
+    (tmp_path / "arm" / "client" / "CLAUDE.md.snippet").write_text("Use lumberroom.")
+    slot = {"checkout": str(tmp_path / "arm"), "mcp_config": "/slot/mcp.json", "client": "gate-A0"}
+    task = {"id": "recall-1", "prompt": "What port?", "items": []}
+    return session.run_session(slot=slot, task=task, stage="sonnet", arm="A0", channel="structured",
+                               rep=1, model="m", root=tmp_path / "root",
+                               claude=fake_claude(tmp_path, events))
+
+
+INIT_OK = {"type": "system", "subtype": "init", "apiKeySource": "none",
+           "mcp_servers": [{"name": "lumberroom", "status": "connected"}],
+           "tools": [f"mcp__lumberroom__{t}" for t in LUMBERROOM_TOOLS], "plugins": []}
+SAVED = "~/.claude/projects/-tmp-lr-gate-abc/s1/tool-results/mcp-lumberroom-memory_search-1.txt"
+
+
+def test_a_read_of_a_saved_answer_records_bad_init_and_file_stubbed(tmp_path, monkeypatch):
+    events = [
+        INIT_OK,
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "1", "name": "mcp__lumberroom__memory_search", "input": {"query": "q"}}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "1",
+            "content": f"Output too large. Full output saved to: {SAVED}"}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "2", "name": "Read", "input": {"file_path": SAVED}}]}},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "rateLimitType": "five_hour",
+                                                         "unifiedWindows": {"five_hour": {"utilization": 0.3}}}},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "9100", "usage": {}},
+    ]
+    rec = stub_session(tmp_path, monkeypatch, events)
+    assert rec["incomplete_reason"] == "bad_init" and rec["file_stubbed"] is True
+    assert rec["rate_limit"]["unifiedWindows"]["five_hour"]["utilization"] == 0.3
+
+
+def test_an_inline_session_records_complete_and_not_file_stubbed(tmp_path, monkeypatch):
+    events = [
+        INIT_OK,
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "1", "name": "mcp__lumberroom__memory_search", "input": {"query": "q"}}]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "1",
+                                                  "content": '{"hits": []}'}]}},
+        {"type": "result", "subtype": "success", "is_error": False, "result": "none", "usage": {}},
+    ]
+    rec = stub_session(tmp_path, monkeypatch, events)
+    assert rec["status"] == "complete" and rec["file_stubbed"] is False and rec["rate_limit"] is None

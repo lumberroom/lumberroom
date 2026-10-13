@@ -27,3 +27,27 @@ def test_the_probe_passes_when_structured_cannot_quote_and_text_can():
     assert not v["pass"] and "structured" in v["reason"]
     v = verdict(structured_quotes=False, text_quotes=False)
     assert not v["pass"] and "proxy" in v["reason"]
+
+
+def test_a_tools_list_without_the_size_declaration_on_memory_search_is_flagged():
+    from probe import missing_result_size
+    declared = {"name": "memory_search", "_meta": {"anthropic/maxResultSizeChars": 500000}}
+    assert missing_result_size([declared, {"name": "memory_write"}]) == []
+    assert missing_result_size([{"name": "memory_search"}]) == ["memory_search"]
+    assert missing_result_size([{"name": "memory_search", "_meta": {}}]) == ["memory_search"]
+    # A tool that never listed is missing too: the check cannot pass on an empty list.
+    assert missing_result_size([]) == ["memory_search"]
+
+
+def test_a_declaration_at_or_under_the_default_threshold_counts_as_missing():
+    from probe import missing_result_size
+    low = {"name": "memory_search", "_meta": {"anthropic/maxResultSizeChars": 50000}}
+    assert missing_result_size([low]) == ["memory_search"]
+
+
+def test_tools_list_reads_the_slot_mcp_config(tmp_path):
+    import json as _j
+    from probe import mcp_endpoint
+    (tmp_path / "mcp.json").write_text(_j.dumps({"mcpServers": {"lumberroom": {
+        "type": "http", "url": "http://127.0.0.1:8941/mcp", "headers": {"Authorization": "Bearer tok"}}}}))
+    assert mcp_endpoint(tmp_path) == ("http://127.0.0.1:8941/mcp", "tok")

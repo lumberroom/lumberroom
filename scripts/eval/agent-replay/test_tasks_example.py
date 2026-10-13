@@ -36,3 +36,11 @@ def test_every_review_task_runs_on_a_template_of_its_own():
     review = [t for t in TASKS if t["group"] == "review"]
     assert review and all(t.get("template") == t["id"] for t in review)
     assert all("template" not in t for t in TASKS if t["group"] != "review")
+
+
+def test_the_forget_task_asks_for_the_delete_with_the_go_ahead_given():
+    # A headless session never confirms, so a prompt that asks to confirm first measures a dry run.
+    forget = [t for t in TASKS if t["group"] == "forget"]
+    assert forget and all(
+        t["prompt"] == "Delete the memory about the dead letter queue replay CLI stub. You have my "
+                       "go-ahead: delete it now, without asking me to confirm." for t in forget)
