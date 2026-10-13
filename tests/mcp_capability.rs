@@ -794,6 +794,43 @@ async fn listed_description(h: &Harness, name: &str) -> String {
     tool["description"].as_str().unwrap_or_default().to_string()
 }
 
+/// The result size a client reads, off the wire. `tests/mcp_tool_annotations.rs` checks every tool
+/// on the router; only this one proves the key leaves the server under `_meta` and that the
+/// rest of each served entry matches the registered tool.
+#[tokio::test]
+async fn tools_list_serves_the_result_size_under_meta_and_the_rest_of_each_entry_unchanged() {
+    let h = harness_or_skip!();
+    let result = h.call(OWNER_TOKEN, "tools/list", serde_json::json!({})).await;
+    let served = result["tools"].as_array().expect("tools/list returns an array");
+    let by_name = |name: &str| {
+        served
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not listed: {result}"))
+            .clone()
+    };
+
+    let search = by_name("memory_search");
+    assert_eq!(
+        search["_meta"],
+        serde_json::json!({ "anthropic/maxResultSizeChars": 500_000 }),
+        "{search}"
+    );
+    let write = by_name("memory_write");
+    assert!(write.get("_meta").is_none(), "{write}");
+
+    for tool in lumberroom_server::mcp::tool_definitions() {
+        let mut wanted = serde_json::to_value(&tool).expect("a tool serializes");
+        let mut got = by_name(&tool.name);
+        // The one field list_tools rewrites, after the write cap. Its own tests cover it.
+        if tool.name == "memory_write" {
+            wanted.as_object_mut().unwrap().remove("description");
+            got.as_object_mut().unwrap().remove("description");
+        }
+        assert_eq!(got, wanted, "{} is served differently from its definition", tool.name);
+    }
+}
+
 #[tokio::test]
 async fn tools_list_states_the_configured_cap_on_memory_write() {
     let h = capped_or_skip!();

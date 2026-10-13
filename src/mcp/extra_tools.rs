@@ -19,6 +19,7 @@ use rmcp::{tool, tool_router, ErrorData as McpError, RoleServer};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use super::large_result;
 use super::tools;
 use super::views;
 use super::Lumberroom;
@@ -176,7 +177,8 @@ depth cap, reported as depth_capped. Each version's source is the name of the ap
             title = "Show a memory's history",
             read_only_hint = true,
             open_world_hint = false
-        )
+        ),
+        meta = large_result()
     )]
     async fn memory_history(
         &self,
@@ -212,7 +214,8 @@ more, 200 at most. Each entry's source is the name of the app that wrote it.",
             title = "Show a registry key's history",
             read_only_hint = true,
             open_world_hint = false
-        )
+        ),
+        meta = large_result()
     )]
     async fn registry_history(
         &self,
@@ -334,7 +337,8 @@ not kept.",
 before recording a new alias, and when a search comes back thinner than the store should hold \
 because the subject may be filed under a name nobody mentioned. Namespaces the credential cannot \
 read are absent, so the list is what the caller may see rather than everything there is.",
-        annotations(title = "List aliases", read_only_hint = true, open_world_hint = false)
+        annotations(title = "List aliases", read_only_hint = true, open_world_hint = false),
+        meta = large_result()
     )]
     async fn alias_list(
         &self,
@@ -370,7 +374,8 @@ undated; omitted, it returns everything this server fills except undated, which 
 named. An undated item is a fact with no start date whose own text names one or more past days, \
 listed in its dates. A source that refuses to answer appears in \
 refused with its own reason.",
-        annotations(title = "List review items", read_only_hint = true, open_world_hint = false)
+        annotations(title = "List review items", read_only_hint = true, open_world_hint = false),
+        meta = large_result()
     )]
     async fn review_queue(
         &self,

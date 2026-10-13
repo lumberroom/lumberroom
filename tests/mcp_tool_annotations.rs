@@ -5,6 +5,9 @@
 //! added without them must fail here, so the list below is the single place a new tool gets
 //! classified.
 //!
+//! The large-answer reads also declare how long a result Claude Code takes inline, and that list
+//! sits here beside the others.
+//!
 //! No database: the definitions come from the router, before any grant filters them.
 
 use std::collections::BTreeSet;
@@ -22,6 +25,22 @@ const READS: [&str; 7] = [
     "alias_list",
     "review_queue",
 ];
+
+/// Reads whose answer can run past 50,000 characters, where Claude Code saves a result to a file
+/// and hands the model a stub. Every read but `registry_get`, which answers one key.
+const LARGE_ANSWERS: [&str; 6] = [
+    "context_bootstrap",
+    "memory_search",
+    "memory_history",
+    "registry_history",
+    "alias_list",
+    "review_queue",
+];
+
+/// Spelled out rather than read from the server's constants, so a typo in the key or a value past
+/// the client's ceiling fails here instead of agreeing with itself.
+const RESULT_SIZE_KEY: &str = "anthropic/maxResultSizeChars";
+const RESULT_SIZE_CEILING: u64 = 500_000;
 
 /// Tools that delete, retire or overwrite data. `readOnlyHint: false`, `destructiveHint: true`.
 ///
@@ -142,6 +161,40 @@ fn the_additive_writers_are_not_destructive() {
         let a = tool.annotations.as_ref().expect("annotations");
         assert_eq!(a.read_only_hint, Some(false), "{}", tool.name);
         assert_eq!(a.destructive_hint, Some(false), "{}", tool.name);
+    }
+}
+
+#[test]
+fn the_large_answer_reads_declare_the_client_ceiling_and_no_other_tool_does() {
+    for tool in tool_definitions() {
+        let declared = tool.meta.as_ref().and_then(|m| m.0.get(RESULT_SIZE_KEY)).cloned();
+        let wanted =
+            LARGE_ANSWERS.contains(&&*tool.name).then(|| serde_json::json!(RESULT_SIZE_CEILING));
+        assert_eq!(declared, wanted, "{}", tool.name);
+    }
+}
+
+/// A write answers with one row or one outcome. Declaring a size there would pass a write answer
+/// inline whole if a bug ever made one large.
+#[test]
+fn only_reads_declare_a_result_size() {
+    for name in LARGE_ANSWERS {
+        assert!(READS.contains(&name), "{name} declares a result size and is not a read");
+    }
+}
+
+/// The declaration adds one key to `_meta` and nothing else. The title, annotation and description
+/// tests above pin the rest of each entry.
+#[test]
+fn the_result_size_is_the_only_meta_a_tool_carries() {
+    for tool in tool_definitions() {
+        let keys: Vec<&String> =
+            tool.meta.as_ref().map(|m| m.0.keys().collect()).unwrap_or_default();
+        assert!(
+            keys.is_empty() || keys == [RESULT_SIZE_KEY],
+            "{} carries _meta {keys:?}",
+            tool.name
+        );
     }
 }
 
