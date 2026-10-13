@@ -641,42 +641,114 @@ const SEED_SUPERSEDES_SQL: &str = r#"
 /// use the ordering filter because both of its sides carry the identical predicate.
 ///
 /// Both rows must be live and in the alias's own namespace. The content match is a substring, which
-/// is loose; the degree cap is what stops a common word from making a hub, and `produced_by` names
-/// this seeder so a bad pass can be undone by its own name.
+/// is loose, and `produced_by` names this seeder so a bad pass can be undone by its own name.
+///
+/// `named` reads each row's content once per alias and records both matches. The first version
+/// joined `memory` twice, so every row on the alias side lowered and searched the whole namespace
+/// again for the canonical name: `n` rows cost `n²` substring searches for one alias.
+///
+/// An alias drops its pairs only when more than `$2` rows say the alias and more than `$2` rows say
+/// the canonical name. The walk expands a row only while its own degree is within the cap, and a
+/// row on one side has a degree of about the other side's size. So the pairs stay crossable from
+/// one end while either side is small: a rename named in a handful of rows beside a canonical name
+/// in hundreds keeps every pair, and the walk crosses them from the canonical rows, whose degree is
+/// the handful. With both sides past the limit, every row on either end carries at least the limit
+/// in edges from this alias alone. The default cap of 60 sits above the limit of 40, so an alias
+/// with 41 to 60 rows on each side loses pairs a default walk could still have crossed; that band
+/// is the price of matching the tag seed's limit. The case the limit exists for is an alias that is
+/// a substring of its canonical name, so every row says both: `m` rows make about `m²/2` pairs, and
+/// an alias in a few thousand rows wrote millions of them, longer than the pool's statement timeout
+/// allows, so the rebuild failed outright.
+///
+/// `in_alias` and `in_canonical` count each side at or below each row's own sensitivity, which is
+/// why the windows order by tier. A pair is judged on the counts at its higher tier, the rows a
+/// reader who can see both ends can see, so private rows naming either name cannot remove an edge
+/// between two open rows. A count over every tier would let an open client watch that edge vanish
+/// and learn that private rows were written, the oracle 0014 forbids for degree. Only plaintext
+/// matches and the write path stores private content as ciphertext, so today the counts read open
+/// rows alone; the ordering keeps that true without leaning on the write path.
+///
+/// `usable` is the whole test, applied per row before the join. Both counts grow with tier, so the
+/// higher-tier end of a pair holds the pair's counts, and the lower end holds counts no larger on
+/// either side. A pair survives when its higher end has a side within the limit, which makes both
+/// ends usable; a pair with an end that is not usable fails at that end's tier or above. Filtering
+/// rows first also keeps a hub's rows out of the join, where they would be paired and discarded.
+///
+/// A gap, kept from the first version: `named` filters on `superseded_by` alone, so a row whose
+/// valid time has ended (`occurred_until` in the past) still pairs and still counts. A reader
+/// without the history capability cannot see that row, yet it moves the counts that decide the
+/// edges between rows that reader can see.
 const SEED_ALIAS_SQL: &str = r#"
+    WITH current AS (
+        SELECT namespace, alias, lower(canonical) AS canonical
+          FROM entity_alias
+         WHERE tenant_id = $1 AND until IS NULL
+    ),
+    named AS (
+        SELECT c.namespace, c.alias, m.id,
+               sensitivity_rank(m.sensitivity) AS tier,
+               position(c.alias in lower(m.content)) > 0 AS says_alias,
+               position(c.canonical in lower(m.content)) > 0 AS says_canonical
+          FROM current c
+          JOIN memory m ON m.tenant_id = $1 AND m.namespace = c.namespace
+                       AND m.superseded_by IS NULL
+    ),
+    counted AS (
+        SELECT namespace, alias, id, says_alias, says_canonical,
+               count(*) FILTER (WHERE says_alias)
+                   OVER (PARTITION BY namespace, alias ORDER BY tier) AS in_alias,
+               count(*) FILTER (WHERE says_canonical)
+                   OVER (PARTITION BY namespace, alias ORDER BY tier) AS in_canonical
+          FROM named
+         WHERE says_alias OR says_canonical
+    ),
+    usable AS (
+        SELECT * FROM counted WHERE in_alias <= $2 OR in_canonical <= $2
+    )
     INSERT INTO memory_edge (tenant_id, src_id, dst_id, relation, produced_by)
     SELECT DISTINCT $1, least(a.id, b.id), greatest(a.id, b.id), 'shares_alias', 'structure'
-      FROM entity_alias ea
-      JOIN memory a ON a.tenant_id = $1 AND a.namespace = ea.namespace
-                   AND a.superseded_by IS NULL
-                   AND position(ea.alias in lower(a.content)) > 0
-      JOIN memory b ON b.tenant_id = $1 AND b.namespace = ea.namespace
-                   AND b.superseded_by IS NULL
-                   AND position(lower(ea.canonical) in lower(b.content)) > 0
-     WHERE ea.tenant_id = $1 AND ea.until IS NULL AND a.id <> b.id
+      FROM usable a
+      JOIN usable b ON b.namespace = a.namespace AND b.alias = a.alias
+                   AND b.says_canonical AND b.id <> a.id
+     WHERE a.says_alias
     ON CONFLICT DO NOTHING
 "#;
+
+/// More rows than this on both sides of an alias makes it a hub rather than a subject. The same
+/// number as `TAG_HUB_LIMIT`, so the two seeders agree on what a crowded name is.
+///
+/// The limit is per alias and bounds nothing per row. A row on the small side of a kept alias gets
+/// one edge per row on the other side, however many that is, and a row naming several aliases
+/// collects edges from each: two aliases at the limit on both sides already give it about 78. The
+/// walk's degree cap is what decides whether such a row is expanded.
+const ALIAS_HUB_LIMIT: i64 = 40;
 
 /// Pairs sharing a tag, with the ubiquitous tags left out.
 ///
 /// `src_id < dst_id` writes one row per pair rather than two. The walk expands from either end, so
 /// storing both directions would double the table to answer the same question.
+///
+/// `tagged` unnests every live row's tags once and both sides join it on the tag. The first version
+/// joined `memory` on `tag = ANY(tags)`, which no index serves inside a join, and the planner,
+/// guessing one usable tag, scanned the whole tenant once per usable tag and again per matched row.
+/// Its cost grew with usable tags times rows rather than with the pairs it wrote. `DISTINCT` covers
+/// a row that carries one tag twice, which `ANY` matched once.
 const SEED_TAG_SQL: &str = r#"
-    WITH common AS (
-        SELECT t AS tag, count(*) AS n
+    WITH tagged AS (
+        SELECT m.id, t AS tag
           FROM memory m, unnest(m.tags) AS t
          WHERE m.tenant_id = $1 AND m.superseded_by IS NULL
-         GROUP BY t
     ),
     usable AS (
-        SELECT tag FROM common
-         WHERE n >= 2 AND n <= $2
+        SELECT tag FROM tagged
+         GROUP BY tag
+        HAVING count(*) >= 2 AND count(*) <= $2
     )
     INSERT INTO memory_edge (tenant_id, src_id, dst_id, relation, produced_by)
     SELECT DISTINCT $1, a.id, b.id, 'shares_tag', 'structure'
       FROM usable u
-      JOIN memory a ON a.tenant_id = $1 AND u.tag = ANY(a.tags) AND a.superseded_by IS NULL
-      JOIN memory b ON b.tenant_id = $1 AND u.tag = ANY(b.tags) AND b.superseded_by IS NULL
+      JOIN tagged a ON a.tag = u.tag
+      JOIN tagged b ON b.tag = u.tag
      WHERE a.id < b.id
     ON CONFLICT DO NOTHING
 "#;
@@ -2670,8 +2742,8 @@ impl MemoryRepository for PgMemoryRepository {
     async fn rebuild_edges(&self, tenant: &str) -> Result<i64> {
         let mut tx = self.pool.begin().await?;
         // Rebuild means rebuild. Appending alone cannot remove an edge whose reason has gone: an
-        // alias closed with an `until`, a tag taken off a row, or a tag that grew past the hub limit
-        // would all leave their edges traversable forever, and the walk would keep crossing them
+        // alias closed with an `until`, a tag taken off a row, or a tag or alias that grew past its hub
+        // limit would all leave their edges traversable forever, and the walk would keep crossing them
         // while the comments above claimed the opposite. Only this seeder's own rows are cleared,
         // so anything a future seeder writes under a different `produced_by` survives.
         sqlx::query("DELETE FROM memory_edge WHERE tenant_id = $1 AND produced_by = 'structure'")
@@ -2679,7 +2751,7 @@ impl MemoryRepository for PgMemoryRepository {
             .execute(&mut *tx)
             .await?;
         sqlx::query(SEED_SUPERSEDES_SQL).bind(tenant).execute(&mut *tx).await?;
-        sqlx::query(SEED_ALIAS_SQL).bind(tenant).execute(&mut *tx).await?;
+        sqlx::query(SEED_ALIAS_SQL).bind(tenant).bind(ALIAS_HUB_LIMIT).execute(&mut *tx).await?;
         sqlx::query(SEED_TAG_SQL).bind(tenant).bind(TAG_HUB_LIMIT).execute(&mut *tx).await?;
         let total: i64 =
             sqlx::query_scalar("SELECT count(*) FROM memory_edge WHERE tenant_id = $1")
@@ -4551,6 +4623,13 @@ mod tests {
         assert!(body.contains("CONFLICT_BACKLOG_SQL"));
         assert!(!body.contains(".begin("), "a scan inside a transaction holds the key per batch");
         assert!(!body.contains("Transaction"));
+    }
+
+    /// `tests/integration.rs` builds its hub fixtures from this number and cannot read the private
+    /// constant, so a change here has to fail somewhere until that copy moves with it.
+    #[test]
+    fn the_hub_limits_are_the_numbers_the_integration_suite_builds_on() {
+        assert_eq!((ALIAS_HUB_LIMIT, TAG_HUB_LIMIT), (40, 40));
     }
 
     /// Every statement in the adapter that reads or writes the supersession link, classified.

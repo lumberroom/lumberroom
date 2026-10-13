@@ -280,6 +280,7 @@ async fn replaying_a_half_applied_merge_inserts_nothing_new() {
     assert_eq!(first.collapsed, 0);
     assert!(first.refused.is_empty(), "refusals: {:?}", first.refused);
     assert_eq!(first.id_map.len(), 3);
+    assert!(first.edges_not_rebuilt.is_none(), "{:?}", first.edges_not_rebuilt);
     assert_eq!(h.sealed_rows().await, 1, "the private row did not land as ciphertext");
 
     let before = h.rows().await;
@@ -384,6 +385,60 @@ async fn a_dry_run_writes_nothing_and_still_reports_what_would_land() {
     // An invented id in a map the job persists is worse than no map at all.
     assert!(report.id_map.is_empty());
     assert_eq!(h.rows().await, 0, "the dry run wrote rows");
+}
+
+/// Every row is committed before the edge rebuild runs, so a rebuild that fails must not turn the
+/// import into an error. It once did: an import that landed every row answered 500, and a caller
+/// that believed it would retry a finished job.
+///
+/// A trigger stands in for the rebuild failing, because the real cause is a store large enough to
+/// outrun the statement timeout. It fires only while the marker row exists, and every test here
+/// truncates `memory` first, so a run that panics before the drop leaves it inert.
+#[tokio::test]
+async fn an_import_whose_edge_rebuild_fails_still_reports_the_rows_it_landed() {
+    // A macro so the trigger body can carry it and still be a literal `sqlx::query` accepts.
+    macro_rules! marker {
+        () => {
+            "The edge rebuild refuses while this row exists."
+        };
+    }
+    let h = harness_or_skip!();
+    for statement in [
+        "DROP TRIGGER IF EXISTS archive_test_refuse_edges ON memory_edge",
+        concat!(
+            "CREATE OR REPLACE FUNCTION archive_test_refuse_edges() RETURNS trigger AS $$
+             BEGIN
+               IF EXISTS (SELECT 1 FROM memory WHERE content = '",
+            marker!(),
+            "') THEN
+                 RAISE EXCEPTION 'edge rebuild refused by the test';
+               END IF;
+               RETURN NULL;
+             END $$ LANGUAGE plpgsql"
+        ),
+        "CREATE TRIGGER archive_test_refuse_edges BEFORE INSERT ON memory_edge
+         FOR EACH STATEMENT EXECUTE FUNCTION archive_test_refuse_edges()",
+    ] {
+        sqlx::query(statement).execute(&h.pool).await.unwrap();
+    }
+
+    let mut records = chain_and_a_private_row();
+    records.push(memory("0195c0de-0000-7000-8000-000000000004", marker!(), "open"));
+    let archive = archive_of(&h.ctx, records);
+    let report =
+        archive::apply(&h.ctx, &archive, archive::Mode::Merge, false, &HashMap::new()).await;
+
+    for statement in [
+        "DROP TRIGGER IF EXISTS archive_test_refuse_edges ON memory_edge",
+        "DROP FUNCTION IF EXISTS archive_test_refuse_edges()",
+    ] {
+        sqlx::query(statement).execute(&h.pool).await.unwrap();
+    }
+
+    let report = report.expect("an import whose rows landed answered with an error");
+    assert_eq!(report.applied, 4, "refusals: {:?}", report.refused);
+    assert_eq!(h.rows().await, 4);
+    assert!(report.edges_not_rebuilt.is_some(), "the failed rebuild went unreported: {report:?}");
 }
 
 #[tokio::test]

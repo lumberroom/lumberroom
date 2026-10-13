@@ -2033,5 +2033,11 @@ pub async fn archive_import(c: &Client, args: &Args) -> Result<()> {
     for (id, reason) in &report.refused {
         out(&format!("  refused {id}: {reason}"));
     }
+    if let Some(reason) = &report.edges_not_rebuilt {
+        out(&format!(
+            "the rows landed and the graph edges were not rebuilt ({reason}). Run `lumberroom graph \
+             rebuild` to retry; the server log carries the cause."
+        ));
+    }
     Ok(())
 }

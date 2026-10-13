@@ -318,6 +318,13 @@ pub struct ApplyReport {
     /// from the store. An import writes chains in bulk, so it is the surface most able to produce
     /// them and the one with the least excuse for staying quiet.
     pub chains_left_open: usize,
+    /// Why the edge rebuild after the rows failed, when it did. `None` when it ran or was not due.
+    ///
+    /// Every row above is committed by the time the rebuild starts, so a failure there is reported
+    /// beside them rather than returned in their place. Returning it answered 500 for an import
+    /// that had landed every row, and a caller retrying that would replay a finished job. Edges are
+    /// derived, so `lumberroom graph rebuild` repairs this later and loses nothing.
+    pub edges_not_rebuilt: Option<String>,
 }
 
 /// Put an archive into this store.
@@ -518,8 +525,7 @@ async fn merge(
     if !dry_run {
         // Version 1 carries no `edge` section. Edges are derived, and a derived thing copied
         // forward is a second source of truth for no gain.
-        super::graph::rebuild(ctx).await?;
-        super::bootstrap::clear_cache();
+        after_rows_landed(ctx, &mut report).await;
     }
     Ok(report)
 }
@@ -623,10 +629,21 @@ async fn restore(
     apply_side_tables(ctx, archive, dry_run, &mut report).await?;
 
     if !dry_run {
-        super::graph::rebuild(ctx).await?;
-        super::bootstrap::clear_cache();
+        after_rows_landed(ctx, &mut report).await;
     }
     Ok(report)
+}
+
+/// Rebuild the edges and drop the digest cache, once every row is in.
+///
+/// The cache goes whatever the rebuild did. It was cleared after the rebuild's `?`, so a failed
+/// rebuild also left the digest serving the store as it stood before the import.
+async fn after_rows_landed(ctx: &Ctx, report: &mut ApplyReport) {
+    if let Err(e) = super::graph::rebuild(ctx).await {
+        tracing::warn!(error = %e.log_message(), "archive rows landed and the edge rebuild failed");
+        report.edges_not_rebuilt = Some(e.client_message().to_string());
+    }
+    super::bootstrap::clear_cache();
 }
 
 /// The parts of a record restore reads without touching the store: a uuid for an id, uuids on both

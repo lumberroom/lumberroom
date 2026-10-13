@@ -3775,6 +3775,326 @@ async fn deleting_a_row_removes_its_edges_rather_than_blocking_the_delete() {
     assert_eq!(touching, 0, "an edge outlived the row it named");
 }
 
+// -- alias edges ---------------------------------------------------------------------------------
+
+/// `ALIAS_HUB_LIMIT` in the Postgres adapter. A unit test there pins the same number, so moving it
+/// fails one of the two until both agree.
+const ALIAS_HUB_LIMIT: usize = 40;
+
+/// Rows written straight into `memory`. The fixtures below differ by a counter, and the write
+/// path's duplicate bands would fold them into one row before the seeder saw them.
+async fn plain_rows_in(
+    pool: &PgPool,
+    tenant: &str,
+    namespace: &str,
+    sensitivity: &str,
+    texts: &[String],
+) -> Vec<uuid::Uuid> {
+    let mut ids = Vec::with_capacity(texts.len());
+    for text in texts {
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO memory (tenant_id, namespace, content, source_client, sensitivity)
+             VALUES ($1, $2, $3, 'test', $4) RETURNING id",
+        )
+        .bind(tenant)
+        .bind(namespace)
+        .bind(text)
+        .bind(sensitivity)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    ids
+}
+
+async fn plain_rows(
+    pool: &PgPool,
+    tenant: &str,
+    sensitivity: &str,
+    texts: &[String],
+) -> Vec<uuid::Uuid> {
+    plain_rows_in(pool, tenant, "user:me", sensitivity, texts).await
+}
+
+/// Every pair of one row from each side, unordered, the shape `alias_pairs` returns.
+fn cross(
+    left: &[uuid::Uuid],
+    right: &[uuid::Uuid],
+) -> std::collections::BTreeSet<(uuid::Uuid, uuid::Uuid)> {
+    let mut out = std::collections::BTreeSet::new();
+    for &a in left {
+        for &b in right {
+            if a != b {
+                out.insert((a.min(b), a.max(b)));
+            }
+        }
+    }
+    out
+}
+
+/// One open row under a chosen id, for a fixture whose assertion depends on uuid order.
+async fn plain_row_at(pool: &PgPool, tenant: &str, id: &str, text: &str) -> uuid::Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO memory (id, tenant_id, namespace, content, source_client, sensitivity)
+         VALUES ($1, $2, 'user:me', $3, 'test', 'open') RETURNING id",
+    )
+    .bind(uuid::Uuid::parse_str(id).unwrap())
+    .bind(tenant)
+    .bind(text)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn texts(n: usize, shape: &str) -> Vec<String> {
+    (0..n).map(|i| format!("{shape} {i}")).collect()
+}
+
+/// Every `shares_alias` edge, as unordered pairs.
+async fn alias_pairs(pool: &PgPool) -> std::collections::BTreeSet<(uuid::Uuid, uuid::Uuid)> {
+    let rows: Vec<(uuid::Uuid, uuid::Uuid)> =
+        sqlx::query_as("SELECT src_id, dst_id FROM memory_edge WHERE relation = 'shares_alias'")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    rows.into_iter().map(|(a, b)| (a.min(b), a.max(b))).collect()
+}
+
+/// Every row naming the alias pairs with every row naming the canonical name, once per pair.
+///
+/// The pair set is computed here and compared whole, because the trap the seeder's comment
+/// describes drops pairs by uuid order: an ordering filter in place of `least`/`greatest` keeps a
+/// pair only when the alias side has the smaller id. The ids are fixed so that some alias rows sort
+/// above a canonical row and some below, which makes that failure certain rather than likely.
+#[tokio::test]
+async fn alias_edges_join_every_alias_row_to_every_canonical_row() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    put_alias(&ctx, "user:me", "kestrel", "Falconworks").await;
+
+    let t = ctx.tenant();
+    let alias_side = [
+        plain_row_at(&pool, t, "00000000-0000-4000-8000-000000000001", "the kestrel build 0").await,
+        plain_row_at(&pool, t, "ffffffff-0000-4000-8000-000000000002", "the kestrel build 1").await,
+        plain_row_at(&pool, t, "7fffffff-0000-4000-8000-000000000003", "the kestrel build 2").await,
+    ];
+    let canonical_side = [
+        plain_row_at(&pool, t, "80000000-0000-4000-8000-000000000004", "the Falconworks build 0")
+            .await,
+        plain_row_at(&pool, t, "10000000-0000-4000-8000-000000000005", "the Falconworks build 1")
+            .await,
+    ];
+    let both =
+        [plain_row_at(&pool, t, "40000000-0000-4000-8000-000000000006", "kestrel is Falconworks")
+            .await];
+    let neither = plain_rows(&pool, t, "open", &texts(1, "the harrier build")).await;
+
+    graph::rebuild(&ctx).await.unwrap();
+
+    let mut expected = std::collections::BTreeSet::new();
+    for &a in alias_side.iter().chain(&both) {
+        for &b in canonical_side.iter().chain(&both) {
+            if a != b {
+                expected.insert((a.min(b), a.max(b)));
+            }
+        }
+    }
+    assert_eq!(expected.len(), 11, "three by two, plus the row naming both against the other five");
+    let got = alias_pairs(&pool).await;
+    assert_eq!(got, expected, "the alias edges are not the alias-by-canonical pairs");
+    assert!(
+        !got.iter().any(|(a, b)| neither.contains(a) || neither.contains(b)),
+        "a row naming neither name was joined"
+    );
+}
+
+/// An alias drops its pairs only once both sides pass the hub limit, and the limit is per alias.
+///
+/// The alias side starts one past the limit and the canonical side at it, so every pair is kept.
+/// One more canonical row puts both sides past it and the alias writes nothing, while a second
+/// alias in the same namespace keeps its pair.
+#[tokio::test]
+async fn an_alias_drops_its_pairs_only_when_both_sides_pass_the_hub_limit() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    put_alias(&ctx, "user:me", "kestrel", "Falconworks").await;
+    put_alias(&ctx, "user:me", "merlin", "Hawkline").await;
+    let t = ctx.tenant();
+
+    let alias_rows =
+        plain_rows(&pool, t, "open", &texts(ALIAS_HUB_LIMIT + 1, "kestrel ticket")).await;
+    let canonical =
+        plain_rows(&pool, t, "open", &texts(ALIAS_HUB_LIMIT, "Falconworks ships")).await;
+    let small = plain_rows(&pool, t, "open", &texts(1, "merlin ticket")).await;
+    let small_canonical = plain_rows(&pool, t, "open", &texts(1, "Hawkline ships")).await;
+    let small_pairs = cross(&small, &small_canonical);
+
+    graph::rebuild(&ctx).await.unwrap();
+    let mut expected = cross(&alias_rows, &canonical);
+    expected.extend(small_pairs.iter().copied());
+    assert_eq!(alias_pairs(&pool).await, expected, "one side within the limit lost pairs");
+
+    plain_rows(&pool, t, "open", &texts(1, "Falconworks overflow")).await;
+    graph::rebuild(&ctx).await.unwrap();
+    assert_eq!(
+        alias_pairs(&pool).await,
+        small_pairs,
+        "an alias past the limit on both sides kept edges, or the limit took the other alias with it"
+    );
+}
+
+/// A rename named in a few rows keeps every pair beside a canonical name named in many more.
+///
+/// The canonical rows each carry one edge per rename row, so the walk expands them and crosses to
+/// the rename. Dropping these pairs because the canonical side is crowded would cut the one join
+/// an alias exists to make.
+#[tokio::test]
+async fn a_rename_in_a_few_rows_keeps_every_pair_beside_a_crowded_canonical_name() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    put_alias(&ctx, "user:me", "wren", "Larkspur").await;
+    let t = ctx.tenant();
+
+    let renamed = plain_rows(&pool, t, "open", &texts(3, "the wren pricing page")).await;
+    let canonical =
+        plain_rows(&pool, t, "open", &texts(ALIAS_HUB_LIMIT + 20, "the Larkspur pricing page"))
+            .await;
+
+    graph::rebuild(&ctx).await.unwrap();
+    let expected = cross(&renamed, &canonical);
+    assert_eq!(expected.len(), 3 * (ALIAS_HUB_LIMIT + 20));
+    assert_eq!(alias_pairs(&pool).await, expected, "a rename lost its pairs to the canonical side");
+}
+
+/// An alias that is part of its canonical name, said on every row, makes no edges past the limit.
+///
+/// Each row says both names, so both sides are the whole set and the pairs are every pair of rows.
+/// At the limit they are all written; one row more and none are.
+#[tokio::test]
+async fn an_alias_inside_its_canonical_name_on_every_row_stops_at_the_hub_limit() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    put_alias(&ctx, "user:me", "kestrel", "Kestrel Works").await;
+    let t = ctx.tenant();
+
+    let rows = plain_rows(&pool, t, "open", &texts(ALIAS_HUB_LIMIT, "Kestrel Works note")).await;
+    graph::rebuild(&ctx).await.unwrap();
+    let at_limit = alias_pairs(&pool).await;
+    assert_eq!(at_limit, cross(&rows, &rows));
+    assert_eq!(at_limit.len(), ALIAS_HUB_LIMIT * (ALIAS_HUB_LIMIT - 1) / 2);
+
+    plain_rows(&pool, t, "open", &texts(1, "Kestrel Works overflow")).await;
+    graph::rebuild(&ctx).await.unwrap();
+    assert!(alias_pairs(&pool).await.is_empty(), "the clique survived past the limit");
+}
+
+/// Private rows naming the canonical name cannot remove the edges between open rows, and a pair
+/// that touches one is judged at the private tier.
+///
+/// At open, the alias side is past the limit and the canonical side is within it, so the open
+/// pairs stay. Counting the private rows puts the canonical side past it too, which is the count a
+/// pair touching a private row is judged on, so those pairs go. A count over every tier would drop
+/// the open pairs as well and let an open client learn that private rows were written. A pair
+/// judged on its alias-side row alone would keep the private pairs.
+///
+/// The write path stores private content as ciphertext, which never matches, so these rows go in
+/// as plaintext on purpose: the guard has to hold for whatever a store holds.
+#[tokio::test]
+async fn private_canonical_rows_cannot_remove_an_edge_between_open_rows() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    put_alias(&ctx, "user:me", "kestrel", "Falconworks").await;
+    let t = ctx.tenant();
+
+    let alias_rows =
+        plain_rows(&pool, t, "open", &texts(ALIAS_HUB_LIMIT + 1, "kestrel ticket")).await;
+    let open_canonical = plain_rows(&pool, t, "open", &texts(5, "Falconworks ships")).await;
+    let private_canonical =
+        plain_rows(&pool, t, "private", &texts(ALIAS_HUB_LIMIT, "Falconworks secret")).await;
+
+    graph::rebuild(&ctx).await.unwrap();
+    let got = alias_pairs(&pool).await;
+    assert_eq!(got, cross(&alias_rows, &open_canonical), "private rows moved the open pairs");
+    assert!(
+        !got.iter().any(|(a, b)| private_canonical.contains(a) || private_canonical.contains(b)),
+        "a pair judged at the private tier, past the limit on both sides there, kept its edge"
+    );
+}
+
+/// The same guard with private rows on both sides, so the alias-side rows have to be filtered too.
+///
+/// At open each side has one row and the pair stays. At private both sides are past the limit, so
+/// every private row is out. Filtering only the canonical side would still pair each private
+/// alias row with the open canonical row.
+#[tokio::test]
+async fn private_rows_on_both_sides_cannot_remove_the_edge_between_open_rows() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    put_alias(&ctx, "user:me", "wren", "Larkspur").await;
+    let t = ctx.tenant();
+
+    let open_alias = plain_rows(&pool, t, "open", &texts(1, "wren ticket")).await;
+    let open_canonical = plain_rows(&pool, t, "open", &texts(1, "Larkspur ships")).await;
+    plain_rows(&pool, t, "private", &texts(ALIAS_HUB_LIMIT, "wren secret")).await;
+    plain_rows(&pool, t, "private", &texts(ALIAS_HUB_LIMIT, "Larkspur secret")).await;
+
+    graph::rebuild(&ctx).await.unwrap();
+    assert_eq!(
+        alias_pairs(&pool).await,
+        cross(&open_alias, &open_canonical),
+        "a private row past the limit on both sides kept an edge, or the open pair was lost"
+    );
+}
+
+/// Alias edges come from current aliases, inside the alias's own namespace, between live rows.
+///
+/// Rows that would pair if one of those filters went missing, and one pair in another namespace
+/// so the scoping is not proved by an empty table. `wren` is recorded in both namespaces with one
+/// name used in each, so the join has to match the namespace as well as the alias.
+#[tokio::test]
+async fn alias_edges_skip_closed_aliases_other_namespaces_and_retired_rows() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let t = ctx.tenant();
+    put_alias(&ctx, "user:me", "kestrel", "Falconworks").await;
+    put_alias(&ctx, "project:alpha", "merlin", "Hawkline").await;
+    put_alias(&ctx, "user:me", "wren", "Larkspur").await;
+    put_alias(&ctx, "project:alpha", "wren", "Larkspur").await;
+    lumberroom_server::services::alias::put(
+        &ctx,
+        ctx.repos.aliases.as_ref(),
+        "user:me",
+        "harrier",
+        "Osprey",
+        None,
+        Some(chrono::Utc::now() - chrono::Duration::days(1)),
+        Some("manual"),
+    )
+    .await
+    .unwrap();
+
+    let kestrel = plain_rows(&pool, t, "open", &texts(1, "kestrel ticket")).await;
+    let falconworks = plain_rows(&pool, t, "open", &texts(1, "Falconworks ships")).await;
+    let retired = plain_rows(&pool, t, "open", &texts(1, "kestrel retired ticket")).await;
+    sqlx::query("UPDATE memory SET superseded_by = $2, superseded_at = now() WHERE id = $1")
+        .bind(retired[0])
+        .bind(falconworks[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A closed alias: these two would pair if `until` were ignored.
+    plain_rows(&pool, t, "open", &texts(1, "harrier ticket")).await;
+    plain_rows(&pool, t, "open", &texts(1, "Osprey ships")).await;
+    // An alias recorded for project:alpha, named in user:me rows.
+    plain_rows(&pool, t, "open", &texts(1, "merlin ticket")).await;
+    plain_rows(&pool, t, "open", &texts(1, "Hawkline ships")).await;
+    // The same alias in two namespaces, each naming one side: no pair crosses between them.
+    plain_rows(&pool, t, "open", &texts(1, "wren ticket")).await;
+    plain_rows_in(&pool, t, "project:alpha", "open", &texts(1, "Larkspur ships")).await;
+    let alpha_merlin = plain_rows_in(&pool, t, "project:alpha", "open", &texts(1, "merlin")).await;
+    let alpha_hawkline =
+        plain_rows_in(&pool, t, "project:alpha", "open", &texts(1, "Hawkline")).await;
+
+    graph::rebuild(&ctx).await.unwrap();
+    let mut expected = cross(&kestrel, &falconworks);
+    expected.extend(cross(&alpha_merlin, &alpha_hawkline));
+    assert_eq!(alias_pairs(&pool).await, expected);
+}
+
 #[tokio::test]
 async fn the_currency_measure_counts_closed_intervals_and_catches_a_double_answer() {
     let (ctx, _pool, _serial) = ctx_or_skip!();
