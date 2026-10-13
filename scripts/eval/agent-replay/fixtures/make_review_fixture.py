@@ -135,7 +135,7 @@ def conflict_rows(n, ws):
 
 
 def stale_rows(n, d):
-    """Ten rows nobody has read in over a year, each about its own service: four lasting facts
+    """Ten rows written over a year ago and never confirmed, each about its own service: four lasting facts
     (confirm), three passing states (leave), two a newer live row retires (delete), one a newer row
     covers in part (merge)."""
     P = lambda opts: pick(n, opts)  # noqa: E731

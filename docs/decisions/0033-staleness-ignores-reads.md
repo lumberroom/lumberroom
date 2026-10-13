@@ -1,7 +1,7 @@
 # 33. Staleness counts from the last write or confirmation, not the last read
 
-**Date:** 13 October 2026 · **Status:** accepted, implemented on `fix/stale-ignores-reads`;
-targeted tests passed, full suite not run, not merged · **Decided by:** the owner
+**Date:** 13 October 2026 · **Status:** accepted, implemented; the full suite passed,
+1842 passed and 0 failed, not merged · **Decided by:** the owner
 
 ## Decision
 
@@ -13,8 +13,10 @@ and the grant.
 
 Content rows are append-only. A rewrite inserts a new row that supersedes the old one, so
 `created_at` is the last write. `last_confirmed_at` is the last confirmation, and three paths set
-it: a `confirm` verdict in the review queue, a write that restates an existing fact, and an ingest
-emission that restates one. The rule needs no new column.
+it: a `confirm` verdict in the review queue, a write that restates an existing open fact, and an
+ingest emission that restates one. A write that restates a private fact confirms nothing, because
+the exact-match lookup in `write.rs` runs on open rows only, so a private row leaves the queue only
+through a `confirm` verdict or an ingest restatement. The rule needs no new column.
 
 `last_accessed_at` and `access_count` stay. Search still bumps them, `/statsz` still reports
 `never_retrieved` from them, and the cleanup pass's unread scan still reads
