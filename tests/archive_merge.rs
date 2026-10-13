@@ -38,7 +38,7 @@ use lumberroom_server::config::{self, Config};
 use lumberroom_server::crypto::kek::{EnvKeyProvider, KeyProvider};
 use lumberroom_server::domain::policy::NamespaceGrant;
 use lumberroom_server::domain::types::{Invocation, Principal};
-use lumberroom_server::services::{archive, bootstrap, write, Ctx, Repos};
+use lumberroom_server::services::{archive, bootstrap, graph, write, Ctx, Repos};
 use sqlx::PgPool;
 
 #[macro_use]
@@ -77,6 +77,14 @@ impl Harness {
 
     async fn rows(&self) -> i64 {
         sqlx::query_scalar("SELECT count(*) FROM memory WHERE tenant_id = $1")
+            .bind(self.tenant())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn edges(&self) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM memory_edge WHERE tenant_id = $1")
             .bind(self.tenant())
             .fetch_one(&self.pool)
             .await
@@ -412,6 +420,33 @@ async fn an_import_whose_edge_rebuild_fails_still_reports_the_rows_it_landed() {
     assert_eq!(report.applied, 4, "refusals: {:?}", report.refused);
     assert_eq!(h.rows().await, 4);
     assert!(report.edges_not_rebuilt.is_some(), "the failed rebuild went unreported: {report:?}");
+}
+
+/// Merge passes the option through as restore does. The write path writes no edges of its own, so
+/// a merge batch with the rebuild off leaves the chain unlinked in the graph until the caller's one
+/// rebuild. The digest side is tested on restore, for the reason the test above gives.
+#[tokio::test]
+async fn a_merge_with_the_rebuild_off_writes_no_edges_until_the_caller_rebuilds() {
+    let h = harness_or_skip!();
+    assert_eq!(h.edges().await, 0, "the store held edges before the merge");
+    let archive = archive_of(&h.ctx, chain_and_a_private_row());
+
+    let report = archive::apply_with(
+        &h.ctx,
+        &archive,
+        archive::Mode::Merge,
+        false,
+        &HashMap::new(),
+        archive::ApplyOptions { rebuild_edges: false },
+    )
+    .await
+    .expect("the merge");
+    assert_eq!(report.applied, 3, "refusals: {:?}", report.refused);
+    assert!(report.edges_not_rebuilt.is_none(), "a skipped rebuild reported: {report:?}");
+    assert_eq!(h.edges().await, 0, "a merge with the rebuild off wrote edges");
+
+    graph::rebuild(&h.ctx).await.expect("the one rebuild at the end");
+    assert!(h.edges().await > 0, "the closing rebuild wrote no edges");
 }
 
 #[tokio::test]

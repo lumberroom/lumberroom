@@ -32,7 +32,7 @@ use lumberroom_server::crypto::kek::{EnvKeyProvider, KeyProvider};
 use lumberroom_server::domain::errors::Kind;
 use lumberroom_server::domain::policy::NamespaceGrant;
 use lumberroom_server::domain::types::{Invocation, Memory, Principal};
-use lumberroom_server::services::{archive, bootstrap, write, Ctx, Repos};
+use lumberroom_server::services::{archive, bootstrap, graph, write, Ctx, Repos};
 use sqlx::PgPool;
 
 #[macro_use]
@@ -87,6 +87,14 @@ impl Harness {
         .fetch_one(&self.pool)
         .await
         .unwrap()
+    }
+
+    async fn edges(&self) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM memory_edge WHERE tenant_id = $1")
+            .bind(self.tenant())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
     }
 
     async fn row(&self, id: &str) -> Memory {
@@ -372,4 +380,90 @@ async fn a_restored_chain_keeps_both_links() {
     assert_eq!(retired.superseded_by.as_deref(), Some(ID_SECOND));
     assert_eq!(live.supersedes.as_deref(), Some(ID_FIRST));
     assert!(live.is_live(), "the successor came back retired");
+}
+
+/// A chain and a row beside it, every row tagged alike, so a rebuild has edges to seed.
+fn a_chain_and_a_neighbour() -> (Vec<MemoryRecord>, MemoryRecord) {
+    let mut first = memory(ID_FIRST, "The study desktop runs Ubuntu 24.04.", "open");
+    first.superseded_by = Some(ID_SECOND.into());
+    first.superseded_at = Some(SUPERSEDED_AT.into());
+    let mut second = memory(ID_SECOND, "The study desktop runs Ubuntu 26.04.", "open");
+    second.supersedes = Some(ID_FIRST.into());
+    let neighbour =
+        memory("0195c0de-0000-7000-8000-000000000003", "Coffee, black, no sugar.", "open");
+    (vec![first, second], neighbour)
+}
+
+const NO_REBUILD: archive::ApplyOptions = archive::ApplyOptions { rebuild_edges: false };
+
+/// A caller that imports in batches lands every batch with the rebuild off and rebuilds once at
+/// the end. Each rebuild rereads the whole store, so one per batch multiplies the slowest step by
+/// the batch count.
+///
+/// The digest has to clear on every batch anyway. Restore writes below the write path, so this is
+/// the only clear it gets, and a skipped rebuild must not take the clear with it.
+#[tokio::test]
+async fn a_batched_restore_with_the_rebuild_off_writes_no_edges_until_the_caller_rebuilds() {
+    let h = harness_or_skip!(Key::Present);
+    assert_eq!(h.edges().await, 0, "the store held edges before the restore");
+    let (chain, neighbour) = a_chain_and_a_neighbour();
+
+    let first = archive::apply_with(
+        &h.ctx,
+        &archive_of(&h.ctx, chain),
+        archive::Mode::Restore,
+        false,
+        &HashMap::new(),
+        NO_REBUILD,
+    )
+    .await
+    .expect("the first batch");
+    assert_eq!(first.applied, 2, "refusals: {:?}", first.refused);
+
+    assert!(!bootstrap::run(&h.ctx, None).await.unwrap().cached);
+    assert!(bootstrap::run(&h.ctx, None).await.unwrap().cached, "the digest cache is off here");
+    let second = archive::apply_with(
+        &h.ctx,
+        &archive_of(&h.ctx, vec![neighbour]),
+        archive::Mode::Restore,
+        false,
+        &first.id_map,
+        NO_REBUILD,
+    )
+    .await
+    .expect("the second batch");
+    assert_eq!(second.applied, 1, "refusals: {:?}", second.refused);
+    assert!(
+        !bootstrap::run(&h.ctx, None).await.unwrap().cached,
+        "a batch that skipped the rebuild left the digest serving the store from before it"
+    );
+    assert!(second.edges_not_rebuilt.is_none(), "a skipped rebuild reported: {second:?}");
+
+    assert_eq!(h.rows().await, 3);
+    assert_eq!(h.edges().await, 0, "a batch with the rebuild off wrote edges");
+
+    graph::rebuild(&h.ctx).await.expect("the one rebuild at the end");
+    assert!(h.edges().await > 0, "the closing rebuild wrote no edges");
+}
+
+/// `apply` keeps rebuilding. The HTTP route and the CLI import call it and rebuild nothing else.
+#[tokio::test]
+async fn apply_rebuilds_the_edges_after_the_rows() {
+    let h = harness_or_skip!(Key::Present);
+    assert_eq!(h.edges().await, 0, "the store held edges before the restore");
+    let (mut records, neighbour) = a_chain_and_a_neighbour();
+    records.push(neighbour);
+
+    let report = archive::apply(
+        &h.ctx,
+        &archive_of(&h.ctx, records),
+        archive::Mode::Restore,
+        false,
+        &HashMap::new(),
+    )
+    .await
+    .expect("the restore");
+    assert_eq!(report.applied, 3, "refusals: {:?}", report.refused);
+    assert!(report.edges_not_rebuilt.is_none(), "{:?}", report.edges_not_rebuilt);
+    assert!(h.edges().await > 0, "apply skipped the rebuild");
 }

@@ -11,6 +11,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   digest section and active project, and no content. The cleanup pass deletes rows older than
   `RECALL_EVENT_RETENTION_DAYS` (default 30), and forgetting a memory deletes its rows. Migration
   `20261006000029`; see `docs/recall-event-log.md` and decision 0024.
+- **An archive import can leave the edge rebuild to its caller.** `services::archive::apply_with`
+  takes `ApplyOptions { rebuild_edges }`. A caller that imports one archive in batches turns the
+  rebuild off for every batch and calls `services::graph::rebuild` once after the last, instead of
+  rereading the whole store per batch. Each batch still clears the digest cache, and a skipped
+  rebuild leaves `edges_not_rebuilt` empty. `apply` keeps its signature and still rebuilds, so the
+  HTTP route and `lumberroom archive import` are unchanged.
 - `client/skills/lr-review`, an agent skill for working the review queue, synced into client plugins.
 - **Undated facts on the MCP review queue.** `review_queue` with `source: ["undated"]` lists live rows
   with no start date whose own text names a past day, each with its `dates`. `review_decide` takes
