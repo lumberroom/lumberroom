@@ -1,7 +1,7 @@
 # 32. Large read answers stay inline
 
 **Date:** 13 October 2026 · **Status:** accepted, implemented; full suite ran with test-fast, 1,782
-passed and 0 failed; not merged · **Decided by:** the owner
+passed and 0 failed; merged in #140 · **Decided by:** the owner
 
 ## Decision
 

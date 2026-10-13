@@ -1208,11 +1208,11 @@ pub async fn undismiss(ctx: &Ctx, a: &str, b: &str) -> Result<bool> {
     ctx.repos.memories.undismiss_pair(ctx.tenant(), a_uuid, b_uuid).await
 }
 
-fn fence_nonce() -> String {
+pub(crate) fn fence_nonce() -> String {
     Uuid::new_v4().simple().to_string()[..12].to_string()
 }
 
-fn as_data(s: &str, nonce: &str) -> String {
+pub(crate) fn as_data(s: &str, nonce: &str) -> String {
     format!("----- data {nonce} -----\n{s}\n----- end of data {nonce} -----")
 }
 

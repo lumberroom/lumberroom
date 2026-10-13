@@ -14,11 +14,13 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::domain::types::{Memory, Provenance, Sensitivity};
+use crate::domain::types::{Invocation, Memory, Provenance, Sensitivity};
 use crate::ports::registry::RegistryVersion;
 use crate::ports::Timeline;
+use crate::services::bootstrap::{Digest, Fact};
 use crate::services::forget::{Doomed, ForgetOutcome};
 use crate::services::registry::{RegistryGetResult, RegistryHistoryResult};
+use crate::services::search::SearchResult;
 use crate::services::{sources, Ctx};
 
 /// A stored `source_client` through the names `sources::labels` returned.
@@ -262,9 +264,181 @@ fn forget_view(f: ForgetOutcome, names: &HashMap<String, String>) -> ForgetView 
     }
 }
 
+/// How much of an answer a caller asked for. Brief is what a model reads unless it asks.
+///
+/// Inline, because rmcp generates draft 2020-12 without inlining, and a named definition would put
+/// the first `$ref` and `$defs` into the tool schemas. Not every client resolves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, schemars::JsonSchema)]
+#[schemars(inline)]
+#[serde(rename_all = "lowercase")]
+pub enum Detail {
+    #[default]
+    Brief,
+    Full,
+}
+
+/// An installed CLI parses `score` as required and cannot send `detail`, so a declared CLI call
+/// reads the full shape. Remove once a CLI that sends `detail` itself has shipped in two tags.
+pub fn detail_for(invocation: Invocation, asked: Option<Detail>) -> Detail {
+    asked.unwrap_or(if invocation == Invocation::Cli { Detail::Full } else { Detail::Brief })
+}
+
+/// `rows` for `context_bootstrap`, by the rule `detail_for` follows.
+pub fn rows_for(invocation: Invocation, asked: Option<bool>) -> bool {
+    asked.unwrap_or(invocation == Invocation::Cli)
+}
+
+/// The text channel's copy of a JSON answer.
+pub fn compact(json: &serde_json::Value) -> String {
+    serde_json::to_string(json).unwrap_or_default()
+}
+
+/// Strips a brief row from the full shape's own JSON, so a field the brief keeps can never differ
+/// from the full one: same value, same timestamp precision. A timestamp cut to whole seconds would
+/// lose its own row under `as_of`.
+fn brief_row(row: &mut serde_json::Value, dropped: &[&str], dropped_when_null: &[&str]) {
+    let Some(o) = row.as_object_mut() else { return };
+    for k in dropped {
+        o.remove(*k);
+    }
+    for k in dropped_when_null {
+        if o.get(*k).is_some_and(serde_json::Value::is_null) {
+            o.remove(*k);
+        }
+    }
+    // `open` is the default and tells a model nothing; a level above it is the warning that
+    // matters before a fact gets quoted somewhere shared.
+    if o.get("sensitivity").and_then(serde_json::Value::as_str) == Some("open") {
+        o.remove("sensitivity");
+    }
+    if o.get("tags").and_then(serde_json::Value::as_array).is_some_and(Vec::is_empty) {
+        o.remove("tags");
+    }
+}
+
+fn brief_rows(answer: &mut serde_json::Value, list: &str, dropped: &[&str], when_null: &[&str]) {
+    if let Some(rows) = answer.get_mut(list).and_then(serde_json::Value::as_array_mut) {
+        for row in rows {
+            brief_row(row, dropped, when_null);
+        }
+    }
+}
+
+/// `memory_search`'s structured answer.
+pub fn search(result: &SearchResult, detail: Detail) -> serde_json::Value {
+    let mut answer = serde_json::to_value(result).unwrap_or_default();
+    if detail == Detail::Brief {
+        // The array order already carries `score`, and agents quoted it back as if it meant
+        // something; `namespace` and `also_searched` already say what `primary` says.
+        brief_rows(&mut answer, "hits", &["score", "primary"], &[]);
+    }
+    answer
+}
+
+/// `memory_history`'s structured answer.
+pub fn timeline_value(t: &TimelineView, detail: Detail) -> serde_json::Value {
+    let mut answer = serde_json::to_value(t).unwrap_or_default();
+    if detail == Detail::Brief {
+        brief_rows(
+            &mut answer,
+            "versions",
+            &["embedding_model", "access_count", "last_accessed_at"],
+            &["supersedes", "superseded_by", "superseded_at", "last_confirmed_at"],
+        );
+    }
+    answer
+}
+
+/// `context_bootstrap`'s structured answer. Brief carries the text, the counts and every row the
+/// text did not print whole; `rows` true is the `Digest` without `tenant`.
+pub fn digest(d: &Digest, rows: bool) -> serde_json::Value {
+    if rows {
+        return full_digest(d);
+    }
+    let mut answer = serde_json::json!({
+        "counts": { "memories": d.counts.memories, "registry": d.counts.registry },
+        "inventory": d.inventory,
+        "sealed_inventory": d.sealed_inventory,
+        "project": d.project,
+        "text": d.text,
+    });
+    let o = answer.as_object_mut().expect("a json! object literal");
+    let facts = || d.profile.iter().chain(&d.project_context).chain(&d.recent);
+    // An id the sections do not hold has nothing to carry, so it drops out here. `render_report`
+    // takes its ids from these same sections, so that means a digest built by hand.
+    let left_out: Vec<serde_json::Value> = d
+        .left_out
+        .iter()
+        .filter_map(|id| facts().find(|f| &f.id == id))
+        .map(left_out_fact)
+        .collect();
+    if !left_out.is_empty() {
+        o.insert("left_out".into(), left_out.into());
+    }
+    let left_out_registry: Vec<serde_json::Value> = d
+        .left_out_registry
+        .iter()
+        .filter_map(|(ns, kind, key)| {
+            d.registry.iter().find(|r| &r.namespace == ns && &r.kind == kind && &r.key == key)
+        })
+        .map(|r| serde_json::to_value(r).unwrap_or_default())
+        .collect();
+    if !left_out_registry.is_empty() {
+        o.insert("left_out_registry".into(), left_out_registry.into());
+    }
+    if facts().next().is_some() {
+        o.insert("more".into(), DIGEST_MORE.into());
+    }
+    answer
+}
+
+/// A memory the text left out, with the stored text exactly: the model reads it nowhere else.
+/// It keeps the writer and date a printed bullet shows, the date as stored rather than cut to a
+/// day, so `as_of` can take it back whole.
+fn left_out_fact(f: &Fact) -> serde_json::Value {
+    let mut row = serde_json::json!({
+        "id": f.id,
+        "namespace": f.namespace,
+        "content": f.content,
+        "source": f.source,
+        "created_at": f.created_at,
+    });
+    let o = row.as_object_mut().expect("a json! object literal");
+    if f.sensitivity > Sensitivity::Open {
+        o.insert("sensitivity".into(), serde_json::to_value(f.sensitivity).unwrap_or_default());
+    }
+    if !f.tags.is_empty() {
+        o.insert("tags".into(), f.tags.clone().into());
+    }
+    row
+}
+
+/// `rows: true`: today's `Digest` serialization minus `tenant`, which names the operator's tenant
+/// to a model, plus what the text left out by id.
+fn full_digest(d: &Digest) -> serde_json::Value {
+    let mut answer = serde_json::to_value(d).unwrap_or_default();
+    if let Some(o) = answer.as_object_mut() {
+        o.remove("tenant");
+        o.insert("left_out".into(), d.left_out.clone().into());
+        let registry: Vec<serde_json::Value> = d
+            .left_out_registry
+            .iter()
+            .map(|(ns, kind, key)| serde_json::json!({ "namespace": ns, "kind": kind, "key": key }))
+            .collect();
+        o.insert("left_out_registry".into(), registry.into());
+    }
+    answer
+}
+
+pub const DIGEST_MORE: &str =
+    "rows: true adds each printed fact's id and exact text; memory_search finds more";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::RegistrySummary;
+    use crate::services::bootstrap::{Counts, Fact};
+    use crate::services::search::Hit;
     use std::collections::BTreeSet;
 
     /// The keys a value serialises to, with every `source_client` swapped for `source`: the one
@@ -468,5 +642,289 @@ mod tests {
         let view = doomed(row, &names());
         assert_eq!(keys(&view), expected);
         assert_eq!(view.source, "Codex");
+    }
+
+    fn hit(id: &str) -> Hit {
+        Hit {
+            id: id.into(),
+            namespace: "global".into(),
+            content: format!("fact {id}"),
+            tags: vec!["t".into()],
+            source: "Codex".into(),
+            source_client: "id-codex".into(),
+            sensitivity: Sensitivity::Open,
+            created_at: "2026-09-28T17:35:39.860834+00:00".into(),
+            score: 0.031,
+            similarity: 0.7608,
+            primary: true,
+            superseded_by: None,
+            occurred_at: None,
+            occurred_until: None,
+        }
+    }
+
+    /// Three hits: one private, one with `occurred_at`, one untagged.
+    fn search_fixture() -> SearchResult {
+        let mut private = hit("h1");
+        private.sensitivity = Sensitivity::Private;
+        let mut dated = hit("h2");
+        dated.occurred_at = Some("2026-06-01T09:30:00.123456+00:00".into());
+        dated.primary = false;
+        let mut untagged = hit("h3");
+        untagged.tags = vec![];
+        SearchResult {
+            namespaces: vec!["global".into()],
+            also_searched: vec!["project:other".into()],
+            hits: vec![private, dated, untagged],
+        }
+    }
+
+    #[test]
+    fn a_brief_search_keeps_ids_in_order_and_drops_only_the_listed_fields() {
+        let result = search_fixture();
+        let full = search(&result, Detail::Full);
+        let brief = search(&result, Detail::Brief);
+        let ids = |v: &serde_json::Value| -> Vec<String> {
+            v["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids(&full), ids(&brief));
+        assert_eq!(full, serde_json::to_value(&result).unwrap());
+        for (f, b) in full["hits"].as_array().unwrap().iter().zip(brief["hits"].as_array().unwrap())
+        {
+            assert!(b.get("score").is_none() && b.get("primary").is_none());
+            for kept in ["similarity", "content", "source", "created_at", "id", "namespace"] {
+                assert_eq!(b[kept], f[kept], "{kept}");
+            }
+            assert_eq!(b.get("occurred_at"), f.get("occurred_at"), "full precision kept");
+            assert_eq!(b.get("sensitivity").is_some(), f["sensitivity"] != "open");
+        }
+    }
+
+    #[test]
+    fn a_brief_search_drops_empty_tags_and_keeps_the_top_level() {
+        let result = search_fixture();
+        let brief = search(&result, Detail::Brief);
+        assert_eq!(brief["hits"][0]["tags"], serde_json::json!(["t"]));
+        assert!(brief["hits"][2].get("tags").is_none());
+        assert_eq!(brief["namespaces"], serde_json::json!(["global"]));
+        assert_eq!(brief["also_searched"], serde_json::json!(["project:other"]));
+    }
+
+    #[test]
+    fn a_brief_history_keeps_the_chain_and_drops_the_counters() {
+        let t = timeline_view(
+            Timeline { versions: vec![row()], withheld: 0, depth_capped: false },
+            &names(),
+        );
+        let brief = timeline_value(&t, Detail::Brief);
+        let v = &brief["versions"][0];
+        for gone in ["embedding_model", "access_count", "last_accessed_at"] {
+            assert!(v.get(gone).is_none(), "{gone} survived: {v}");
+        }
+        let full = timeline_value(&t, Detail::Full);
+        assert_eq!(full, serde_json::to_value(&t).unwrap());
+        assert_eq!(v["created_at"], full["versions"][0]["created_at"]);
+        assert_eq!(v["occurred_at"], full["versions"][0]["occurred_at"]);
+    }
+
+    #[test]
+    fn a_brief_history_names_a_link_only_when_it_is_set() {
+        let mut newer = row();
+        newer.id = "m2".into();
+        newer.supersedes = Some("m1".into());
+        newer.sensitivity = Sensitivity::Private;
+        newer.tags = vec![];
+        let t = timeline_view(
+            Timeline { versions: vec![row(), newer], withheld: 1, depth_capped: true },
+            &names(),
+        );
+        let brief = timeline_value(&t, Detail::Brief);
+        let (old, new) = (&brief["versions"][0], &brief["versions"][1]);
+        for unset in
+            ["supersedes", "superseded_by", "superseded_at", "last_confirmed_at", "sensitivity"]
+        {
+            assert!(old.get(unset).is_none(), "{unset} survived: {old}");
+        }
+        assert_eq!(new["supersedes"], "m1");
+        assert_eq!(new["sensitivity"], "private");
+        assert!(new.get("tags").is_none());
+        assert_eq!(old["source"], "Codex");
+        assert_eq!(brief["withheld"], 1);
+        assert_eq!(brief["depth_capped"], true);
+    }
+
+    fn fact(id: &str, ns: &str) -> Fact {
+        Fact {
+            id: id.into(),
+            namespace: ns.into(),
+            content: format!("fact {id}\nsecond line"),
+            tags: vec![],
+            source: "Codex".into(),
+            sensitivity: Sensitivity::Open,
+            created_at: "2026-09-28T17:35:39.860834+00:00".into(),
+        }
+    }
+
+    /// Profile p1, p2; recent r1; registry one port; tenant "t-1".
+    fn digest_fixture() -> Digest {
+        let mut p2 = fact("p2", "user:me");
+        p2.sensitivity = Sensitivity::Private;
+        p2.tags = vec!["digest".into()];
+        Digest {
+            generated_at: "2026-10-12T10:00:00.000001+00:00".into(),
+            tenant: "t-1".into(),
+            project: Some("project:lumberroom".into()),
+            namespaces: vec!["user:me".into(), "global".into()],
+            inventory: HashMap::from([("user:me".to_string(), 3)]),
+            sealed_inventory: HashMap::from([("user:me".to_string(), 1)]),
+            profile: vec![fact("p1", "user:me"), p2],
+            project_context: vec![],
+            recent: vec![fact("r1", "global")],
+            registry: vec![RegistrySummary {
+                namespace: "global".into(),
+                kind: "service".into(),
+                key: "services.lumberroom.port".into(),
+                value: serde_json::json!(8080),
+            }],
+            counts: Counts {
+                memories: 3,
+                registry: 1,
+                by_namespace: HashMap::from([("user:me".to_string(), 3)]),
+            },
+            cached: false,
+            text: "## Memory digest\n- fact p1 second line\n".into(),
+            left_out: vec![],
+            left_out_registry: vec![],
+        }
+    }
+
+    #[test]
+    fn a_brief_digest_carries_every_row_the_text_left_out_whole() {
+        let mut d = digest_fixture();
+        d.left_out = vec!["p2".into(), "r1".into()];
+        let brief = digest(&d, false);
+        let left: Vec<&str> = brief["left_out"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(left, ["p2", "r1"]);
+        assert_eq!(brief["left_out"][0]["content"], d.profile[1].content.as_str());
+        assert!(brief.get("profile").is_none() && brief.get("tenant").is_none());
+        assert!(brief["counts"].get("by_namespace").is_none());
+        assert_eq!(brief["inventory"], serde_json::to_value(&d.inventory).unwrap());
+        assert_eq!(brief["sealed_inventory"], serde_json::to_value(&d.sealed_inventory).unwrap());
+        assert_eq!(brief["text"], d.text.as_str());
+        assert_eq!(brief["more"], DIGEST_MORE);
+    }
+
+    #[test]
+    fn a_left_out_row_names_sensitivity_and_tags_only_when_they_say_something() {
+        let mut d = digest_fixture();
+        d.left_out = vec!["p2".into(), "r1".into()];
+        let brief = digest(&d, false);
+        let (p2, r1) = (&brief["left_out"][0], &brief["left_out"][1]);
+        assert_eq!(p2["sensitivity"], "private");
+        assert_eq!(p2["tags"], serde_json::json!(["digest"]));
+        assert_eq!(p2["namespace"], "user:me");
+        assert!(r1.get("sensitivity").is_none() && r1.get("tags").is_none());
+    }
+
+    /// rmcp builds tool input schemas as draft 2020-12 without inlining, so a `Detail` derived as
+    /// its own definition lands as the first `$ref` and `$defs` in a tool schema. Some clients
+    /// resolve neither, and the argument then reaches the model with no allowed values.
+    #[test]
+    fn a_detail_argument_leaves_no_ref_in_a_tool_input_schema() {
+        use rmcp::handler::server::common::schema_for_type;
+        for (tool, schema) in [
+            ("memory_search", schema_for_type::<crate::mcp::SearchArgs>()),
+            ("memory_history", schema_for_type::<crate::mcp::extra_tools::MemoryHistoryArgs>()),
+        ] {
+            let json = serde_json::to_string(&*schema).unwrap();
+            assert!(!json.contains("$ref"), "{tool} schema carries a $ref: {json}");
+            assert!(!json.contains("$defs"), "{tool} schema carries $defs: {json}");
+            assert!(json.contains("\"brief\"") && json.contains("\"full\""), "{tool}: {json}");
+        }
+    }
+
+    /// A printed bullet ends `(namespace, YYYY-MM-DD, via Source)`. A row the text left out carries
+    /// the same date and writer, the date as stored, so the model can weigh it like a printed one.
+    #[test]
+    fn a_left_out_row_carries_its_writer_and_its_stored_timestamp() {
+        let mut d = digest_fixture();
+        d.left_out = vec!["p2".into(), "r1".into()];
+        let brief = digest(&d, false);
+        for row in brief["left_out"].as_array().unwrap() {
+            assert_eq!(row["source"], "Codex");
+            assert_eq!(row["created_at"], "2026-09-28T17:35:39.860834+00:00");
+        }
+    }
+
+    #[test]
+    fn a_brief_digest_carries_each_registry_entry_the_text_left_out() {
+        let mut d = digest_fixture();
+        d.left_out_registry =
+            vec![("global".into(), "service".into(), "services.lumberroom.port".into())];
+        let brief = digest(&d, false);
+        assert_eq!(brief["left_out_registry"], serde_json::to_value(&d.registry).unwrap());
+        assert!(digest(&digest_fixture(), false).get("left_out_registry").is_none());
+    }
+
+    #[test]
+    fn a_digest_that_printed_everything_carries_no_left_out_key() {
+        let d = digest_fixture();
+        assert!(digest(&d, false).get("left_out").is_none());
+    }
+
+    #[test]
+    fn a_digest_with_no_facts_carries_no_more_hint() {
+        let mut d = digest_fixture();
+        d.profile.clear();
+        d.recent.clear();
+        let brief = digest(&d, false);
+        assert!(brief.get("more").is_none());
+        assert_eq!(brief["project"], "project:lumberroom");
+        assert_eq!(brief["counts"], serde_json::json!({"memories": 3, "registry": 1}));
+    }
+
+    #[test]
+    fn the_full_digest_drops_only_the_tenant() {
+        let d = digest_fixture();
+        let full = digest(&d, true);
+        let mut expected = serde_json::to_value(&d).unwrap();
+        expected.as_object_mut().unwrap().remove("tenant");
+        for (k, v) in expected.as_object().unwrap() {
+            assert_eq!(full.get(k), Some(v), "{k}");
+        }
+        assert!(full.get("tenant").is_none());
+    }
+
+    #[test]
+    fn the_full_digest_lists_what_the_text_left_out_by_id() {
+        let mut d = digest_fixture();
+        d.left_out = vec!["r1".into()];
+        d.left_out_registry =
+            vec![("global".into(), "service".into(), "services.lumberroom.port".into())];
+        let full = digest(&d, true);
+        assert_eq!(full["left_out"], serde_json::json!(["r1"]));
+        assert_eq!(
+            full["left_out_registry"],
+            serde_json::json!([{"namespace": "global", "kind": "service", "key": "services.lumberroom.port"}])
+        );
+    }
+
+    #[test]
+    fn a_cli_call_reads_the_full_shape_unless_it_asks_otherwise() {
+        assert_eq!(detail_for(Invocation::Cli, None), Detail::Full);
+        assert_eq!(detail_for(Invocation::Hook, None), Detail::Brief);
+        assert_eq!(detail_for(Invocation::User, None), Detail::Brief);
+        assert_eq!(detail_for(Invocation::Cli, Some(Detail::Brief)), Detail::Brief);
+        assert!(rows_for(Invocation::Cli, None) && !rows_for(Invocation::Model, None));
     }
 }

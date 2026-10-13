@@ -36,7 +36,9 @@ fact, every claim kept, no fact corrected from outside the store.
 | A fact the memories leave unclear or unconfirmed | Leave it as written. Do not ask. |
 
 Merged text keeps every number, name, identifier, path, command and date from its sources, drops
-the repetition, and comes out shorter than the sources combined.
+the repetition, and comes out shorter than the sources combined. Write it without the
+`----- data` and `----- end of data` marker lines around any value you copy from the queue: content
+carrying one is refused with `content_carries_fence`.
 
 `delete` and `memory_forget` remove a row for good, and removing a row that superseded older rows
 makes those older rows live again. Prefer `supersede`. Before any delete, check `memory_history`
@@ -68,7 +70,9 @@ a row with no start date whose text names one or more past days, listed in `date
 - The text leaves it unclear which day the fact is about: leave the row undated. Do not ask.
 
 `occurred_at` must be one of the item's `dates`. Any other day is refused, and so is a row that
-already carries a date. Rows you leave stay on the first page, so page on with `offset`.
+already carries a date. Decided items leave the queue and the items you leave stay, so read again
+from offset 0 after a pass. To page, narrow `source` to one kind and set `offset` to the number of
+that kind's items you chose to leave.
 
 ## Dreaming proposals
 
@@ -89,11 +93,15 @@ list and sometimes `held_by`, the check the proposal failed.
 
 ## Large queues
 
-When your harness has subagents and the queue runs past about 40 items, split it so no two workers
-share a row: group items that share any row id, then deal the groups out. Give every worker this
-skill's rules in its prompt and a log to fill. Keep shared files in a directory named for the task,
-outside any scratch area other sessions clean up. Read the queue again after the workers finish:
-merges create new pairs, and the new pairs need the same treatment.
+A read returns up to 50 items per source, so `more` appears only when a source holds over 50. When
+it does, work one source at a time: call `review_queue` with `source` set to that source and page
+with `offset` inside it only. An `offset` without `source` skips items in every source, including
+ones you have not seen. If your harness has subagents, read every page of the source before anyone decides, because each
+verdict moves the items after it and an `offset` range handed to a worker drifts. Group the items
+that share any row id, then deal the groups out. Give every
+worker this skill's rules in its prompt and a log to fill. Keep shared files in a directory named
+for the task, outside any scratch area other sessions clean up. Read the queue again after the workers
+finish: merges create new pairs, and the new pairs need the same treatment.
 
 ## Finish
 

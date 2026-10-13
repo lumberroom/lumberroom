@@ -20,8 +20,10 @@
 //! project, recent, with recent skipping every row the first two chose. The database compares the
 //! stored vectors and returns pairs of ids, so there is still no embedding call on this path.
 //!
-//! The structured payload is authoritative. Ceilings on the rendered text differ by surface and at
-//! least one is undocumented, so a client that truncates the markdown block still has the data.
+//! Ceilings on the rendered text differ by surface, and `render_report` names every row the text
+//! left out or shortened. The brief structured payload carries each of those rows with its exact
+//! stored text, so a client that reads the structured copy still has every fact the digest drew
+//! from (decision 0031). `rows: true` adds the full sections and every id.
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -77,6 +79,105 @@ pub struct Digest {
     /// Rendered markdown, bounded by `max_chars`. Each stored row occupies one bullet: `one_line`
     /// is what keeps a body from opening a section of its own.
     pub text: String,
+    /// Memory ids the text left out or shortened. Skipped here so the service serialization stays
+    /// as it was; `mcp::views::digest` adds them to the MCP shapes.
+    #[serde(skip)]
+    pub left_out: Vec<String>,
+    /// `(namespace, kind, key)` of registry entries the text left out.
+    #[serde(skip)]
+    pub left_out_registry: Vec<(String, String, String)>,
+}
+
+/// What one render printed, and which rows it did not print whole.
+pub struct Rendered {
+    pub text: String,
+    /// Memory ids from profile, project_context and recent that the layout left out or shortened.
+    pub left_out: Vec<String>,
+    /// `(namespace, kind, key)` of registry entries the layout left out.
+    pub left_out_registry: Vec<(String, String, String)>,
+}
+
+/// `render`'s layout, with the rows it did not print whole. Every return below names the picks
+/// that produced its text, so the report and the text cannot describe two different layouts.
+pub fn render_report(d: &Digest, max_chars: usize) -> Rendered {
+    let header = header(d);
+    let mut seen = std::collections::HashSet::new();
+    let mut sections = vec![memory_section(
+        "profile",
+        "About the user and standing preferences",
+        &d.profile,
+        SHARES[0],
+        &mut seen,
+    )];
+    // Without an active project the section stays empty and its share flows on to recent.
+    let project: &[Fact] = if d.project.is_some() { &d.project_context } else { &[] };
+    let title = format!("Project {}", d.project.as_deref().unwrap_or_default());
+    sections.push(memory_section("project", &title, project, SHARES[1], &mut seen));
+    sections.push(memory_section("recent", "Recently learned", &d.recent, SHARES[2], &mut seen));
+    sections.push(registry_section(d));
+
+    let every: Picks = sections.iter().map(|s| vec![Pick::Whole; s.entries.len()]).collect();
+    let full = assemble(d, &header, &sections, &every, "", Tail::Full);
+    if chars(&full) <= max_chars {
+        return report(d, &sections, &every, full);
+    }
+
+    // An overflowing digest caps its tail, then cuts the tail to its shortest form, then keeps
+    // only the sealed count. Each step gives the sections more room. The first step that fits
+    // and prints a whole entry wins, so a normal budget keeps its namespace names. When none
+    // prints a whole entry, the step that printed the most wins.
+    let room = max_chars.saturating_sub(chars(&header));
+    let any_entries = sections.iter().any(|s| !s.entries.is_empty());
+    let mut first_fit: Option<(String, Picks)> = None;
+    for mode in [Tail::Within(room * TAIL_SHARE / 100), Tail::Within(0), Tail::SealedOnly] {
+        let Some((text, whole, picks)) = two_passes(d, &header, &sections, max_chars, mode) else {
+            continue;
+        };
+        if whole > 0 || !any_entries {
+            return report(d, &sections, &picks, text);
+        }
+        first_fit.get_or_insert((text, picks));
+    }
+    if let Some((text, picks)) = first_fit {
+        return report(d, &sections, &picks, text);
+    }
+    // Only a budget smaller than the header and the footer together gets here.
+    let none: Picks = sections.iter().map(|s| vec![Pick::Out; s.entries.len()]).collect();
+    let all: Vec<(&str, usize)> = sections.iter().map(|s| (s.noun, s.entries.len())).collect();
+    let bare = header_lines_within(&header, max_chars);
+    let with_footer = format!("{bare}{}", footer(&all, max_chars));
+    let text = if chars(&with_footer) <= max_chars { with_footer } else { bare };
+    report(d, &sections, &none, text)
+}
+
+/// The ids behind a finished layout. A memory counts as printed only when some entry printed it
+/// whole, so the dedupe in `memory_section` needs no case of its own: a repeat never becomes an
+/// entry, and the first section's pick decides. Rows that never became an entry at all, such as
+/// project rows without an active project, are left out by the same rule.
+fn report(d: &Digest, sections: &[Section], picks: &[Vec<Pick>], text: String) -> Rendered {
+    let mut whole = std::collections::HashSet::new();
+    let mut left_out_registry = Vec::new();
+    for (s, p) in sections.iter().zip(picks) {
+        for (e, p) in s.entries.iter().zip(p) {
+            match (&e.id, &e.registry, p) {
+                (Some(id), _, Pick::Whole) => {
+                    whole.insert(id.as_str());
+                }
+                (_, Some(key), Pick::Out) => left_out_registry.push(key.clone()),
+                _ => {}
+            }
+        }
+    }
+    let mut named = std::collections::HashSet::new();
+    let left_out = d
+        .profile
+        .iter()
+        .chain(&d.project_context)
+        .chain(&d.recent)
+        .filter(|f| !whole.contains(f.id.as_str()) && named.insert(f.id.as_str()))
+        .map(|f| f.id.clone())
+        .collect();
+    Rendered { text, left_out, left_out_registry }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,8 +345,13 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
         },
         cached: false,
         text: String::new(),
+        left_out: vec![],
+        left_out_registry: vec![],
     };
-    digest.text = render(&digest, budget);
+    let rendered = render_report(&digest, budget);
+    digest.text = rendered.text;
+    digest.left_out = rendered.left_out;
+    digest.left_out_registry = rendered.left_out_registry;
 
     // What the digest handed out, so a transcript quoting it back comes in as a confirmation rather
     // than as the same fact proposed again. Recorded on the build path only: a cache hit returns
@@ -403,6 +509,10 @@ struct Entry {
     body: Option<(String, String)>,
     /// The namespace a printed memory marks as shown, for the inventory line.
     namespace: Option<String>,
+    /// A memory's id, for `render_report`.
+    id: Option<String>,
+    /// A registry entry's `(namespace, kind, key)`, for `render_report`.
+    registry: Option<(String, String, String)>,
 }
 
 /// One `###` section and the word the footer uses for it.
@@ -421,6 +531,9 @@ enum Pick {
     Whole,
     Shortened(String),
 }
+
+/// One `Pick` per entry, one row per section.
+type Picks = Vec<Vec<Pick>>;
 
 /// Profile 40, project 25, recent 20, registry 15, as percentages of what the header and the
 /// tail leave over.
@@ -480,6 +593,8 @@ fn memory_section(
             line: format!("- {body}{suffix}"),
             body: Some((body, suffix)),
             namespace: Some(f.namespace.clone()),
+            id: Some(f.id.clone()),
+            registry: None,
         });
     }
     Section { noun, heading: format!("\n\n### {title}"), entries, share }
@@ -499,6 +614,8 @@ fn registry_section(d: &Digest) -> Section {
             ),
             body: None,
             namespace: None,
+            id: None,
+            registry: Some((r.namespace.clone(), r.kind.clone(), r.key.clone())),
         })
         .collect();
     Section { noun: "registry", heading: "\n\n### Registry".into(), entries, share: SHARES[3] }
@@ -703,57 +820,7 @@ fn footer(left: &[(&str, usize)], max_chars: usize) -> String {
 /// one exception is a memory longer than its whole section budget, which `fill_oversized` prints
 /// shortened. Before issue #109 the text stopped at `max_chars` in the middle of a bullet.
 pub fn render(d: &Digest, max_chars: usize) -> String {
-    let header = header(d);
-    let mut seen = std::collections::HashSet::new();
-    let mut sections = vec![memory_section(
-        "profile",
-        "About the user and standing preferences",
-        &d.profile,
-        SHARES[0],
-        &mut seen,
-    )];
-    // Without an active project the section stays empty and its share flows on to recent.
-    let project: &[Fact] = if d.project.is_some() { &d.project_context } else { &[] };
-    let title = format!("Project {}", d.project.as_deref().unwrap_or_default());
-    sections.push(memory_section("project", &title, project, SHARES[1], &mut seen));
-    sections.push(memory_section("recent", "Recently learned", &d.recent, SHARES[2], &mut seen));
-    sections.push(registry_section(d));
-
-    let every: Vec<Vec<Pick>> =
-        sections.iter().map(|s| vec![Pick::Whole; s.entries.len()]).collect();
-    let full = assemble(d, &header, &sections, &every, "", Tail::Full);
-    if chars(&full) <= max_chars {
-        return full;
-    }
-
-    // An overflowing digest caps its tail, then cuts the tail to its shortest form, then keeps
-    // only the sealed count. Each step gives the sections more room. The first step that fits
-    // and prints a whole entry wins, so a normal budget keeps its namespace names. When none
-    // prints a whole entry, the step that printed the most wins.
-    let room = max_chars.saturating_sub(chars(&header));
-    let any_entries = sections.iter().any(|s| !s.entries.is_empty());
-    let mut first_fit: Option<String> = None;
-    for mode in [Tail::Within(room * TAIL_SHARE / 100), Tail::Within(0), Tail::SealedOnly] {
-        let Some((text, whole)) = two_passes(d, &header, &sections, max_chars, mode) else {
-            continue;
-        };
-        if whole > 0 || !any_entries {
-            return text;
-        }
-        first_fit.get_or_insert(text);
-    }
-    if let Some(text) = first_fit {
-        return text;
-    }
-    // Only a budget smaller than the header and the footer together gets here.
-    let all: Vec<(&str, usize)> = sections.iter().map(|s| (s.noun, s.entries.len())).collect();
-    let bare = header_lines_within(&header, max_chars);
-    let with_footer = format!("{bare}{}", footer(&all, max_chars));
-    if chars(&with_footer) <= max_chars {
-        with_footer
-    } else {
-        bare
-    }
+    render_report(d, max_chars).text
 }
 
 /// How much of the tail an overflowing digest prints.
@@ -785,32 +852,32 @@ const TAIL_SHARE: usize = 20;
 /// well short of its cap; once memories print, their namespaces leave the list and shorter names
 /// fill more of it. So a first pass that overflows tries once more with the size it saw.
 ///
-/// Returns the text and how many entries printed whole.
+/// Returns the text, how many entries printed whole, and the picks behind the text.
 fn two_passes(
     d: &Digest,
     header: &str,
     sections: &[Section],
     max_chars: usize,
     mode: Tail,
-) -> Option<(String, usize)> {
+) -> Option<(String, usize, Picks)> {
     let worst_left: Vec<(&str, usize)> =
         sections.iter().map(|s| (s.noun, s.entries.len())).collect();
     let worst = chars(&tail(d, &std::collections::HashSet::new(), mode))
         + chars(&footer(&worst_left, max_chars));
-    let (text, used, whole) = match fit(d, header, sections, max_chars, worst, mode) {
+    let (text, used, whole, picks) = match fit(d, header, sections, max_chars, worst, mode) {
         Ok(first) => first,
         Err(seen) if seen > worst => fit(d, header, sections, max_chars, seen, mode).ok()?,
         Err(_) => return None,
     };
     Some(match fit(d, header, sections, max_chars, used, mode) {
-        Ok((second, _, w)) => (second, w),
-        Err(_) => (text, whole),
+        Ok((second, _, w, p)) => (second, w, p),
+        Err(_) => (text, whole, picks),
     })
 }
 
 /// Lays the sections out in what `reserve` leaves and renders the result, with the characters
-/// the tail and footer took and the count of entries printed whole. `Err` carries the characters
-/// the tail and footer took when the result overflowed.
+/// the tail and footer took, the count of entries printed whole and the picks. `Err` carries the
+/// characters the tail and footer took when the result overflowed.
 fn fit(
     d: &Digest,
     header: &str,
@@ -818,7 +885,7 @@ fn fit(
     max_chars: usize,
     reserve: usize,
     mode: Tail,
-) -> std::result::Result<(String, usize, usize), usize> {
+) -> std::result::Result<(String, usize, usize, Picks), usize> {
     let picks = layout(sections, max_chars.saturating_sub(chars(header) + reserve));
     let left: Vec<(&str, usize)> = sections
         .iter()
@@ -833,7 +900,7 @@ fn fit(
         return Err(used);
     }
     let whole = picks.iter().flatten().filter(|p| matches!(p, Pick::Whole)).count();
-    Ok((text, used, whole))
+    Ok((text, used, whole, picks))
 }
 
 /// The header's whole lines, as many as fit.
@@ -1013,6 +1080,8 @@ mod tests {
             counts: Counts { memories: 0, registry: 0, by_namespace: HashMap::new() },
             cached: false,
             text: String::new(),
+            left_out: vec![],
+            left_out_registry: vec![],
         }
     }
 
@@ -1093,8 +1162,8 @@ mod tests {
         assert!(!render(&base(), 6000).contains("### Sealed"));
     }
 
-    #[test]
-    fn truncates_instead_of_blowing_the_context_budget() {
+    /// Five hundred profile rows, far more than 1,000 characters hold.
+    fn overflowing_digest() -> Digest {
         let mut d = base();
         d.profile = (0..500)
             .map(|i| {
@@ -1102,6 +1171,27 @@ mod tests {
             })
             .collect();
         d.counts.memories = 500;
+        d
+    }
+
+    /// Two profile rules and one registry entry, which 6,000 characters hold with room to spare.
+    fn small_digest() -> Digest {
+        let mut d = base();
+        d.profile = three_rules().into_iter().take(2).collect();
+        d.registry = vec![RegistrySummary {
+            namespace: "global".into(),
+            kind: "host".into(),
+            key: "db".into(),
+            value: serde_json::json!("10.0.0.1"),
+        }];
+        d.counts.memories = 2;
+        d.counts.registry = 1;
+        d
+    }
+
+    #[test]
+    fn truncates_instead_of_blowing_the_context_budget() {
+        let d = overflowing_digest();
         let text = render(&d, 1000);
         assert!(text.chars().count() <= 1000, "{} chars: {text}", text.chars().count());
         assert!(text.contains("more profile entries left out at 1,000 chars"), "{text}");
@@ -1769,6 +1859,140 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
             value: serde_json::json!({"host": "127.0.0.1", "port": 5432}),
         }];
         assert!(render(&d, 6000).contains("host/db: {\"host\":\"127.0.0.1\",\"port\":5432}"));
+    }
+
+    /// The memory ids a rendered text printed whole: a bullet carries the row's flattened body
+    /// in full. A shortened bullet carries a prefix and the ellipsis, so it never matches.
+    fn printed_whole(text: &str, f: &Fact) -> bool {
+        text.lines().any(|l| l.starts_with("- ") && l.contains(&one_line(&f.content)))
+    }
+
+    fn registry_printed(text: &str, r: &RegistrySummary) -> bool {
+        let head = format!("- {}/{}: ", r.kind, r.key);
+        text.lines().any(|l| l.starts_with(&head))
+    }
+
+    fn registry_key(r: &RegistrySummary) -> (String, String, String) {
+        (r.namespace.clone(), r.kind.clone(), r.key.clone())
+    }
+
+    #[test]
+    fn render_report_names_every_row_not_printed_whole_and_nothing_printed_whole() {
+        let d = overflowing_digest();
+        let r = render_report(&d, 1000);
+        for f in d.profile.iter().chain(&d.project_context).chain(&d.recent) {
+            let whole = printed_whole(&r.text, f);
+            assert_eq!(!whole, r.left_out.contains(&f.id), "{}", f.id);
+        }
+    }
+
+    #[test]
+    fn a_tail_mode_render_reports_what_it_left_out() {
+        let d = overflowing_digest();
+        let r = render_report(&d, 1000);
+        assert!(r.text.contains("left out at 1,000 chars") && !r.left_out.is_empty());
+    }
+
+    #[test]
+    fn a_header_only_budget_leaves_every_row_out() {
+        let mut d = overflowing_digest();
+        d.registry = small_digest().registry;
+        let r = render_report(&d, 0);
+        let all: Vec<&String> =
+            d.profile.iter().chain(&d.project_context).chain(&d.recent).map(|f| &f.id).collect();
+        for id in all {
+            assert!(r.left_out.contains(id), "{id}");
+        }
+        assert_eq!(r.left_out_registry, vec![registry_key(&d.registry[0])]);
+    }
+
+    #[test]
+    fn a_digest_that_fits_leaves_nothing_out() {
+        let d = small_digest();
+        let r = render_report(&d, 6000);
+        assert!(r.left_out.is_empty() && r.left_out_registry.is_empty());
+    }
+
+    /// The property behind `left_out`, at every budget the crowded digest passes through: a
+    /// memory is named exactly when no bullet prints it whole, and a registry entry exactly when
+    /// no bullet prints it. Each id appears once.
+    #[test]
+    fn every_budget_names_exactly_the_rows_its_text_did_not_print_whole() {
+        let d = crowded();
+        let full = render(&d, 1_000_000).chars().count();
+        for max in (0..=full + 11).step_by(13) {
+            let r = render_report(&d, max);
+            for f in d.profile.iter().chain(&d.project_context).chain(&d.recent) {
+                let whole = printed_whole(&r.text, f);
+                assert_eq!(!whole, r.left_out.contains(&f.id), "{} at {max}:\n{}", f.id, r.text);
+            }
+            for e in &d.registry {
+                let left = r.left_out_registry.contains(&registry_key(e));
+                assert_eq!(registry_printed(&r.text, e), !left, "{} at {max}", e.key);
+            }
+            let unique: std::collections::HashSet<&String> = r.left_out.iter().collect();
+            assert_eq!(unique.len(), r.left_out.len(), "{max}");
+        }
+    }
+
+    #[test]
+    fn a_shortened_entry_counts_as_left_out() {
+        let mut d = base();
+        d.profile = vec![fact("p0", &"x".repeat(5000), "user:me", &[])];
+        d.counts.memories = 1;
+        let r = render_report(&d, 800);
+        assert!(r.text.contains(ELLIPSIS), "{}", r.text);
+        assert_eq!(r.left_out, vec!["p0".to_string()]);
+    }
+
+    #[test]
+    fn a_multi_line_fact_printed_on_one_line_counts_as_printed_whole() {
+        let mut d = base();
+        d.profile = vec![fact("p0", "first line\nsecond line\n- a list item", "user:me", &[])];
+        d.counts.memories = 1;
+        let r = render_report(&d, 6000);
+        assert!(r.text.contains("- first line second line \\- a list item"), "{}", r.text);
+        assert!(r.left_out.is_empty(), "{:?}", r.left_out);
+    }
+
+    #[test]
+    fn a_fact_printed_whole_in_one_section_is_not_left_out_by_its_repeat() {
+        let mut d = base();
+        d.project = Some("project:warden".into());
+        let rule = fact("p0", "Standing rule 0", "user:me", &[]);
+        d.profile = vec![rule.clone()];
+        d.recent = vec![rule];
+        d.counts.memories = 1;
+        let r = render_report(&d, 6000);
+        assert!(r.left_out.is_empty(), "{:?}", r.left_out);
+    }
+
+    #[test]
+    fn a_fact_left_out_of_its_first_section_stays_left_out_when_it_repeats() {
+        let mut d = overflowing_digest();
+        let last = d.profile.last().unwrap().clone();
+        d.recent = vec![last.clone()];
+        let r = render_report(&d, 1000);
+        assert!(!printed_whole(&r.text, &last), "{}", r.text);
+        assert_eq!(r.left_out.iter().filter(|id| **id == last.id).count(), 1);
+    }
+
+    #[test]
+    fn project_rows_without_an_active_project_are_left_out() {
+        let mut d = small_digest();
+        d.project_context = vec![fact("w0", "Warden fact 0", "project:warden", &[])];
+        let r = render_report(&d, 6000);
+        assert!(!r.text.contains("Warden fact 0"), "{}", r.text);
+        assert_eq!(r.left_out, vec!["w0".to_string()]);
+    }
+
+    #[test]
+    fn registry_entries_the_layout_drops_are_named_by_namespace_kind_and_key() {
+        let d = crowded();
+        let r = render_report(&d, 1500);
+        assert!(left_out(&r.text, "registry") > 0, "{}", r.text);
+        assert_eq!(r.left_out_registry.len(), left_out(&r.text, "registry"));
+        assert!(r.left_out_registry.iter().all(|(ns, kind, _)| ns == "global" && kind == "host"));
     }
 
     #[test]

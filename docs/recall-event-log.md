@@ -22,8 +22,11 @@ it exists and what lost.
 
 A digest served from the cache logs its rows as a new call, because a caller received them. A row
 that sits in two digest sections, such as a profile fact written this week that also lands in
-recent, gets one event per section. The digest rows are the structured payload's rows. The
-rendered markdown can leave an entry out for budget, and the log does not record that.
+recent, gets one event per section. The digest rows are
+the ones the digest held before rendering, the rows `rows: true` returns. The rendered markdown can
+leave an entry out for budget, and the log does not record that. The default structured payload
+carries the text, plus only the rows the text left out or shortened, so its rows are a subset of
+the logged ones.
 
 A private row is logged by id like any other. `recall_emission` skips private rows because it
 stores a keyed digest of the content. This log stores no content, so there is nothing to probe. It

@@ -1,5 +1,9 @@
 # 19. A caller corrects a proposal
 
+> **12 October 2026:** decision [0031](0031-mcp-answers-carry-what-an-agent-acts-on.md) supersedes
+> the clause that strips row content, `proposed_content` and field values from the MCP structured
+> copy. Each value now goes there inside its own fence. The rest of this record stands.
+
 **Date:** 23 September 2026 · **Status:** accepted, implemented · **Decided by:** the owner
 
 What was run, and where: on 23 September 2026, `./scripts/cargo.sh check --all-targets` ran clean,

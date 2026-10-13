@@ -42,7 +42,11 @@ pub struct Hit {
     pub id: String,
     pub namespace: String,
     pub content: String,
-    pub score: f64,
+    /// Absent on a brief answer: a call made without `detail: "full"` under `--invocation user`
+    /// or a hook. The CLI asks for the full shape, so a hit without it is a server that ignored
+    /// the request, and the reader prints a dash.
+    #[serde(default)]
+    pub score: Option<f64>,
 }
 
 /// `memory_write`'s structured content, from `domain::types::WriteOutcome`.
@@ -550,6 +554,11 @@ pub struct SearchArgsRequest {
     /// typed, so the server never has to guess which midnight a bare date meant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub as_of: Option<String>,
+    /// `"full"` keeps `score` and the other ranking fields on each hit. Every CLI search sets it,
+    /// so a server that defaults to the brief shape for other callers does not change what
+    /// `--json` prints or what `forget` ranks by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// `mcp::WriteArgs`.
@@ -599,6 +608,10 @@ pub struct RegistryArgsRequest {
 pub struct BootstrapArgsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// `true` asks for the digest's rows in the structured copy. `bootstrap --json` sets it; the
+    /// hook and the text path read only the text and leave it unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<bool>,
 }
 
 /// `ExportBody` in `src/http/archive.rs`. The passphrase travels in the body on this route too,
