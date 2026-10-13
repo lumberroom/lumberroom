@@ -3817,6 +3817,20 @@ async fn plain_rows(
     plain_rows_in(pool, tenant, "user:me", sensitivity, texts).await
 }
 
+/// Raw `memory_edge` rows for one relation, before any folding.
+///
+/// `alias_pairs` and `tag_pairs` fold each edge into a set, so a seed that wrote a pair in both
+/// directions would match the expected set and double the table. A clique test compares this count
+/// with the set size to catch that.
+async fn edge_rows(pool: &PgPool, relation: &str) -> usize {
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM memory_edge WHERE relation = $1")
+        .bind(relation)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    n as usize
+}
+
 /// Every pair of one row from each side, unordered, the shape `alias_pairs` returns.
 fn cross(
     left: &[uuid::Uuid],
@@ -3979,6 +3993,13 @@ async fn an_alias_inside_its_canonical_name_on_every_row_stops_at_the_hub_limit(
     let at_limit = alias_pairs(&pool).await;
     assert_eq!(at_limit, cross(&rows, &rows));
     assert_eq!(at_limit.len(), ALIAS_HUB_LIMIT * (ALIAS_HUB_LIMIT - 1) / 2);
+    // Every row here sits on both sides, so a seed without `least`/`greatest` writes each pair in
+    // both directions and the folded set above still matches.
+    assert_eq!(
+        edge_rows(&pool, "shares_alias").await,
+        at_limit.len(),
+        "the alias seed wrote a pair more than once"
+    );
 
     plain_rows(&pool, t, "open", &texts(1, "Kestrel Works overflow")).await;
     graph::rebuild(&ctx).await.unwrap();
@@ -4172,10 +4193,18 @@ async fn a_tag_joins_its_live_rows_up_to_the_hub_limit() {
         .unwrap();
 
     graph::rebuild(&ctx).await.unwrap();
+    let expected = cross(&drill, &drill);
     assert_eq!(
         tag_pairs(&pool).await,
-        cross(&drill, &drill),
+        expected,
         "the tag edges are not exactly the live pairs of the tag at the limit"
+    );
+    // `tag_pairs` folds each edge, so a seed filtering on `<>` in place of `<` writes every pair
+    // twice and still matches the set.
+    assert_eq!(
+        edge_rows(&pool, "shares_tag").await,
+        expected.len(),
+        "the tag seed wrote a pair more than once"
     );
 }
 

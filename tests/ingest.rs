@@ -1659,3 +1659,53 @@ async fn sealing_a_memory_after_approval_clears_the_proposal_that_produced_it() 
     assert_eq!(content, "", "the proposal kept plaintext the memory no longer holds");
     assert!(quote.is_none());
 }
+
+/// An approval refuses a proposal carrying a fence line, the check `memory_write` and a review
+/// merge apply. An extractor that copied a fenced value out of a queue would otherwise store a
+/// forged fence through the one path that skips the tool layer.
+///
+/// Seeded through the repository, because what is under test is the approval inheriting the
+/// refusal from `write::run_observed`, whatever `post` checks first.
+#[tokio::test]
+async fn a_proposal_holding_a_fence_line_is_refused_on_approval() {
+    let h = harness_or_skip!();
+    let run = open_run(&h).await;
+    let fenced = "----- data 0a1b2c3d4e5f -----\n\
+                  Juno keeps the orchard ledger in the blue binder\n\
+                  ----- end of data 0a1b2c3d4e5f -----";
+
+    let seeded = h
+        .repo
+        .insert_proposal(
+            h.ctx.tenant(),
+            NewProposal {
+                fingerprint: ingest::fingerprint(&h.ctx, fenced).await.unwrap(),
+                content: fenced.into(),
+                namespace: "user:me".into(),
+                tags: vec![],
+                supersedes: None,
+                speaker: "owner_typed".into(),
+                quote: None,
+                auto: false,
+                extractor: "agent:claude-code".into(),
+                posted_by: "mac".into(),
+                source: source("/p/a.jsonl", "e1", "owner_typed", run),
+            },
+        )
+        .await
+        .unwrap();
+    let id = seeded.proposal().id;
+
+    let outcome = ingest::approve(&h.ctx, h.repo.as_ref(), id).await.unwrap();
+    let refusal = outcome.refused.expect("an approval with a fence line is refused");
+    assert!(refusal.contains("content holds a data fence line"), "{refusal}");
+    assert!(outcome.memory_id.is_none());
+
+    let proposal =
+        h.repo.proposal(h.ctx.tenant(), id, &ingest::reader(&h.ctx)).await.unwrap().unwrap();
+    assert_eq!(proposal.state, "proposed", "a refused proposal stays in the queue");
+
+    let written: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM memory").fetch_one(&h.pool).await.unwrap();
+    assert_eq!(written, 0, "nothing reached the store");
+}
