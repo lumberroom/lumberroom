@@ -376,7 +376,8 @@ async fn an_oauth_writer_reads_as_its_name_and_its_client_id_never_reaches_mcp()
     assert_no_id("memory_history", &history, &codex.id);
 
     bootstrap::clear_cache();
-    let digest = h.call("context_bootstrap", json!({})).await;
+    // rows: true asks for every fact with its id; the brief answer carries only what the text left out.
+    let digest = h.call("context_bootstrap", json!({ "rows": true })).await;
     assert!(text(&digest).contains("via Codex"), "{}", text(&digest));
     // `global` feeds the profile section as well as the recent one, so look in every section.
     let payload = structured(&digest);

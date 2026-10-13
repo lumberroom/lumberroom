@@ -35,6 +35,7 @@ use crate::services::{bootstrap, forget, registry, search, write, Ctx, Repos};
 
 pub mod capability;
 pub mod extra_tools;
+pub mod review_view;
 pub mod views;
 
 pub const SERVER_NAME: &str = "lumberroom";
@@ -167,6 +168,10 @@ pub struct BootstrapArgs {
     /// Absolute path or slug of the project you are working in, so its memory is promoted.
     #[serde(default)]
     pub project: Option<String>,
+    /// true adds every fact the digest drew from, with its id and exact text. The digest text
+    /// carries no ids.
+    #[serde(default)]
+    pub rows: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -182,7 +187,7 @@ pub struct SearchArgs {
     /// search. Namespaces the credential cannot read are left out either way.
     #[serde(default)]
     pub namespaces: Option<Vec<String>>,
-    /// Maximum rows. Default 8.
+    /// Maximum rows. Default 8, at most 50 unless the operator changed it.
     #[serde(default)]
     pub limit: Option<i64>,
     /// Slug or path of the current project. Its namespace joins the user namespace and global in
@@ -211,6 +216,10 @@ pub struct SearchArgs {
     /// something the store holds. Absent or empty, no tag filter applies.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// 'full' adds each hit's fused score and whether it came from the primary set. Results and
+    /// order are the same either way.
+    #[serde(default)]
+    pub detail: Option<views::Detail>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -305,7 +314,8 @@ path or slug, promotes that project's memory.",
         self.run("context_bootstrap", None, &rc, |ctx| async move {
             let digest = bootstrap::run(&ctx, args.project.as_deref()).await?;
             let text = digest.text.clone();
-            Ok((text, serde_json::to_value(&digest).unwrap_or_default()))
+            let rows = views::rows_for(ctx.invocation, args.rows);
+            Ok((text, views::digest(&digest, rows)))
         })
         .await
     }
@@ -350,8 +360,8 @@ that wrote it. tags keeps only facts carrying all of them.",
                 &args.tags.unwrap_or_default(),
             )
             .await?;
-            let json = serde_json::to_value(&result).unwrap_or_default();
-            Ok((serde_json::to_string_pretty(&json).unwrap_or_default(), json))
+            let json = views::search(&result, views::detail_for(ctx.invocation, args.detail));
+            Ok((views::compact(&json), json))
         })
         .await
     }
@@ -407,7 +417,7 @@ and step-by-step history stay in the conversation.",
             .await
             .map_err(with_split_advice)?;
             let json = serde_json::to_value(&result).unwrap_or_default();
-            Ok((serde_json::to_string_pretty(&json).unwrap_or_default(), json))
+            Ok((views::compact(&json), json))
         })
         .await
     }
@@ -442,7 +452,7 @@ source is the name of the app that wrote the value.",
             .await?;
             let view = views::registry_get(&ctx, result).await;
             let json = serde_json::to_value(&view).unwrap_or_default();
-            Ok((serde_json::to_string_pretty(&json).unwrap_or_default(), json))
+            Ok((views::compact(&json), json))
         })
         .await
     }
@@ -545,7 +555,8 @@ impl Lumberroom {
         match outcome {
             Ok((text, structured)) => {
                 let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-                // Models read the text; the CLI and any dashboard read the structured payload.
+                // Some clients put the text in front of the model and some the structured payload, so each
+                // channel carries the whole answer (decision 0031).
                 result.structured_content = Some(structured);
                 Ok(result)
             }

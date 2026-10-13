@@ -17,6 +17,7 @@ use lumberroom_server::domain::policy::NamespaceGrant;
 use lumberroom_server::domain::types::{Invocation, Memory, Principal};
 use lumberroom_server::mcp::AppState;
 use lumberroom_server::ports::OauthStore;
+use lumberroom_server::services::review_queue;
 use lumberroom_server::services::review_queue::{
     ProposalDecided, ProposalDecision, ProposalItem, ProposalSource, Verdict, Via,
 };
@@ -459,47 +460,140 @@ async fn asking_the_engine_for_proposals_returns_the_configured_source() {
     );
 }
 
+/// `^----- data ([0-9a-f]{12}) -----\n(.*)\n----- end of data \1 -----$` in dotall mode, matched by
+/// hand: the engine takes no regex crate for one pattern.
+fn fenced(s: &str) -> Option<(String, String)> {
+    let rest = s.strip_prefix("----- data ")?;
+    if rest.len() < 12 {
+        return None;
+    }
+    let (nonce, rest) = rest.split_at(12);
+    if !nonce.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+        return None;
+    }
+    let body = rest.strip_prefix(" -----\n")?;
+    let body = body.strip_suffix(&format!("\n----- end of data {nonce} -----"))?;
+    Some((nonce.to_string(), body.to_string()))
+}
+
+// Decision 0031 supersedes 0019's clause that kept free text out of the structured copy. Claude
+// Code reads only that copy, so the text now travels there too, each value inside its own fence.
 #[tokio::test]
-async fn the_structured_copy_carries_no_row_or_proposal_free_text() {
+async fn the_structured_copy_fences_every_row_and_proposal_free_text() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
-    let id = write_at(
-        &h.ctx,
-        &format!("free text that must never leave the fence {}", nonce("s4")),
-        "global",
-    )
-    .await;
+    let content = format!("free text the fence carries {}", nonce("s4"));
+    let id = write_at(&h.ctx, &content, "global").await;
     make_stale(&h.pool, &id).await;
 
     let result = h.call("review_queue", serde_json::json!({})).await;
     assert!(!refused(&result), "{result:?}");
 
     let body = structured(&result);
-    let dump = serde_json::to_string(&body).unwrap();
-    assert!(
-        !dump.contains("free text that must never leave the fence"),
-        "row content reached the structured copy: {dump}"
-    );
-    assert!(
-        !dump.contains("what apply would write"),
-        "the canned proposal's proposed_content reached the structured copy: {dump}"
-    );
-
     let items = body["items"].as_array().cloned().unwrap_or_default();
     assert!(!items.is_empty(), "the page carries at least the stale row and the canned proposal");
+    let mut nonces = std::collections::HashSet::new();
+    let mut saw_row = false;
+    let mut saw_proposal = false;
     for item in &items {
-        if let Some(rows) = item["rows"].as_array() {
-            for row in rows {
-                assert!(row.get("content").is_none(), "a row kept its content: {row:?}");
-                assert!(row.get("id").is_some(), "a row lost its id: {row:?}");
+        for row in item["rows"].as_array().cloned().unwrap_or_default() {
+            assert!(row.get("id").is_some(), "a row lost its id: {row:?}");
+            let raw = row["content"].as_str().unwrap_or_else(|| panic!("no content: {row:?}"));
+            let (n, inner) = fenced(raw).unwrap_or_else(|| panic!("unfenced row text: {raw:?}"));
+            assert!(nonces.insert(n), "two values share a nonce: {body}");
+            if inner == content {
+                saw_row = true;
             }
         }
         if let Some(proposal) = item.get("proposal").filter(|p| !p.is_null()) {
-            assert!(proposal.get("proposed_content").is_none(), "{proposal:?}");
-            assert!(proposal.get("fields").is_none(), "{proposal:?}");
             assert!(proposal.get("id").is_some(), "a proposal lost its id: {proposal:?}");
             assert!(proposal.get("version").is_some(), "a proposal lost its version: {proposal:?}");
+            if let Some(raw) = proposal["proposed_content"].as_str() {
+                let (n, inner) =
+                    fenced(raw).unwrap_or_else(|| panic!("unfenced proposed_content: {raw:?}"));
+                assert!(nonces.insert(n), "two values share a nonce: {body}");
+                if inner == "what apply would write" {
+                    saw_proposal = true;
+                }
+            }
         }
     }
+    assert!(saw_row, "the stale row's text came back fenced: {body}");
+    assert!(saw_proposal, "the canned proposal's text came back fenced: {body}");
+}
+
+/// `count` stale rows backdated past `stale_days`.
+async fn stale_rows(h: &Harness, count: i64) {
+    for i in 0..count {
+        let label = format!("page{i}");
+        let id = write_at(
+            &h.ctx,
+            &format!("stale row {i} for the default page {}", nonce(&label)),
+            "global",
+        )
+        .await;
+        make_stale(&h.pool, &id).await;
+    }
+}
+
+fn stale_items(body: &serde_json::Value) -> usize {
+    body["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|i| i["key"].as_str().is_some_and(|k| k.starts_with("stale:")))
+                .count()
+        })
+        .unwrap_or_default()
+}
+
+// An MCP call with no limit reads the service's own page, as HTTP and the CLI do. A short MCP page
+// hid stale items from agents, and a search during review clears staleness, so the queue shrank
+// before page two. One row past the default leaves exactly one behind and says so.
+#[tokio::test]
+async fn an_mcp_call_with_no_limit_reads_the_service_default_and_says_more_waits() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
+    stale_rows(&h, review_queue::DEFAULT_LIMIT + 1).await;
+
+    let result = h.call("review_queue", serde_json::json!({ "source": ["stale"] })).await;
+    assert!(!refused(&result), "{result:?}");
+    let body = structured(&result);
+    let page = usize::try_from(review_queue::DEFAULT_LIMIT).unwrap();
+    assert_eq!(stale_items(&body), page, "{body}");
+    assert!(body.get("more").is_some(), "a full page with rows left carries the more hint: {body}");
+    let answer = text(&result);
+    let last = answer.lines().last().unwrap_or_default();
+    assert!(last.starts_with("more: "), "the text ends on the more line: {answer}");
+}
+
+// Twelve rows sit well under the service default of 50, so every row comes back and no `more` hint
+// appears on either channel.
+#[tokio::test]
+async fn an_mcp_call_with_no_source_returns_every_row_under_the_default_without_more() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
+    stale_rows(&h, 12).await;
+
+    let result = h.call("review_queue", serde_json::json!({})).await;
+    assert!(!refused(&result), "{result:?}");
+    let body = structured(&result);
+    assert_eq!(stale_items(&body), 12, "{body}");
+    assert!(body.get("more").is_none(), "no source holds more than the default: {body}");
+    let answer = text(&result);
+    assert!(!answer.lines().any(|l| l.starts_with("more: ")), "{answer}");
+}
+
+// An explicit limit reaches the service: five rows with limit 3 return three items and the hint.
+#[tokio::test]
+async fn an_mcp_call_with_an_explicit_limit_returns_that_page_and_says_more_waits() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
+    stale_rows(&h, 5).await;
+
+    let result =
+        h.call("review_queue", serde_json::json!({ "source": ["stale"], "limit": 3 })).await;
+    assert!(!refused(&result), "{result:?}");
+    let body = structured(&result);
+    assert_eq!(stale_items(&body), 3, "{body}");
+    assert!(body.get("more").is_some(), "rows are left, so more is present: {body}");
 }
 
 // ---------------------------------------------------------------------------------------------

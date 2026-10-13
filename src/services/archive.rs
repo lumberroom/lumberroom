@@ -410,7 +410,8 @@ async fn merge(
         }
 
         // `run_restored` is `run_observed` with the carried cap. An exported row was valid where it
-        // was written, and a cap of 2000 would refuse every longer one.
+        // was written, and a cap of 2000 would refuse every longer one. The fence-line check of
+        // decision 0031 is off for the same reason: the row arrives as it was stored.
         //
         // `run_observed` rather than `run`, and the near-now fence is the whole difference.
         //
