@@ -51,3 +51,31 @@ def test_tools_list_reads_the_slot_mcp_config(tmp_path):
     (tmp_path / "mcp.json").write_text(_j.dumps({"mcpServers": {"lumberroom": {
         "type": "http", "url": "http://127.0.0.1:8941/mcp", "headers": {"Authorization": "Bearer tok"}}}}))
     assert mcp_endpoint(tmp_path) == ("http://127.0.0.1:8941/mcp", "tok")
+
+
+def test_fetch_tools_follows_next_cursor_across_pages(tmp_path, monkeypatch):
+    import io
+    import json as _j
+    import probe
+    (tmp_path / "mcp.json").write_text(_j.dumps({"mcpServers": {"lumberroom": {
+        "type": "http", "url": "http://127.0.0.1:8941/mcp", "headers": {"Authorization": "Bearer tok"}}}}))
+    pages = {None: {"tools": [{"name": "memory_write"}], "nextCursor": "p2"},
+             "p2": {"tools": [{"name": "memory_search"}]}}
+    sent = []
+
+    class Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def urlopen(req, timeout=None):
+        body = _j.loads(req.data)
+        sent.append(body["params"].get("cursor"))
+        msg = {"jsonrpc": "2.0", "id": body["id"], "result": pages[body["params"].get("cursor")]}
+        return Resp(("event: message\ndata: " + _j.dumps(msg) + "\n\n").encode())
+
+    monkeypatch.setattr(probe.urllib.request, "urlopen", urlopen)
+    assert [t["name"] for t in probe.fetch_tools(tmp_path)] == ["memory_write", "memory_search"]
+    assert sent == [None, "p2"]

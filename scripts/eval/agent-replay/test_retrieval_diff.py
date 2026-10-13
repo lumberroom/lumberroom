@@ -121,3 +121,11 @@ def test_frozen_queries_and_the_report_default_to_the_gate_root(monkeypatch, tmp
     r = resolve_outputs(build_parser().parse_args(
         ["run", "--base-slot", "a", "--branch-slot", "b", "--cli-fixture", "c"]))
     assert r.frozen == tmp_path / "frozen-queries.jsonl" and r.out == tmp_path / "build-replay.md"
+
+
+def test_a_source_the_branch_returns_outside_the_compared_sources_is_a_difference():
+    full = {"conflict": keys("conflict", 2), "stale": keys("stale", 2)}
+    page = {**full, "undated": keys("undated", 3)}
+    diffs = default_page_diffs(full, page, has_more_hint=False)
+    assert [d["name"] for d in diffs] == ["review undated default page (source not compared)"]
+    assert diffs[0]["branch"] == keys("undated", 3)

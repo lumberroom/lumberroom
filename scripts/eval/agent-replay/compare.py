@@ -208,6 +208,9 @@ def rescore(records, tasks):
     A record keeps the outcome its session derived, and records written before the forget outcome
     read the whole end state say `deleted` for a run that also deleted other rows. Agreement on a
     forget task scores the outcome the end state supports, whenever the record was written."""
+    bad = unfilled_targets(tasks)
+    if bad:
+        raise ValueError(f"unfilled {UNFILLED} target ids in the task file: {', '.join(bad)}")
     out = []
     for r in records:
         items = [i for i in (tasks.get(r.get("task")) or {}).get("items", []) if i.get("kind") == "forget"]
@@ -219,8 +222,25 @@ def rescore(records, tasks):
     return out
 
 
+UNFILLED = "@id:"
+
+
+def unfilled_targets(tasks):
+    """`task/item` for every forget item whose target_id is still a seed-key token."""
+    return [f"{tid}/{i.get('item')}" for tid, t in tasks.items() for i in t.get("items", [])
+            if str(i.get("target_id", "")).startswith(UNFILLED)]
+
+
 def load_tasks(path: Path):
-    return {t["id"]: t for t in (json.loads(l) for l in path.read_text().splitlines() if l.strip())}
+    """Task id -> task. Refuses a file whose target ids still hold `@id:` tokens: rescored against
+    one, every forget run that deleted anything reads `wrong_row` on every arm, and the arms agree
+    on a failure nobody made."""
+    tasks = {t["id"]: t for t in (json.loads(l) for l in path.read_text().splitlines() if l.strip())}
+    bad = unfilled_targets(tasks)
+    if bad:
+        raise ValueError(f"{path} holds unfilled {UNFILLED} target ids ({', '.join(bad)}); "
+                         "pass the file fill_ids.py wrote")
+    return tasks
 
 
 def judge_path(root: Path, stage, channel, base, arm, task) -> Path:
@@ -464,7 +484,12 @@ def main(argv=None):
     ap.add_argument("--noise", default="A0b", help="second runs on the base build; A1b when scoring A2")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args(argv)
-    text, failed = report(load_records(args.root), load_tasks(args.tasks), load_judge(args.root),
+    try:
+        tasks = load_tasks(args.tasks)
+    except ValueError as e:
+        print(f"compare.py: {e}", file=sys.stderr)
+        return 2
+    text, failed = report(load_records(args.root), tasks, load_judge(args.root),
                           args.arm, args.base, args.noise, root=args.root)
     (args.out.write_text(text) if args.out else print(text))
     return 1 if failed else 0

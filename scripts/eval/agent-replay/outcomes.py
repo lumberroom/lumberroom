@@ -188,12 +188,14 @@ def forget_outcome(target_id, end_state: dict) -> str:
 
     `deleted`: the target went and nothing else was deleted or superseded. `deleted:extra`: the
     target went with other rows. `wrong_row`: the target survived and another row was deleted.
-    `left`: nothing was deleted."""
+    `superseded`: the target was superseded and nothing was deleted. `left`: none of these."""
     deleted = set(end_state.get("deleted") or [])
     others = (deleted | set(end_state.get("superseded") or [])) - {target_id}
     if target_id in deleted:
         return "deleted:extra" if others else "deleted"
-    return "wrong_row" if deleted else "left"
+    if deleted:
+        return "wrong_row"
+    return "superseded" if target_id in set(end_state.get("superseded") or []) else "left"
 
 
 def derive_outcomes(task: dict, calls, received_keys, end_state: dict) -> dict:

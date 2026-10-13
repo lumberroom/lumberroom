@@ -142,6 +142,36 @@ def disk_stop(free_bytes, min_free_gb):
     return free_bytes < min_free_gb * 2**30
 
 
+def existing_parent(path: Path) -> Path:
+    """`path`, or its nearest parent that exists, so free space reads before the directory does."""
+    path = Path(path)
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
+
+
+# Claude Code writes a tool answer it saves to a file under here, outside the gate root.
+SPILL_DIR = Path.home() / ".claude" / "projects"
+
+
+class Halt:
+    """The batch's stop flag. The first stop keeps its exit code and message: a later stop that
+    races it only confirms the batch is stopping."""
+
+    def __init__(self):
+        self._event, self._lock = threading.Event(), threading.Lock()
+        self.code = self.message = None
+
+    def halt(self, code, message):
+        with self._lock:
+            if self.code is None:
+                self.code, self.message = code, message
+        self._event.set()
+
+    def is_set(self):
+        return self._event.is_set()
+
+
 def preflight(names, root: Path, fetch=probe.fetch_tools, declarations=True):
     """Problems with the slots a queue uses, one line each. A slot directory must exist, and with
     `declarations` its tools/list must carry decision 0032's size declaration."""
@@ -208,7 +238,8 @@ def load_existing(root: Path):
     return out
 
 
-def run(args, *, run_job=run_job, disk_free=lambda p: shutil.disk_usage(p).free, check_slots=None):
+def run(args, *, run_job=run_job, disk_free=lambda p: shutil.disk_usage(p).free, check_slots=None,
+        spill_dir=SPILL_DIR):
     root = args.root
     slot_of = slot_map(args.slot_of)
     tasks = {t["id"]: t for t in (json.loads(l) for l in args.tasks.read_text().splitlines() if l.strip())}
@@ -228,8 +259,7 @@ def run(args, *, run_job=run_job, disk_free=lambda p: shutil.disk_usage(p).free,
         for line in problems:
             print("SLOT CHECK FAILED:", line)
         return EXIT_SLOTS
-    stop = threading.Event()
-    why = {}
+    stop = Halt()
     slot_locks = {}
     guard = threading.Lock()
 
@@ -237,11 +267,7 @@ def run(args, *, run_job=run_job, disk_free=lambda p: shutil.disk_usage(p).free,
         with guard:
             return slot_locks.setdefault(name, threading.Lock())
 
-    def halt(code, message):
-        with guard:
-            why.setdefault("code", code)
-            why.setdefault("message", message)
-        stop.set()
+    halt = stop.halt
 
     def one(job):
         if stop.is_set():
@@ -249,9 +275,10 @@ def run(args, *, run_job=run_job, disk_free=lambda p: shutil.disk_usage(p).free,
         with lock_for(slot_name(job, slot_of)):
             if stop.is_set():
                 return None
-            free = disk_free(root)
+            # Saved answers land under spill_dir, which can sit on another disk: the lower wins.
+            free, where = min((disk_free(p), p) for p in (root, existing_parent(spill_dir)))
             if disk_stop(free, args.min_free_gb):
-                halt(EXIT_DISK, f"free disk under {root} is {free / 2**30:.1f} GB, below "
+                halt(EXIT_DISK, f"free disk under {where} is {free / 2**30:.1f} GB, below "
                                 f"{args.min_free_gb} GB: batch stopped, free space and rerun `batch.py run`")
                 return None
             # The slot resets before every session: a fresh database from the task's template.
@@ -270,8 +297,8 @@ def run(args, *, run_job=run_job, disk_free=lambda p: shutil.disk_usage(p).free,
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         list(pool.map(one, todo))
     if stop.is_set():
-        print(why["message"])
-        return why["code"]
+        print(stop.message)
+        return stop.code
     return 0
 
 

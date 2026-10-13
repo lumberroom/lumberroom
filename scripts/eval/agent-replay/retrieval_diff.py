@@ -87,6 +87,11 @@ def default_page_diffs(full, branch_default, has_more_hint):
         if len(got) > DEFAULT_PAGE:
             diffs.append({"name": f"review {src} default page size", "base": DEFAULT_PAGE,
                           "branch": len(got)})
+    # A source the branch answered from that the replay never read in full has nothing to compare
+    # against, so its keys are a difference rather than a silent pass.
+    for src in sorted(set(branch_default) - set(full)):
+        diffs.append({"name": f"review {src} default page (source not compared)", "base": [],
+                      "branch": branch_default[src]})
     want_more = any(len(keys) > DEFAULT_PAGE for keys in full.values())
     if want_more != bool(has_more_hint):
         diffs.append({"name": "review default page more", "base": want_more, "branch": bool(has_more_hint)})

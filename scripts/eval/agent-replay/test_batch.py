@@ -224,10 +224,58 @@ def test_the_run_stops_past_the_five_hour_threshold(tmp_path):
 def test_the_run_stops_when_free_disk_falls_below_the_floor(tmp_path):
     from batch import build_parser, run
     seen, free = [], iter([10**12, 10**12, 10**6, 10**6])
+    (tmp_path / "spill").mkdir()
     a = build_parser().parse_args(batch_files(tmp_path))
-    rc = run(a, run_job=fake_job([], seen), disk_free=lambda p: next(free),
-             check_slots=lambda names, root: [])
+    rc = run(a, run_job=fake_job([], seen), disk_free=lambda p: next(free) if p == tmp_path else 10**12,
+             check_slots=lambda names, root: [], spill_dir=tmp_path / "spill")
     assert seen == [1, 2] and rc == 4
+
+
+def test_the_disk_stop_also_reads_where_claude_code_saves_answers(tmp_path):
+    # Saved tool answers land under ~/.claude/projects/, which can sit on another disk.
+    from batch import build_parser, run
+    seen, asked, spill = [], [], tmp_path / "spill"
+    spill.mkdir()
+    free = iter([10**12, 10**6])
+
+    def disk_free(p):
+        asked.append(p)
+        return 10**12 if p == tmp_path else next(free)
+    a = build_parser().parse_args(batch_files(tmp_path))
+    rc = run(a, run_job=fake_job([], seen), disk_free=disk_free,
+             check_slots=lambda names, root: [], spill_dir=spill)
+    assert seen == [1] and rc == 4
+    assert set(asked) == {tmp_path, spill}
+
+
+def test_the_spill_check_reads_the_nearest_existing_parent(tmp_path):
+    from batch import existing_parent
+    assert existing_parent(tmp_path / "not" / "yet") == tmp_path
+
+
+def test_the_first_stop_keeps_its_exit_code_when_two_stops_race():
+    import threading
+    from batch import Halt, EXIT_DISK, EXIT_RATE_LIMIT
+    h = Halt()
+    h.halt(EXIT_RATE_LIMIT, "rate")
+    h.halt(EXIT_DISK, "disk")
+    assert h.is_set() and (h.code, h.message) == (EXIT_RATE_LIMIT, "rate")
+    # Racing threads: one pair wins whole, never a code from one and a message from another.
+    for _ in range(50):
+        h, go = Halt(), threading.Barrier(8)
+
+        def stopper(i):
+            go.wait()
+            h.halt(i, f"m{i}")
+        ts = [threading.Thread(target=stopper, args=(i,)) for i in range(8)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        assert h.message == f"m{h.code}"
+
+
+def test_a_fresh_halt_is_not_set():
+    from batch import Halt
+    assert not Halt().is_set()
 
 
 def test_a_failed_slot_check_starts_no_session(tmp_path):

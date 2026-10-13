@@ -368,3 +368,32 @@ def test_the_report_prints_the_stub_count_and_fails_nothing_on_it(tmp_path, caps
     assert main_of(tmp_path) == 0
     out = capsys.readouterr().out
     assert "File-stubbed sessions" in out and "A0 1 of 5" in out
+
+
+def test_a_task_file_with_unfilled_ids_is_refused_by_name(tmp_path):
+    import json as _j
+    import pytest
+    from compare import load_tasks
+    f = tmp_path / "tasks.example.jsonl"
+    f.write_text(_j.dumps({"id": "forget-1", "group": "forget", "items": [
+        {"item": "gone", "kind": "forget", "target_id": "@id:project-x-0016"}]}) + "\n")
+    with pytest.raises(ValueError, match="tasks.example.jsonl"):
+        load_tasks(f)
+
+
+def test_rescore_refuses_an_unfilled_target_id():
+    import pytest
+    from compare import rescore
+    tasks = {"forget-1": {"id": "forget-1", "items": [{"item": "gone", "kind": "forget", "target_id": "@id:k"}]}}
+    with pytest.raises(ValueError, match="@id:"):
+        rescore([forget_run("A0", ["t"])], tasks)
+
+
+def test_main_exits_two_on_an_unfilled_task_file(tmp_path, capsys):
+    import json as _j
+    import compare
+    write_tree(tmp_path, AGREE)
+    (tmp_path / "tasks.jsonl").write_text(_j.dumps({"id": "forget-1", "group": "forget", "decision": True,
+        "channels": ["structured"], "items": [{"item": "gone", "kind": "forget", "target_id": "@id:k"}]}) + "\n")
+    assert compare.main(["--root", str(tmp_path), "--tasks", str(tmp_path / "tasks.jsonl")]) == 2
+    assert "fill_ids.py" in capsys.readouterr().err

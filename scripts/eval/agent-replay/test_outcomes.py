@@ -348,3 +348,8 @@ def test_the_last_rate_limit_event_lands_in_the_parse():
 
 def test_a_stream_with_no_rate_limit_event_parses_to_none():
     assert parse_stream(lines(INIT, final()))["rate_limit"] is None
+
+
+def test_a_forget_that_supersedes_the_target_and_deletes_nothing_reads_superseded():
+    assert derive_outcomes(FORGET, [], [], end(superseded=[B])) == {"gone": "superseded"}
+    assert derive_outcomes(FORGET, [], [], end(superseded=[A])) == {"gone": "left"}

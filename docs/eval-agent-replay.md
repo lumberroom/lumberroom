@@ -286,13 +286,19 @@ slot: `slot.sh load-template D "$LR_GATE_ROOT/dumps/review-1.dump" review-1` and
 `slot.sh load-template D "$LR_GATE_ROOT/dumps/default.dump"` with no name for the default template. `backdate` merge-imports the fixture rows, rewrites
 `created_at` in SQL, clears the conflict-pair marks for those rows so the sweeper rescans them in
 the corrected order, and writes the key map. The merge mints new ids, which is why the template is
-built once and copied: one backdate, one set of ids, one key map. Point the task file at the live
-keys with every map at once:
+built once and copied: one backdate, one set of ids, one key map. First replace the task file's
+`@id:<seed key>` tokens with server ids, then point it at the live keys with every map at once:
 
 ```
+fill_ids.py --ids <ids file seed.py load wrote> --in scripts/eval/agent-replay/tasks.example.jsonl \
+    --out "$LR_GATE_ROOT/tasks.jsonl"
 seed_review.py remap-tasks --keys-map "$LR_GATE_ROOT"/map-review-{1,2,3,4}.json \
-    --in tasks.jsonl --out "$LR_GATE_ROOT/tasks.live.jsonl"
+    --in "$LR_GATE_ROOT/tasks.jsonl" --out "$LR_GATE_ROOT/tasks.live.jsonl"
 ```
+
+Every later command takes `tasks.live.jsonl`. `compare.py` refuses a task file whose `target_id`
+still starts with `@id:` and names the file: rescored against an unfilled id, every forget run that
+deleted anything reads `wrong_row` on every arm, and the arms would agree on a failure.
 
 `empty` waits for `conflicts_pending` to read 0, applies `keep_both` to every real conflict pair,
 sets `last_confirmed_at = now()` on every real stale row, fills the first listed day on every real
@@ -364,8 +370,8 @@ apart from the `runs/` tree that `batch.py` resumes from and `compare.py` scores
 ## Batches
 
 ```
-batch.py expand --tasks tasks.jsonl --stage sonnet --model claude-sonnet-5-5 --out "$LR_GATE_ROOT/sonnet.jsonl"
-batch.py run --batch "$LR_GATE_ROOT/sonnet.jsonl" --tasks tasks.jsonl --limit 40 --concurrency 3
+batch.py expand --tasks "$LR_GATE_ROOT/tasks.live.jsonl" --stage sonnet --model claude-sonnet-5-5 --out "$LR_GATE_ROOT/sonnet.jsonl"
+batch.py run --batch "$LR_GATE_ROOT/sonnet.jsonl" --tasks "$LR_GATE_ROOT/tasks.live.jsonl" --limit 40 --concurrency 3
 ```
 
 `expand` writes 264 structured and 162 text sessions for the Sonnet stage of the example task
@@ -389,8 +395,10 @@ same task and repeat, so a model or quota change between windows lands on every 
   `allowed`, or its five-hour utilization (`unifiedWindows.five_hour.utilization`) passes
   `--max-five-hour` (default 0.6), the queue stops starting sessions and exits 3, the same as a
   usage limit. The run that reported it keeps its record.
-- *Disk.* Before each session `run` reads free space under the gate root. Below `--min-free-gb`
-  (default 5) it stops starting sessions and exits 4.
+- *Disk.* Before each session `run` reads free space under the gate root and under
+  `~/.claude/projects/`, where Claude Code saves a tool answer it moved to a file. When the lower of
+  the two falls below `--min-free-gb` (default 5), it stops starting sessions and exits 4.
+- *Two stops at once.* When two stops race, the first one keeps its exit code and message.
 - *Order.* `--keep-order` runs jobs in the batch file's order instead of interleaving the arms.
 - *Incomplete runs.* A session that ends on a refusal, an MCP error, a rejected `init`, a
   structured payload on the text channel, a 20-minute timeout or output it cannot parse is recorded
@@ -419,7 +427,8 @@ A forget item reads the whole end state:
 | `deleted` | The target is deleted, and no other row is deleted or superseded |
 | `deleted:extra` | The target and other rows are deleted or superseded |
 | `wrong_row` | The target survives and another row is deleted |
-| `left` | Nothing is deleted |
+| `superseded` | The target is superseded and nothing is deleted |
+| `left` | Nothing is deleted and the target is not superseded |
 
 `compare.py` derives the forget outcome again from each record's `end_state`, so records written
 before this rule score the same way.
@@ -447,7 +456,8 @@ with `namespaces`; `context_bootstrap` per project (text byte for byte, plus the
 `left_out` on the branch); `memory_history` for up to 50 ids that have predecessors;
 `review_queue` pages 0 to 3 per source and the default page. A call with no `limit` reads up to 50
 per source (decision 0031), so the check holds each source's default page to the first 50 keys of
-its full list, and expects `more` on the page exactly when some source holds more than 50. Then it runs the consumer check (Python `json.dumps` and Node
+its full list, and expects `more` on the page exactly when some source holds more than 50. Keys
+from a source the branch returned and `--sources` left out count as a difference. Then it runs the consumer check (Python `json.dumps` and Node
 `JSON.stringify` round trips against each consumer's fields) and `scripts/policy-test.sh` from the
 branch checkout. It exits 1 on any difference. A tool either build refuses is reported as a
 difference. `--sources` names the sources the default call reads: `conflict stale` for the engine,
@@ -455,7 +465,7 @@ plus `proposal` for the fork. `--template` resets from a named template.
 
 ## Reading the report
 
-`compare.py --tasks tasks.jsonl [--arm A1] [--base A0] [--noise A0b] [--out report.md]` prints one
+`compare.py --tasks "$LR_GATE_ROOT/tasks.live.jsonl" [--arm A1] [--base A0] [--noise A0b] [--out report.md]` prints one
 section per stage and channel, with a row per rule and per task group, the failures, notes, and a
 token table (input plus cache read, and output, mean per run). It exits 1 when a rule fails.
 
@@ -497,11 +507,11 @@ A1 A1b A2`). Reusing A0b would measure A1's noise with A0's runs, and the two bu
 the same noise.
 
 ```
-judge.py --tasks tasks.jsonl --stage sonnet --channel structured --base A1 --arms A1b A2
-compare.py --tasks tasks.jsonl --arm A2 --base A1 --noise A1b
+judge.py --tasks "$LR_GATE_ROOT/tasks.live.jsonl" --stage sonnet --channel structured --base A1 --arms A1b A2
+compare.py --tasks "$LR_GATE_ROOT/tasks.live.jsonl" --arm A2 --base A1 --noise A1b
 ```
 
-`judge.py --tasks tasks.jsonl --stage sonnet --channel structured` runs one `claude -p --model
+`judge.py --tasks "$LR_GATE_ROOT/tasks.live.jsonl" --stage sonnet --channel structured` runs one `claude -p --model
 claude-opus-5-5` session per task and judged arm (by default A0b and A1 against A0), with no MCP
 server and no tools. The prompt holds the task, the base arm's answers and the answers under test,
 and asks for `{"equivalent": [...], "reasons": [...]}` on one line. A reply that does not parse
