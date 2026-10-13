@@ -1141,7 +1141,7 @@ struct StaleQuery {
     limit: Option<i64>,
 }
 
-/// Live rows never retrieved and older than `days`. A review list, never a reaper.
+/// Live rows neither written nor confirmed within `days`. A review list, never a reaper.
 ///
 /// Reads `review_queue::queue` filtered to one source, so the grant rule and the live-row
 /// predicate live in one place instead of two. `days` and `limit` clamp inside that call now,

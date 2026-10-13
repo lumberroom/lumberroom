@@ -680,7 +680,8 @@ pub struct QualityConfig {
     pub conflict_sweep_secs: u64,
     /// Time one sweep may spend on a tenant before it yields until the next tick or wake.
     pub conflict_sweep_budget_ms: u64,
-    /// A live row never retrieved and older than this appears in `lumberroom review --stale`.
+    /// A live row neither written nor confirmed for this many days appears in the review queue's
+    /// stale source. Reads do not count (decision 0033).
     pub stale_days: i32,
     /// Highest sensitivity the Obsidian export may include. Private content in a vault synced to a
     /// third party defeats the encryption it was given.

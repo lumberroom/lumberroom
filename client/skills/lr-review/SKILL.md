@@ -46,8 +46,10 @@ for predecessors and retire each one that comes back.
 
 ## Stale items
 
-A `stale:` item is one row nobody has read or confirmed for a long time. Its verdicts are
-`confirm`, `merge` and `delete`. Search for newer rows on the same subject first.
+A `stale:` item is one row nobody has written or confirmed for a long time, a year unless the
+operator changed it. Reading a row does not keep it out of the queue, so searching during a review
+leaves every item in place. Its verdicts are `confirm`, `merge` and `delete`, and `confirm` takes
+the row off the queue for one window. Search for newer rows on the same subject first.
 
 - A newer live row holds every claim of the stale row: `delete` it, after the predecessor check.
 - A newer row holds part of it: `merge` with `content` carrying the stale row's remaining claims,

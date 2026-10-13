@@ -31,6 +31,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Staleness counts from the last write or confirmation, and reads no longer matter.** The review
+  queue's stale source lists a live row written more than `STALE_DAYS` ago (365 by default) and not
+  confirmed within that span. It used to list only rows nobody had ever read, and every
+  `memory_search` hit marks a row read, so a search during a review removed the rows it touched
+  from the queue before the next page. The queue shows different rows after an upgrade: an old row
+  that agents still read now appears, and a `confirm` verdict takes it off for one window.
+  `GET /admin/review/stale`, `lumberroom review --source stale` and `review_queue` all read the new
+  rule. The `staleness` block in `/statsz` still reports `never_retrieved`, which counts reads
+  and keeps its meaning. Decision 0033.
 - **Large read answers reach Claude Code inline.** `context_bootstrap`, `memory_search`,
   `memory_history`, `registry_history`, `alias_list` and `review_queue` declare
   `_meta: {"anthropic/maxResultSizeChars": 500000}` in `tools/list`. Claude Code saves an undeclared
@@ -55,8 +64,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     chain field and `last_confirmed_at` when null, `sensitivity` when `open`, and `tags` when
     empty. `detail: "full"` returns them.
   - `review_queue` with no `limit` keeps the service's default of 50 items per source, as HTTP
-    does, because a search during review clears staleness and a short page hid stale items. An
-    explicit `limit` keeps its per-source meaning. When more items wait, the structured copy carries
+    does, because a short page hid stale items. An explicit `limit` keeps its per-source meaning.
+    When more items wait, the structured copy carries
     `more` and the text ends with a `more:` line; the hint names no offset, because each verdict
     moves the live queue. The tool description and the hint both tell an agent in a review to
     keep paging until `more` is absent before it reports the queue done. Rows drop `access_count` and

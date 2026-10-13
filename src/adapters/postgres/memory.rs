@@ -1401,6 +1401,11 @@ const SUBJECT_HISTORY_SQL: &str = select_memory!(
 
 /// The review queue's stale source. A constant so a test can scan it, and so the grant block and
 /// the confirmation window live in one place rather than in the handler that reads them.
+///
+/// A row is stale when nobody has written or confirmed it within the window. Reads do not count:
+/// every search hit sets `last_accessed_at`, so a filter on it let a review's own research empty
+/// the queue between pages (decision 0033). Rows are append-only for content, so `created_at` is
+/// the last write and `last_confirmed_at` the last confirmation.
 const STALE_SQL: &str = select_memory!(
     "m.",
     concat!(
@@ -1409,12 +1414,11 @@ const STALE_SQL: &str = select_memory!(
         AND ",
         live!(),
         "
-        AND m.last_accessed_at IS NULL
         AND m.created_at < now() - make_interval(days => $2)
         -- A confirmed row leaves the queue for one window. Without this the column `confirm`
-        -- writes changes nothing a reader can see, which is the bug this replaces. Floored at one
-        -- day: `--days 0` asks for every never-read row, and without the floor this clause reduces
-        -- to `last_confirmed_at < now()`, so a confirmation today would hide nothing.
+        -- writes changes nothing a reader can see. Floored at one day: `--days 0` asks for every
+        -- live row, and without the floor this clause reduces to `last_confirmed_at < now()`, so a
+        -- confirmation today would hide nothing.
         AND (m.last_confirmed_at IS NULL
              OR m.last_confirmed_at < now() - make_interval(days => greatest($2, 1)))
         AND EXISTS (
@@ -3276,10 +3280,8 @@ impl MemoryRepository for PgMemoryRepository {
 
     /// The review queue, not a reaper.
     ///
-    /// No index serves `last_accessed_at IS NULL`, on purpose. `memory_never_accessed` did, and it
-    /// turned every search's touch into a write to every index on `memory`; migration 026 dropped
-    /// it. The plan walks `memory_created_at` oldest first and filters, so a page costs as many rows
-    /// as precede the first unread ones.
+    /// The plan walks `memory_created_at` oldest first and filters on liveness, the confirmation
+    /// window and the grant, so a page costs as many rows as precede the first that pass.
     async fn stale(
         &self,
         tenant: &str,
@@ -4566,6 +4568,16 @@ mod tests {
     fn both_review_statements_bind_an_offset_rather_than_skipping_rows_later() {
         assert!(CONFLICTS_SQL.contains("OFFSET $4"));
         assert!(STALE_SQL.contains("OFFSET $4"));
+    }
+
+    /// Decision 0033: a search touches `last_accessed_at`, so staleness must not read it or a
+    /// review loses rows to its own research.
+    #[test]
+    fn the_stale_statement_does_not_filter_on_the_access_columns() {
+        // The select list returns both columns; only the filter must leave them alone.
+        let (_, filter) = STALE_SQL.split_once("WHERE").expect("a WHERE clause");
+        assert!(!filter.contains("last_accessed_at"), "{filter}");
+        assert!(!filter.contains("access_count"), "{filter}");
     }
 
     #[test]
