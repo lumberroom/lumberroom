@@ -1662,7 +1662,7 @@ async fn sealing_a_memory_after_approval_clears_the_proposal_that_produced_it() 
 
 /// An approval refuses a proposal carrying a fence line, the check `memory_write` and a review
 /// merge apply. An extractor that copied a fenced value out of a queue would otherwise store a
-/// forged fence through the one path that skips the tool layer.
+/// forged fence through a path that never passes through an MCP tool.
 ///
 /// Seeded through the repository, because what is under test is the approval inheriting the
 /// refusal from `write::run_observed`, whatever `post` checks first.

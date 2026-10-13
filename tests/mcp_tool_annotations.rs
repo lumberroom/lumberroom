@@ -174,11 +174,12 @@ fn the_large_answer_reads_declare_the_client_ceiling_and_no_other_tool_does() {
     }
 }
 
-/// Reads that answer one key or one row, and so stay well under 50,000 characters. The only reads
-/// excused from the result-size declaration. A read joins this list with a comment saying what
-/// bounds its answer.
+/// Reads that answer one key or one row, the only reads excused from the result-size declaration.
+/// A read joins this list with a comment saying what bounds its answer.
 ///
-/// `registry_get` answers one registry key.
+/// `registry_get` answers one registry key. Nothing caps a registry value's length, so a value past
+/// 50,000 characters would still reach Claude Code as a file; the list records an expected size,
+/// not an enforced one.
 const SMALL_READS: [&str; 1] = ["registry_get"];
 
 /// `LARGE_ANSWERS` names the reads that declare a size, so a read added to `READS` and left off
