@@ -34,8 +34,9 @@ calls for an answer the server had already sent. An agent replay with the declar
 no answer saved to a file.
 
 The MCP schema types a tool's `_meta` as an open map (`{ [key: string]: unknown }`). The spec
-reserves only prefixes that carry `mcp` or `modelcontextprotocol` as a label followed by another,
-such as `mcp.dev/`, so `anthropic/` sits outside the reserved space.
+reserves any prefix whose second label is `mcp` or `modelcontextprotocol`, such as `dev.mcp/`, along
+with a few bare keys such as `progressToken`, so the single-label `anthropic/` sits outside the
+reserved space.
 
 ## What lost
 
@@ -65,7 +66,7 @@ per-tool figure would be a guess that a setting change breaks without a test not
   chose that over a stub the agent has to search around.
 - The declaration also lifts Claude Code's 25,000-token cap for text, so one 500,000-character
   answer, about 125,000 tokens, can sit inline. A reviewer of this change dissented on that point,
-  and the owner accepted the cost. A caller who wants less passes a smaller limit.
+  and the owner chose inline answers on 13 October 2026 with that cost stated. A caller who wants less passes a smaller limit.
 - An answer that grows through a bug reaches the model whole up to 500,000 characters, where at
   50,000 it would have gone to a file.
 - The key names one vendor's client in the engine's `tools/list`. It is one entry in `_meta`, and

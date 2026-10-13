@@ -58,9 +58,9 @@ pub fn tool_definitions() -> Vec<rmcp::model::Tool> {
 /// before it saves the result to a file and hands the model a path. Undeclared, that threshold is
 /// 50,000 characters, and `MAX_MCP_OUTPUT_TOKENS` does not move it. An agent then searches again
 /// with narrower queries to get around the stub. The MCP schema types a tool's `_meta` as an open
-/// map (`{ [key: string]: unknown }`), and the spec reserves only prefixes that carry `mcp` or
-/// `modelcontextprotocol` as a label followed by another, so `anthropic/` is free for a vendor
-/// key. See https://code.claude.com/docs/en/mcp and decision 0032.
+/// map (`{ [key: string]: unknown }`), and the spec reserves a prefix whose second label is `mcp`
+/// or `modelcontextprotocol`, such as `dev.mcp/`, so the single-label `anthropic/` is free for a
+/// vendor key. See https://code.claude.com/docs/en/mcp and decision 0032.
 pub const RESULT_SIZE_KEY: &str = "anthropic/maxResultSizeChars";
 
 /// The client's own ceiling. Every figure below it is one a declared read can pass: `review_queue`
