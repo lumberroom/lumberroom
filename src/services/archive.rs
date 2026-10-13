@@ -318,7 +318,8 @@ pub struct ApplyReport {
     /// from the store. An import writes chains in bulk, so it is the surface most able to produce
     /// them and the one with the least excuse for staying quiet.
     pub chains_left_open: usize,
-    /// Why the edge rebuild after the rows failed, when it did. `None` when it ran or was not due.
+    /// Why the edge rebuild after the rows failed, when it did. `None` when it ran, was not due, or
+    /// the caller turned it off through `ApplyOptions`.
     ///
     /// Every row above is committed by the time the rebuild starts, so a failure there is reported
     /// beside them rather than returned in their place. Returning it answered 500 for an import
@@ -327,7 +328,20 @@ pub struct ApplyReport {
     pub edges_not_rebuilt: Option<String>,
 }
 
-/// Put an archive into this store.
+/// What `apply_with` does once the rows are in.
+///
+/// No `Default`: the short spelling would be the one that skips the rebuild, and a caller who
+/// skips it owes the store a rebuild it may never run.
+#[derive(Debug, Clone, Copy)]
+pub struct ApplyOptions {
+    /// Run `graph::rebuild` after the rows land. Turn it off only when this call is one batch of a
+    /// larger import: each rebuild rereads the whole store, so one per batch repeats the slowest
+    /// step once for every batch. A caller that turns it off calls `graph::rebuild` once after its
+    /// last batch, and until then the graph walk reads the edges from before the import.
+    pub rebuild_edges: bool,
+}
+
+/// Put an archive into this store, and rebuild the edges after it.
 ///
 /// `prior` is the id map from an interrupted run of the same job, and it is the only thing making a
 /// replay safe. Pass an empty map for a first run.
@@ -337,6 +351,18 @@ pub async fn apply(
     mode: Mode,
     dry_run: bool,
     prior: &HashMap<String, String>,
+) -> Result<ApplyReport> {
+    apply_with(ctx, archive, mode, dry_run, prior, ApplyOptions { rebuild_edges: true }).await
+}
+
+/// `apply`, with the edge rebuild under the caller's control. See `ApplyOptions`.
+pub async fn apply_with(
+    ctx: &Ctx,
+    archive: &Archive,
+    mode: Mode,
+    dry_run: bool,
+    prior: &HashMap<String, String>,
+    opts: ApplyOptions,
 ) -> Result<ApplyReport> {
     // The tripwire is the backstop for a row whose namespace inference was wrong in the expensive
     // direction, and a bulk import is where that goes wrong at scale. It runs at open alone, so
@@ -350,8 +376,8 @@ pub async fn apply(
     }
 
     match mode {
-        Mode::Merge => merge(ctx, archive, dry_run, prior).await,
-        Mode::Restore => restore(ctx, archive, dry_run, prior).await,
+        Mode::Merge => merge(ctx, archive, dry_run, prior, opts).await,
+        Mode::Restore => restore(ctx, archive, dry_run, prior, opts).await,
     }
 }
 
@@ -360,6 +386,7 @@ async fn merge(
     archive: &Archive,
     dry_run: bool,
     prior: &HashMap<String, String>,
+    opts: ApplyOptions,
 ) -> Result<ApplyReport> {
     let mut report = ApplyReport { id_map: prior.clone(), ..Default::default() };
     // Membership is the question the chain rewrite asks, and a dry run answers it without an id.
@@ -526,7 +553,7 @@ async fn merge(
     if !dry_run {
         // Version 1 carries no `edge` section. Edges are derived, and a derived thing copied
         // forward is a second source of truth for no gain.
-        after_rows_landed(ctx, &mut report).await;
+        after_rows_landed(ctx, &mut report, opts).await;
     }
     Ok(report)
 }
@@ -536,6 +563,7 @@ async fn restore(
     archive: &Archive,
     dry_run: bool,
     prior: &HashMap<String, String>,
+    opts: ApplyOptions,
 ) -> Result<ApplyReport> {
     // An empty `prior` means this restore has not started, so any row in the target belongs to
     // somebody else and restore would write over a store it did not make. A non-empty one means the
@@ -630,20 +658,26 @@ async fn restore(
     apply_side_tables(ctx, archive, dry_run, &mut report).await?;
 
     if !dry_run {
-        after_rows_landed(ctx, &mut report).await;
+        after_rows_landed(ctx, &mut report, opts).await;
     }
     Ok(report)
 }
 
-/// Rebuild the edges and drop the digest cache, once every row is in.
+/// Rebuild the edges, unless the caller asked to do it later, and drop the digest cache, once
+/// every row is in.
 ///
-/// The cache goes whatever the rebuild did. It was cleared after the rebuild's `?`, so a restore
-/// whose rebuild failed left the digest serving the store as it stood before. Merge never showed
-/// it, because `write::run` clears the cache on every row.
-async fn after_rows_landed(ctx: &Ctx, report: &mut ApplyReport) {
-    if let Err(e) = super::graph::rebuild(ctx).await {
-        tracing::warn!(error = %e.log_message(), "archive rows landed and the edge rebuild failed");
-        report.edges_not_rebuilt = Some(e.client_message().to_string());
+/// The cache goes whatever the rebuild did, and whether it ran at all. It was cleared after the
+/// rebuild's `?`, so a restore whose rebuild failed left the digest serving the store as it stood
+/// before. Merge never showed it, because `write::run` clears the cache on every row; restore
+/// writes below the write path, so this is the only clear its rows get. A skipped rebuild leaves
+/// `edges_not_rebuilt` at `None`: the field reports a failure, and nothing failed.
+async fn after_rows_landed(ctx: &Ctx, report: &mut ApplyReport, opts: ApplyOptions) {
+    if opts.rebuild_edges {
+        if let Err(e) = super::graph::rebuild(ctx).await {
+            let error = e.log_message();
+            tracing::warn!(error = %error, "archive rows landed and the edge rebuild failed");
+            report.edges_not_rebuilt = Some(e.client_message().to_string());
+        }
     }
     super::bootstrap::clear_cache();
 }
