@@ -192,3 +192,41 @@ pub fn test_embedders(
         std::collections::HashMap::from([(embedder.id(), std::sync::Arc::new(t))]),
     ))
 }
+
+/// The content of the row whose presence makes the trigger from `refuse_edge_rebuild` fire.
+pub const EDGE_REBUILD_MARKER: &str = "The edge rebuild refuses while this row exists.";
+
+const REFUSE_EDGES_FN: &str = "CREATE OR REPLACE FUNCTION test_refuse_edges() RETURNS trigger AS $$
+     BEGIN
+       IF EXISTS (SELECT 1 FROM memory
+                   WHERE content = 'The edge rebuild refuses while this row exists.') THEN
+         RAISE EXCEPTION 'edge rebuild refused by the test';
+       END IF;
+       RETURN NULL;
+     END $$ LANGUAGE plpgsql";
+
+/// Make every edge rebuild fail while a row holding `EDGE_REBUILD_MARKER` exists.
+///
+/// A stand-in for the real cause, a store large enough to outrun the statement timeout. Every
+/// binary truncates `memory` before a test, so a test that panics before `allow_edge_rebuild`
+/// leaves the trigger inert rather than failing the next one.
+pub async fn refuse_edge_rebuild(pool: &PgPool) {
+    assert!(REFUSE_EDGES_FN.contains(EDGE_REBUILD_MARKER), "the trigger and the marker disagree");
+    for statement in [
+        "DROP TRIGGER IF EXISTS test_refuse_edges ON memory_edge",
+        REFUSE_EDGES_FN,
+        "CREATE TRIGGER test_refuse_edges BEFORE INSERT ON memory_edge
+         FOR EACH STATEMENT EXECUTE FUNCTION test_refuse_edges()",
+    ] {
+        sqlx::query(statement).execute(pool).await.unwrap();
+    }
+}
+
+pub async fn allow_edge_rebuild(pool: &PgPool) {
+    for statement in [
+        "DROP TRIGGER IF EXISTS test_refuse_edges ON memory_edge",
+        "DROP FUNCTION IF EXISTS test_refuse_edges()",
+    ] {
+        sqlx::query(statement).execute(pool).await.unwrap();
+    }
+}

@@ -73,22 +73,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - **The edge rebuild finishes on a store where one alias is everywhere.** An alias that is part of
-  its canonical name, said on most rows of a namespace, paired every one of them, and an alias in
-  a few thousand rows wrote millions of `shares_alias` edges until the pool's 30-second statement
-  timeout cancelled the rebuild. An alias now makes no edges when more than 40 live rows in its
-  namespace say the alias and more than 40 say the canonical name, the limit `shares_tag` already
-  applies to tags. While either side stays within 40, every pair is written, so a rename named in a
-  few rows beside a widely used canonical name keeps its edges. Past the limit on both sides, every
-  row on either end carries at least 40 edges from that alias alone; with 41 to 60 rows on each
-  side a walk at the default degree cap of 60 could still have crossed some of the dropped pairs.
-  Each side is counted per sensitivity tier, so private rows never remove an edge between two open
-  rows. Below the limit the alias edges are the same pairs as before. The alias seed now searches
-  each row once per alias, and the tag seed unnests tags once instead of rescanning the tenant per
-  tag; the tag edges are unchanged.
+  its canonical name, said on most rows of a namespace, paired every one of them, and `m` rows make
+  about `m²/2` `shares_alias` pairs: an alias on 2,000 rows pairs about two million times, more than
+  the pool's 30-second statement timeout lets the rebuild write. An alias now makes no edges when
+  more than 40 live rows in its namespace say the alias and more than 40 say the canonical name, the
+  limit `shares_tag` already applies to tags. While either side stays within 40, every pair is
+  written, so a rename named in a few rows beside a widely used canonical name keeps its edges. Past
+  the limit on both sides, every row on either end carries at least 40 edges from that alias alone;
+  with 41 to 60 rows on each side a walk at the default degree cap of 60 could still have crossed
+  some of the dropped pairs. Each side is counted per sensitivity tier, so private rows never remove
+  an edge between two open rows, and only rows that are live, neither superseded nor past their
+  `occurred_until`, count; a row whose valid time has ended still gets its edges. Below the limit
+  the alias edges are the same pairs as before. The alias seed now searches each row once per alias,
+  and the tag seed unnests tags once instead of rescanning the tenant per tag; the tag edges are
+  unchanged.
 - **An archive import that lands its rows answers 200 when the edge rebuild after them fails.** It
   answered 500 `archive_import_failed`, so a caller saw an error for a job that had finished. The
-  report carries `edges_not_rebuilt` with the reason, the CLI prints it and points at
-  `lumberroom graph rebuild`, and the digest cache is cleared either way.
+  report carries `edges_not_rebuilt` with the reason, the CLI prints it to stderr, points at
+  `lumberroom graph rebuild` and still exits 0, and the digest cache is cleared either way.
 - `fill_date` opens a private row before checking its text, so a private row can take a date.
 - **A 0.5.0 dump restores again.** `pg_restore --exit-on-error` stopped every 0.5.0 dump at trigger
   `memory_conflict_moved` with `operator does not exist: public.vector = public.vector`, and a

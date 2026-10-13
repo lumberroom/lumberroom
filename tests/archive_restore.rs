@@ -314,6 +314,40 @@ async fn a_restored_row_keeps_its_id_and_its_timestamps() {
     assert_ne!(row.embedding_model.as_deref(), Some("bge-small-en-v1.5"));
 }
 
+/// Restore lands every row before the edge rebuild, the same as merge, so a failed rebuild is
+/// reported beside the rows rather than returned in their place.
+///
+/// The digest cache has to go as well. Restore writes rows below the write path, so nothing else
+/// clears it, and it used to be cleared after the rebuild's `?`: a failed rebuild left
+/// `context_bootstrap` serving the store as it stood before the restore. The first two digests
+/// prove the cache is on; the third has to be built fresh.
+#[tokio::test]
+async fn a_restore_whose_edge_rebuild_fails_still_reports_its_rows_and_clears_the_digest() {
+    let h = harness_or_skip!(Key::Present);
+    assert!(!bootstrap::run(&h.ctx, None).await.unwrap().cached);
+    assert!(bootstrap::run(&h.ctx, None).await.unwrap().cached, "the digest cache is off here");
+    common::refuse_edge_rebuild(&h.pool).await;
+    let archive = archive_of(
+        &h.ctx,
+        vec![
+            memory(ID_FIRST, "Coffee, black, no sugar.", "open"),
+            memory("0195c0de-0000-7000-8000-0000000000ee", common::EDGE_REBUILD_MARKER, "open"),
+        ],
+    );
+    let report =
+        archive::apply(&h.ctx, &archive, archive::Mode::Restore, false, &HashMap::new()).await;
+    common::allow_edge_rebuild(&h.pool).await;
+
+    let report = report.expect("a restore whose rows landed answered with an error");
+    assert_eq!(report.applied, 2, "refusals: {:?}", report.refused);
+    assert_eq!(h.rows().await, 2);
+    assert!(report.edges_not_rebuilt.is_some(), "the failed rebuild went unreported: {report:?}");
+    assert!(
+        !bootstrap::run(&h.ctx, None).await.unwrap().cached,
+        "the digest still served the store from before the restore"
+    );
+}
+
 #[tokio::test]
 async fn a_restored_chain_keeps_both_links() {
     // The retired row comes first in the file and names a successor that has not been inserted yet.

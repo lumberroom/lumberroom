@@ -636,8 +636,9 @@ async fn restore(
 
 /// Rebuild the edges and drop the digest cache, once every row is in.
 ///
-/// The cache goes whatever the rebuild did. It was cleared after the rebuild's `?`, so a failed
-/// rebuild also left the digest serving the store as it stood before the import.
+/// The cache goes whatever the rebuild did. It was cleared after the rebuild's `?`, so a restore
+/// whose rebuild failed left the digest serving the store as it stood before. Merge never showed
+/// it, because `write::run` clears the cache on every row.
 async fn after_rows_landed(ctx: &Ctx, report: &mut ApplyReport) {
     if let Err(e) = super::graph::rebuild(ctx).await {
         tracing::warn!(error = %e.log_message(), "archive rows landed and the edge rebuild failed");

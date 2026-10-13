@@ -657,8 +657,8 @@ const SEED_SUPERSEDES_SQL: &str = r#"
 /// with 41 to 60 rows on each side loses pairs a default walk could still have crossed; that band
 /// is the price of matching the tag seed's limit. The case the limit exists for is an alias that is
 /// a substring of its canonical name, so every row says both: `m` rows make about `m²/2` pairs, and
-/// an alias in a few thousand rows wrote millions of them, longer than the pool's statement timeout
-/// allows, so the rebuild failed outright.
+/// an alias on 2,000 rows pairs about two million times, more than the pool's statement timeout
+/// lets the rebuild write.
 ///
 /// `in_alias` and `in_canonical` count each side at or below each row's own sensitivity, which is
 /// why the windows order by tier. A pair is judged on the counts at its higher tier, the rows a
@@ -674,11 +674,15 @@ const SEED_SUPERSEDES_SQL: &str = r#"
 /// ends usable; a pair with an end that is not usable fails at that end's tier or above. Filtering
 /// rows first also keeps a hub's rows out of the join, where they would be paired and discarded.
 ///
-/// A gap, kept from the first version: `named` filters on `superseded_by` alone, so a row whose
-/// valid time has ended (`occurred_until` in the past) still pairs and still counts. A reader
-/// without the history capability cannot see that row, yet it moves the counts that decide the
-/// edges between rows that reader can see.
-const SEED_ALIAS_SQL: &str = r#"
+/// Only rows that pass `live!()`, the predicate a walk applies for a reader without the history
+/// capability, count toward either side; `holds` carries it. Pairing still reads `superseded_by`
+/// alone, as it always has, so a row whose valid time has ended keeps its edges: a reader who may
+/// walk history reaches it, and the walk severs it for one who may not. The first version kept no
+/// counts, so an ended row could only add edges. Counted, one row past its `occurred_until` could
+/// put a side over the limit and remove every edge a reader without history sees, decided by a row
+/// that reader cannot read.
+const SEED_ALIAS_SQL: &str = concat!(
+    r#"
     WITH current AS (
         SELECT namespace, alias, lower(canonical) AS canonical
           FROM entity_alias
@@ -688,16 +692,19 @@ const SEED_ALIAS_SQL: &str = r#"
         SELECT c.namespace, c.alias, m.id,
                sensitivity_rank(m.sensitivity) AS tier,
                position(c.alias in lower(m.content)) > 0 AS says_alias,
-               position(c.canonical in lower(m.content)) > 0 AS says_canonical
+               position(c.canonical in lower(m.content)) > 0 AS says_canonical,
+               ("#,
+    live!(),
+    r#") AS holds
           FROM current c
           JOIN memory m ON m.tenant_id = $1 AND m.namespace = c.namespace
                        AND m.superseded_by IS NULL
     ),
     counted AS (
         SELECT namespace, alias, id, says_alias, says_canonical,
-               count(*) FILTER (WHERE says_alias)
+               count(*) FILTER (WHERE says_alias AND holds)
                    OVER (PARTITION BY namespace, alias ORDER BY tier) AS in_alias,
-               count(*) FILTER (WHERE says_canonical)
+               count(*) FILTER (WHERE says_canonical AND holds)
                    OVER (PARTITION BY namespace, alias ORDER BY tier) AS in_canonical
           FROM named
          WHERE says_alias OR says_canonical
@@ -712,7 +719,8 @@ const SEED_ALIAS_SQL: &str = r#"
                    AND b.says_canonical AND b.id <> a.id
      WHERE a.says_alias
     ON CONFLICT DO NOTHING
-"#;
+"#
+);
 
 /// More rows than this on both sides of an alias makes it a hub rather than a subject. The same
 /// number as `TAG_HUB_LIMIT`, so the two seeders agree on what a crowded name is.

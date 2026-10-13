@@ -391,49 +391,22 @@ async fn a_dry_run_writes_nothing_and_still_reports_what_would_land() {
 /// import into an error. It once did: an import that landed every row answered 500, and a caller
 /// that believed it would retry a finished job.
 ///
-/// A trigger stands in for the rebuild failing, because the real cause is a store large enough to
-/// outrun the statement timeout. It fires only while the marker row exists, and every test here
-/// truncates `memory` first, so a run that panics before the drop leaves it inert.
+/// The digest cache is checked on the restore side: merge writes through `write::run`, which
+/// clears the cache on every row, so a merge cannot show whether the import cleared it.
 #[tokio::test]
 async fn an_import_whose_edge_rebuild_fails_still_reports_the_rows_it_landed() {
-    // A macro so the trigger body can carry it and still be a literal `sqlx::query` accepts.
-    macro_rules! marker {
-        () => {
-            "The edge rebuild refuses while this row exists."
-        };
-    }
     let h = harness_or_skip!();
-    for statement in [
-        "DROP TRIGGER IF EXISTS archive_test_refuse_edges ON memory_edge",
-        concat!(
-            "CREATE OR REPLACE FUNCTION archive_test_refuse_edges() RETURNS trigger AS $$
-             BEGIN
-               IF EXISTS (SELECT 1 FROM memory WHERE content = '",
-            marker!(),
-            "') THEN
-                 RAISE EXCEPTION 'edge rebuild refused by the test';
-               END IF;
-               RETURN NULL;
-             END $$ LANGUAGE plpgsql"
-        ),
-        "CREATE TRIGGER archive_test_refuse_edges BEFORE INSERT ON memory_edge
-         FOR EACH STATEMENT EXECUTE FUNCTION archive_test_refuse_edges()",
-    ] {
-        sqlx::query(statement).execute(&h.pool).await.unwrap();
-    }
-
+    common::refuse_edge_rebuild(&h.pool).await;
     let mut records = chain_and_a_private_row();
-    records.push(memory("0195c0de-0000-7000-8000-000000000004", marker!(), "open"));
+    records.push(memory(
+        "0195c0de-0000-7000-8000-000000000004",
+        common::EDGE_REBUILD_MARKER,
+        "open",
+    ));
     let archive = archive_of(&h.ctx, records);
     let report =
         archive::apply(&h.ctx, &archive, archive::Mode::Merge, false, &HashMap::new()).await;
-
-    for statement in [
-        "DROP TRIGGER IF EXISTS archive_test_refuse_edges ON memory_edge",
-        "DROP FUNCTION IF EXISTS archive_test_refuse_edges()",
-    ] {
-        sqlx::query(statement).execute(&h.pool).await.unwrap();
-    }
+    common::allow_edge_rebuild(&h.pool).await;
 
     let report = report.expect("an import whose rows landed answered with an error");
     assert_eq!(report.applied, 4, "refusals: {:?}", report.refused);

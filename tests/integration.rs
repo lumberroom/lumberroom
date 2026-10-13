@@ -4095,6 +4095,121 @@ async fn alias_edges_skip_closed_aliases_other_namespaces_and_retired_rows() {
     assert_eq!(alias_pairs(&pool).await, expected);
 }
 
+/// A row whose valid time has ended keeps its edges and does not count toward the hub limit.
+///
+/// A walk for a reader without the history capability never reaches that row, so letting it count
+/// would let one ended fact the reader cannot see remove every edge here the reader can. The alias
+/// side starts past the limit and the canonical side at it; the ended row would be the 41st.
+#[tokio::test]
+async fn an_ended_row_cannot_put_an_alias_over_the_hub_limit() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    put_alias(&ctx, "user:me", "kestrel", "Falconworks").await;
+    let t = ctx.tenant();
+
+    let alias_rows =
+        plain_rows(&pool, t, "open", &texts(ALIAS_HUB_LIMIT + 1, "kestrel ticket")).await;
+    let mut canonical =
+        plain_rows(&pool, t, "open", &texts(ALIAS_HUB_LIMIT, "Falconworks ships")).await;
+    let ended = plain_rows(&pool, t, "open", &texts(1, "Falconworks ended")).await;
+    sqlx::query("UPDATE memory SET occurred_until = now() - interval '1 day' WHERE id = $1")
+        .bind(ended[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    canonical.extend(ended);
+
+    graph::rebuild(&ctx).await.unwrap();
+    assert_eq!(
+        alias_pairs(&pool).await,
+        cross(&alias_rows, &canonical),
+        "an ended row moved the hub count, or lost the edges it still has for a history walk"
+    );
+}
+
+/// Every `shares_tag` edge, as unordered pairs.
+async fn tag_pairs(pool: &PgPool) -> std::collections::BTreeSet<(uuid::Uuid, uuid::Uuid)> {
+    let rows: Vec<(uuid::Uuid, uuid::Uuid)> =
+        sqlx::query_as("SELECT src_id, dst_id FROM memory_edge WHERE relation = 'shares_tag'")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    rows.into_iter().map(|(a, b)| (a.min(b), a.max(b))).collect()
+}
+
+async fn tag_rows(pool: &PgPool, ids: &[uuid::Uuid], tag: &str) {
+    sqlx::query("UPDATE memory SET tags = ARRAY[$2] WHERE id = ANY($1)")
+        .bind(ids)
+        .bind(tag)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// A tag joins its live rows while it is on at most the hub limit of them.
+///
+/// `drill` sits on exactly the limit of live rows and on one retired row: every live pair is
+/// written, and the retired row neither pairs nor counts, which would make the tag one over. `crowd`
+/// sits on one row more than the limit and writes nothing. `solo` sits on one row; the seed's
+/// `>= 2` floor cannot change the outcome there, since one row has no pair under `src_id < dst_id`.
+#[tokio::test]
+async fn a_tag_joins_its_live_rows_up_to_the_hub_limit() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let t = ctx.tenant();
+
+    let drill = plain_rows(&pool, t, "open", &texts(ALIAS_HUB_LIMIT, "drill note")).await;
+    let retired = plain_rows(&pool, t, "open", &texts(1, "drill retired note")).await;
+    let crowd = plain_rows(&pool, t, "open", &texts(ALIAS_HUB_LIMIT + 1, "crowd note")).await;
+    let solo = plain_rows(&pool, t, "open", &texts(1, "solo note")).await;
+    tag_rows(&pool, &drill, "drill").await;
+    tag_rows(&pool, &retired, "drill").await;
+    tag_rows(&pool, &crowd, "crowd").await;
+    tag_rows(&pool, &solo, "solo").await;
+    sqlx::query("UPDATE memory SET superseded_by = $2, superseded_at = now() WHERE id = $1")
+        .bind(retired[0])
+        .bind(drill[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    graph::rebuild(&ctx).await.unwrap();
+    assert_eq!(
+        tag_pairs(&pool).await,
+        cross(&drill, &drill),
+        "the tag edges are not exactly the live pairs of the tag at the limit"
+    );
+}
+
+/// Alias edges belong to one tenant: its aliases, its rows, nothing from a neighbour.
+///
+/// The other tenant records an alias whose names this tenant's rows use, and holds rows naming an
+/// alias this tenant records. Either crossing writes a pair the expected set does not hold.
+#[tokio::test]
+async fn alias_edges_never_cross_a_tenant() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let t = ctx.tenant();
+    let other = "graph-test-neighbour";
+    assert_ne!(t, other);
+    put_alias(&ctx, "user:me", "merlin", "Hawkline").await;
+    sqlx::query(
+        "INSERT INTO entity_alias (tenant_id, namespace, alias, canonical)
+         VALUES ($1, 'user:me', 'kestrel', 'Falconworks')",
+    )
+    .bind(other)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let merlin = plain_rows(&pool, t, "open", &texts(1, "merlin ticket")).await;
+    let hawkline = plain_rows(&pool, t, "open", &texts(1, "Hawkline ships")).await;
+    plain_rows(&pool, t, "open", &texts(1, "kestrel ticket")).await;
+    plain_rows(&pool, t, "open", &texts(1, "Falconworks ships")).await;
+    plain_rows(&pool, other, "open", &texts(1, "merlin elsewhere")).await;
+    plain_rows(&pool, other, "open", &texts(1, "Hawkline elsewhere")).await;
+
+    graph::rebuild(&ctx).await.unwrap();
+    assert_eq!(alias_pairs(&pool).await, cross(&merlin, &hawkline));
+}
+
 #[tokio::test]
 async fn the_currency_measure_counts_closed_intervals_and_catches_a_double_answer() {
     let (ctx, _pool, _serial) = ctx_or_skip!();
