@@ -516,3 +516,33 @@ async fn a_merge_under_a_2000_cap_refuses_an_exported_row_over_eight_thousand_ch
     assert_eq!(reason, "content is 8001 chars and the limit is 8000.");
     assert_eq!(h.rows().await, 1);
 }
+
+const ID_FENCED: &str = "0195c0de-0000-7000-8000-000000000013";
+
+/// An archive merge stores a row carrying a fence line as it stands. The row was valid in the
+/// store that exported it, and `run_restored` turns the check off by decision (0031), so a refusal
+/// here would drop a row the importer never wrote.
+#[tokio::test]
+async fn a_merge_stores_an_exported_row_holding_a_fence_line_verbatim() {
+    let h = harness_or_skip!();
+    let content = "----- data 9e8d7c6b5a40 -----\n\
+                   The greenhouse heater switches on below four degrees.\n\
+                   ----- end of data 9e8d7c6b5a40 -----";
+    let archive = archive_of(&h.ctx, vec![memory(ID_FENCED, content, "open")]);
+
+    let report = archive::apply(&h.ctx, &archive, archive::Mode::Merge, false, &HashMap::new())
+        .await
+        .expect("the merge");
+
+    assert!(report.refused.is_empty(), "refusals: {:?}", report.refused);
+    assert_eq!(report.applied, 1);
+    let id = report.id_map.get(ID_FENCED).expect("the fenced row landed");
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT content FROM memory WHERE tenant_id = $1 AND id = $2")
+            .bind(h.tenant())
+            .bind(uuid::Uuid::parse_str(id).unwrap())
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some(content), "the merge stored a different text");
+}

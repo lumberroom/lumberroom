@@ -174,6 +174,50 @@ fn the_large_answer_reads_declare_the_client_ceiling_and_no_other_tool_does() {
     }
 }
 
+/// Reads that answer one key or one row, the only reads excused from the result-size declaration.
+/// A read joins this list with a comment saying what bounds its answer.
+///
+/// `registry_get` answers one registry key. Nothing caps a registry value's length, so a value past
+/// 50,000 characters would still reach Claude Code as a file; the list records an expected size,
+/// not an enforced one.
+const SMALL_READS: [&str; 1] = ["registry_get"];
+
+/// `LARGE_ANSWERS` names the reads that declare a size, so a read added to `READS` and left off
+/// both lists passes every test above. This one walks the router instead: a read the allowlist
+/// does not excuse has to declare the ceiling.
+#[test]
+fn every_read_outside_the_small_allowlist_declares_the_result_size() {
+    for tool in tool_definitions() {
+        let a = tool.annotations.as_ref().expect("annotations");
+        if a.read_only_hint != Some(true) || SMALL_READS.contains(&&*tool.name) {
+            continue;
+        }
+        let declared = tool.meta.as_ref().and_then(|m| m.0.get(RESULT_SIZE_KEY)).cloned();
+        assert_eq!(
+            declared,
+            Some(serde_json::json!(RESULT_SIZE_CEILING)),
+            "{} is a read and declares no {RESULT_SIZE_KEY}: add `meta = large_result()`, or \
+             excuse it in SMALL_READS with what bounds its answer",
+            tool.name
+        );
+    }
+}
+
+/// A stale name in the allowlist would excuse nothing and hide that a tool was renamed or became a
+/// write.
+#[test]
+fn every_small_read_is_a_registered_read() {
+    let tools = tool_definitions();
+    for name in SMALL_READS {
+        let tool = tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is in SMALL_READS and not registered"));
+        let a = tool.annotations.as_ref().expect("annotations");
+        assert_eq!(a.read_only_hint, Some(true), "{name} is in SMALL_READS and is not a read");
+    }
+}
+
 /// A write answers with one row or one outcome. Declaring a size there would pass a write answer
 /// inline whole if a bug ever made one large.
 #[test]
