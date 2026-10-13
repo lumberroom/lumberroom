@@ -329,6 +329,17 @@ fn an_apply_report_parses_with_only_the_required_field() {
     let r: ApplyReport = serde_json::from_value(raw).unwrap();
     assert_eq!(r.skipped_already_applied, 0);
     assert!(r.refused.is_empty());
+    assert!(r.edges_not_rebuilt.is_none());
+}
+
+/// An import whose rows landed and whose edge rebuild failed answers 200 with the reason beside
+/// the counts, and the client has to read it rather than report a clean import.
+#[test]
+fn an_apply_report_carries_a_failed_edge_rebuild() {
+    let raw = serde_json::json!({ "applied": 12, "edges_not_rebuilt": "internal error" });
+    let r: ApplyReport = serde_json::from_value(raw).unwrap();
+    assert_eq!(r.applied, 12);
+    assert_eq!(r.edges_not_rebuilt.as_deref(), Some("internal error"));
 }
 
 // ---- phase 8, the review queue ----

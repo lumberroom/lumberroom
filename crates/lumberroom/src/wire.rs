@@ -506,6 +506,10 @@ pub struct ApplyReport {
     pub collapsed: usize,
     #[serde(default)]
     pub refused: Vec<(String, String)>,
+    /// Set when the rows landed and the edge rebuild after them failed. Absent from a server that
+    /// predates the field, which answered that case with a 500 instead.
+    #[serde(default)]
+    pub edges_not_rebuilt: Option<String>,
 }
 
 // ---- requests ----

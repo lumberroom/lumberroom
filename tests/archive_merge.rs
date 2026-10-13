@@ -280,6 +280,7 @@ async fn replaying_a_half_applied_merge_inserts_nothing_new() {
     assert_eq!(first.collapsed, 0);
     assert!(first.refused.is_empty(), "refusals: {:?}", first.refused);
     assert_eq!(first.id_map.len(), 3);
+    assert!(first.edges_not_rebuilt.is_none(), "{:?}", first.edges_not_rebuilt);
     assert_eq!(h.sealed_rows().await, 1, "the private row did not land as ciphertext");
 
     let before = h.rows().await;
@@ -384,6 +385,33 @@ async fn a_dry_run_writes_nothing_and_still_reports_what_would_land() {
     // An invented id in a map the job persists is worse than no map at all.
     assert!(report.id_map.is_empty());
     assert_eq!(h.rows().await, 0, "the dry run wrote rows");
+}
+
+/// Every row is committed before the edge rebuild runs, so a rebuild that fails must not turn the
+/// import into an error. It once did: an import that landed every row answered 500, and a caller
+/// that believed it would retry a finished job.
+///
+/// The digest cache is checked on the restore side: merge writes through `write::run`, which
+/// clears the cache on every row, so a merge cannot show whether the import cleared it.
+#[tokio::test]
+async fn an_import_whose_edge_rebuild_fails_still_reports_the_rows_it_landed() {
+    let h = harness_or_skip!();
+    common::refuse_edge_rebuild(&h.pool).await;
+    let mut records = chain_and_a_private_row();
+    records.push(memory(
+        "0195c0de-0000-7000-8000-000000000004",
+        common::EDGE_REBUILD_MARKER,
+        "open",
+    ));
+    let archive = archive_of(&h.ctx, records);
+    let report =
+        archive::apply(&h.ctx, &archive, archive::Mode::Merge, false, &HashMap::new()).await;
+    common::allow_edge_rebuild(&h.pool).await;
+
+    let report = report.expect("an import whose rows landed answered with an error");
+    assert_eq!(report.applied, 4, "refusals: {:?}", report.refused);
+    assert_eq!(h.rows().await, 4);
+    assert!(report.edges_not_rebuilt.is_some(), "the failed rebuild went unreported: {report:?}");
 }
 
 #[tokio::test]

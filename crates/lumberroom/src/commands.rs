@@ -2016,6 +2016,7 @@ pub async fn archive_import(c: &Client, args: &Args) -> Result<()> {
     if status != 200 {
         return Err(err(format!("archive import failed ({status}): {}", compact(&resp))));
     }
+    warn_edges_not_rebuilt(&resp);
     if args.present("json") {
         out_json(&resp);
         return Ok(());
@@ -2034,4 +2035,15 @@ pub async fn archive_import(c: &Client, args: &Args) -> Result<()> {
         out(&format!("  refused {id}: {reason}"));
     }
     Ok(())
+}
+
+/// The rows landed and the edges did not, so the run still succeeded and exits 0. The warning goes
+/// to stderr in both output modes, where a script reading `--json` from stdout is not broken by it.
+fn warn_edges_not_rebuilt(resp: &Value) {
+    if let Some(reason) = resp.get("edges_not_rebuilt").and_then(Value::as_str) {
+        eprintln!(
+            "the rows landed and the graph edges were not rebuilt ({reason}). Run `lumberroom graph \
+             rebuild` to retry; the server log carries the cause."
+        );
+    }
 }
