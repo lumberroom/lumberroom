@@ -338,6 +338,9 @@ pub struct ApplyOptions {
     /// larger import: each rebuild rereads the whole store, so one per batch repeats the slowest
     /// step once for every batch. A caller that turns it off calls `graph::rebuild` once after its
     /// last batch, and until then the graph walk reads the edges from before the import.
+    ///
+    /// Keep a supersession chain inside one batch. A successor whose predecessor lands in a later
+    /// batch has no row to link to yet, and the link comes back in `refused`.
     pub rebuild_edges: bool,
 }
 
