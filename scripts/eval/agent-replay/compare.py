@@ -168,6 +168,21 @@ def more_path_ok(required, a0b, a1):
     return rate(a1) >= rate(a0b) - EPS
 
 
+def expected_call_rate(expected, runs):
+    """Share of complete runs that called every tool in `expected` at least once. A call the
+    server refused still counts: the rule measures whether the agent reaches for the tool."""
+    runs = scored(runs)
+    if not runs:
+        return 0.0
+    return _mean(1.0 if set(expected) <= {c["tool"] for c in r["calls"]} else 0.0 for r in runs)
+
+
+def expect_calls_ok(base_rate, noise_rate, test_rate):
+    """Rule 8: the tested arm's expected-call rate reaches the lower of the base and noise arms',
+    minus 5 points. The noise arm shows how often the base build itself skips the call."""
+    return test_rate >= min(base_rate, noise_rate) - 0.05 - EPS
+
+
 def fence_leak(runs):
     """Rule 6: runs whose memory or registry writes carry a fence marker line. Every run counts,
     complete or not: a session that wrote a fence before it timed out still wrote it."""
@@ -203,7 +218,8 @@ def load_records(root: Path):
 
 
 def rescore(records, tasks):
-    """Derive every forget item's outcome again from the record's end state.
+    """Derive every forget item's outcome again from the record's end state, and every release
+    item's from its calls.
 
     A record keeps the outcome its session derived, and records written before the forget outcome
     read the whole end state say `deleted` for a run that also deleted other rows. Agreement on a
@@ -213,11 +229,18 @@ def rescore(records, tasks):
         raise ValueError(f"unfilled {UNFILLED} target ids in the task file: {', '.join(bad)}")
     out = []
     for r in records:
-        items = [i for i in (tasks.get(r.get("task")) or {}).get("items", []) if i.get("kind") == "forget"]
+        task_items = (tasks.get(r.get("task")) or {}).get("items", [])
+        items = [i for i in task_items if i.get("kind") == "forget"]
         if items and r.get("end_state") is not None:
             r = {**r, "outcomes": {**(r.get("outcomes") or {}),
                                    **{i["item"]: outcomes.forget_outcome(i["target_id"], r["end_state"])
                                       for i in items if i["item"] in (r.get("outcomes") or {})}}}
+        # A session run with no target, or by a harness that lacked the kind, recorded `unscored`.
+        releases = [i for i in task_items if i.get("kind") == "release"]
+        if releases and r.get("calls") is not None:
+            r = {**r, "outcomes": {**(r.get("outcomes") or {}),
+                                   **{i["item"]: outcomes.release_outcome(i, r["calls"])
+                                      for i in releases if i["item"] in (r.get("outcomes") or {})}}}
         out.append(r)
     return out
 
@@ -226,9 +249,9 @@ UNFILLED = "@id:"
 
 
 def unfilled_targets(tasks):
-    """`task/item` for every forget item whose target_id is still a seed-key token."""
+    """`task/item` for every item whose `target_id` or `target` is still a seed-key token."""
     return [f"{tid}/{i.get('item')}" for tid, t in tasks.items() for i in t.get("items", [])
-            if str(i.get("target_id", "")).startswith(UNFILLED)]
+            if any(str(i.get(f, "")).startswith(UNFILLED) for f in ("target_id", "target"))]
 
 
 def load_tasks(path: Path):
@@ -240,6 +263,9 @@ def load_tasks(path: Path):
     if bad:
         raise ValueError(f"{path} holds unfilled {UNFILLED} target ids ({', '.join(bad)}); "
                          "pass the file fill_ids.py wrote")
+    problems = outcomes.task_problems(tasks, session.session_tools())
+    if problems:
+        raise ValueError(f"{path} holds items no rule can score: " + "; ".join(problems))
     return tasks
 
 
@@ -282,7 +308,7 @@ def planned_reps(tasks, stage, channel, arm):
 
 
 def evaluate(records, tasks, judge, stage, channel, test_arm="A1", base_arm="A0", noise_arm="A0b"):
-    """Apply the seven rules for one stage and channel. Returns (rows, failures, notes)."""
+    """Apply the eight rules for one stage and channel. Returns (rows, failures, notes)."""
     sel = [r for r in records if r["stage"] == stage and r["channel"] == channel]
     arm = lambda a: [r for r in sel if r["arm"] == a]  # noqa: E731
     a0, a0b, a1 = arm(base_arm), arm(noise_arm), arm(test_arm)
@@ -360,6 +386,17 @@ def evaluate(records, tasks, judge, stage, channel, test_arm="A1", base_arm="A0"
                 rows.append((f"5 more path [{tid}]", f"{test_arm} vs {noise_arm} required facts", ok5))
                 if not ok5:
                     failures.append(f"rule 5: task {tid} {test_arm} retrieved fewer required facts than {noise_arm}")
+            expected = t.get("expect_calls") or []
+            if expected:
+                rates = {a: expected_call_rate(expected, tr(runs))
+                         for a, runs in ((base_arm, a0), (noise_arm, a0b), (test_arm, a1))}
+                ok8 = expect_calls_ok(rates[base_arm], rates[noise_arm], rates[test_arm])
+                rows.append((f"8 expected calls [{tid}]",
+                             " ".join(f"{a} {v:.2f}" for a, v in rates.items()), ok8))
+                if not ok8:
+                    failures.append(f"rule 8: task {tid} {test_arm} made every expected call "
+                                    f"({', '.join(expected)}) in fewer runs than the lower of "
+                                    f"{base_arm} and {noise_arm} minus 0.05")
         # Rule 4 needs both verdicts whole. A verdict that is missing or did not parse fails.
         verdicts, ok4 = {}, True
         for who in (test_arm, noise_arm):

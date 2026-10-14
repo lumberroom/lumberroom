@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from batch import expand, ARMS
+from outcomes import KINDS
 
 TASKS = [json.loads(l) for l in (Path(__file__).parent / "tasks.example.jsonl").read_text().splitlines() if l.strip()]
 
@@ -29,7 +30,7 @@ def test_every_review_task_owns_between_15_and_20_keys():
 
 def test_item_kinds_are_the_ones_the_runner_understands():
     kinds = {i["kind"] for t in TASKS for i in t["items"]}
-    assert kinds <= {"verdict", "supersede", "forget", "write"}
+    assert kinds <= KINDS
 
 
 def test_every_review_task_runs_on_a_template_of_its_own():

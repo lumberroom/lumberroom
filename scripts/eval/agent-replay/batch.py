@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python3 -I` drops the script dir
+import outcomes
 import probe
 import session
 
@@ -45,7 +46,19 @@ MAX_FIVE_HOUR = 0.6
 MIN_FREE_GB = 5.0
 # Exit codes for a batch that stopped early. Each one means rerun `batch.py run` once it clears.
 EXIT_RATE_LIMIT, EXIT_DISK, EXIT_SLOTS = 3, 4, 5
+# A task file or tool declaration no session can use. Rerunning changes nothing; fix the input.
+EXIT_INPUT = 2
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def read_tasks(path: Path):
+    """The task file's tasks in file order. Raises ValueError on an item no rule can score, so a
+    bad file fails here and not in every session, where each failure would spend an attempt."""
+    tasks = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    problems = outcomes.task_problems({t["id"]: t for t in tasks}, session.session_tools())
+    if problems:
+        raise ValueError(f"{path} holds items no rule can score: " + "; ".join(problems))
+    return tasks
 
 
 def key(job):
@@ -242,7 +255,12 @@ def run(args, *, run_job=run_job, disk_free=lambda p: shutil.disk_usage(p).free,
         spill_dir=SPILL_DIR):
     root = args.root
     slot_of = slot_map(args.slot_of)
-    tasks = {t["id"]: t for t in (json.loads(l) for l in args.tasks.read_text().splitlines() if l.strip())}
+    try:
+        tasks = {t["id"]: t for t in read_tasks(args.tasks)}
+        session.session_tools()
+    except ValueError as e:
+        print("INPUT REFUSED:", e)
+        return EXIT_INPUT
     jobs = [json.loads(l) for l in args.batch.read_text().splitlines() if l.strip()]
     existing = load_existing(root)
     todo, given_up = pending(order_jobs(jobs, args.keep_order), existing)
@@ -335,7 +353,11 @@ def build_parser():
 def main(argv=None):
     a = build_parser().parse_args(argv)
     if a.cmd == "expand":
-        tasks = [json.loads(l) for l in a.tasks.read_text().splitlines() if l.strip()]
+        try:
+            tasks = read_tasks(a.tasks)
+        except ValueError as e:
+            print("INPUT REFUSED:", e)
+            return EXIT_INPUT
         jobs = interleave(expand(tasks, stage=a.stage, arms=a.arms, model=a.model))
         a.out.write_text("".join(json.dumps(j) + "\n" for j in jobs))
         print(f"{len(jobs)} jobs -> {a.out}")

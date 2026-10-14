@@ -309,3 +309,76 @@ def test_a_slot_whose_memory_search_lacks_the_declaration_fails_the_preflight(tm
     declared = [{"name": "memory_search", "_meta": {"anthropic/maxResultSizeChars": 500000}}]
     assert "maxResultSizeChars" in preflight(["A0-text"], tmp_path, fetch=lambda d: bare)[0]
     assert preflight(["A0-text"], tmp_path, fetch=lambda d: declared) == []
+
+
+# ---- a task file or tool declaration no session can use stops the batch before it starts ----
+
+def test_a_task_file_with_an_unknown_item_kind_starts_no_session(tmp_path, capsys):
+    from batch import build_parser, run
+    seen = []
+    a = build_parser().parse_args(batch_files(tmp_path))
+    task = {"id": "o0", "group": "registry", "decision": False, "channels": ["structured"],
+            "prompt": "p", "items": [{"item": "odd", "kind": "teleport"}]}
+    (tmp_path / "tasks.jsonl").write_text(json.dumps(task) + "\n")
+    rc = run(a, run_job=fake_job([], seen), disk_free=lambda p: 10**12, check_slots=lambda n, r: [])
+    assert seen == [] and rc == 2
+    assert "o0/odd" in capsys.readouterr().out
+
+
+def test_a_malformed_extra_tool_declaration_starts_no_session(tmp_path, monkeypatch, capsys):
+    from batch import build_parser, run
+    seen = []
+    monkeypatch.setenv("LR_GATE_EXTRA_TOOLS", "mcp__lumberroom__extra_lookup")
+    a = build_parser().parse_args(batch_files(tmp_path))
+    rc = run(a, run_job=fake_job([], seen), disk_free=lambda p: 10**12, check_slots=lambda n, r: [])
+    assert seen == [] and rc == 2
+    assert "LR_GATE_EXTRA_TOOLS" in capsys.readouterr().out
+
+
+def test_expand_refuses_a_task_file_with_an_unknown_item_kind(tmp_path, capsys):
+    from batch import main
+    task = {"id": "o0", "group": "registry", "decision": False, "channels": ["structured"],
+            "prompt": "p", "items": [{"item": "odd", "kind": "teleport"}]}
+    (tmp_path / "tasks.jsonl").write_text(json.dumps(task) + "\n")
+    rc = main(["expand", "--tasks", str(tmp_path / "tasks.jsonl"), "--stage", "sonnet",
+               "--model", "m", "--out", str(tmp_path / "b.jsonl")])
+    assert rc == 2 and not (tmp_path / "b.jsonl").exists()
+    assert "teleport" in capsys.readouterr().out
+
+
+def release_tasks(tmp_path):
+    task = {"id": "o0", "group": "registry", "decision": False, "channels": ["structured"], "prompt": "p",
+            "items": [{"item": "r", "kind": "release", "target": "p-1", "tool": "item_release"}]}
+    (tmp_path / "tasks.jsonl").write_text(json.dumps(task) + "\n")
+
+
+def test_run_refuses_a_release_tool_no_server_declares(tmp_path, monkeypatch, capsys):
+    from batch import build_parser, run
+    seen = []
+    monkeypatch.delenv("LR_GATE_EXTRA_TOOLS", raising=False)
+    a = build_parser().parse_args(batch_files(tmp_path))
+    release_tasks(tmp_path)
+    rc = run(a, run_job=fake_job([], seen), disk_free=lambda p: 10**12, check_slots=lambda n, r: [])
+    assert seen == [] and rc == 2 and "item_release" in capsys.readouterr().out
+
+
+def test_run_starts_sessions_once_the_release_tool_is_declared(tmp_path, monkeypatch):
+    from batch import build_parser, run
+    seen = []
+    monkeypatch.setenv("LR_GATE_EXTRA_TOOLS", "item_release")
+    a = build_parser().parse_args(batch_files(tmp_path, n=1))
+    release_tasks(tmp_path)
+    rc = run(a, run_job=fake_job([], seen), disk_free=lambda p: 10**12, check_slots=lambda n, r: [])
+    assert seen == [1] and rc == 0
+
+
+def test_expand_refuses_an_expect_calls_name_no_server_declares(tmp_path, monkeypatch, capsys):
+    from batch import main
+    monkeypatch.delenv("LR_GATE_EXTRA_TOOLS", raising=False)
+    task = {"id": "o0", "group": "registry", "decision": False, "channels": ["structured"],
+            "prompt": "p", "items": [], "expect_calls": ["context_bootstrp"]}
+    (tmp_path / "tasks.jsonl").write_text(json.dumps(task) + "\n")
+    rc = main(["expand", "--tasks", str(tmp_path / "tasks.jsonl"), "--stage", "sonnet",
+               "--model", "m", "--out", str(tmp_path / "b.jsonl")])
+    assert rc == 2 and not (tmp_path / "b.jsonl").exists()
+    assert "context_bootstrp" in capsys.readouterr().out

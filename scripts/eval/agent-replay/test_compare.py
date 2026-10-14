@@ -397,3 +397,138 @@ def test_main_exits_two_on_an_unfilled_task_file(tmp_path, capsys):
         "channels": ["structured"], "items": [{"item": "gone", "kind": "forget", "target_id": "@id:k"}]}) + "\n")
     assert compare.main(["--root", str(tmp_path), "--tasks", str(tmp_path / "tasks.jsonl")]) == 2
     assert "fill_ids.py" in capsys.readouterr().err
+
+
+# ---- task file checks, release items, expect_calls ------------------------------------------
+
+def test_a_task_file_with_an_unknown_item_kind_is_refused_by_name(tmp_path):
+    import json as _j
+    import pytest
+    from compare import load_tasks
+    f = tmp_path / "tasks.jsonl"
+    f.write_text(_j.dumps({"id": "promo-1", "group": "release", "items": [
+        {"item": "odd", "kind": "teleport"}]}) + "\n")
+    with pytest.raises(ValueError, match="promo-1/odd.*teleport"):
+        load_tasks(f)
+
+
+def test_main_exits_two_on_an_unknown_item_kind(tmp_path, capsys):
+    import json as _j
+    import compare
+    write_tree(tmp_path, AGREE)
+    (tmp_path / "tasks.jsonl").write_text(_j.dumps({"id": "review-1", "group": "review", "decision": True,
+        "channels": ["structured"], "items": [{"item": "k", "kind": "teleport"}]}) + "\n")
+    assert compare.main(["--root", str(tmp_path), "--tasks", str(tmp_path / "tasks.jsonl")]) == 2
+    assert "teleport" in capsys.readouterr().err
+
+
+def test_an_unfilled_release_target_is_refused():
+    # Scored against an @id: token, every release reads `left` on every arm and the arms agree.
+    from compare import unfilled_targets
+    tasks = {"promo-1": {"id": "promo-1", "items": [{"item": "r", "kind": "release", "target": "@id:p", "tool": "item_release"}]}}
+    assert unfilled_targets(tasks) == ["promo-1/r"]
+
+
+def expect_run(arm, tools, status="complete"):
+    r = run(arm, "boot-1", {}, status=status)
+    r["calls"] = [{"tool": t, "args": {}, "ok": True} for t in tools]
+    return r
+
+
+def test_the_expected_call_rate_is_the_share_of_runs_that_made_every_expected_call():
+    from compare import expected_call_rate
+    runs = [expect_run("A0", ["context_bootstrap", "memory_search"]),
+            expect_run("A0", ["memory_search"]),
+            expect_run("A0", ["context_bootstrap"]),
+            expect_run("A0", [], status="incomplete")]
+    assert expected_call_rate(["context_bootstrap"], runs) == 2 / 3
+    assert expected_call_rate(["context_bootstrap", "memory_search"], runs) == 1 / 3
+
+
+def test_expected_calls_floor_on_the_lower_of_base_and_noise_minus_five_points():
+    # Shares from 5 runs move in steps of 0.2, so the 5-point margin forgives rounding only.
+    from compare import expect_calls_ok
+    assert expect_calls_ok(1.0, 1.0, 1.0)
+    assert expect_calls_ok(0.8, 1.0, 1.0)
+    assert not expect_calls_ok(1.0, 1.0, 0.8)
+    assert not expect_calls_ok(1.0, 0.8, 0.6)
+
+
+def test_a_tested_arm_level_with_a_weaker_noise_arm_passes():
+    # A0 5 of 5, A0b 4 of 5, A1 4 of 5: the base build itself missed the call once.
+    from compare import expect_calls_ok
+    assert expect_calls_ok(5 / 5, 4 / 5, 4 / 5)
+
+
+def expect_tree_records(a1_tools):
+    recs = []
+    for arm in ("A0", "A0b", "A1"):
+        for rep in range(1, 4):
+            tools = a1_tools if arm == "A1" else ["context_bootstrap", "memory_search"]
+            recs.append({**expect_run(arm, tools), "stage": "sonnet", "rep": rep, "usage": {}})
+    return recs
+
+
+EXPECT_TASKS = {"boot-1": {"id": "boot-1", "group": "recall", "decision": False, "channels": ["structured"],
+                           "items": [], "expect_calls": ["context_bootstrap"]}}
+
+
+def test_the_report_fails_an_arm_that_stops_making_an_expected_call():
+    from compare import evaluate
+    rows, failures, _ = evaluate(expect_tree_records(["memory_search", "memory_search"]),
+                                 EXPECT_TASKS, {}, "sonnet", "structured")
+    assert any(f.startswith("rule 8: task boot-1") for f in failures)
+    assert [r for r in rows if r[0] == "8 expected calls [boot-1]"] == [
+        ("8 expected calls [boot-1]", "A0 1.00 A0b 1.00 A1 0.00", False)]
+
+
+def test_the_report_passes_an_arm_that_keeps_the_expected_calls():
+    from compare import evaluate
+    rows, failures, _ = evaluate(expect_tree_records(["context_bootstrap", "memory_search"]),
+                                 EXPECT_TASKS, {}, "sonnet", "structured")
+    assert not [f for f in failures if f.startswith("rule 8")]
+    assert ("8 expected calls [boot-1]", "A0 1.00 A0b 1.00 A1 1.00", True) in rows
+
+
+def test_a_task_without_expect_calls_adds_no_rule_8_row():
+    from compare import evaluate
+    tasks = {"boot-1": {**EXPECT_TASKS["boot-1"], "expect_calls": []}}
+    rows, failures, _ = evaluate(expect_tree_records([]), tasks, {}, "sonnet", "structured")
+    assert not [r for r in rows if r[0].startswith("8 ")]
+    assert not [f for f in failures if f.startswith("rule 8")]
+
+
+def test_rescore_derives_release_items_again_from_the_stored_calls():
+    # A record a session scored before its task file named the kind holds `unscored`.
+    from compare import rescore
+    tasks = {"promo-1": {"id": "promo-1", "items": [{"item": "r", "kind": "release", "target": "p-1", "tool": "item_release"}]}}
+    r = run("A0", "promo-1", {"r": "unscored"})
+    r["calls"] = [{"tool": "item_release", "args": {"id": "p-1"}, "ok": True}]
+    assert rescore([r], tasks)[0]["outcomes"] == {"r": "released"}
+
+
+def tasks_file(tmp_path, task):
+    import json as _j
+    f = tmp_path / "tasks.jsonl"
+    f.write_text(_j.dumps({"id": "t-1", "group": "g", "items": [], **task}) + "\n")
+    return f
+
+
+def test_load_tasks_refuses_an_expect_calls_name_no_server_declares(tmp_path, monkeypatch):
+    import pytest
+    from compare import load_tasks
+    monkeypatch.delenv("LR_GATE_EXTRA_TOOLS", raising=False)
+    with pytest.raises(ValueError, match="context_bootstrp"):
+        load_tasks(tasks_file(tmp_path, {"expect_calls": ["context_bootstrp"]}))
+
+
+def test_load_tasks_accepts_a_release_tool_declared_in_lr_gate_extra_tools(tmp_path, monkeypatch):
+    import pytest
+    from compare import load_tasks
+    f = tasks_file(tmp_path, {"items": [{"item": "r", "kind": "release", "target": "p-1",
+                                         "tool": "item_release"}]})
+    monkeypatch.delenv("LR_GATE_EXTRA_TOOLS", raising=False)
+    with pytest.raises(ValueError, match="item_release"):
+        load_tasks(f)
+    monkeypatch.setenv("LR_GATE_EXTRA_TOOLS", "item_release")
+    assert list(load_tasks(f)) == ["t-1"]

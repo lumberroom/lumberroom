@@ -26,6 +26,16 @@ backstop for a file written there by hand.
 `LR_GATE_CLAUDE` is the Claude Code binary (default `claude`, found on `PATH`). Set it when the
 binary is not on `PATH` for non-login shells.
 
+`LR_GATE_EXTRA_TOOLS` declares tools a server registers beyond the engine's twelve, as bare names
+separated by commas: `LR_GATE_EXTRA_TOOLS=tool_a,tool_b`. Every session in the run allows them in
+`--allowedTools` and `check_init` expects them in `init`. Set it in the environment of every
+harness command: `batch.py`, `session.py` and `probe.py` run sessions with it, and `batch.py
+expand`, `compare.py` and `judge.py` refuse a task file that names a tool it does not declare. It applies to every arm in the run, so arms whose
+builds register different tools run in separate batches. The variable never reaches the session
+itself, which inherits only the allowlist below. A name with a server prefix or a double
+underscore stops `batch.py run` before its first session and `probe.py` before it reads a slot,
+both with exit 2.
+
 Every Python script starts with `python3 -I`. Isolated mode drops the script directory from the
 import path, so each script puts its own directory back at the head of `sys.path`.
 
@@ -41,7 +51,7 @@ import path, so each script puts its own directory back at the head of `sys.path
 | `probe.py` | The `tools/list` size declaration check and the two probe questions, before batch 1 |
 | `retrieval_diff.py` | The build replay with no model, the consumer check, and `freeze` for the frozen queries |
 | `consumer_check.mjs` | The `JSON.stringify(structured ?? {})` half of the consumer check |
-| `compare.py` | The seven pass rules and the report |
+| `compare.py` | The eight pass rules and the report |
 | `judge.py` | Judge sessions through `claude -p` |
 | `seed_review.py` | Empties the real queue and seeds the review fixtures |
 | `diff_archives.py` | Row-by-row diff of two plaintext archive exports (the engine template check) |
@@ -89,7 +99,8 @@ event shows any of:
   (a server that failed lists no tools, and the session would answer from nothing);
 - `memory_paths.auto`, which means auto memory is on;
 - a tool that does not start with `mcp__lumberroom__`;
-- one of the twelve lumberroom tools missing from `tools`;
+- a lumberroom tool outside the twelve and the extras `LR_GATE_EXTRA_TOOLS` declares;
+- one of the twelve or a declared extra missing from `tools`;
 - a plugin outside `cc-plugin-agents-md`, `cc-plugin-telemetry`, `cc-plugin-plugin-authoring`.
 
 `check_event` also rejects a hook event and any tool use outside the slot's server. On the text
@@ -297,8 +308,9 @@ seed_review.py remap-tasks --keys-map "$LR_GATE_ROOT"/map-review-{1,2,3,4}.json 
 ```
 
 Every later command takes `tasks.live.jsonl`. `compare.py` refuses a task file whose `target_id`
-still starts with `@id:` and names the file: rescored against an unfilled id, every forget run that
-deleted anything reads `wrong_row` on every arm, and the arms would agree on a failure.
+or `target` still starts with `@id:` and names the file: rescored against an unfilled id, every
+forget run that deleted anything reads `wrong_row` on every arm, and the arms would agree on a
+failure.
 
 `empty` waits for `conflicts_pending` to read 0, applies `keep_both` to every real conflict pair,
 sets `last_confirmed_at = now()` on every real stale row, fills the first listed day on every real
@@ -353,8 +365,9 @@ the check, for an arm whose answers never pass the threshold.
 
 ## The probe
 
-`probe.py` runs before batch 1. It first reads both slots' `tools/list` and exits 1 when either
-lacks the size declaration above. Then it runs two sessions per channel against A0 slots.
+`probe.py` runs before batch 1. It first checks `LR_GATE_EXTRA_TOOLS` and exits 2 on a malformed
+name. Then it reads both slots' `tools/list` and exits 1 when either lacks the size declaration
+above. Then it runs two sessions per channel against A0 slots.
 
 1. Asks the model to list every instruction it was given. The report states whether
    `~/.claude/CLAUDE.md` text appeared.
@@ -366,6 +379,41 @@ lacks the size declaration above. Then it runs two sessions per channel against 
 
 The verdict lands in `probe.json` under the gate root, and the sessions' records under `probe/`,
 apart from the `runs/` tree that `batch.py` resumes from and `compare.py` scores.
+
+## The task file
+
+One JSON object per line. `id`, `group`, `decision`, `channels`, `prompt` and `items` are always
+there. `required_facts` feeds rule 5, `template` names a review task's template, `skill` is a path
+in the arm's checkout whose body joins the prompt, and `note` is for the reader.
+
+`expect_calls` lists tools the agent must call at least once, such as `["context_bootstrap"]`. A run
+meets it when it called every listed tool, whether or not the server accepted the call. Rule 8
+compares the share of runs that meet it across the arms. Every name must be one the run declares:
+the engine's twelve or an extra in `LR_GATE_EXTRA_TOOLS`.
+
+Each item has a name (`item`) and a `kind`:
+
+| Kind | Fields | Outcomes |
+|---|---|---|
+| `verdict` | | the verdict, `unseen`, `resolved_elsewhere`, `left` |
+| `supersede` | `target_id` | `superseded`, `deleted`, `left` |
+| `forget` | `target_id` | see the forget table under Batches |
+| `write` | `match` (regexes, at least one), optional `occurred_at` | `written`, `written:date_mismatch`, `not_written` |
+| `release` | `target`, `tool` | `released`, `left` |
+
+A `release` item scores `released` when the session called the item's `tool` with `id` equal to
+`target` and the call came back without an error. The item must name its tool: the engine
+registers no release tool, so the harness has no default. The tool must be one the run declares,
+so a fork's release tool goes in `LR_GATE_EXTRA_TOOLS`.
+
+`batch.py expand`, `batch.py run`, `compare.py` and `judge.py` refuse a task file with an unknown
+kind, a `supersede` or `forget` item without `target_id`, a `write` item without `match`, a
+`release` item without `target` or `tool`, or an `expect_calls` that is not a list of tool names.
+They also refuse an `expect_calls` name or a release `tool` the run does not declare: no arm can
+call it, so every arm would score alike and the rule would pass on nothing. They name the task and
+item, and `batch.py` exits 2 before its first session. A task file can still reach
+`session.py` directly, so an item the session cannot score records `unscored` and the session's
+record survives.
 
 ## Batches
 
@@ -418,7 +466,8 @@ with the memory snapshot.
 
 An outcome is the verdict or write the agent made, `unseen` (never received the key and nothing
 touched its rows), `resolved_elsewhere` (never decided, but another verdict retired or rewrote its
-rows) or `left` (received and untouched). Only changes by the gate token's client count.
+rows) or `left` (received and untouched). Only changes by the gate token's client count. A release
+item reads `released` or `left`, and an item no rule can score reads `unscored`.
 
 A forget item reads the whole end state:
 
@@ -431,7 +480,9 @@ A forget item reads the whole end state:
 | `left` | Nothing is deleted and the target is not superseded |
 
 `compare.py` derives the forget outcome again from each record's `end_state`, so records written
-before this rule score the same way.
+before this rule score the same way. It derives a release outcome again from the record's `calls`,
+so a release item that read `unscored` because the session ran without its `target` or `tool`
+scores once the task file carries both.
 
 The forget task asks for the delete and gives the go-ahead in the prompt. A headless
 session has nobody to confirm, so a prompt that asks the agent to show the match or confirm first
@@ -495,6 +546,7 @@ The report fails closed: missing evidence fails the gate.
 | 5 | On needs-more tasks, the tested arm's answers carry at least as many `required_facts` as the noise arm's |
 | 6 | Any run of the tested arm that wrote a memory row or a registry entry containing `----- data ` fails the gate, complete or not |
 | 7 | Per task group, the tested arm's mean answer length stays under the base's plus the base to noise spread plus 10 percent of the base |
+| 8 | Per task with `expect_calls`, the share of the tested arm's runs that made every expected call reaches the lower of the base and noise arms' shares, minus 5 points. The row prints all three arms' shares |
 
 "Spread" is the absolute difference between the base arm's mean and the noise arm's mean for the
 quantity under test. Rule 5 checks the final answer for the required fact text, because the record
@@ -555,7 +607,8 @@ Those need the gate host and a Claude subscription login.
 
 Covered by pytest only, never run against a live slot or a live session: the `tools/list` size
 declaration check in `probe.py` and `batch.py run`, the rate-limit and disk stops, `--keep-order`,
-`--slot-of`, the file-stub count, the forget outcome rescoring, and the 50-per-source default page
-check in `retrieval_diff.py`. The `rate_limit_event` shape the stop reads was captured from one
+`--slot-of`, the file-stub count, the forget outcome rescoring, the 50-per-source default page
+check in `retrieval_diff.py`, `LR_GATE_EXTRA_TOOLS`, the `release` item, `expect_calls` with rule 8,
+and the task file check in `batch.py`. The `rate_limit_event` shape the stop reads was captured from one
 local Claude Code session on 13 October 2026; the stub signature was seen in transcripts from a
 gate run in October 2026, and the tests pin it with synthetic paths.
