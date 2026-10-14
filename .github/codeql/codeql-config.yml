@@ -1,0 +1,7 @@
+# Integration tests write fixture facts through the encryption path, and
+# rust/hard-coded-cryptographic-value reads every such literal as a key or password.
+# Rust has no inline suppression comment (no AlertSuppression.ql), and Rust runs with
+# build-mode none, so paths-ignore drops tests/ from extraction. src/ stays scanned
+# by every query, including that one.
+paths-ignore:
+  - tests/**
