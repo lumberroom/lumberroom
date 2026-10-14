@@ -855,8 +855,9 @@ pub trait MemoryRepository: Send + Sync {
         plan: &DeletePlan,
     ) -> Result<DeleteOutcome>;
 
-    /// Live rows older than a threshold that were never retrieved. The review queue, not a reaper.
-    /// Live, never-accessed rows older than `older_than_days`, oldest first.
+    /// Live rows neither written nor confirmed within `older_than_days`, oldest first. The review
+    /// queue, not a reaper. Reads do not count: a search during a review must not empty the queue
+    /// it is researching (decision 0033).
     ///
     /// `reader` is a term of the query rather than a pass over the rows, so `limit` counts only what
     /// the caller may see. Filtering afterwards returns a short page and calls it full, and it puts

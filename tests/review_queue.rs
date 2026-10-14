@@ -24,7 +24,7 @@ use lumberroom_server::services::review_queue::{
     self, Decided, Decision, ProposalDecided, ProposalDecision, ProposalField, ProposalItem,
     ProposalSource, QueueQuery, Source, Verdict, Via,
 };
-use lumberroom_server::services::{conflicts, review, write, Ctx, Repos};
+use lumberroom_server::services::{conflicts, review, search, write, Ctx, Repos};
 use sqlx::PgPool;
 
 #[macro_use]
@@ -268,7 +268,7 @@ async fn set_last_confirmed_at(pool: &PgPool, id: &str, at: DateTime<Utc>) {
         .unwrap();
 }
 
-/// Never accessed, older than any `--days` window a test uses, so `stale` picks it up.
+/// Written and confirmed longer ago than any `--days` window a test uses, so `stale` picks it up.
 async fn make_stale(pool: &PgPool, id: &str) {
     sqlx::query(
         "UPDATE memory SET created_at = now() - interval '400 days', last_accessed_at = NULL,
@@ -2335,6 +2335,93 @@ async fn a_confirmed_stale_row_leaves_the_list_for_one_window() {
     assert!(
         after_window.items.iter().any(|i| i.rows.iter().any(|r| r.id == id)),
         "the row comes back once the window passes"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Staleness ignores reads. Decision 0033.
+// ---------------------------------------------------------------------------------------------
+
+fn stale_page(offset: i64, limit: i64) -> QueueQuery {
+    QueueQuery {
+        sources: Some(vec![Source::Stale]),
+        limit: Some(limit),
+        offset: Some(offset),
+        days: Some(30),
+        min_similarity: None,
+    }
+}
+
+/// The search touch runs on a spawned task nobody awaits. Polls until it lands, so a test that
+/// asserts the row survived a read has watched the read happen.
+async fn wait_for_touch(pool: &PgPool, id: &str) {
+    let uuid = uuid::Uuid::parse_str(id).unwrap();
+    for _ in 0..100 {
+        let touched: bool =
+            sqlx::query_scalar("SELECT last_accessed_at IS NOT NULL FROM memory WHERE id = $1")
+                .bind(uuid)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        if touched {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the search never marked {id} read");
+}
+
+/// An agent reads page one, searches for context, then reads page two. The search touched a row
+/// waiting on page two, and that row has to still be there.
+#[tokio::test]
+async fn a_search_between_two_review_pages_does_not_remove_a_stale_row() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
+    let mut rows = Vec::new();
+    for w in ["amber", "birch", "cedar"] {
+        let content = format!("the {w} relay forwards to the backup site {}", nonce(w));
+        let id = write_at(&h.ctx, &content, "global").await;
+        make_stale(&h.pool, &id).await;
+        rows.push((id, content));
+    }
+
+    let first = review_queue::queue(&h.ctx, &no_sources(), stale_page(0, 1)).await.unwrap();
+    assert_eq!(first.items.len(), 1, "page one holds one item");
+    let on_first = first.items[0].rows[0].id.clone();
+    let (later, later_content) = rows.into_iter().find(|(id, _)| *id != on_first).unwrap();
+
+    let found = search::run(&h.ctx, &later_content, None, Some(5), None, None, None).await.unwrap();
+    assert!(found.hits.iter().any(|hit| hit.id == later), "the search found the row");
+    wait_for_touch(&h.pool, &later).await;
+
+    let second = review_queue::queue(&h.ctx, &no_sources(), stale_page(1, 10)).await.unwrap();
+    assert!(
+        second.items.iter().any(|i| i.rows.iter().any(|r| r.id == later)),
+        "a row the search read left the stale queue between pages: refused {:?}, items {:?}",
+        second.refused,
+        second.items.iter().map(|i| &i.key).collect::<Vec<_>>()
+    );
+}
+
+/// Staleness measures how long since the fact was written or confirmed. A row that agents read
+/// every day can still describe a world that moved on.
+#[tokio::test]
+async fn a_row_read_often_but_unwritten_past_the_threshold_is_stale() {
+    let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);
+    let id =
+        write_at(&h.ctx, &format!("the gateway listens on 8443 {}", nonce("hot")), "global").await;
+    make_stale(&h.pool, &id).await;
+    sqlx::query("UPDATE memory SET access_count = 50, last_accessed_at = now() WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(&id).unwrap())
+        .execute(&h.pool)
+        .await
+        .unwrap();
+
+    let q = review_queue::queue(&h.ctx, &no_sources(), stale_page(0, 50)).await.unwrap();
+    assert!(
+        q.items.iter().any(|i| i.rows.iter().any(|r| r.id == id)),
+        "a row read 50 times but written 400 days ago is stale: refused {:?}, items {:?}",
+        q.refused,
+        q.items.iter().map(|i| &i.key).collect::<Vec<_>>()
     );
 }
 

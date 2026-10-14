@@ -548,8 +548,7 @@ fn stale_items(body: &serde_json::Value) -> usize {
 }
 
 // An MCP call with no limit reads the service's own page, as HTTP and the CLI do. A short MCP page
-// hid stale items from agents, and a search during review clears staleness, so the queue shrank
-// before page two. One row past the default leaves exactly one behind and says so.
+// hid stale items from agents. One row past the default leaves exactly one behind and says so.
 #[tokio::test]
 async fn an_mcp_call_with_no_limit_reads_the_service_default_and_says_more_waits() {
     let h = ctx_or_skip!(|c: &mut Config| c.quality.stale_days = 30);

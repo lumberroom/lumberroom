@@ -115,9 +115,9 @@ pub struct ReviewQueueArgs {
     /// refused.
     #[serde(default)]
     pub offset: Option<i64>,
-    /// stale: a fact counts as stale once it is older than this many days, has never been read
-    /// back, and has not been confirmed within that span. Defaults to the server's setting, 365
-    /// unless the operator changed it.
+    /// stale: a fact counts as stale once it was written more than this many days ago and has not
+    /// been confirmed within that span. Reading it does not reset the count. Defaults to the
+    /// server's setting, 365 unless the operator changed it.
     #[serde(default)]
     pub days: Option<i32>,
     /// conflict: how similar two facts must be, from 0 to 1, to appear as a pair. A value below
@@ -395,8 +395,7 @@ refused with its own reason.",
         self.run("review_queue", None, &rc, |ctx| async move {
             let sources = parse_review_sources(args.source.as_deref()).map_err(lead_with_code)?;
             // No limit passes through: the service default of 50 per source applies, as on HTTP
-            // and the CLI. A short MCP page hid stale items, because a search during review marks
-            // a row read and clears its staleness before page two.
+            // and the CLI.
             let query = review_queue::QueueQuery {
                 sources,
                 limit: args.limit,

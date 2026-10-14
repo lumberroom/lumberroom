@@ -234,6 +234,10 @@ lumberroom graph walk "<question>" | lumberroom graph rebuild
 
 `review` opens one queue over conflicts, stale rows and, on a server that fills them, proposals.
 `--stale` and `--conflicts` still work, as aliases for `--source stale` and `--source conflict`.
+A stale row is a live fact nobody has written or confirmed for `--days` days, `STALE_DAYS` (365)
+when the flag is absent. Reading a row does not reset the count, so a fact your agents read every
+day still turns up once it is old enough to check. A `confirm` verdict takes it off the queue for
+one window of the same length. Decision 0033 has the reasoning.
 Over MCP the same pass as `review --dates` is a queue source: `review_queue` with
 `source: ["undated"]` lists the rows, and `review_decide` with `fill_date` fills one. It appears only
 when named.

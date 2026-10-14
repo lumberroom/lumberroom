@@ -16,8 +16,9 @@ Two things the generator cannot promise, and the operator measures after seeding
 - A conflict pair needs an embedding similarity at or above the server's conflict threshold. The
   pairs restate one fact with a detail changed, which is what lands in the band, but the embedder
   decides. Count `memory_conflict` rows after the sweep and adjust the wording if a pair is missing.
-- A stale row needs `created_at` older than STALE_DAYS (365) at gate time and no read since. The
-  stale rows carry 2024 and early 2025 dates. Every other row turns stale a year after its
+- A stale row needs `created_at` older than STALE_DAYS (365) at gate time and no confirmation
+  within that span; reads do not count (decision 0033). The stale rows carry 2024 and early 2025
+  dates. Every other row turns stale a year after its
   `created_at` and then adds a key nobody listed: the conflict rows from 2027-02-03, the -live rows
   from 2027-07-01. A gate run on or after 2027-02-03 needs every date moved forward.
 
@@ -134,7 +135,7 @@ def conflict_rows(n, ws):
 
 
 def stale_rows(n, d):
-    """Ten rows nobody has read in over a year, each about its own service: four lasting facts
+    """Ten rows written over a year ago and never confirmed, each about its own service: four lasting facts
     (confirm), three passing states (leave), two a newer live row retires (delete), one a newer row
     covers in part (merge)."""
     P = lambda opts: pick(n, opts)  # noqa: E731
