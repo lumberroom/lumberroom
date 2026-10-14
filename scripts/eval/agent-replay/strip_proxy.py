@@ -59,7 +59,10 @@ def make_server(host, port, upstream):
             self.send_response(resp.status)
             for k, v in resp.getheaders():
                 if k.lower() not in HOP:
-                    self.send_header(k, v)
+                    # http.client keeps an obs-fold inside the value as CRLF plus whitespace, and
+                    # send_header writes it back unchecked. RFC 9112 section 5.2 has a proxy unfold
+                    # before forwarding; dropping CR and LF leaves the fold's own whitespace.
+                    self.send_header(k, v.replace("\r", "").replace("\n", ""))
             if ctype.startswith("text/event-stream"):
                 # Streamed line by line: a GET stream stays open, so buffering would hang it.
                 self.send_header("Connection", "close")

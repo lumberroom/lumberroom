@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Every job only reads the checkout. The rust-cache and the buildx gha cache authenticate with the
+# Actions runtime token, which these scopes do not govern, and the image build never pushes.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 

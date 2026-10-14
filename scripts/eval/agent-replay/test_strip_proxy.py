@@ -72,3 +72,31 @@ def test_an_event_stream_answer_crosses_the_proxy_without_structured_content():
     data = [l for l in body.splitlines() if l.startswith("data:")]
     assert len(data) == 1 and "structuredContent" not in data[0]
     assert json.loads(data[0][5:])["result"]["content"][0]["text"] == "hello"
+
+
+def test_a_folded_upstream_header_reaches_the_client_on_one_line():
+    # RFC 9112 section 5.2: a proxy that receives obs-fold in a response replaces each fold with
+    # SP before forwarding it. Passed through, the fold reaches a client that may read it as a
+    # header line of its own.
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            # send_header does not check its value, which is what lets this test emit a fold.
+            self.send_header("X-Folded", "one\r\n two")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+    up = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    px = make_server("127.0.0.1", 0, f"http://127.0.0.1:{up.server_address[1]}")
+    threading.Thread(target=px.serve_forever, daemon=True).start()
+    req = urllib.request.Request(f"http://127.0.0.1:{px.server_address[1]}/mcp", data=b"{}")
+    with urllib.request.urlopen(req, timeout=5) as r:
+        folded = r.headers["X-Folded"]
+    up.shutdown(); px.shutdown()
+    assert folded == "one two"
