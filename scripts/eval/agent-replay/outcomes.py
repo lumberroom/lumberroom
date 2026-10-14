@@ -17,6 +17,10 @@ USAGE_LIMIT_RE = re.compile(r"usage limit|limit reached|hit your limit|rate.?lim
 # legitimate answer the agent must handle, so it never marks a run incomplete.
 TRANSPORT_RE = re.compile(r"connection (refused|closed|reset)|ECONNREFUSED|failed to connect|"
                           r"mcp server .*(disconnected|not connected)|timed out", re.I)
+# Claude Code saves a tool answer past its size threshold (50,000 characters unless the tool declares
+# `anthropic/maxResultSizeChars`) to a file under `tool-results/` and hands the model a stub with
+# the path. The model then tries the built-in `Read` on it.
+STUB_PATH_RE = re.compile(r"[/\\]tool-results[/\\][^\s\"']+")
 
 
 def _result_text(block) -> str:
@@ -41,11 +45,12 @@ def _has_structured(node) -> bool:
 def parse_stream(raw_lines) -> dict:
     """Parse stream-json lines. `bad_lines` counts lines that were not JSON. `structured_results`
     counts user events that carry a `structuredContent` key, which the text channel must never
-    deliver."""
-    calls, by_id, keys = [], {}, []
+    deliver. `file_stubbed` says a server answer reached the model as a saved file, and
+    `rate_limit` holds the last `rate_limit_event`'s `rate_limit_info`."""
+    calls, by_id, keys, server_ids = [], {}, [], set()
     out = {"init": None, "calls": calls, "received_keys": keys, "answer": "", "usage": None,
            "result": None, "bad_lines": 0, "refusal": False, "transport_error": False,
-           "structured_results": 0, "events": []}
+           "structured_results": 0, "file_stubbed": False, "rate_limit": None, "events": []}
     for line in raw_lines:
         line = line.strip()
         if not line:
@@ -66,10 +71,14 @@ def parse_stream(raw_lines) -> dict:
             for b in msg.get("content", []) or []:
                 if b.get("type") == "tool_use":
                     name = b.get("name", "")
+                    if not name.startswith(PREFIX) and STUB_PATH_RE.search(json.dumps(b.get("input", {}))):
+                        out["file_stubbed"] = True
                     rec = {"tool": name[len(PREFIX):] if name.startswith(PREFIX) else name,
                            "args": b.get("input", {}), "ok": True}
                     calls.append(rec)
                     by_id[b.get("id")] = rec
+                    if name.startswith(PREFIX):
+                        server_ids.add(b.get("id"))
         elif t == "user":
             if _has_structured(ev):
                 out["structured_results"] += 1
@@ -78,6 +87,8 @@ def parse_stream(raw_lines) -> dict:
                     continue
                 rec = by_id.get(b.get("tool_use_id"))
                 text = _result_text(b)
+                if b.get("tool_use_id") in server_ids and STUB_PATH_RE.search(text):
+                    out["file_stubbed"] = True
                 if b.get("is_error"):
                     if rec is not None:
                         rec["ok"] = False
@@ -87,6 +98,9 @@ def parse_stream(raw_lines) -> dict:
                     for k in KEY_RE.findall(text):
                         if k not in keys:
                             keys.append(k)
+        elif t == "rate_limit_event":
+            # The last one wins: it is the newest reading of the window the next session starts in.
+            out["rate_limit"] = ev.get("rate_limit_info") or {}
         elif t == "result":
             out["result"] = ev
             out["answer"] = ev.get("result", "") or ""
@@ -168,8 +182,25 @@ def _ids_in_key(key: str):
         key.split(":")[1:]
 
 
+def forget_outcome(target_id, end_state: dict) -> str:
+    """A forget item's outcome from the whole end state, so a run that deleted the target and more
+    never agrees with one that deleted the target alone.
+
+    `deleted`: the target went and nothing else was deleted or superseded. `deleted:extra`: the
+    target went with other rows. `wrong_row`: the target survived and another row was deleted.
+    `superseded`: the target was superseded and nothing was deleted. `left`: none of these."""
+    deleted = set(end_state.get("deleted") or [])
+    others = (deleted | set(end_state.get("superseded") or [])) - {target_id}
+    if target_id in deleted:
+        return "deleted:extra" if others else "deleted"
+    if deleted:
+        return "wrong_row"
+    return "superseded" if target_id in set(end_state.get("superseded") or []) else "left"
+
+
 def derive_outcomes(task: dict, calls, received_keys, end_state: dict) -> dict:
-    """Per-item outcome: the verdict or write, `unseen`, `resolved_elsewhere`, or `left`."""
+    """Per-item outcome: the verdict or write, `unseen`, `resolved_elsewhere`, or `left`. A forget
+    item reads `forget_outcome`."""
     touched = set(end_state["superseded"]) | set(end_state["deleted"])
     decided = {}
     for c in calls:
@@ -193,7 +224,7 @@ def derive_outcomes(task: dict, calls, received_keys, end_state: dict) -> dict:
             out[name] = "superseded" if tid in end_state["superseded"] else (
                 "deleted" if tid in end_state["deleted"] else "left")
         elif kind == "forget":
-            out[name] = "deleted" if it["target_id"] in end_state["deleted"] else "left"
+            out[name] = forget_outcome(it["target_id"], end_state)
         elif kind == "write":
             pats = [re.compile(p, re.I) for p in it.get("match", [])]
             hit = [w for w in end_state["written"] if all(p.search(w["content"]) for p in pats)]

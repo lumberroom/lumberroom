@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python3 -I` drops the script dir
 import batch
+import outcomes
 import session
 
 EPS = 1e-9
@@ -201,8 +202,45 @@ def load_records(root: Path):
     return out
 
 
+def rescore(records, tasks):
+    """Derive every forget item's outcome again from the record's end state.
+
+    A record keeps the outcome its session derived, and records written before the forget outcome
+    read the whole end state say `deleted` for a run that also deleted other rows. Agreement on a
+    forget task scores the outcome the end state supports, whenever the record was written."""
+    bad = unfilled_targets(tasks)
+    if bad:
+        raise ValueError(f"unfilled {UNFILLED} target ids in the task file: {', '.join(bad)}")
+    out = []
+    for r in records:
+        items = [i for i in (tasks.get(r.get("task")) or {}).get("items", []) if i.get("kind") == "forget"]
+        if items and r.get("end_state") is not None:
+            r = {**r, "outcomes": {**(r.get("outcomes") or {}),
+                                   **{i["item"]: outcomes.forget_outcome(i["target_id"], r["end_state"])
+                                      for i in items if i["item"] in (r.get("outcomes") or {})}}}
+        out.append(r)
+    return out
+
+
+UNFILLED = "@id:"
+
+
+def unfilled_targets(tasks):
+    """`task/item` for every forget item whose target_id is still a seed-key token."""
+    return [f"{tid}/{i.get('item')}" for tid, t in tasks.items() for i in t.get("items", [])
+            if str(i.get("target_id", "")).startswith(UNFILLED)]
+
+
 def load_tasks(path: Path):
-    return {t["id"]: t for t in (json.loads(l) for l in path.read_text().splitlines() if l.strip())}
+    """Task id -> task. Refuses a file whose target ids still hold `@id:` tokens: rescored against
+    one, every forget run that deleted anything reads `wrong_row` on every arm, and the arms agree
+    on a failure nobody made."""
+    tasks = {t["id"]: t for t in (json.loads(l) for l in path.read_text().splitlines() if l.strip())}
+    bad = unfilled_targets(tasks)
+    if bad:
+        raise ValueError(f"{path} holds unfilled {UNFILLED} target ids ({', '.join(bad)}); "
+                         "pass the file fill_ids.py wrote")
+    return tasks
 
 
 def judge_path(root: Path, stage, channel, base, arm, task) -> Path:
@@ -351,6 +389,38 @@ def evaluate(records, tasks, judge, stage, channel, test_arm="A1", base_arm="A0"
     return rows, failures, notes
 
 
+def _stubbed(rec, root):
+    """True or False from the record's flag, else from its transcript; None when neither says."""
+    if "file_stubbed" in rec:
+        return bool(rec["file_stubbed"])
+    if root is None or not rec.get("transcript"):
+        return None
+    path = Path(root) / rec["transcript"]
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
+    return outcomes.parse_stream(lines)["file_stubbed"]
+
+
+def stub_counts(records, root, stage, channel):
+    """arm -> {stubbed, runs, unknown}: sessions where Claude Code saved a server answer to a file,
+    over every run complete or not, because the model's `Read` on the saved path ends the run as
+    `bad_init`. `unknown` counts runs with no flag and no readable transcript."""
+    out = {}
+    for r in records:
+        if r.get("stage") != stage or r.get("channel") != channel:
+            continue
+        c = out.setdefault(r["arm"], {"stubbed": 0, "runs": 0, "unknown": 0})
+        c["runs"] += 1
+        s = _stubbed(r, root)
+        if s is None:
+            c["unknown"] += 1
+        elif s:
+            c["stubbed"] += 1
+    return dict(sorted(out.items()))
+
+
 def token_table(records, stage, channel):
     cells = defaultdict(list)
     for r in scored([r for r in records if r["stage"] == stage and r["channel"] == channel]):
@@ -369,10 +439,11 @@ def token_table(records, stage, channel):
     return "\n".join(lines)
 
 
-def report(records, tasks, judge, test_arm="A1", base_arm="A0", noise_arm="A0b"):
+def report(records, tasks, judge, test_arm="A1", base_arm="A0", noise_arm="A0b", root=None):
     out, failed = ["# Agent replay report", ""], False
     if not records:
         return "\n".join(out + ["FAIL: no run records under the gate root", ""]), True
+    records = rescore(records, tasks)
     combos = {(r["stage"], r["channel"]) for r in records}
     # Every stage and channel the task plan schedules gets evaluated, records or not, so a planned
     # stage or channel with no records fails on coverage instead of dropping out of the report.
@@ -392,6 +463,13 @@ def report(records, tasks, judge, test_arm="A1", base_arm="A0", noise_arm="A0b")
             out += ["Failures:", ""] + [f"- {f}" for f in failures] + [""]
         if notes:
             out += ["Notes:", ""] + [f"- {n}" for n in notes] + [""]
+        stubs = stub_counts(records, root, stage, channel)
+        if stubs:
+            out += ["File-stubbed sessions (a server answer Claude Code saved to a file; informs, "
+                    "fails nothing), all runs: " + ", ".join(
+                        f"{a} {c['stubbed']} of {c['runs']}"
+                        + (f" ({c['unknown']} unknown)" if c["unknown"] else "")
+                        for a, c in stubs.items()), ""]
         out += ["Input tokens (input plus cache read) / output tokens, mean per run:", "",
                 token_table(records, stage, channel), ""]
     return "\n".join(out), failed
@@ -406,8 +484,13 @@ def main(argv=None):
     ap.add_argument("--noise", default="A0b", help="second runs on the base build; A1b when scoring A2")
     ap.add_argument("--out", type=Path)
     args = ap.parse_args(argv)
-    text, failed = report(load_records(args.root), load_tasks(args.tasks), load_judge(args.root),
-                          args.arm, args.base, args.noise)
+    try:
+        tasks = load_tasks(args.tasks)
+    except ValueError as e:
+        print(f"compare.py: {e}", file=sys.stderr)
+        return 2
+    text, failed = report(load_records(args.root), tasks, load_judge(args.root),
+                          args.arm, args.base, args.noise, root=args.root)
     (args.out.write_text(text) if args.out else print(text))
     return 1 if failed else 0
 

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import re
 import subprocess
@@ -67,10 +66,36 @@ def collect_keys(node):
     return out
 
 
-def default_page_size(n_sources):
-    """The brief MCP default page per source when the call names no limit: max(2, ceil(10 / n))
-    for n sources read, so the first page stays near ten items however many sources there are."""
-    return max(2, math.ceil(10 / n_sources))
+# What an MCP `review_queue` call with no `limit` reads from each source: the service default, the
+# same as HTTP (decision 0031). A shorter default page hid stale items, because a search during
+# review marks a row read and drops it from the stale source before the agent pages on.
+DEFAULT_PAGE = 50
+
+
+def default_page_diffs(full, branch_default, has_more_hint):
+    """Differences between the branch's default review page and what decision 0031 promises.
+
+    `full` maps each source to its whole key list in queue order, `branch_default` to the keys the
+    default page carried, and `has_more_hint` says whether that page carried `more`. Each source
+    holds its first DEFAULT_PAGE keys, and `more` appears only when a source holds past that."""
+    diffs = []
+    for src, keys in full.items():
+        got = branch_default.get(src, [])
+        d = diff_lists(f"review {src} default page", keys[:DEFAULT_PAGE], got[:DEFAULT_PAGE])
+        if d:
+            diffs.append(d)
+        if len(got) > DEFAULT_PAGE:
+            diffs.append({"name": f"review {src} default page size", "base": DEFAULT_PAGE,
+                          "branch": len(got)})
+    # A source the branch answered from that the replay never read in full has nothing to compare
+    # against, so its keys are a difference rather than a silent pass.
+    for src in sorted(set(branch_default) - set(full)):
+        diffs.append({"name": f"review {src} default page (source not compared)", "base": [],
+                      "branch": branch_default[src]})
+    want_more = any(len(keys) > DEFAULT_PAGE for keys in full.values())
+    if want_more != bool(has_more_hint):
+        diffs.append({"name": "review default page more", "base": want_more, "branch": bool(has_more_hint)})
+    return diffs
 
 
 def diff_lists(name, base, branch):
@@ -197,7 +222,7 @@ def search_variants(q, projects):
     return variants
 
 
-def replay(base: Mcp, branch: Mcp, queries, projects, n_sources, page_limit):
+def replay(base: Mcp, branch: Mcp, queries, projects, page_limit, sources=HOME_SOURCES):
     diffs, notes, left_out = [], [], {}
 
     def both(tool, args, name):
@@ -245,7 +270,7 @@ def replay(base: Mcp, branch: Mcp, queries, projects, n_sources, page_limit):
         if d:
             diffs.append(d)
     # 4. review_queue: explicit-limit pages, then the brief default page
-    for src in HOME_SOURCES:
+    for src in sources:
         for page in PAGES:
             args = {"source": [src], "limit": page_limit, "offset": page * page_limit}
             pair = both("review_queue", args, f"review {src} page {page}")
@@ -255,20 +280,16 @@ def replay(base: Mcp, branch: Mcp, queries, projects, n_sources, page_limit):
             d = diff_lists(f"review {src} page {page}", collect_keys(structured(b)), collect_keys(structured(n)))
             if d:
                 diffs.append(d)
-    size = default_page_size(n_sources)
     dflt = both("review_queue", {}, "review default page")
-    branch_default = split_by_source(collect_keys(structured(dflt[1]))) if dflt else {}
-    for src in HOME_SOURCES:
-        full_call = both("review_queue", {"source": [src], "limit": 200}, f"review {src} full page")
-        if full_call is None:
-            continue
-        full = collect_keys(structured(full_call[0]))
-        d = diff_lists(f"review {src} default page", full[:size], branch_default.get(src, [])[:size])
-        if d:
-            diffs.append(d)
-        if len(branch_default.get(src, [])) > size:
-            diffs.append({"name": f"review {src} default page size", "base": size,
-                          "branch": len(branch_default[src])})
+    if dflt is not None:
+        full = {}
+        for src in sources:
+            full_call = both("review_queue", {"source": [src], "limit": 200}, f"review {src} full page")
+            if full_call is not None:
+                full[src] = collect_keys(structured(full_call[0]))
+        branch_page = structured(dflt[1])
+        diffs.extend(default_page_diffs(full, split_by_source(collect_keys(branch_page)),
+                                        "more" in branch_page))
     return diffs, notes, left_out
 
 
@@ -348,7 +369,7 @@ def cmd_run(a):
     queries = load_queries(a.cli_fixture, a.frozen)
     projects = a.projects or [p for p in base.sql(
         "SELECT DISTINCT namespace FROM memory WHERE namespace LIKE 'project:%' ORDER BY 1")]
-    diffs, notes, left_out = replay(base, branch, queries, projects, a.n_sources, a.page_limit)
+    diffs, notes, left_out = replay(base, branch, queries, projects, a.page_limit, a.sources)
     problems = consumer_check(base, branch, queries, projects)
     pol_rc, pol_out = (run_policy_test(Path(a.branch_checkout)) if a.branch_checkout else (None, "skipped"))
     lines = ["# Build replay", "",
@@ -380,8 +401,8 @@ def build_parser():
     r.add_argument("--cli-fixture", required=True, help="client/eval-fixture.example.jsonl format")
     r.add_argument("--frozen", type=Path, help="queries written once by `freeze`; default under LR_GATE_ROOT")
     r.add_argument("--projects", nargs="*", help="project namespaces; default: every one in the corpus")
-    r.add_argument("--n-sources", type=int, default=len(HOME_SOURCES),
-                   help="sources the default review call reads; the fork passes 3")
+    r.add_argument("--sources", nargs="+", default=HOME_SOURCES,
+                   help="sources the default review call reads; the fork adds proposal")
     r.add_argument("--page-limit", type=int, default=5)
     r.add_argument("--branch-checkout", help="repo checkout whose scripts/policy-test.sh runs last")
     r.add_argument("--reset", action="store_true", help="reset both slots from their templates first")

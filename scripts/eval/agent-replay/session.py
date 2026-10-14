@@ -229,6 +229,7 @@ def run_session(*, slot, task, stage, arm, channel, rep, model, root=None, claud
         "outcomes": outcomes.derive_outcomes(task, parsed["calls"], parsed["received_keys"],
                                              end_state),
         "answer": parsed["answer"], "usage": parsed["usage"] or {"input": 0, "cache_read": 0, "output": 0},
+        "file_stubbed": parsed["file_stubbed"], "rate_limit": parsed["rate_limit"],
         "transcript": str(tpath.relative_to(root)),
         "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }

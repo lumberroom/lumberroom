@@ -297,3 +297,103 @@ def test_a_stage_the_plan_never_schedules_adds_no_section(tmp_path, capsys):
         "items": [{"item": "k", "kind": "verdict"}]}) + "\n")
     main_of(tmp_path)
     assert "opus" not in capsys.readouterr().out
+
+
+def forget_run(arm, deleted, stored="deleted"):
+    r = run(arm, "forget-1", {"gone": stored})
+    r["end_state"]["deleted"] = list(deleted)
+    return r
+
+
+FORGET_TASKS = {"forget-1": {"id": "forget-1", "group": "forget", "items": [
+    {"item": "gone", "kind": "forget", "target_id": "t"}]}}
+
+
+def test_forget_agreement_scores_the_whole_end_state_and_not_the_stored_outcome():
+    # A record written before the forget outcome read the whole end state says `deleted` for a run
+    # that also deleted another row. Rescored, it disagrees with a run that deleted the target alone.
+    from compare import rescore
+    a0 = rescore([forget_run("A0", ["t"]) for _ in range(3)], FORGET_TASKS)
+    a1 = rescore([forget_run("A1", ["t", "other"]) for _ in range(3)], FORGET_TASKS)
+    assert {r["outcomes"]["gone"] for r in a1} == {"deleted:extra"}
+    assert item_agreement(a0, a1) == 0.0
+    assert item_agreement(a0, a0) == 1.0
+
+
+def test_rescore_leaves_other_items_and_unknown_tasks_alone():
+    from compare import rescore
+    r = run("A0", "review-1", {"k": "keep_both"})
+    assert rescore([r], FORGET_TASKS)[0]["outcomes"] == {"k": "keep_both"}
+
+
+def test_the_report_scores_forget_items_on_the_rescored_outcome():
+    from compare import report
+    tasks = {"forget-1": {**FORGET_TASKS["forget-1"], "decision": True, "channels": ["structured"]}}
+    recs = []
+    for arm, deleted in (("A0", ["t"]), ("A0b", ["t"]), ("A1", ["t", "other"])):
+        for rep in range(1, 6):
+            r = forget_run(arm, deleted)
+            recs.append({**r, "stage": "sonnet", "rep": rep, "usage": {}})
+    text, failed = report(recs, tasks, {})
+    assert failed and "rule 1: item forget-1/gone fails alone" in text
+
+
+def test_stubbed_sessions_count_per_arm_from_the_flag_or_the_transcript(tmp_path):
+    import json as _j
+    from compare import stub_counts
+    saved = "~/.claude/projects/-tmp-lr-gate-abc/s/tool-results/r.txt"
+    t = tmp_path / "transcripts" / "a.jsonl"
+    t.parent.mkdir(parents=True)
+    t.write_text(_j.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "2", "name": "Read", "input": {"file_path": saved}}]}}) + "\n")
+    recs = [
+        {**run("A0", "t", {}), "stage": "sonnet", "file_stubbed": True},
+        {**run("A0", "t", {}, status="incomplete"), "stage": "sonnet", "file_stubbed": True},
+        {**run("A0", "t", {}), "stage": "sonnet", "file_stubbed": False},
+        # An older record with no flag: the transcript decides.
+        {**run("A1", "t", {}), "stage": "sonnet", "transcript": "transcripts/a.jsonl"},
+        # No flag and no transcript: it counts as unknown and never as clean.
+        {**run("A1", "t", {}), "stage": "sonnet", "transcript": "transcripts/missing.jsonl"},
+    ]
+    assert stub_counts(recs, tmp_path, "sonnet", "structured") == {
+        "A0": {"stubbed": 2, "runs": 3, "unknown": 0}, "A1": {"stubbed": 1, "runs": 2, "unknown": 1}}
+
+
+def test_the_report_prints_the_stub_count_and_fails_nothing_on_it(tmp_path, capsys):
+    import json as _j
+    write_tree(tmp_path, AGREE)
+    p = tmp_path / "runs" / "sonnet" / "A0" / "structured" / "review-1" / "1.json"
+    rec = _j.loads(p.read_text())
+    p.write_text(_j.dumps({**rec, "file_stubbed": True}))
+    assert main_of(tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "File-stubbed sessions" in out and "A0 1 of 5" in out
+
+
+def test_a_task_file_with_unfilled_ids_is_refused_by_name(tmp_path):
+    import json as _j
+    import pytest
+    from compare import load_tasks
+    f = tmp_path / "tasks.example.jsonl"
+    f.write_text(_j.dumps({"id": "forget-1", "group": "forget", "items": [
+        {"item": "gone", "kind": "forget", "target_id": "@id:project-x-0016"}]}) + "\n")
+    with pytest.raises(ValueError, match="tasks.example.jsonl"):
+        load_tasks(f)
+
+
+def test_rescore_refuses_an_unfilled_target_id():
+    import pytest
+    from compare import rescore
+    tasks = {"forget-1": {"id": "forget-1", "items": [{"item": "gone", "kind": "forget", "target_id": "@id:k"}]}}
+    with pytest.raises(ValueError, match="@id:"):
+        rescore([forget_run("A0", ["t"])], tasks)
+
+
+def test_main_exits_two_on_an_unfilled_task_file(tmp_path, capsys):
+    import json as _j
+    import compare
+    write_tree(tmp_path, AGREE)
+    (tmp_path / "tasks.jsonl").write_text(_j.dumps({"id": "forget-1", "group": "forget", "decision": True,
+        "channels": ["structured"], "items": [{"item": "gone", "kind": "forget", "target_id": "@id:k"}]}) + "\n")
+    assert compare.main(["--root", str(tmp_path), "--tasks", str(tmp_path / "tasks.jsonl")]) == 2
+    assert "fill_ids.py" in capsys.readouterr().err
