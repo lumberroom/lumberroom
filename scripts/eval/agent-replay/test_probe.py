@@ -91,3 +91,15 @@ def test_a_malformed_extra_tool_declaration_stops_the_probe_before_any_network_r
                      "--fixture", str(tmp_path / "f.json"), "--root", str(tmp_path)])
     assert rc == 2 and read == []
     assert "LR_GATE_EXTRA_TOOLS" in capsys.readouterr().err
+
+
+def test_an_empty_lr_gate_tools_stops_the_probe_before_any_network_read(tmp_path, monkeypatch, capsys):
+    import probe
+    read = []
+    monkeypatch.setenv("LR_GATE_TOOLS", "")
+    monkeypatch.setattr(probe, "fetch_tools", lambda d: read.append(d) or [])
+    monkeypatch.setattr(probe, "declaration_problems", lambda dirs, fetch=None: read.append(dirs) or [])
+    rc = probe.main(["--structured-slot", str(tmp_path / "s"), "--text-slot", str(tmp_path / "t"),
+                     "--fixture", str(tmp_path / "f.json"), "--root", str(tmp_path)])
+    assert rc == 2 and read == []
+    assert "LR_GATE_TOOLS" in capsys.readouterr().err

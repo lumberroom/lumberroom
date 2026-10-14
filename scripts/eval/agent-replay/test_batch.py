@@ -382,3 +382,32 @@ def test_expand_refuses_an_expect_calls_name_no_server_declares(tmp_path, monkey
                "--model", "m", "--out", str(tmp_path / "b.jsonl")])
     assert rc == 2 and not (tmp_path / "b.jsonl").exists()
     assert "context_bootstrp" in capsys.readouterr().out
+
+
+def test_an_empty_lr_gate_tools_starts_no_session(tmp_path, monkeypatch, capsys):
+    from batch import build_parser, run
+    seen = []
+    monkeypatch.setenv("LR_GATE_TOOLS", "")
+    a = build_parser().parse_args(batch_files(tmp_path))
+    rc = run(a, run_job=fake_job([], seen), disk_free=lambda p: 10**12, check_slots=lambda n, r: [])
+    assert seen == [] and rc == 2 and "LR_GATE_TOOLS" in capsys.readouterr().out
+
+
+def test_expand_refuses_a_malformed_lr_gate_tools(tmp_path, monkeypatch, capsys):
+    from batch import main
+    batch_files(tmp_path)
+    monkeypatch.setenv("LR_GATE_TOOLS", "mcp__lumberroom__memory_search")
+    rc = main(["expand", "--tasks", str(tmp_path / "tasks.jsonl"), "--stage", "sonnet",
+               "--model", "m", "--out", str(tmp_path / "out.jsonl")])
+    assert rc == 2 and not (tmp_path / "out.jsonl").exists()
+    assert "LR_GATE_TOOLS" in capsys.readouterr().out
+
+
+def test_the_summary_counts_complete_records_and_not_jobs_the_limit_held_back(tmp_path, capsys):
+    from batch import build_parser, run, key
+    from session import record_path, write_record
+    a = build_parser().parse_args(batch_files(tmp_path, n=4) + ["--limit", "1"])
+    job = {"stage": "sonnet", "arm": "A0", "channel": "structured", "task": "o0", "rep": 4, "model": "m"}
+    write_record(record_path(tmp_path, *key(job)), {**job, "status": "complete", "incomplete_reason": None})
+    run(a, run_job=fake_job([], []), disk_free=lambda p: 10**12, check_slots=lambda n, r: [])
+    assert "1 sessions queued, 1 already complete" in capsys.readouterr().out
