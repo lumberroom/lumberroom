@@ -28,8 +28,9 @@ binary is not on `PATH` for non-login shells.
 
 `LR_GATE_EXTRA_TOOLS` declares tools a server registers beyond the engine's twelve, as bare names
 separated by commas: `LR_GATE_EXTRA_TOOLS=tool_a,tool_b`. Every session in the run allows them in
-`--allowedTools` and `check_init` expects them in `init`. Set it in the environment of
-`batch.py run`, `session.py` and `probe.py`. It applies to every arm in the run, so arms whose
+`--allowedTools` and `check_init` expects them in `init`. Set it in the environment of every
+harness command: `batch.py`, `session.py` and `probe.py` run sessions with it, and `batch.py
+expand`, `compare.py` and `judge.py` refuse a task file that names a tool it does not declare. It applies to every arm in the run, so arms whose
 builds register different tools run in separate batches. The variable never reaches the session
 itself, which inherits only the allowlist below. A name with a server prefix or a double
 underscore stops `batch.py run` before its first session and `probe.py` before it reads a slot,
