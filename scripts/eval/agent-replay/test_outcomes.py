@@ -358,6 +358,8 @@ def test_a_forget_that_supersedes_the_target_and_deletes_nothing_reads_supersede
 # ---- release items, unknown kinds -----------------------------------------------------------
 
 EMPTY_END = {"written": [], "superseded": [], "deleted": [], "verdicts": {}}
+# The tools a run declares: the engine's twelve plus one extra, as session.session_tools returns them.
+TOOLS = ["context_bootstrap", "memory_search", "review_decide", "item_release"]
 
 
 def release_task(target="p-1", tool="item_release"):
@@ -401,7 +403,7 @@ def test_a_release_item_with_no_tool_scores_unscored_instead_of_guessing_one():
 
 def test_task_problems_refuse_a_release_item_with_no_tool():
     from outcomes import task_problems
-    got = task_problems({"b": {"id": "b", "items": [{"item": "r", "kind": "release", "target": "p-1"}]}})
+    got = task_problems({"b": {"id": "b", "items": [{"item": "r", "kind": "release", "target": "p-1"}]}}, TOOLS)
     assert len(got) == 1 and "b/r" in got[0] and "'tool'" in got[0]
 
 
@@ -419,7 +421,7 @@ def test_task_problems_name_every_unknown_kind_and_a_release_with_no_target():
              "b": {"id": "b", "items": [{"item": "r", "kind": "release", "tool": "item_release"}]},
              "c": {"id": "c", "items": [{"item": "r", "kind": "release", "target": "p-1",
                                          "tool": "item_release"}]}}
-    got = task_problems(tasks)
+    got = task_problems(tasks, TOOLS)
     assert len(got) == 2
     assert any("a/odd" in g and "teleport" in g for g in got)
     assert any("b/r" in g and "target" in g for g in got)
@@ -428,8 +430,9 @@ def test_task_problems_name_every_unknown_kind_and_a_release_with_no_target():
 def test_every_kind_derive_outcomes_scores_passes_the_task_check():
     from outcomes import KINDS, task_problems
     assert KINDS == {"verdict", "supersede", "forget", "write", "release"}
-    items = [{"item": k, "kind": k, "target": "t", "target_id": "t", "tool": "x"} for k in sorted(KINDS)]
-    assert task_problems({"t": {"id": "t", "items": items}}) == []
+    items = [{"item": k, "kind": k, "target": "t", "target_id": "t", "tool": "item_release", "match": ["t"]}
+             for k in sorted(KINDS)]
+    assert task_problems({"t": {"id": "t", "items": items}}, TOOLS) == []
     assert "unscored" not in derive_outcomes({"id": "t", "items": items}, [], [], EMPTY_END).values()
 
 
@@ -441,7 +444,30 @@ def test_a_release_item_with_no_target_scores_unscored_instead_of_raising():
 def test_expect_calls_given_as_a_string_is_refused():
     # A string reads as a set of letters, every arm's rate drops to 0 and rule 8 passes on nothing.
     from outcomes import task_problems
-    assert task_problems({"b": {"id": "b", "items": [], "expect_calls": ["context_bootstrap"]}}) == []
+    assert task_problems({"b": {"id": "b", "items": [], "expect_calls": ["context_bootstrap"]}}, TOOLS) == []
     for bad in ("context_bootstrap", [""], [3]):
-        got = task_problems({"b": {"id": "b", "items": [], "expect_calls": bad}})
+        got = task_problems({"b": {"id": "b", "items": [], "expect_calls": bad}}, TOOLS)
         assert len(got) == 1 and "b" in got[0] and "expect_calls" in got[0]
+
+
+def test_an_expect_calls_name_outside_the_declared_tools_is_refused():
+    # A typo no arm can call puts every arm at 0.00, and rule 8 passes on nothing.
+    from outcomes import task_problems
+    got = task_problems({"b": {"id": "b", "items": [], "expect_calls": ["context_bootstrp"]}}, TOOLS)
+    assert len(got) == 1 and "b" in got[0] and "context_bootstrp" in got[0]
+
+
+def test_a_release_tool_outside_the_declared_tools_is_refused():
+    # A mistyped tool scores `left` on every arm, and the arms agree on a release nobody could make.
+    from outcomes import task_problems
+    item = {"item": "r", "kind": "release", "target": "p-1", "tool": "item_relase"}
+    got = task_problems({"b": {"id": "b", "items": [item]}}, TOOLS)
+    assert len(got) == 1 and "b/r" in got[0] and "item_relase" in got[0]
+
+
+def test_a_write_item_with_no_match_is_refused():
+    # An empty pattern list matches every row the session wrote.
+    from outcomes import task_problems
+    for item in ({"item": "w", "kind": "write"}, {"item": "w", "kind": "write", "match": []}):
+        got = task_problems({"b": {"id": "b", "items": [item]}}, TOOLS)
+        assert len(got) == 1 and "b/w" in got[0] and "'match'" in got[0]

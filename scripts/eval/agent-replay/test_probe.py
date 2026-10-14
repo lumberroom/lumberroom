@@ -79,3 +79,15 @@ def test_fetch_tools_follows_next_cursor_across_pages(tmp_path, monkeypatch):
     monkeypatch.setattr(probe.urllib.request, "urlopen", urlopen)
     assert [t["name"] for t in probe.fetch_tools(tmp_path)] == ["memory_write", "memory_search"]
     assert sent == [None, "p2"]
+
+
+def test_a_malformed_extra_tool_declaration_stops_the_probe_before_any_network_read(tmp_path, monkeypatch, capsys):
+    import probe
+    read = []
+    monkeypatch.setenv("LR_GATE_EXTRA_TOOLS", "mcp__lumberroom__extra_lookup")
+    monkeypatch.setattr(probe, "fetch_tools", lambda d: read.append(d) or [])
+    monkeypatch.setattr(probe, "declaration_problems", lambda dirs, fetch=None: read.append(dirs) or [])
+    rc = probe.main(["--structured-slot", str(tmp_path / "s"), "--text-slot", str(tmp_path / "t"),
+                     "--fixture", str(tmp_path / "f.json"), "--root", str(tmp_path)])
+    assert rc == 2 and read == []
+    assert "LR_GATE_EXTRA_TOOLS" in capsys.readouterr().err

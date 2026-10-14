@@ -177,9 +177,10 @@ def expected_call_rate(expected, runs):
     return _mean(1.0 if set(expected) <= {c["tool"] for c in r["calls"]} else 0.0 for r in runs)
 
 
-def expect_calls_ok(base_rate, test_rate):
-    """Rule 8: the tested arm's expected-call rate reaches the base arm's, minus 5 points."""
-    return test_rate >= base_rate - 0.05 - EPS
+def expect_calls_ok(base_rate, noise_rate, test_rate):
+    """Rule 8: the tested arm's expected-call rate reaches the lower of the base and noise arms',
+    minus 5 points. The noise arm shows how often the base build itself skips the call."""
+    return test_rate >= min(base_rate, noise_rate) - 0.05 - EPS
 
 
 def fence_leak(runs):
@@ -262,7 +263,7 @@ def load_tasks(path: Path):
     if bad:
         raise ValueError(f"{path} holds unfilled {UNFILLED} target ids ({', '.join(bad)}); "
                          "pass the file fill_ids.py wrote")
-    problems = outcomes.task_problems(tasks)
+    problems = outcomes.task_problems(tasks, session.session_tools())
     if problems:
         raise ValueError(f"{path} holds items no rule can score: " + "; ".join(problems))
     return tasks
@@ -389,12 +390,13 @@ def evaluate(records, tasks, judge, stage, channel, test_arm="A1", base_arm="A0"
             if expected:
                 rates = {a: expected_call_rate(expected, tr(runs))
                          for a, runs in ((base_arm, a0), (noise_arm, a0b), (test_arm, a1))}
-                ok8 = expect_calls_ok(rates[base_arm], rates[test_arm])
+                ok8 = expect_calls_ok(rates[base_arm], rates[noise_arm], rates[test_arm])
                 rows.append((f"8 expected calls [{tid}]",
                              " ".join(f"{a} {v:.2f}" for a, v in rates.items()), ok8))
                 if not ok8:
                     failures.append(f"rule 8: task {tid} {test_arm} made every expected call "
-                                    f"({', '.join(expected)}) in fewer runs than {base_arm} minus 0.05")
+                                    f"({', '.join(expected)}) in fewer runs than the lower of "
+                                    f"{base_arm} and {noise_arm} minus 0.05")
         # Rule 4 needs both verdicts whole. A verdict that is missing or did not parse fails.
         verdicts, ok4 = {}, True
         for who in (test_arm, noise_arm):

@@ -201,18 +201,25 @@ def forget_outcome(target_id, end_state: dict) -> str:
 # Every item kind `derive_outcomes` scores, and the fields each one needs to score at all. A release
 # item names its own tool: the engine registers no release tool, so it has no default to offer.
 KINDS = {"verdict", "supersede", "forget", "write", "release"}
-REQUIRED = {"supersede": ("target_id",), "forget": ("target_id",), "release": ("target", "tool")}
+# An empty `match` list would match every row the session wrote.
+REQUIRED = {"supersede": ("target_id",), "forget": ("target_id",), "release": ("target", "tool"),
+            "write": ("match",)}
 
 
-def task_problems(tasks: dict) -> list:
-    """One line per item a task file cannot score: an unknown kind, or a kind missing the field it
-    reads. Loaders refuse the file on any line, so a typo fails before a session spends quota."""
-    out = []
+def task_problems(tasks: dict, tools) -> list:
+    """One line per item a task file cannot score: an unknown kind, a kind missing the field it
+    reads, or a tool name outside `tools`, the set the run declares (session.session_tools). Loaders
+    refuse the file on any line, so a typo fails before a session spends quota."""
+    out, tools = [], set(tools)
     for tid, t in tasks.items():
         exp = t.get("expect_calls", [])
         if not isinstance(exp, list) or not all(isinstance(n, str) and n for n in exp):
             # A string reads as a set of letters: every arm's rate drops to 0 and rule 8 passes.
             out.append(f"{tid}: expect_calls must be a list of tool names, not {exp!r}")
+        else:
+            # No arm can call an undeclared tool, so every arm reads 0.00 and rule 8 passes.
+            out += [f"{tid}: expect_calls names {n!r}, which no server in this run declares"
+                    for n in exp if n not in tools]
         for it in t.get("items", []):
             where, kind = f"{tid}/{it.get('item')}", it.get("kind")
             if kind not in KINDS:
@@ -220,6 +227,10 @@ def task_problems(tasks: dict) -> list:
             else:
                 out += [f"{where}: a {kind} item needs {f!r}" for f in REQUIRED.get(kind, ())
                         if not it.get(f)]
+                # A tool nobody declared leaves every arm at `left`, and the arms agree on nothing.
+                if kind == "release" and it.get("tool") and it["tool"] not in tools:
+                    out.append(f"{where}: release tool {it['tool']!r} is not declared; add it to "
+                               "LR_GATE_EXTRA_TOOLS")
     return out
 
 

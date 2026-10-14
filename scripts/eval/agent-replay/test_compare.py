@@ -445,11 +445,19 @@ def test_the_expected_call_rate_is_the_share_of_runs_that_made_every_expected_ca
     assert expected_call_rate(["context_bootstrap", "memory_search"], runs) == 1 / 3
 
 
-def test_expected_calls_pass_within_five_points_of_the_base_and_fail_past_it():
+def test_expected_calls_floor_on_the_lower_of_base_and_noise_minus_five_points():
+    # Shares from 5 runs move in steps of 0.2, so the 5-point margin forgives rounding only.
     from compare import expect_calls_ok
-    assert expect_calls_ok(1.0, 0.96)
-    assert expect_calls_ok(0.8, 1.0)
-    assert not expect_calls_ok(1.0, 0.8)
+    assert expect_calls_ok(1.0, 1.0, 1.0)
+    assert expect_calls_ok(0.8, 1.0, 1.0)
+    assert not expect_calls_ok(1.0, 1.0, 0.8)
+    assert not expect_calls_ok(1.0, 0.8, 0.6)
+
+
+def test_a_tested_arm_level_with_a_weaker_noise_arm_passes():
+    # A0 5 of 5, A0b 4 of 5, A1 4 of 5: the base build itself missed the call once.
+    from compare import expect_calls_ok
+    assert expect_calls_ok(5 / 5, 4 / 5, 4 / 5)
 
 
 def expect_tree_records(a1_tools):
@@ -497,3 +505,30 @@ def test_rescore_derives_release_items_again_from_the_stored_calls():
     r = run("A0", "promo-1", {"r": "unscored"})
     r["calls"] = [{"tool": "item_release", "args": {"id": "p-1"}, "ok": True}]
     assert rescore([r], tasks)[0]["outcomes"] == {"r": "released"}
+
+
+def tasks_file(tmp_path, task):
+    import json as _j
+    f = tmp_path / "tasks.jsonl"
+    f.write_text(_j.dumps({"id": "t-1", "group": "g", "items": [], **task}) + "\n")
+    return f
+
+
+def test_load_tasks_refuses_an_expect_calls_name_no_server_declares(tmp_path, monkeypatch):
+    import pytest
+    from compare import load_tasks
+    monkeypatch.delenv("LR_GATE_EXTRA_TOOLS", raising=False)
+    with pytest.raises(ValueError, match="context_bootstrp"):
+        load_tasks(tasks_file(tmp_path, {"expect_calls": ["context_bootstrp"]}))
+
+
+def test_load_tasks_accepts_a_release_tool_declared_in_lr_gate_extra_tools(tmp_path, monkeypatch):
+    import pytest
+    from compare import load_tasks
+    f = tasks_file(tmp_path, {"items": [{"item": "r", "kind": "release", "target": "p-1",
+                                         "tool": "item_release"}]})
+    monkeypatch.delenv("LR_GATE_EXTRA_TOOLS", raising=False)
+    with pytest.raises(ValueError, match="item_release"):
+        load_tasks(f)
+    monkeypatch.setenv("LR_GATE_EXTRA_TOOLS", "item_release")
+    assert list(load_tasks(f)) == ["t-1"]

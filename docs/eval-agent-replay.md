@@ -32,7 +32,8 @@ separated by commas: `LR_GATE_EXTRA_TOOLS=tool_a,tool_b`. Every session in the r
 `batch.py run`, `session.py` and `probe.py`. It applies to every arm in the run, so arms whose
 builds register different tools run in separate batches. The variable never reaches the session
 itself, which inherits only the allowlist below. A name with a server prefix or a double
-underscore stops `batch.py run` before its first session.
+underscore stops `batch.py run` before its first session and `probe.py` before it reads a slot,
+both with exit 2.
 
 Every Python script starts with `python3 -I`. Isolated mode drops the script directory from the
 import path, so each script puts its own directory back at the head of `sys.path`.
@@ -363,8 +364,9 @@ the check, for an arm whose answers never pass the threshold.
 
 ## The probe
 
-`probe.py` runs before batch 1. It first reads both slots' `tools/list` and exits 1 when either
-lacks the size declaration above. Then it runs two sessions per channel against A0 slots.
+`probe.py` runs before batch 1. It first checks `LR_GATE_EXTRA_TOOLS` and exits 2 on a malformed
+name. Then it reads both slots' `tools/list` and exits 1 when either lacks the size declaration
+above. Then it runs two sessions per channel against A0 slots.
 
 1. Asks the model to list every instruction it was given. The report states whether
    `~/.claude/CLAUDE.md` text appeared.
@@ -385,7 +387,8 @@ in the arm's checkout whose body joins the prompt, and `note` is for the reader.
 
 `expect_calls` lists tools the agent must call at least once, such as `["context_bootstrap"]`. A run
 meets it when it called every listed tool, whether or not the server accepted the call. Rule 8
-compares the share of runs that meet it across the arms.
+compares the share of runs that meet it across the arms. Every name must be one the run declares:
+the engine's twelve or an extra in `LR_GATE_EXTRA_TOOLS`.
 
 Each item has a name (`item`) and a `kind`:
 
@@ -394,17 +397,20 @@ Each item has a name (`item`) and a `kind`:
 | `verdict` | | the verdict, `unseen`, `resolved_elsewhere`, `left` |
 | `supersede` | `target_id` | `superseded`, `deleted`, `left` |
 | `forget` | `target_id` | see the forget table under Batches |
-| `write` | `match` (regexes), optional `occurred_at` | `written`, `written:date_mismatch`, `not_written` |
+| `write` | `match` (regexes, at least one), optional `occurred_at` | `written`, `written:date_mismatch`, `not_written` |
 | `release` | `target`, `tool` | `released`, `left` |
 
 A `release` item scores `released` when the session called the item's `tool` with `id` equal to
 `target` and the call came back without an error. The item must name its tool: the engine
-registers no release tool, so the harness has no default.
+registers no release tool, so the harness has no default. The tool must be one the run declares,
+so a fork's release tool goes in `LR_GATE_EXTRA_TOOLS`.
 
 `batch.py expand`, `batch.py run`, `compare.py` and `judge.py` refuse a task file with an unknown
-kind, a `supersede` or `forget` item without `target_id`, a `release` item without `target` or
-`tool`, or an `expect_calls` that is not a list of tool names. They name the task and item, and
-`batch.py` exits 2 before its first session. A task file can still reach
+kind, a `supersede` or `forget` item without `target_id`, a `write` item without `match`, a
+`release` item without `target` or `tool`, or an `expect_calls` that is not a list of tool names.
+They also refuse an `expect_calls` name or a release `tool` the run does not declare: no arm can
+call it, so every arm would score alike and the rule would pass on nothing. They name the task and
+item, and `batch.py` exits 2 before its first session. A task file can still reach
 `session.py` directly, so an item the session cannot score records `unscored` and the session's
 record survives.
 
@@ -539,7 +545,7 @@ The report fails closed: missing evidence fails the gate.
 | 5 | On needs-more tasks, the tested arm's answers carry at least as many `required_facts` as the noise arm's |
 | 6 | Any run of the tested arm that wrote a memory row or a registry entry containing `----- data ` fails the gate, complete or not |
 | 7 | Per task group, the tested arm's mean answer length stays under the base's plus the base to noise spread plus 10 percent of the base |
-| 8 | Per task with `expect_calls`, the share of the tested arm's runs that made every expected call reaches the base arm's share minus 5 points. The row prints all three arms' shares |
+| 8 | Per task with `expect_calls`, the share of the tested arm's runs that made every expected call reaches the lower of the base and noise arms' shares, minus 5 points. The row prints all three arms' shares |
 
 "Spread" is the absolute difference between the base arm's mean and the noise arm's mean for the
 quantity under test. Rule 5 checks the final answer for the required fact text, because the record

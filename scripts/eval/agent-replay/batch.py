@@ -55,7 +55,7 @@ def read_tasks(path: Path):
     """The task file's tasks in file order. Raises ValueError on an item no rule can score, so a
     bad file fails here and not in every session, where each failure would spend an attempt."""
     tasks = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
-    problems = outcomes.task_problems({t["id"]: t for t in tasks})
+    problems = outcomes.task_problems({t["id"]: t for t in tasks}, session.session_tools())
     if problems:
         raise ValueError(f"{path} holds items no rule can score: " + "; ".join(problems))
     return tasks

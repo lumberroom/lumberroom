@@ -165,6 +165,12 @@ def main(argv=None):
     ap.add_argument("--model", default="claude-sonnet-5-5")
     ap.add_argument("--root", type=Path, default=session.gate_root())
     a = ap.parse_args(argv)
+    try:
+        session.session_tools()
+    except ValueError as e:
+        # Every session would fail as bad_init, so stop before reading a slot.
+        print("FAIL:", e, file=sys.stderr)
+        return 2
     problems = declaration_problems([a.structured_slot, a.text_slot])
     if problems:
         for line in problems:
