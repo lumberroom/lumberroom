@@ -268,7 +268,9 @@ def run(args, *, run_job=run_job, disk_free=lambda p: shutil.disk_usage(p).free,
         print("GIVEN UP (incomplete after three reruns):", "/".join(map(str, g)))
     if args.limit:
         todo = todo[: args.limit]
-    print(f"{len(todo)} sessions queued, {len(jobs) - len(todo) - len(given_up)} already complete")
+    # Count records, not jobs: under --limit, jobs held back are neither queued nor complete.
+    done = sum(1 for j in jobs if (existing.get(key(j)) or {}).get("status") == "complete")
+    print(f"{len(todo)} sessions queued, {done} already complete")
     if check_slots is None:
         check_slots = functools.partial(preflight, declarations=not args.allow_undeclared)
     names = sorted({slot_name(j, slot_of) for j in todo})

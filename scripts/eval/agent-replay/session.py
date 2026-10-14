@@ -48,8 +48,8 @@ def gate_root(env=os.environ):
 CLAUDE = claude_bin()
 TIMEOUT_SECS = 20 * 60
 SERVER = "lumberroom"
-# The twelve tools the engine registers. A session may call these and the extras a run declares in
-# LR_GATE_EXTRA_TOOLS, nothing else.
+# The twelve tools the engine registers. A session may call these, or the list LR_GATE_TOOLS puts in
+# their place, plus the extras LR_GATE_EXTRA_TOOLS declares, and nothing else.
 LUMBERROOM_TOOLS = [
     "context_bootstrap", "memory_search", "memory_write", "registry_get", "memory_forget",
     "memory_history", "registry_history", "registry_set", "alias_set", "alias_list",
@@ -59,21 +59,39 @@ LUMBERROOM_TOOLS = [
 TOOL_NAME_RE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
 
 
-def extra_tools(env=os.environ):
-    """Tools a server registers on top of the engine's twelve, from LR_GATE_EXTRA_TOOLS, comma
-    separated. A build that adds tools declares them here instead of editing LUMBERROOM_TOOLS, so
-    one harness serves every build and `check_init` still rejects a tool nobody declared."""
-    names = [n.strip() for n in (env.get("LR_GATE_EXTRA_TOOLS") or "").split(",") if n.strip()]
+def _tool_names(env, var):
+    """Bare tool names from a comma-separated variable. Raises ValueError on a malformed name."""
+    names = [n.strip() for n in (env.get(var) or "").split(",") if n.strip()]
     bad = [n for n in names if not TOOL_NAME_RE.fullmatch(n)]
     if bad:
         # A prefixed name never matches an init entry, so every session would fail as bad_init.
-        raise ValueError(f"LR_GATE_EXTRA_TOOLS holds {bad}: list bare tool names, such as tool_a")
+        raise ValueError(f"{var} holds {bad}: list bare tool names, such as tool_a")
+    return names
+
+
+def extra_tools(env=os.environ):
+    """Tools a server registers on top of the base list, from LR_GATE_EXTRA_TOOLS, comma
+    separated. A build that adds tools declares them here instead of editing LUMBERROOM_TOOLS, so
+    one harness serves every build and `check_init` still rejects a tool nobody declared."""
+    return _tool_names(env, "LR_GATE_EXTRA_TOOLS")
+
+
+def base_tools(env=os.environ):
+    """LR_GATE_TOOLS when set, else the engine's twelve. A server whose principal lacks some engine
+    tools exposes a set extras cannot reach, because extras only add."""
+    if "LR_GATE_TOOLS" not in env:
+        return list(LUMBERROOM_TOOLS)
+    names = list(dict.fromkeys(_tool_names(env, "LR_GATE_TOOLS")))
+    if not names:
+        # Set but empty would allow no tool, and every session would fail at check_init.
+        raise ValueError("LR_GATE_TOOLS is set but names no tool: list the server's tools, or unset it")
     return names
 
 
 def session_tools(env=os.environ):
-    """The engine's twelve tools plus the declared extras, each once."""
-    return LUMBERROOM_TOOLS + [t for t in dict.fromkeys(extra_tools(env)) if t not in LUMBERROOM_TOOLS]
+    """The base list plus the declared extras, each once."""
+    base = base_tools(env)
+    return base + [t for t in dict.fromkeys(extra_tools(env)) if t not in base]
 
 
 BUILTIN_PLUGINS = {"cc-plugin-agents-md", "cc-plugin-telemetry", "cc-plugin-plugin-authoring"}
@@ -160,7 +178,8 @@ def check_init(ev, server=SERVER, expected_tools=LUMBERROOM_TOOLS):
     # An undeclared tool would let one arm's agent reach for a tool the other arm lacks.
     undeclared = [t for t in tools if t[len(f"mcp__{server}__"):] not in expected_tools]
     if undeclared:
-        raise Rejected(f"undeclared tools in init: {undeclared}; declare them in LR_GATE_EXTRA_TOOLS")
+        raise Rejected(f"undeclared tools in init: {undeclared}; declare them in LR_GATE_EXTRA_TOOLS "
+                       "or list the full set in LR_GATE_TOOLS")
     missing = [t for t in expected_tools if f"mcp__{server}__{t}" not in tools]
     if missing:
         raise Rejected(f"lumberroom tools missing from init: {missing}")

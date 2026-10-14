@@ -30,11 +30,21 @@ binary is not on `PATH` for non-login shells.
 separated by commas: `LR_GATE_EXTRA_TOOLS=tool_a,tool_b`. Every session in the run allows them in
 `--allowedTools` and `check_init` expects them in `init`. Set it in the environment of every
 harness command: `batch.py`, `session.py` and `probe.py` run sessions with it, and `batch.py
-expand`, `compare.py` and `judge.py` refuse a task file that names a tool it does not declare. It applies to every arm in the run, so arms whose
-builds register different tools run in separate batches. The variable never reaches the session
-itself, which inherits only the allowlist below. A name with a server prefix or a double
-underscore stops `batch.py run` before its first session and `probe.py` before it reads a slot,
-both with exit 2.
+expand`, `compare.py` and `judge.py` refuse a task file that names a tool it does not declare. It
+applies to every arm in the run, so arms whose builds register different tools run in separate
+batches.
+
+`LR_GATE_TOOLS` replaces the engine's twelve with a complete list, in the same form:
+`LR_GATE_TOOLS=tool_a,tool_b`. Use it when a server does not expose every engine tool, for example
+a principal granted some engine tools and others of its own. `LR_GATE_EXTRA_TOOLS` cannot remove a
+tool, and `check_init` rejects a session whose server lacks one it expects. Extras still add on top
+of whichever list applies. With `LR_GATE_TOOLS` set, an engine tool missing from it counts as
+undeclared, and a session whose `init` lists it is rejected.
+
+Neither variable reaches the session itself, which inherits only the allowlist below. A name with
+a server prefix or a double underscore, or an `LR_GATE_TOOLS` that is set but names no tool, stops
+`batch.py run` and `expand` before they start, `compare.py` and `judge.py` before they read
+records, and `probe.py` before it reads a slot. `batch.py`, `compare.py` and `probe.py` exit 2.
 
 Every Python script starts with `python3 -I`. Isolated mode drops the script directory from the
 import path, so each script puts its own directory back at the head of `sys.path`.
@@ -99,8 +109,9 @@ event shows any of:
   (a server that failed lists no tools, and the session would answer from nothing);
 - `memory_paths.auto`, which means auto memory is on;
 - a tool that does not start with `mcp__lumberroom__`;
-- a lumberroom tool outside the twelve and the extras `LR_GATE_EXTRA_TOOLS` declares;
-- one of the twelve or a declared extra missing from `tools`;
+- a lumberroom tool outside the base list (the twelve, or `LR_GATE_TOOLS`) and the extras
+  `LR_GATE_EXTRA_TOOLS` declares;
+- a tool from the base list or a declared extra missing from `tools`;
 - a plugin outside `cc-plugin-agents-md`, `cc-plugin-telemetry`, `cc-plugin-plugin-authoring`.
 
 `check_event` also rejects a hook event and any tool use outside the slot's server. On the text
@@ -365,8 +376,8 @@ the check, for an arm whose answers never pass the threshold.
 
 ## The probe
 
-`probe.py` runs before batch 1. It first checks `LR_GATE_EXTRA_TOOLS` and exits 2 on a malformed
-name. Then it reads both slots' `tools/list` and exits 1 when either lacks the size declaration
+`probe.py` runs before batch 1. It first checks `LR_GATE_TOOLS` and `LR_GATE_EXTRA_TOOLS` and
+exits 2 on a malformed or empty declaration. Then it reads both slots' `tools/list` and exits 1 when either lacks the size declaration
 above. Then it runs two sessions per channel against A0 slots.
 
 1. Asks the model to list every instruction it was given. The report states whether
@@ -389,7 +400,7 @@ in the arm's checkout whose body joins the prompt, and `note` is for the reader.
 `expect_calls` lists tools the agent must call at least once, such as `["context_bootstrap"]`. A run
 meets it when it called every listed tool, whether or not the server accepted the call. Rule 8
 compares the share of runs that meet it across the arms. Every name must be one the run declares:
-the engine's twelve or an extra in `LR_GATE_EXTRA_TOOLS`.
+the base list (the engine's twelve, or `LR_GATE_TOOLS`) or an extra in `LR_GATE_EXTRA_TOOLS`.
 
 Each item has a name (`item`) and a `kind`:
 
@@ -432,7 +443,8 @@ at a time. Across slots it runs `--concurrency` sessions together. It interleave
 same task and repeat, so a model or quota change between windows lands on every arm alike.
 
 - *Resume.* A job with a complete record is skipped. A record appears only once it is whole: every
-  writer goes through a temporary file and a rename.
+  writer goes through a temporary file and a rename. The summary line counts the batch's complete
+  records, so jobs `--limit` held back count as neither queued nor complete.
 - *Slot check.* Before the first session, `run` checks every slot the queue uses: the directory
   exists and its `tools/list` declares the size limit on `memory_search`. A failure starts no
   session and exits 5.
@@ -608,7 +620,7 @@ Those need the gate host and a Claude subscription login.
 Covered by pytest only, never run against a live slot or a live session: the `tools/list` size
 declaration check in `probe.py` and `batch.py run`, the rate-limit and disk stops, `--keep-order`,
 `--slot-of`, the file-stub count, the forget outcome rescoring, the 50-per-source default page
-check in `retrieval_diff.py`, `LR_GATE_EXTRA_TOOLS`, the `release` item, `expect_calls` with rule 8,
+check in `retrieval_diff.py`, `LR_GATE_EXTRA_TOOLS`, `LR_GATE_TOOLS`, the `release` item, `expect_calls` with rule 8,
 and the task file check in `batch.py`. The `rate_limit_event` shape the stop reads was captured from one
 local Claude Code session on 13 October 2026; the stub signature was seen in transcripts from a
 gate run in October 2026, and the tests pin it with synthetic paths.

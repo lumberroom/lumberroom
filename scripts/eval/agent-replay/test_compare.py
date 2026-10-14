@@ -532,3 +532,11 @@ def test_load_tasks_accepts_a_release_tool_declared_in_lr_gate_extra_tools(tmp_p
         load_tasks(f)
     monkeypatch.setenv("LR_GATE_EXTRA_TOOLS", "item_release")
     assert list(load_tasks(f)) == ["t-1"]
+
+
+def test_load_tasks_refuses_an_empty_lr_gate_tools(tmp_path, monkeypatch):
+    import pytest
+    from compare import load_tasks
+    monkeypatch.setenv("LR_GATE_TOOLS", "")
+    with pytest.raises(ValueError, match="LR_GATE_TOOLS"):
+        load_tasks(tasks_file(tmp_path, {}))

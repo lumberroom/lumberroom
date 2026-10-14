@@ -371,3 +371,48 @@ def test_an_unknown_item_kind_records_unscored_instead_of_losing_the_session(tmp
     task = {"id": "x-1", "prompt": "p", "items": [{"item": "odd", "kind": "teleport"}]}
     rec = run_stub(tmp_path, monkeypatch, [INIT_OK, CLEAN_END], task=task)
     assert rec["status"] == "complete" and rec["outcomes"] == {"odd": "unscored"}
+
+
+# ---- LR_GATE_TOOLS replaces the engine's twelve ---------------------------------------------
+
+def test_lr_gate_tools_replaces_the_engine_list_and_extras_still_add_on_top():
+    from session import session_tools
+    env = {"LR_GATE_TOOLS": "context_bootstrap, memory_search,tool_x", "LR_GATE_EXTRA_TOOLS": "extra_lookup,tool_x"}
+    assert session_tools(env) == ["context_bootstrap", "memory_search", "tool_x", "extra_lookup"]
+    assert session_tools({"LR_GATE_EXTRA_TOOLS": "extra_lookup"}) == LUMBERROOM_TOOLS + ["extra_lookup"]
+
+
+@pytest.mark.parametrize("value", ["", " , ", "mcp__lumberroom__memory_search", "memory_search,Tool_X"])
+def test_an_empty_or_malformed_lr_gate_tools_is_refused(value):
+    # Set but empty would allow no tool at all, so every session would fail at check_init.
+    from session import session_tools
+    with pytest.raises(ValueError, match="LR_GATE_TOOLS"):
+        session_tools({"LR_GATE_TOOLS": value})
+
+
+REPLACED = ["context_bootstrap", "memory_search", "tool_x"]
+
+
+def test_a_replaced_set_drops_the_missing_engine_tool_from_allowed_tools(tmp_path, monkeypatch):
+    monkeypatch.setenv("LR_GATE_TOOLS", ",".join(REPLACED))
+    monkeypatch.delenv("LR_GATE_EXTRA_TOOLS", raising=False)
+    init = {**INIT_OK, "tools": [f"mcp__lumberroom__{t}" for t in REPLACED]}
+    rec = run_stub(tmp_path, monkeypatch, [init, CLEAN_END])
+    assert rec["status"] == "complete"
+    args = (tmp_path / "args.txt").read_text().splitlines()
+    allowed = args[args.index("--allowedTools") + 1].split(",")
+    assert allowed == [f"mcp__lumberroom__{t}" for t in REPLACED]
+
+
+def test_a_replaced_set_refuses_an_init_that_lists_a_dropped_engine_tool(tmp_path, monkeypatch):
+    monkeypatch.setenv("LR_GATE_TOOLS", ",".join(REPLACED))
+    monkeypatch.delenv("LR_GATE_EXTRA_TOOLS", raising=False)
+    init = {**INIT_OK, "tools": [f"mcp__lumberroom__{t}" for t in REPLACED + ["review_decide"]]}
+    rec = run_stub(tmp_path, monkeypatch, [init, CLEAN_END])
+    assert rec["incomplete_reason"] == "bad_init"
+
+
+def test_check_init_names_a_dropped_engine_tool_as_undeclared():
+    with pytest.raises(Rejected, match="undeclared.*review_decide"):
+        check_init(good_init(tools=[f"mcp__lumberroom__{t}" for t in REPLACED + ["review_decide"]]),
+                   server="lumberroom", expected_tools=REPLACED)
