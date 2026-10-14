@@ -277,3 +277,97 @@ def test_an_inline_session_records_complete_and_not_file_stubbed(tmp_path, monke
     ]
     rec = stub_session(tmp_path, monkeypatch, events)
     assert rec["status"] == "complete" and rec["file_stubbed"] is False and rec["rate_limit"] is None
+
+
+# ---- extra tools a run declares through LR_GATE_EXTRA_TOOLS ---------------------------------
+
+def test_extra_tools_come_from_lr_gate_extra_tools_comma_separated():
+    from session import extra_tools
+    assert extra_tools({"LR_GATE_EXTRA_TOOLS": "extra_queue, extra_release,,"}) == [
+        "extra_queue", "extra_release"]
+    assert extra_tools({}) == [] and extra_tools({"LR_GATE_EXTRA_TOOLS": ""}) == []
+
+
+def test_session_tools_add_the_declared_extras_to_the_engine_twelve_once():
+    from session import session_tools
+    got = session_tools({"LR_GATE_EXTRA_TOOLS": "extra_lookup,memory_search"})
+    assert got == LUMBERROOM_TOOLS + ["extra_lookup"]
+
+
+def test_an_extra_tool_name_that_is_not_a_bare_tool_name_is_refused():
+    # A prefixed or comma-mangled name would never match an init entry and fail every session.
+    from session import extra_tools
+    for bad in ("mcp__lumberroom__extra_lookup", "memory why", "Extra_Lookup"):
+        with pytest.raises(ValueError, match="LR_GATE_EXTRA_TOOLS"):
+            extra_tools({"LR_GATE_EXTRA_TOOLS": bad})
+
+
+def test_an_undeclared_tool_on_the_slot_server_is_rejected():
+    with pytest.raises(Rejected, match="undeclared"):
+        check_init(good_init(tools=ALL_TOOLS + ["mcp__lumberroom__extra_release"]),
+                   server="lumberroom")
+
+
+def test_a_declared_extra_tool_on_the_slot_server_passes():
+    expected = LUMBERROOM_TOOLS + ["extra_release"]
+    check_init(good_init(tools=ALL_TOOLS + ["mcp__lumberroom__extra_release"]),
+               server="lumberroom", expected_tools=expected)
+
+
+def test_a_declared_extra_tool_the_server_never_loaded_is_rejected():
+    with pytest.raises(Rejected, match="missing"):
+        check_init(good_init(), server="lumberroom",
+                   expected_tools=LUMBERROOM_TOOLS + ["extra_release"])
+
+
+def test_lr_gate_extra_tools_never_reaches_the_session_environment():
+    got = argv(env={**ENV, "LR_GATE_EXTRA_TOOLS": "extra_release"})
+    assert "LR_GATE_EXTRA_TOOLS" not in " ".join(got[:got.index(CLAUDE)])
+
+
+def arg_logging_claude(tmp_path, events):
+    """A stand-in binary that prints the stream and keeps its own argv, one argument per line."""
+    import json as _j
+    stream = tmp_path / "stream.jsonl"
+    stream.write_text("".join(_j.dumps(e) + "\n" for e in events))
+    exe = tmp_path / "claude"
+    exe.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > '{tmp_path / 'args.txt'}'\ncat '{stream}'\n")
+    exe.chmod(0o755)
+    return str(exe)
+
+
+def run_stub(tmp_path, monkeypatch, events, task=None):
+    import session
+    monkeypatch.setattr(session, "snapshot", lambda slot: {"memory": {}, "registry": {}})
+    (tmp_path / "arm" / "client").mkdir(parents=True)
+    (tmp_path / "arm" / "client" / "CLAUDE.md.snippet").write_text("Use lumberroom.")
+    slot = {"checkout": str(tmp_path / "arm"), "mcp_config": "/slot/mcp.json", "client": "gate-A0"}
+    task = task or {"id": "recall-1", "prompt": "What port?", "items": []}
+    return session.run_session(slot=slot, task=task, stage="sonnet", arm="A0", channel="structured",
+                               rep=1, model="m", root=tmp_path / "root",
+                               claude=arg_logging_claude(tmp_path, events))
+
+
+CLEAN_END = {"type": "result", "subtype": "success", "is_error": False, "result": "ok", "usage": {}}
+
+
+def test_a_run_with_declared_extras_allows_them_and_accepts_an_init_that_lists_them(tmp_path, monkeypatch):
+    monkeypatch.setenv("LR_GATE_EXTRA_TOOLS", "extra_release")
+    init = {**INIT_OK, "tools": INIT_OK["tools"] + ["mcp__lumberroom__extra_release"]}
+    rec = run_stub(tmp_path, monkeypatch, [init, CLEAN_END])
+    assert rec["status"] == "complete"
+    args = (tmp_path / "args.txt").read_text().splitlines()
+    assert "mcp__lumberroom__extra_release" in args[args.index("--allowedTools") + 1].split(",")
+
+
+def test_a_run_without_the_declaration_rejects_an_init_that_lists_an_extra(tmp_path, monkeypatch):
+    monkeypatch.delenv("LR_GATE_EXTRA_TOOLS", raising=False)
+    init = {**INIT_OK, "tools": INIT_OK["tools"] + ["mcp__lumberroom__extra_release"]}
+    rec = run_stub(tmp_path, monkeypatch, [init, CLEAN_END])
+    assert rec["incomplete_reason"] == "bad_init"
+
+
+def test_an_unknown_item_kind_records_unscored_instead_of_losing_the_session(tmp_path, monkeypatch):
+    task = {"id": "x-1", "prompt": "p", "items": [{"item": "odd", "kind": "teleport"}]}
+    rec = run_stub(tmp_path, monkeypatch, [INIT_OK, CLEAN_END], task=task)
+    assert rec["status"] == "complete" and rec["outcomes"] == {"odd": "unscored"}

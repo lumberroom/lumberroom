@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -47,12 +48,34 @@ def gate_root(env=os.environ):
 CLAUDE = claude_bin()
 TIMEOUT_SECS = 20 * 60
 SERVER = "lumberroom"
-# The twelve tools the engine registers. A session may call any of them and nothing else.
+# The twelve tools the engine registers. A session may call these and the extras a run declares in
+# LR_GATE_EXTRA_TOOLS, nothing else.
 LUMBERROOM_TOOLS = [
     "context_bootstrap", "memory_search", "memory_write", "registry_get", "memory_forget",
     "memory_history", "registry_history", "registry_set", "alias_set", "alias_list",
     "review_queue", "review_decide",
 ]
+# No double underscore: that is how a server-prefixed name such as mcp__lumberroom__x reads.
+TOOL_NAME_RE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
+
+
+def extra_tools(env=os.environ):
+    """Tools a server registers on top of the engine's twelve, from LR_GATE_EXTRA_TOOLS, comma
+    separated. A build that adds tools declares them here instead of editing LUMBERROOM_TOOLS, so
+    one harness serves every build and `check_init` still rejects a tool nobody declared."""
+    names = [n.strip() for n in (env.get("LR_GATE_EXTRA_TOOLS") or "").split(",") if n.strip()]
+    bad = [n for n in names if not TOOL_NAME_RE.fullmatch(n)]
+    if bad:
+        # A prefixed name never matches an init entry, so every session would fail as bad_init.
+        raise ValueError(f"LR_GATE_EXTRA_TOOLS holds {bad}: list bare tool names, such as tool_a")
+    return names
+
+
+def session_tools(env=os.environ):
+    """The engine's twelve tools plus the declared extras, each once."""
+    return LUMBERROOM_TOOLS + [t for t in dict.fromkeys(extra_tools(env)) if t not in LUMBERROOM_TOOLS]
+
+
 BUILTIN_PLUGINS = {"cc-plugin-agents-md", "cc-plugin-telemetry", "cc-plugin-plugin-authoring"}
 # The only variables a session inherits. Claude Code reads ANTHROPIC_* and CLAUDE_CODE_USE_* to pick
 # an API key or a cloud provider over the subscription login, and a deny list misses the next one.
@@ -117,7 +140,8 @@ def _plugin_name(p):
 def check_init(ev, server=SERVER, expected_tools=LUMBERROOM_TOOLS):
     """Reject a session whose `init` event breaks an isolation condition: an API key, a server
     other than the slot's or one that did not connect, auto memory on, a tool outside the slot's
-    server, a lumberroom tool that never loaded, or a plugin outside the builtin set."""
+    server, a server tool nobody declared, a declared tool that never loaded, or a plugin outside
+    the builtin set."""
     if ev.get("apiKeySource") != "none":
         raise Rejected(f"apiKeySource is {ev.get('apiKeySource')!r}, not 'none'")
     servers = ev.get("mcp_servers", []) or []
@@ -133,6 +157,10 @@ def check_init(ev, server=SERVER, expected_tools=LUMBERROOM_TOOLS):
     for t in tools:
         if not t.startswith(f"mcp__{server}__"):
             raise Rejected(f"built-in or foreign tool {t!r} is loaded")
+    # An undeclared tool would let one arm's agent reach for a tool the other arm lacks.
+    undeclared = [t for t in tools if t[len(f"mcp__{server}__"):] not in expected_tools]
+    if undeclared:
+        raise Rejected(f"undeclared tools in init: {undeclared}; declare them in LR_GATE_EXTRA_TOOLS")
     missing = [t for t in expected_tools if f"mcp__{server}__{t}" not in tools]
     if missing:
         raise Rejected(f"lumberroom tools missing from init: {missing}")
@@ -183,8 +211,9 @@ def run_session(*, slot, task, stage, arm, channel, rep, model, root=None, claud
     snippet = (arm_root / "client" / "CLAUDE.md.snippet").read_text()
     skill = (arm_root / task["skill"]).read_text() if task.get("skill") else None
     prompt = build_prompt(snippet, task["prompt"], skill)
+    tools = session_tools()
     argv = build_argv(claude=claude, prompt=prompt, model=model, mcp_config=slot["mcp_config"],
-                      tools=LUMBERROOM_TOOLS)
+                      tools=tools)
     before = snapshot(slot)
     work = tempfile.mkdtemp(prefix="lr-gate.", dir="/tmp")
     reason, stdout = None, ""
@@ -205,7 +234,7 @@ def run_session(*, slot, task, stage, arm, channel, rep, model, root=None, claud
         try:
             if parsed["init"] is None:
                 raise Rejected("no init event")
-            check_init(parsed["init"], slot.get("server", SERVER))
+            check_init(parsed["init"], slot.get("server", SERVER), tools)
             for ev in parsed["events"]:
                 check_event(ev, slot.get("server", SERVER))
         except Rejected:

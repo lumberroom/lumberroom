@@ -198,9 +198,46 @@ def forget_outcome(target_id, end_state: dict) -> str:
     return "superseded" if target_id in set(end_state.get("superseded") or []) else "left"
 
 
+# Every item kind `derive_outcomes` scores, and the fields each one needs to score at all. A release
+# item names its own tool: the engine registers no release tool, so it has no default to offer.
+KINDS = {"verdict", "supersede", "forget", "write", "release"}
+REQUIRED = {"supersede": ("target_id",), "forget": ("target_id",), "release": ("target", "tool")}
+
+
+def task_problems(tasks: dict) -> list:
+    """One line per item a task file cannot score: an unknown kind, or a kind missing the field it
+    reads. Loaders refuse the file on any line, so a typo fails before a session spends quota."""
+    out = []
+    for tid, t in tasks.items():
+        exp = t.get("expect_calls", [])
+        if not isinstance(exp, list) or not all(isinstance(n, str) and n for n in exp):
+            # A string reads as a set of letters: every arm's rate drops to 0 and rule 8 passes.
+            out.append(f"{tid}: expect_calls must be a list of tool names, not {exp!r}")
+        for it in t.get("items", []):
+            where, kind = f"{tid}/{it.get('item')}", it.get("kind")
+            if kind not in KINDS:
+                out.append(f"{where}: unknown item kind {kind!r}, expected one of {sorted(KINDS)}")
+            else:
+                out += [f"{where}: a {kind} item needs {f!r}" for f in REQUIRED.get(kind, ())
+                        if not it.get(f)]
+    return out
+
+
+def release_outcome(item: dict, calls) -> str:
+    """`released` when a call to the item's `tool` named the target as `id` and came back without
+    an error, else `left`. `unscored` when the item lacks either field."""
+    if not item.get("target") or not item.get("tool"):
+        return "unscored"
+    hit = any(c["tool"] == item["tool"] and c.get("ok") and (c.get("args") or {}).get("id") == item["target"]
+              for c in calls)
+    return "released" if hit else "left"
+
+
 def derive_outcomes(task: dict, calls, received_keys, end_state: dict) -> dict:
     """Per-item outcome: the verdict or write, `unseen`, `resolved_elsewhere`, or `left`. A forget
-    item reads `forget_outcome`."""
+    item reads `forget_outcome`, a release item `release_outcome`. An unknown kind scores
+    `unscored`: raising here would drop a session that already ran, and the loaders refuse such a
+    file before any session starts."""
     touched = set(end_state["superseded"]) | set(end_state["deleted"])
     decided = {}
     for c in calls:
@@ -235,6 +272,8 @@ def derive_outcomes(task: dict, calls, received_keys, end_state: dict) -> dict:
                 out[name] = "written:date_mismatch"
             else:
                 out[name] = "written"
+        elif kind == "release":
+            out[name] = release_outcome(it, calls)
         else:
-            raise ValueError(f"unknown item kind {kind!r} on {name}")
+            out[name] = "unscored"
     return out
