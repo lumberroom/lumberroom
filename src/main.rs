@@ -828,8 +828,9 @@ fn resolve_blocks(cfg: &config::Config, registry: &similarity::Registry) -> Resu
                 value = l.value,
                 table_value = table,
                 model = %t.model,
-                "an old single threshold variable overrides this model's table value; clear it \
-                 unless it was tuned on this model, or move it into EMBED_THRESHOLDS"
+                "an old single threshold variable overrides this model's table value, or bge's \
+                 guess for a model with no entry; clear it unless it was tuned on this model, or \
+                 move it into EMBED_THRESHOLDS"
             );
         }
         let problems = registry.check(&t);

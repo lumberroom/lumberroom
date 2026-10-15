@@ -44,8 +44,9 @@ one database row and reports what the server did with it. Nothing stops, and wri
 
 ## Before you start
 
-- **Same width.** Both models must produce 768-dimension vectors. `EMBED_PREVIOUS_DIM` must equal
-  `EMBED_DIM`, and both vector columns are `vector(768)`.
+- **Same width.** Both blocks store 768-dimension vectors. `EMBED_PREVIOUS_DIM` must equal
+  `EMBED_DIM`, and both vector columns are `vector(768)`. A narrower model, such as
+  multilingual-e5-small at 384, is zero-padded to the column, which leaves every cosine unchanged.
 - **The new endpoint must answer from inside the server container.** In there `127.0.0.1` is the
   container itself, not your host. Use the name of a service on the same Compose network (for
   example `http://embedder:8080/v1` for an embedding server you added to this compose project) or an
@@ -252,6 +253,61 @@ you removed the block of a model the row still targets:
 docker compose run --rm -T server lumberroom-server embeddings rollback
 ```
 
+## Moving to a multilingual model
+
+bge-base-en-v1.5 was trained on English. A store written in Hindi, Japanese or any mix of
+languages moves to multilingual E5 the same way, with both blocks local:
+
+```sh
+# The model the store moves to.
+EMBED_PROVIDER=local
+EMBED_MODEL=multilingual-e5-base
+EMBED_DIM=768
+
+# The model the store holds now.
+EMBED_PREVIOUS_PROVIDER=local
+EMBED_PREVIOUS_MODEL=Xenova/bge-base-en-v1.5
+```
+
+`multilingual-e5-small` works too: it is 384 wide and the server zero-pads it to the column. A new
+store with no rows sets `EMBED_MODEL` alone and needs none of the steps above, though it still runs
+on the guessed thresholds described below until you set `EMBED_THRESHOLDS`.
+
+- **Build the image yourself.** The published image carries bge's weights only. Build with both
+  blocks in `.env` (`docker compose build server`, or the installer's `--build-local`) and the
+  build bakes the weights of every local block in.
+- **The weights are fp32.** fastembed ships E5 unquantised, so its stored id ends `@fp32`
+  (`multilingual-e5-base@fp32`), where bge's ends `@q8`. From the published parameter counts,
+  278 million for base and 118 million for small at four bytes each, expect about 1.1 GB and
+  470 MB of weights. Nobody has measured resident memory or embedding latency for either.
+- **The server adds E5's prefixes.** E5 was trained with `query: ` in front of a search and
+  `passage: ` in front of a stored text. The local embedder adds both; `EMBED_QUERY_PREFIX` and
+  `EMBED_DOCUMENT_PREFIX` apply only to the `openai` provider.
+- **E5 has no threshold entry, so `flip` refuses until you set one.** Every key runs on bge's value,
+  marked `guessed`, and the boot log names them. bge's values were set on bge's scale. In one run of
+  the adapter's ignored test (`e5_ranks_the_relevant_passage_first` in
+  `src/adapters/embedding/local.rs`, 15 October 2026, hand-written English, Hindi and Japanese
+  sentences), unrelated pairs scored 0.66 to 0.76 and relevant ones 0.80 to 0.84, so bge's
+  `cleanup_worth_asking` and `route_max_top` of 0.65 sit below every unrelated pair. Those are a
+  few synthetic pairs and calibrate nothing. Once `status` shows the unit `held`, measure your own
+  store with the script under the next heading and put its line in `EMBED_THRESHOLDS`.
+- **A store that started on E5 has no measuring tool of its own.** Nothing gates it: with one
+  block the server writes, folds duplicates at `dedupe` and proposes cleanup merges at
+  `cleanup_near_certain`, both at bge's guessed 0.97. `scripts/embedding-thresholds.sql` maps one
+  model's thresholds onto another's and needs both vector columns full; pointed at one column twice
+  it returns about the values you fed it. Until you measure, the cautious setting turns the two
+  merging keys off in practice:
+
+  ```sh
+  EMBED_THRESHOLDS=dedupe=1,cleanup_near_certain=1
+  ```
+
+  Writes then fold only a pair scoring a full 1.0, and cleanup hands every pair above
+  `cleanup_worth_asking` to a model instead of merging it. The cost is duplicates that stay until
+  cleanup reaches them, and more model calls. `conflict` stays guessed.
+
+  No supported path measures E5's own thresholds yet. Issue #153 tracks it.
+
 ## Thresholds per model
 
 Each model reads its own cosine thresholds. The server ships a table:
@@ -263,8 +319,8 @@ Each model reads its own cosine thresholds. The server ships a table:
 | `bootstrap_dedup` | no | 0.90 | 0.919 |
 | `cleanup_near_certain` | yes | 0.97 | 0.995 |
 | `cleanup_worth_asking` | no | 0.65 | 0.754 |
-| `route_max_top` | no | 0.65 | 0.65 |
-| `route_max_spread` | no | 0.08 | 0.08 |
+| `route_max_top` | no | 0.65 | 0.76 |
+| `route_max_spread` | no | 0.08 | 0.07 |
 
 A model matches a row when its id contains the family name. `status` prints every value with its
 source: `override` (your line), `legacy` (an old single variable), `shipped`, `study`, `sweep`
@@ -371,8 +427,9 @@ starting the server.
 `EMBED_MIGRATION_CONTROL=env` replaces the command with configuration: `EMBED_PREVIOUS_*` starts the
 move, `EMBED_FLIP` (`all`, `none`, or a list of unit ids) allows flips, and `EMBED_RETIRE` names the
 model to delete once its window has passed, each applied by a recreate. Write `EMBED_RETIRE` as the
-id `status` prints: `openai:<model>` for a remote model, `<model>@q8` for a local one. A bare name
-reads as a local model and gains the `@q8`, so a remote model needs its `openai:` prefix. Boot
+id `status` prints: `openai:<model>` for a remote model, and for a local one `<model>@fp32` when it
+is multilingual E5 and `<model>@q8` otherwise. A bare name reads as a local model and gains the
+suffix its model takes, so a remote model needs its `openai:` prefix. Boot
 refuses a value that names either configured block. Rollback swaps the two blocks. In this mode
 every `embeddings` verb exits 2. The command suits a single-unit install; `env` mode suits a
 deployment that manages many units from configuration.

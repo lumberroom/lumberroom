@@ -487,19 +487,20 @@ ids. The schema, the tools and the database are unaffected.
 
 ## Changing the embedding model
 
-The `vector(768)` column is fixed in SQL, and the server refuses to start when `EMBED_DIM`
-disagrees with it. Changing providers at the same width needs no migration, but vectors from two
-models do not compare, so re-embed:
+Both vector columns, `embedding` and `embedding_b`, are `vector(768)` in SQL, and the server
+refuses to start when `EMBED_DIM` disagrees with them. Vectors from two models do not compare, so a
+store that already holds rows re-embeds them through `lumberroom-server embeddings`, which runs
+while the server keeps serving: [`docs/switching-embedding-models.md`](docs/switching-embedding-models.md)
+has the steps. Editing `EMBED_MODEL` alone stops the boot with `units active on a model no block
+configures`, naming each unit and the model its rows hold. Set `EMBED_MODEL` back, or name the old
+model in `EMBED_PREVIOUS_*` and follow the guide.
 
-```bash
-docker compose exec -T db psql -U lumberroom -d lumberroom \
-  -c "SELECT id, content FROM memory WHERE embedding_model <> '<new model id>'"
-```
+English stores keep the default, bge-base-en-v1.5. A store written in other languages sets
+`EMBED_MODEL=multilingual-e5-base`, or `multilingual-e5-small` for a smaller footprint, and builds
+with `--build-local` so the image carries those weights. The published image carries only bge.
 
-There is no re-embed command. With a store this size, the practical move is to dump the content,
-truncate, and rewrite through `lumberroom write`. That does not reach `private` rows, whose `content`
-column is NULL. If you are changing the width as well, write a new migration that alters the column
-type and rebuilds the HNSW index, then set `EMBED_DIM` to match.
+A model wider than 768 needs a new migration that alters the type of both vector columns and
+rebuilds both HNSW indexes, then `EMBED_DIM` to match.
 
 ---
 
