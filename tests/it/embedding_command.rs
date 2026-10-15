@@ -1,7 +1,7 @@
 //! `lumberroom-server embeddings` against a real Postgres (decision 0027). Each test runs the verbs
 //! through `command::embeddings::execute` with the Postgres repository and drives a command-mode
 //! `Sweep` by hand between them, so a written intent meets the pass that applies it. Skipped when no
-//! database is reachable, in the shape `tests/thresholds_per_model.rs` uses.
+//! database is reachable, in the shape `tests/it/thresholds_per_model.rs` uses.
 //!
 //! The two fakes carry production ids and answer deterministic unit vectors whose first component
 //! names the model (bge +0.6, Gemma -0.6). The clock is real time plus an offset a test can move.
@@ -32,8 +32,7 @@ use lumberroom_server::services::row_opener::NoOpener;
 use sqlx::{Connection, PgPool, Row};
 use uuid::Uuid;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const DIM: usize = 768;
@@ -43,7 +42,7 @@ const WITHDRAWN: &str = "openai:some/withdrawn-model";
 const UNIT: &str = "me";
 const NS: &str = "project:embedding-command";
 
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 /// Seconds the command's clock runs ahead of real time.
 static CLOCK_OFFSET_SECS: AtomicI64 = AtomicI64::new(0);
@@ -52,7 +51,7 @@ fn clock() -> DateTime<Utc> {
     Utc::now() + chrono::Duration::seconds(CLOCK_OFFSET_SECS.load(Ordering::SeqCst))
 }
 
-/// As `tests/embedding_migration.rs`: other binaries truncate `memory` and leave these alone.
+/// As `tests/it/embedding_migration.rs`: other modules truncate `memory` and leave these alone.
 const RESET: &str = "\
 DELETE FROM embedding_state;
 INSERT INTO embedding_control (singleton) VALUES (true) ON CONFLICT DO NOTHING;

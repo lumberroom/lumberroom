@@ -1,6 +1,6 @@
 //! Write-time conflict pairs, plan tasks E1-T4 and E2-T4: the triggers, the sweep, the scan and the
 //! stored-pair read against a real Postgres, skipped when none is reachable, in the shape
-//! `tests/review_queue.rs` uses.
+//! `tests/it/review_queue.rs` uses.
 //!
 //! Every event test ends in `assert_parity`: one sweep, then the adapter's `conflicts` must return
 //! the rows the old self-join returns, in the same order, and every stored similarity must equal
@@ -29,8 +29,7 @@ use sqlx::postgres::PgListener;
 use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 /// A database of its own rather than the suite's shared `lumberroom_rust_test`. Two assertions here
 /// read database-wide state, the `memory_conflict` channel and `pg_stat_database.deadlocks`, and a
@@ -45,7 +44,7 @@ const TEST_KEK_ID: &str = "kek-test";
 const FLOOR: f64 = 0.90;
 const DIM: usize = 768;
 
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 /// `CONFLICTS_SQL` as it stood before E2 (`src/adapters/postgres/memory.rs` at 47d7a55), kept here
 /// as the oracle. The adapter now reads stored pairs; this copy must not follow it.

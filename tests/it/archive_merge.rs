@@ -1,7 +1,7 @@
 //! Merge mode, against a real database. Skipped when none is reachable.
 //!
 //!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom \
-//!     cargo test --test archive_merge
+//!     cargo test --test it archive_merge::
 //!
 //! One fixture carries most of this file, and its shape is the whole point. Three rows: an open
 //! one, a second that supersedes it, and a private one. Those last two are precisely the rows the
@@ -41,8 +41,7 @@ use lumberroom_server::domain::types::{Invocation, Principal};
 use lumberroom_server::services::{archive, bootstrap, graph, write, Ctx, Repos};
 use sqlx::PgPool;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
@@ -57,16 +56,14 @@ const ID_PRIVATE: &str = "0195c0de-0000-7000-8000-000000000003";
 
 const WHEN: &str = "2026-08-30T11:04:00Z";
 
-/// Every test here truncates the shared test database, so they serialise themselves rather than
-/// relying on `--test-threads=1` being remembered.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 struct Harness {
     ctx: Ctx,
     pool: PgPool,
     _serial: tokio::sync::MutexGuard<'static, ()>,
-    /// Held for the whole test. The mutex above serialises this binary's own threads; this is what
-    /// keeps the other test binaries out of the same database.
+    /// Held for the whole test. `common::SERIAL` serialises this process's threads; this is what
+    /// keeps every other process out of the same database.
     _db: common::DbGuard,
 }
 
@@ -136,7 +133,7 @@ async fn setup() -> Option<Harness> {
     std::env::set_var("EMBED_PROVIDER", "hash");
     std::env::set_var(TEST_KEK_VAR, TEST_KEK_HEX);
 
-    // Before the truncate below, and before anything reads. Every other binary targeting this
+    // Before the truncate below, and before anything reads. Every other test targeting this
     // database waits here.
     let db_lock = common::lock_database(&url).await;
     let pool = step!("connecting to the test database", postgres::connect(&url).await);

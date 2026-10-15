@@ -13,8 +13,7 @@ use std::any::Any;
 use lumberroom_server::adapters::postgres;
 use sqlx::AssertSqlSafe;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 /// A database of its own, so planting a foreign migration never touches `lumberroom_rust_test`.
 const PROBE_DB: &str = "lumberroom_rust_test_fails_closed";

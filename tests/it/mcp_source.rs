@@ -1,5 +1,5 @@
 //! The MCP tools name the app that wrote a row (decision 0020). Against a real Postgres and a bound
-//! server, in the shape `tests/review_queue_mcp.rs` uses, skipped when no database is reachable.
+//! server, in the shape `tests/it/review_queue_mcp.rs` uses, skipped when no database is reachable.
 //!
 //! An OAuth writer here goes through the whole path a real client does: a consented row in
 //! `oauth_client`, an access token in `oauth_token`, and a `memory_write` over MCP with that token
@@ -25,8 +25,7 @@ use lumberroom_server::services::{bootstrap, sources, write, Ctx, Repos};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
@@ -34,7 +33,7 @@ const TEST_KEK_VAR: &str = "LUMBERROOM_TEST_KEK";
 const TEST_KEK_ID: &str = "kek-test";
 const OWNER_TOKEN: &str = "oooooooooooooooooooooooooooooooo";
 
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 struct Harness {
     ctx: Ctx,
@@ -67,7 +66,7 @@ impl Harness {
         parse_body(&text)
     }
 
-    /// One tool call, with a fresh `initialize` first, the way `tests/review_queue_mcp.rs` does it.
+    /// One tool call, with a fresh `initialize` first, as `tests/it/review_queue_mcp.rs` does it.
     async fn call_as(&self, bearer: &str, name: &str, args: Value) -> Value {
         let init = self
             .rpc(

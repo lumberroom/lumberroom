@@ -1,6 +1,6 @@
 //! `review_queue` and `review_decide` on the MCP surface, Phase 8 T7. Against a real Postgres, in
-//! the shape `tests/mcp_capability.rs` and `tests/review_queue.rs` each use: a bound server, real
-//! JSON-RPC round trips, skipped when no database is reachable.
+//! the shape `tests/it/mcp_capability.rs` and `tests/it/review_queue.rs` each use: a bound server,
+//! real JSON-RPC round trips, skipped when no database is reachable.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -24,8 +24,7 @@ use lumberroom_server::services::review_queue::{
 use lumberroom_server::services::{conflicts, write, Ctx, Repos};
 use sqlx::PgPool;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
@@ -33,7 +32,7 @@ const TEST_KEK_VAR: &str = "LUMBERROOM_TEST_KEK";
 const TEST_KEK_ID: &str = "kek-test";
 const OWNER_TOKEN: &str = "oooooooooooooooooooooooooooooooo";
 
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 /// A test double for `ProposalSource`, held by every harness alongside conflict and stale so T4's
 /// tool tests can exercise a proposal decide over the real MCP surface. Origin "canned", one item
@@ -108,7 +107,7 @@ struct Harness {
 }
 
 impl Harness {
-    /// One JSON-RPC round trip, the same shape `tests/mcp_capability.rs::rpc` uses.
+    /// One JSON-RPC round trip, the same shape `tests/it/mcp_capability.rs::rpc` uses.
     async fn rpc(&self, method: &str, params: serde_json::Value) -> serde_json::Value {
         let res = reqwest::Client::new()
             .post(format!("{}/mcp", self.base))
@@ -351,7 +350,7 @@ async fn set_created_at(pool: &PgPool, id: &str, at: chrono::DateTime<Utc>) {
         .unwrap();
 }
 
-/// The same near-duplicate shape `tests/review_queue.rs::conflict_pair` uses: close enough in
+/// The same near-duplicate shape `tests/it/review_queue.rs::conflict_pair` uses: close enough in
 /// wording that the hash embedder scores the pair as neighbours, backdated so ordering never races
 /// the clock.
 async fn conflict_pair(ctx: &Ctx, pool: &PgPool, namespace: &str, tag: &str) -> (String, String) {
@@ -446,7 +445,7 @@ async fn an_unknown_source_word_is_refused_with_the_queue_s_own_code() {
 
 /// Every harness in this file carries one configured origin, "canned" (T4 step 2), so a bare
 /// `source: ["proposal"]` request now returns its item rather than refusing `source_not_filled`;
-/// `tests/review_queue.rs::source_proposal_on_an_engine_answers_400_source_not_filled` still
+/// `tests/it/review_queue.rs::source_proposal_on_an_engine_answers_400_source_not_filled` still
 /// covers the refusal directly against `sources: &[]`.
 #[tokio::test]
 async fn asking_the_engine_for_proposals_returns_the_configured_source() {

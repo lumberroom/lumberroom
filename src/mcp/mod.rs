@@ -8,8 +8,8 @@
 //! about behaviour: when to read or write memory is the owner's rule, kept in the owner's own agent
 //! configuration (docs/connect-*.md carries the snippets), and a server that issues those orders
 //! itself fails connector directory review. Every tool also carries a title and the hints a
-//! client reads to decide what runs without a prompt; `tests/mcp_tool_annotations.rs` fails a tool
-//! that lacks them. Signatures extend and never rename: a client pinned to an older argument list
+//! client reads to decide what runs without a prompt; `tests/it/mcp_tool_annotations.rs` fails a
+//! tool that lacks them. Signatures extend and never rename: a client pinned to an older argument list
 //! keeps working, and a renamed tool is a tool the model has to be told about again.
 
 pub mod tools;

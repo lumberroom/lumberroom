@@ -17,11 +17,50 @@ docker build -t lumberroom-builder -f Dockerfile.builder .   # once, and again a
 docker compose up -d db                                # Postgres 16 + pgvector on 127.0.0.1:5432, your store
 
 ./scripts/cargo.sh check --all-targets
-./scripts/cargo.sh test-fast                           # the suite on testdb, six binaries at a time
+./scripts/cargo.sh nextest                             # the suite on testdb, each test in its own process
 ./scripts/cargo.sh test                                # the suite on testdb, one binary at a time
 ./scripts/cargo.sh test -j 1                           # the same, linking one binary at a time
+./scripts/cargo.sh test-fast                           # the binaries on testdb, six at a time
 ./scripts/cargo.sh test -j 1 -p lumberroom
 ```
+
+The integration tests build as one binary, `it`. Each file under `tests/it/` is a module of
+`tests/it/main.rs`, and the shared helpers stay in `tests/common/`. A new test file goes in
+`tests/it/` with a `mod` line in `main.rs`. A file directly under `tests/` builds a binary of its
+own and links the whole server crate again, which is the cost this layout removed.
+
+`nextest` runs `cargo nextest run`, which starts every test in a process of its own and runs as
+many at once as the container has CPUs. CI runs the suite this way. nextest skips doctests, so
+`./scripts/cargo.sh test --doc` covers those. The image carries a pinned cargo-nextest, and
+`cargo.sh` refuses `nextest` on an image built before it, printing the rebuild line above.
+
+What the layout and nextest bought, measured on 15 October 2026 on a Mac whose Docker VM had 7.7 GiB
+and 5 CPUs, so at the `-j 1` default, each figure from cargo's `Finished` or nextest's `Summary`
+line:
+
+| | 29 binaries | one binary |
+|---|---|---|
+| cold `cargo test --no-run -j 1` | 4m 21s | 3m 48s |
+| rebuild after touching `src/config.rs` | 36.6s, 38.6s | 11.8s, 11.4s |
+| `target/` after both | 6.7G, 34 executables at 2.7G | 3.8G, 6 executables at 567M |
+| peak memory, cold build | 966 MiB | 1000 MiB |
+| peak memory, the two rebuilds | 982, 922 MiB | 782, 847 MiB |
+| run, `cargo test`, summed over the binaries | 112s | 117s, 117s |
+| run, `cargo nextest run` | | 95s, 97s |
+
+Every run counted 1857 passed and 4 ignored. The `before` run time and both cold builds are one
+sample each. Peak memory is the highest `docker stats --no-stream` reading of the build container,
+sampled every one to two seconds, so a shorter spike can be missed; Postgres runs in another
+container and is not counted. The tests on
+`lumberroom_rust_test` queue on the suite lock under every runner, so the nextest gain most likely
+comes from the probe-database and database-free tests running beside that queue. Nobody has
+profiled it.
+
+The issue that asked for this also proposed a script mapping changed files to the test modules
+that cover them. It was left out. With one binary the build costs the same whatever subset runs, the
+tests on `lumberroom_rust_test` queue on the suite lock whatever subset runs, and a map from source
+files to modules is wrong the first time a Postgres adapter change reaches every module. To run one
+module, use nextest's `-E` filter below.
 
 `test-fast` builds every test binary once, as `test` does, then runs them six at a time instead of
 one after another. It prints one line per binary as it finishes, then a summary in `cargo test`'s
@@ -29,16 +68,15 @@ shape: the totals, each failure's `---- name stdout ----` block, and the failed 
 `--test <name>` so you can rerun one. It exits 101 on any failure, and 1 when it found nothing to
 run. `TEST_FAST_JOBS=3` changes the width, and arguments after `--` reach every binary.
 Logs land in `test-logs/<run>/`, one per binary, and git ignores them. `scripts/test-pool-test.sh`
-tests the pool that does the running and the summing.
+tests the pool that does the running and the summing. With one integration binary there is little
+left to run beside it: on the machine above, `test-fast` finished in 112s, all of it `it`.
 
-What it costs and what it buys. Every binary that touches `lumberroom_rust_test` still queues on the
-suite lock, so the gain comes from the binaries that do not: the lib tests, the doctests,
-`migration_lock` and the ones that need no database. Nobody has timed this repository's suite both
-ways yet. Each running binary holds its own Postgres connections, so two suites sharing one cluster
-at once, from two worktrees or from this repository and lumberroom-cloud, should take
-`TEST_FAST_JOBS=3` each. A test that reads a cluster-wide catalog such as `pg_locks` sees the other
-binaries' state; see docs/traps.md. When a failure only shows up in `test-fast`, rerun that binary
-alone with `test --test <name>` before believing it.
+Each running binary or nextest process holds its own Postgres connections, so two suites sharing
+one cluster at once, from two worktrees or from this repository and lumberroom-cloud, should take
+`TEST_FAST_JOBS=3` or nextest's `-j 3` each. A test that reads a cluster-wide catalog such as
+`pg_locks` sees the other processes' state; see docs/traps.md. When a failure only shows up under
+`test-fast` or `nextest`, rerun that test alone with `test --test it <module>::<name>` before
+believing it.
 
 The builder links with mold, and `scripts/cargo.sh` refuses to start on an image without the
 `lumberroom.linker=mold` label. The fix it prints is the rebuild line above.
@@ -59,13 +97,15 @@ same time got the linker OOM-killed in a Docker VM holding 6 GB: `collect2: fata
 with signal 9`. It reads as a compile error and it is a memory limit. So `test` and `test-fast` pick
 their own `-j` when you pass none: `-j 4` when `docker info` reports 12 GiB or more, `-j 1` below that
 or when the read fails. On a 12-CPU Linux build host with 15 GB, a cold suite build took 14m35s at
-`-j 1` and 11m07s at `-j 4`. Pass `-j` yourself to override either default.
+`-j 1` and 11m07s at `-j 4`, back when the suite linked one binary per test file. Pass `-j` yourself
+to override either default. `nextest` takes the same default as `--build-jobs`, because nextest reads
+`-j` as the number of tests to run at once.
 
 The suite runs on `testdb`, a Postgres service of its own in `docker-compose.yml` under the `test`
-profile, never on `db` where your store lives. `scripts/cargo.sh test` and `test-fast` start it when
-it is not healthy and hand the container
+profile, never on `db` where your store lives. `scripts/cargo.sh test`, `test-fast` and `nextest`
+start it when it is not healthy and hand the container
 `DATABASE_URL=postgres://$POSTGRES_USER:$POSTGRES_PASSWORD@testdb:5432/lumberroom_test`, an admin
-connection each test binary creates its own databases from. The cluster runs with fsync,
+connection each test creates its own databases from. The cluster runs with fsync,
 synchronous_commit and full_page_writes off and `max_connections=200`, because it holds nothing worth
 keeping and a parallel run at `db`'s 50 connections failed binaries with "too many clients". In one
 measured run of the hosted fork of [lumberroom](https://github.com/lumberroom/lumberroom) on a 12-CPU
@@ -95,16 +135,27 @@ the hash embedder, so it downloads nothing. A database that answers and then fai
 migration another branch left in `lumberroom_rust_test`, fails the test and names the fix. Under plain
 `cargo test` a test **skips rather than fails** when no database answers, and libtest counts the
 skip as passed, so the count cannot tell you. Set `LUMBERROOM_TEST_REQUIRE_DB=1` to make a missing
-database fail, or use `./scripts/cargo.sh test` or `test-fast`, which set it (so does CI). Without
-the switch, run with `-- --nocapture` and grep for "skipping". Tests serialise themselves on a
-Postgres advisory lock, because each one truncates that database and every test binary is its own
-process. A mutex serialises threads and would not do.
+database fail, or use `./scripts/cargo.sh test`, `test-fast` or `nextest`, which set it (so does
+CI). Without the switch, run with `-- --nocapture` and grep for "skipping". Tests serialise
+themselves on a Postgres advisory lock, because each one truncates that database and nextest, a
+second worktree or the fork's suite runs them in other processes. A mutex serialises threads and
+would not do.
 
-Run one test:
+Under `cargo test` the modules of `it` share one process, and with it the environment and every
+static. Each module's setup sets its own `AUTH_TOKENS` and then loads the config, so a test that
+sets an environment variable, loads the config or clears the digest cache takes `common::SERIAL`
+first and holds it for the whole test. A mutex per module failed 16 of 495 tests in the first fold.
+
+Run one test. Test names carry their old file name as a module path, and a `cargo test` filter
+matches any part of the name. `integration::` selects that module's 111 tests, but `cleanup::`
+selects 34, because `console_cleanup::` contains it; add `-- --skip console_cleanup` for 23.
+nextest's `-E` takes an anchored pattern.
 
 ```bash
-./scripts/cargo.sh test -j 1 --test integration <name>   # one integration test
-./scripts/cargo.sh test -j 1 --lib <name>                # one unit test
+./scripts/cargo.sh test -j 1 --test it integration::<name>   # one integration test
+./scripts/cargo.sh nextest integration::<name>               # the same under nextest
+./scripts/cargo.sh nextest -E 'test(/^cleanup::/)'           # exactly one old file's tests
+./scripts/cargo.sh test -j 1 --lib <name>                    # one unit test
 ```
 
 ## The acceptance gates

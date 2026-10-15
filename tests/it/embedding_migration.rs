@@ -1,7 +1,7 @@
 //! An embedding-model migration against a real Postgres (decision 0027): the repository adapter
 //! statement by statement, the migration's tables and triggers, the write path's two vectors, and
 //! the sweep end to end. Skipped when no database is reachable, in the shape
-//! `tests/thresholds_per_model.rs` uses.
+//! `tests/it/thresholds_per_model.rs` uses.
 //!
 //! Two fakes stand in for the models and carry production ids. Each answers a deterministic unit
 //! vector whose first component is its marker (bge +0.6, Gemma -0.6), so a stored vector names the
@@ -35,8 +35,7 @@ use lumberroom_server::services::{search, write, Ctx, Repos};
 use sqlx::{Connection, PgPool, Row};
 use uuid::Uuid;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const DIM: usize = 768;
@@ -46,9 +45,9 @@ const THIRD: &str = "openai:some/third-model";
 const UNIT: &str = "me";
 const NS: &str = "project:embedding-migration";
 
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
-/// The migration tables back to the state `migrate` leaves. Other binaries truncate `memory` and
+/// The migration tables back to the state `migrate` leaves. Other modules truncate `memory` and
 /// leave these alone, and a state row left active on slot B would move their conflict scans onto
 /// `embedding_b`.
 const RESET: &str = "\

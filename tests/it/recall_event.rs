@@ -22,16 +22,13 @@ use lumberroom_server::ports::{Emission, RecallCall, RecallEvent};
 use lumberroom_server::services::{bootstrap, forget, recall_events, search, write, Ctx, Repos};
 use sqlx::{AssertSqlSafe, PgPool, Row};
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
 const TEST_KEK_VAR: &str = "LUMBERROOM_RECALL_EVENT_TEST_KEK";
 const TEST_KEK_ID: &str = "kek-recall-event";
 
-/// The digest cache is a process-wide static and `config::load` reads the process environment, so
-/// the tests in this binary take turns.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 struct Probe {
     ctx: Ctx,
@@ -580,7 +577,7 @@ async fn the_table_holds_ids_and_times_and_no_content() {
 /// Caller-observed latency of `memory_search` and `context_bootstrap`, log off against log on, 20
 /// runs each. Ignored because it measures rather than asserts:
 ///
-///   ./scripts/cargo.sh test -j 1 --test recall_event -- --ignored --nocapture latency
+///   ./scripts/cargo.sh test -j 1 --test it -- --ignored --nocapture recall_event::latency
 #[tokio::test]
 #[ignore]
 async fn latency_with_and_without_the_log() {

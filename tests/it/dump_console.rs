@@ -1,8 +1,8 @@
 //! Renders console pages to `design/current/` for design work.
 //!
 //! Ignored by default: this writes files and is a tool rather than a check. Run it with
-//! `cargo test --test dump_console -- --ignored --nocapture` when the markup has changed and the
-//! design reference needs to catch up.
+//! `cargo test --test it dump_console:: -- --ignored --nocapture` when the markup has changed and
+//! the design reference needs to catch up.
 
 use chrono::Utc;
 use lumberroom_server::console::clients;

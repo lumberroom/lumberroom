@@ -1,9 +1,9 @@
 //! Acceptance suite for the review queue, Phase 8 T5. Against a real Postgres, skipped when none
-//! is reachable, in the shape `tests/integration.rs` and `tests/cleanup.rs` use.
+//! is reachable, in the shape `tests/it/integration.rs` and `tests/it/cleanup.rs` use.
 //!
 //! Every test seeds through `write::run` and calls `review_queue::{queue, decide}` directly,
 //! except the three that name the HTTP route: those go through a bound server the way
-//! `tests/cleanup.rs` does, because the capability gate and the route wiring live in the router.
+//! `tests/it/cleanup.rs` does, because the capability gate and the route wiring live in the router.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -27,18 +27,14 @@ use lumberroom_server::services::review_queue::{
 use lumberroom_server::services::{conflicts, review, search, write, Ctx, Repos};
 use sqlx::PgPool;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
 const TEST_KEK_VAR: &str = "LUMBERROOM_TEST_KEK";
 const TEST_KEK_ID: &str = "kek-test";
 
-/// Every test here truncates the shared test database, so they serialise themselves rather than
-/// relying on `--test-threads=1` being remembered, the same reason `integration.rs` and
-/// `cleanup.rs` each carry their own copy of this mutex.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 struct Harness {
     ctx: Ctx,

@@ -1,18 +1,22 @@
-//! What every database test shares: one lock, and the rule for when a test may skip.
+//! What every database test shares: two locks, and the rule for when a test may skip.
 //!
-//! Every integration binary here truncates `lumberroom_rust_test`, and each carries its own
-//! `static SERIAL` mutex. A mutex serialises threads inside one process, and each binary is its own
-//! process, so nothing stopped `tests/console_cleanup` truncating the table `tests/cleanup` was
-//! part way through asserting against.
+//! Most modules of `tests/it` truncate `lumberroom_rust_test`. When each was a binary of its own,
+//! each carried its own `static SERIAL` mutex. A mutex serialises threads inside one process, and
+//! each binary was its own process, so nothing stopped `tests/console_cleanup` truncating the table
+//! `tests/cleanup` was part way through asserting against.
 //!
 //! It fails the way shared state always does: every file passes on its own and two of them fail in
 //! a full run, with an assertion that reads like a logic bug. The two that failed were a proposal
 //! whose members had gone and a survivor chosen from a cluster that had changed underneath, both of
 //! which are exactly what a truncate from another process looks like from the inside.
 //!
-//! A Postgres advisory lock is held by a session rather than by a process, so every binary queues
-//! on the same one. It is released when the connection closes, which is what dropping the guard
-//! does.
+//! A Postgres advisory lock is held by a session rather than by a process, so every test queues on
+//! the same one whatever process it runs in: a thread of the one binary under `cargo test`, a
+//! process of its own under `cargo nextest run`, or another checkout's run on the same cluster. It
+//! is released when the connection closes, which is what dropping the guard does.
+//!
+//! `SERIAL` covers what the advisory lock cannot: the process environment and the statics the
+//! modules now share. See its own comment.
 //!
 //! It also owns the rule for when a database test may skip. Only a database that never answered
 //! is a reason to skip, and `LUMBERROOM_TEST_REQUIRE_DB` takes even that away. Every step after
@@ -20,7 +24,7 @@
 //! database holding another checkout's migrations hid a failing mutation on 24 September and
 //! 12 October 2026.
 
-// Each test binary compiles its own copy of this module and uses a different part of it.
+// No module uses all of this, and a helper only some module calls should not warn.
 #![allow(dead_code)]
 
 use sqlx::{Connection, PgPool};
@@ -28,7 +32,8 @@ use sqlx::{Connection, PgPool};
 /// A setup step that ran after the database answered. Its failure panics with the real error.
 ///
 /// Every test file used to carry its own copy that printed "skipping" and returned `None`, which
-/// turned a broken setup into a skip. A binary reaches this one through `#[macro_use] mod common;`.
+/// turned a broken setup into a skip. `tests/it/main.rs` declares this module with `#[macro_use]`,
+/// which is how every module reaches it.
 macro_rules! step {
     ($what:expr, $result:expr) => {
         match $result {
@@ -145,7 +150,21 @@ pub async fn migrate(pool: &PgPool, database: &str) {
     }
 }
 
-/// Any constant, as long as every binary uses this one. Derived from nothing: it just has to be a
+/// Held by every test that sets a process environment variable, loads the config or touches the
+/// digest cache, from its first `set_var` until the test ends.
+///
+/// The modules of `tests/it` share one process under `cargo test`. Each sets its own `AUTH_TOKENS`
+/// before it waits on the advisory lock and reads it back through `config::load` after, so without
+/// this a module waiting on the lock rewrites the tokens another module is about to load. Folding
+/// the files into one binary with a mutex per module failed 16 of 495 tests that way, and
+/// `ingest`'s `SENSITIVITY_DEFAULTS` reclassified a write in `integration`.
+///
+/// Take it before `lock_database`, never after: every holder of the advisory lock that also wants
+/// this one has to want it first, or two tests deadlock. Under `cargo nextest run` each test is its
+/// own process and this lock never has a second contender.
+pub static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Any constant, as long as every test uses this one. Derived from nothing: it just has to be a
 /// number no other advisory lock in this database picks.
 const SUITE_LOCK: i64 = 0x5574_7254_6573_74;
 
@@ -162,7 +181,7 @@ impl Drop for DbGuard {
     }
 }
 
-/// Blocks until every other test binary has finished with the database.
+/// Blocks until every other test, in this process or another, has finished with the database.
 ///
 /// A dedicated connection rather than one from the pool: a pooled connection goes back to be reused
 /// while still holding the lock, and the next test to borrow it would inherit a lock it never took
@@ -208,7 +227,7 @@ const REFUSE_EDGES_FN: &str = "CREATE OR REPLACE FUNCTION test_refuse_edges() RE
 /// Make every edge rebuild fail while a row holding `EDGE_REBUILD_MARKER` exists.
 ///
 /// A stand-in for the real cause, a store large enough to outrun the statement timeout. Every
-/// binary truncates `memory` before a test, so a test that panics before `allow_edge_rebuild`
+/// setup truncates `memory` before a test, so a test that panics before `allow_edge_rebuild`
 /// leaves the trigger inert rather than failing the next one.
 pub async fn refuse_edge_rebuild(pool: &PgPool) {
     assert!(REFUSE_EDGES_FN.contains(EDGE_REBUILD_MARKER), "the trigger and the marker disagree");

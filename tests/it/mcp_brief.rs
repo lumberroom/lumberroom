@@ -1,6 +1,6 @@
 //! The brief MCP answers (decision 0031), over HTTP against a real Postgres, in the shape
-//! `tests/mcp_source.rs` uses. A call with no `x-memory-invocation` header reads as a model's and
-//! gets the brief shape; `x-memory-invocation: cli` gets the full one.
+//! `tests/it/mcp_source.rs` uses. A call with no `x-memory-invocation` header reads as a model's
+//! and gets the brief shape; `x-memory-invocation: cli` gets the full one.
 //!
 //! Each test drives the bound router rather than `views` directly: the handlers pick the shape from
 //! the invocation, and a view that is right in isolation still fails if a handler skips it.
@@ -23,8 +23,7 @@ use lumberroom_server::services::{bootstrap, write, Ctx, Repos};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
@@ -32,7 +31,7 @@ const TEST_KEK_VAR: &str = "LUMBERROOM_TEST_KEK";
 const TEST_KEK_ID: &str = "kek-test";
 const OWNER_TOKEN: &str = "oooooooooooooooooooooooooooooooo";
 
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 struct Harness {
     ctx: Ctx,

@@ -71,7 +71,7 @@ shape's grant for that side.
 
 Save, and the new grant decides that client's next call. The grant lives on the client row and
 `OpaqueTokenAuthenticator` reads it on every request, so nothing reconnects and no token is
-reissued. Implemented, and covered by the `changing a client's access` tests in `tests/console.rs`.
+reissued. Implemented, and covered by the `changing a client's access` tests in `tests/it/console.rs`.
 
 Two limits worth knowing before you reach for this. It edits OAuth clients only: a static bearer
 client's grant lives in `AUTH_TOKENS`, which is read once at boot, so changing one means editing
@@ -110,7 +110,7 @@ name ending in one could pass for another client's.
 A rename changes the name and nothing else. The grant, the tokens and every stored row stay as they
 were, and no audit row is written; the server logs one line with the client id. The consent page
 keeps judging a client on the name it registered and the host its codes go to, so renaming a client
-never softens a warning. Implemented and covered by `tests/client_label.rs` and the unit tests in `src/console/clients.rs`;
+never softens a warning. Implemented and covered by `tests/it/client_label.rs` and the unit tests in `src/console/clients.rs`;
 not yet run against a live server.
 
 ### Approving a client that registered itself

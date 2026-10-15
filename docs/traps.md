@@ -44,7 +44,7 @@ exists for that.
 search wrote a new entry into every index on `memory`, the HNSW graph included. On a 5,000-row
 scratch store, 2,400 touches ran 0 HOT with the index and 2,027 HOT after migration 026 dropped it.
 Never name `last_accessed_at` or `access_count` in an index on `memory`, key or predicate;
-`tests/search_touch_hot.rs` reads the catalog for it, and that covers indexes a fork adds.
+`tests/it/search_touch_hot.rs` reads the catalog for it, and that covers indexes a fork adds.
 
 **A bare parameter takes its type from the first place it appears.** `PREPARE p AS SELECT 1 WHERE
 $1 > 0 AND $1 * 1.0::float8 > 0` gives `$1` the type `integer` on Postgres 17, the later float
@@ -57,7 +57,7 @@ one namespace that overlap each scan before the other commits, both rows get mar
 pair between them is never found or retried. The same holds for an `AFTER INSERT` trigger and for a
 deferred constraint trigger. Only the sweeper calls `memory_conflict_record`, and it runs after commit:
 a wake reaches it once Postgres releases the notification, and a timer sweep reads committed rows.
-`tests/conflict_pairs.rs` reads `pg_proc` and fails if any trigger function on `memory` calls
+`tests/it/conflict_pairs.rs` reads `pg_proc` and fails if any trigger function on `memory` calls
 `memory_conflict_record` or inserts into `memory_conflict`. The argument is in
 [`specs/write-time-conflicts.md`](specs/write-time-conflicts.md) section 6.
 
@@ -67,7 +67,7 @@ clause comparing two vectors that way fails to restore: `operator does not exist
 public.vector`. 0.5.0 shipped `memory_conflict_moved` like this, and every dump of it stopped
 `pg_restore --exit-on-error`. Any stored expression has the same exposure: a CHECK, an index
 predicate, a default. Write a plain operator, which `pg_dump` prints as `OPERATOR(public.<>)`, plus
-an explicit NULL test where NULL matters. `tests/trigger_restore.rs` replays every trigger as
+an explicit NULL test where NULL matters. `tests/it/trigger_restore.rs` replays every trigger as
 `pg_dump` prints it; nothing yet checks the other expression kinds.
 
 **A pooler in transaction mode drops conflict wakes.** `LISTEN` binds to one server session, and
@@ -239,8 +239,21 @@ passed alone and two failed in a full run, with assertions that read like logic 
 The guard has to be carried out of `setup`; an unused-variable warning was the only tell when it was
 not.
 
+**One test binary means one process environment.** Folding the 29 integration binaries into
+`tests/it` with a mutex per module failed 16 of 495 tests under `cargo test`. Each module's setup sets
+`AUTH_TOKENS` before it waits on the advisory lock and calls `config::load` after, so a module
+waiting on the lock rewrote the tokens another module was about to load. `ingest` also left
+`SENSITIVITY_DEFAULTS` set for every later module. Every setup now takes `common::SERIAL` before
+its first `set_var` and holds it for the test, and `ingest` unsets its variable after loading.
+nextest hides all of this, since each test gets a process of its own, and plain `cargo test` brings it
+back.
+
+**`cargo nextest run -j 4` sets test threads, not build jobs.** nextest spells cargo's `-j` as
+`--build-jobs`. `scripts/cargo.sh nextest` passes its memory-based default that way and leaves a
+caller's `-j` alone.
+
 **A catalog view in a test sees every database on the cluster.** `pg_locks`, `pg_stat_activity` and
-`pg_db_role_setting` are cluster-wide. `tests/migration_lock.rs` counted every advisory lock on the
+`pg_db_role_setting` are cluster-wide. `tests/it/migration_lock.rs` counted every advisory lock on the
 cluster to prove a failed migration released its own, and passed because `cargo test` runs one binary
 at a time. In lumberroom-cloud's copy of the test, the first run of `scripts/cargo.sh test-fast` put
 another binary's suite lock beside it and it failed with "left 2 advisory lock(s) held". Filter on

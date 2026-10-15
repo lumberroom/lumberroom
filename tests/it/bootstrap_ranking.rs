@@ -20,8 +20,8 @@ use lumberroom_server::services::bootstrap::{self, Digest};
 use lumberroom_server::services::{Ctx, Repos};
 use sqlx::{AssertSqlSafe, PgPool};
 
-#[macro_use]
-mod common;
+use crate::common;
+use crate::common::SERIAL;
 
 const DIMS: usize = 768;
 const PROJECT: &str = "alpha";
@@ -31,11 +31,14 @@ struct Store {
     admin: PgPool,
     name: &'static str,
     tenant: String,
+    /// `ctx` sets environment variables and loads the config, which other modules do too.
+    _serial: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl Store {
     /// A migrated database of its own, dropped first if a crashed run left it behind.
     async fn fresh(name: &'static str) -> Option<Store> {
+        let serial = SERIAL.lock().await;
         let (admin, base) = common::connect_admin().await?;
         // DDL takes no bind parameter. Audited: every caller passes a compile-time literal.
         step!(
@@ -51,7 +54,7 @@ impl Store {
         let pool =
             step!("connecting to the database", postgres::connect(&format!("{base}/{name}")).await);
         postgres::migrate(&pool).await.expect("migrations apply to an empty database");
-        Some(Store { pool, admin, name, tenant: "me".into() })
+        Some(Store { pool, admin, name, tenant: "me".into(), _serial: serial })
     }
 
     async fn drop(self) {

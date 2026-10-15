@@ -1,7 +1,7 @@
 //! Each embedding model reads its own cosine thresholds (decision 0029). These tests write through
 //! `write::run` and read through `review_queue::queue` against a real Postgres, under two fake
 //! embedders that carry the production ids of bge-base-en-v1.5 and EmbeddingGemma 2. Skipped when
-//! no database is reachable, in the shape `tests/review_queue.rs` uses.
+//! no database is reachable, in the shape `tests/it/review_queue.rs` uses.
 //!
 //! Every fake maps known texts to fixed unit vectors, so a test sets the cosine between two texts
 //! exactly. A pair at cosine c is `e0` and `c*e0 + sqrt(1 - c^2)*e1`. The store rounds similarities
@@ -22,15 +22,14 @@ use lumberroom_server::ports::Embedder;
 use lumberroom_server::services::review_queue::{self, QueueQuery, Source};
 use lumberroom_server::services::{conflicts, write, Ctx, Repos};
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const DIM: usize = 768;
 const BGE_ID: &str = "Xenova/bge-base-en-v1.5@q8";
 const GEMMA_ID: &str = "openai:google/embeddinggemma-2";
 
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 /// An embedder whose vectors the test chose. It refuses a text it was not given, so a write path
 /// that embeds something unexpected fails loudly instead of landing on an arbitrary vector.

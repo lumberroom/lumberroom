@@ -34,7 +34,7 @@ lumberroom-kek*
 # Screenshots design agents take while checking their own mockups.
 .shot-*.png
 
-# Rendered console pages, written by `cargo test --test dump_console -- --ignored` for design work.
+# Rendered console pages, written by `cargo test --test it dump_console:: -- --ignored` for design work.
 # Regenerated from the code on demand, so committing them makes a second source of truth that goes
 # stale the first time the markup changes.
 design/current/

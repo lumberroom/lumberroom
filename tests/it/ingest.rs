@@ -1,7 +1,7 @@
 //! Transcript ingestion, server side. Real Postgres with pgvector, the hash embedder, the same
 //! `lumberroom_rust_test` database as the rest of the suite. Skipped when no database is reachable.
 //!
-//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test --test ingest
+//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test --test it ingest::
 //!
 //! Four properties are the reason this file exists, and each of them has already been got wrong
 //! once in the design.
@@ -41,8 +41,7 @@ use lumberroom_server::ports::OauthStore;
 use lumberroom_server::services::{bootstrap, ingest, search, write, Ctx, Repos};
 use sqlx::PgPool;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
@@ -63,10 +62,7 @@ const READER_TOKEN: &str = "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr";
 /// `connection_string_password`, and it is the shape a transcript actually carries.
 const CREDENTIAL: &str = "postgres://lumberroom:s3cr3tPassw0rd@db.internal:5432/lumberroom";
 
-/// Every test here truncates the shared test database, so they serialise themselves rather than
-/// relying on `--test-threads=1` being remembered. Cargo runs one test binary at a time, so this
-/// mutex and the ones in `integration.rs` and `console.rs` do not have to know about each other.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 struct Harness {
     ctx: Ctx,
@@ -76,8 +72,8 @@ struct Harness {
     /// service-level test cannot see it.
     base: String,
     _serial: tokio::sync::MutexGuard<'static, ()>,
-    /// Held for the whole test. The mutex above serialises this binary's own threads; this is what
-    /// keeps the other five binaries out of the same database.
+    /// Held for the whole test. `common::SERIAL` serialises this process's threads; this is what
+    /// keeps every other process out of the same database.
     _db: common::DbGuard,
 }
 
@@ -146,12 +142,9 @@ async fn setup() -> Option<Harness> {
         ),
     );
     std::env::set_var("EMBED_PROVIDER", "hash");
-    // The production table classifies personal:* as private (migration 004). The tests that pin
-    // the level a proposal is read at need that rule to exist here too.
-    std::env::set_var("SENSITIVITY_DEFAULTS", "personal:*=private");
     std::env::set_var(TEST_KEK_VAR, TEST_KEK_HEX);
 
-    // Before the truncate below, and before anything reads. Every other binary
+    // Before the truncate below, and before anything reads. Every other test
     // targeting this database waits here.
     let db_lock = common::lock_database(&url).await;
     let pool = step!("connecting to the test database", postgres::connect(&url).await);
@@ -169,7 +162,14 @@ async fn setup() -> Option<Harness> {
     .await;
     step!("truncating the test database", truncated);
 
-    let cfg: Config = step!("loading the config", config::load());
+    // The production table classifies personal:* as private (migration 004). The tests that pin
+    // the level a proposal is read at need that rule to exist here too. Set only around the load:
+    // the modules of tests/it share this process, `integration` pins what an unset variable means,
+    // and a panic anywhere else in setup must not leave it set.
+    std::env::set_var("SENSITIVITY_DEFAULTS", "personal:*=private");
+    let loaded = config::load();
+    std::env::remove_var("SENSITIVITY_DEFAULTS");
+    let cfg: Config = step!("loading the config", loaded);
     let keys: Arc<dyn KeyProvider> = Arc::new(EnvKeyProvider::new(TEST_KEK_VAR, TEST_KEK_ID));
     let kek = step!("reading the test key", keys.kek().await);
     let check = postgres::verify_kek(
