@@ -421,6 +421,37 @@ pub struct RecentQuery {
     pub tags: Vec<String>,
 }
 
+/// One page of the retired list, newest retirement first.
+///
+/// Every filter here runs inside the query beside the cursor, so a filtered page is full and the
+/// next one starts where it ended.
+#[derive(Debug, Clone)]
+pub struct RetiredQuery {
+    pub tenant_id: String,
+    /// Every namespace the caller may read, with its ceiling. Both axes run in the query.
+    pub readable: Vec<NamespaceCeiling>,
+    /// Rows retired at or after this instant.
+    pub since: chrono::DateTime<chrono::Utc>,
+    /// Keyset cursor: rows that come after this `(retired_at, id)` in the page order, which runs
+    /// newest first, so strictly older, or tied and lower in id. `retired_at` is the instant the
+    /// page sorts on, `superseded_at` for a supersession and the closed end for an expiry. A cursor
+    /// built from `superseded_at` alone would skip every expired row.
+    pub after: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
+    /// Rows whose namespace starts with this. It narrows `readable` and never adds to it: a prefix
+    /// that names a namespace outside the list matches nothing.
+    pub namespace_prefix: Option<String>,
+    /// Rows whose content holds this, case-insensitive, with `%`, `_` and `\` read literally.
+    ///
+    /// A plain `ILIKE` on the content column rather than the lexical index. Decision 0005 keeps
+    /// private rows out of that index, and a list that dropped them for that reason would hide a
+    /// supersession with no sign a filter ran. An encrypted row stores no plaintext either, so
+    /// `ILIKE` has nothing to read and a private row never matches. Nothing here decrypts to
+    /// search, because that reads every private row in the window on every query. Empty reads as no
+    /// filter: `%%` would drop every encrypted row as well.
+    pub contains: Option<String>,
+    pub limit: i64,
+}
+
 /// What one namespace holds, filtered on both axes.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct NamespaceSummary {
@@ -609,13 +640,10 @@ pub trait MemoryRepository: Send + Sync {
     /// Ordered on when the row was retired, not on when it was written, because those are different
     /// questions and `recent` already answers the second. A wrong supersession is otherwise found by
     /// missing a fact, which is the one way this store loses something quietly.
-    async fn retired_since(
-        &self,
-        tenant: &str,
-        readable: &[NamespaceCeiling],
-        since: chrono::DateTime<chrono::Utc>,
-        limit: i64,
-    ) -> Result<Vec<Retired>>;
+    ///
+    /// An encrypted row comes back with empty content, the same as `memory_from_row` hands it to
+    /// every other read; only the service holds the key that could fill it in.
+    async fn retired_since(&self, q: RetiredQuery) -> Result<Vec<Retired>>;
 
     /// Per-namespace counts and the last write, for a reader deciding where to look.
     ///

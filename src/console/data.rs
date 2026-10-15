@@ -25,7 +25,7 @@ use crate::domain::types::{Memory, RegistryEntry, Sensitivity};
 use crate::ports::ingest::{IngestRepository, Proposal, ProposalFilter};
 use crate::ports::memory::Retired;
 use crate::ports::Timeline;
-use crate::ports::{RecentQuery, TagCount};
+use crate::ports::{RecentQuery, RetiredQuery, TagCount};
 use crate::services::{search, Ctx};
 
 /// How many entries one page holds by default, and the ceiling on what a query string may ask for.
@@ -428,9 +428,65 @@ pub async fn leaf(ctx: &Ctx, id: &str) -> Result<Option<Leaf>> {
 /// approved in a batch of forty is the one that needs finding before the next batch. A wrong
 /// supersession is otherwise discovered by missing a fact, and by then nothing says which run did
 /// it: the only undo runs off the delete plan, so it costs the successor row and a new id.
-pub async fn retired(ctx: &Ctx, readable: &[NamespaceCeiling]) -> Result<Vec<Retired>> {
+///
+/// `namespace` keeps rows whose namespace starts with it and `contains` keeps rows whose text holds
+/// it. Both run in the query beside the cursor, so a filtered page is full. A private row is
+/// encrypted and never matches `contains`; the port says why.
+pub async fn retired(
+    ctx: &Ctx,
+    readable: &[NamespaceCeiling],
+    filter: &RetiredFilter,
+    after: Option<Cursor>,
+    limit: i64,
+) -> Result<RetiredPage> {
     let since = chrono::Utc::now() - chrono::Duration::days(7);
-    ctx.repos.memories.retired_since(ctx.tenant(), readable, since, 100).await
+    // One more than the page, for the reason `page` gives.
+    let mut rows = ctx
+        .repos
+        .memories
+        .retired_since(RetiredQuery {
+            tenant_id: ctx.tenant().to_string(),
+            readable: readable.to_vec(),
+            since,
+            after: after.map(|c| (c.at, c.id)),
+            namespace_prefix: filter.namespace.clone(),
+            contains: filter.contains.clone(),
+            limit: limit + 1,
+        })
+        .await?;
+    let older = if rows.len() as i64 > limit {
+        rows.truncate(limit as usize);
+        rows.last().map(|r| Cursor { at: r.retired_at, id: r.id })
+    } else {
+        None
+    };
+    Ok(RetiredPage { rows, older })
+}
+
+/// What the retired page was asked to narrow to, trimmed, with a blank box read as no filter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetiredFilter {
+    pub namespace: Option<String>,
+    pub contains: Option<String>,
+}
+
+impl RetiredFilter {
+    pub fn new(namespace: Option<&str>, contains: Option<&str>) -> Self {
+        let kept =
+            |raw: Option<&str>| raw.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        Self { namespace: kept(namespace), contains: kept(contains) }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.namespace.is_none() && self.contains.is_none()
+    }
+}
+
+/// A run of retired rows with the cursor that continues it.
+#[derive(Debug, Clone, Default)]
+pub struct RetiredPage {
+    pub rows: Vec<Retired>,
+    pub older: Option<Cursor>,
 }
 
 /// Every version of this fact, oldest first, with the ids whose content would not open.
@@ -747,6 +803,17 @@ mod tests {
         assert_eq!(entry.dateline(same_year), "19 Aug");
         assert_eq!(entry.dateline(next_year), "19 Aug 2026");
         assert_eq!(entry.daymark(), "19 Aug 2026");
+    }
+
+    /// A submitted form sends both boxes, filled or not. A blank one is no filter: as a pattern it
+    /// would still drop every encrypted row, and as a prefix it is noise in the next page's link.
+    #[test]
+    fn a_blank_retired_filter_box_is_no_filter() {
+        assert!(RetiredFilter::new(Some(""), Some("   ")).is_empty());
+        assert!(RetiredFilter::new(None, None).is_empty());
+        let kept = RetiredFilter::new(Some(" project: "), Some(" deploy target "));
+        assert_eq!(kept.namespace.as_deref(), Some("project:"));
+        assert_eq!(kept.contains.as_deref(), Some("deploy target"));
     }
 
     #[test]

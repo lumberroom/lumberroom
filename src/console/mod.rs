@@ -442,6 +442,20 @@ struct NamespaceQuery {
     limit: Option<i64>,
 }
 
+/// The retired list's query string. `ns` is a prefix here, where the namespace page reads it as
+/// one exact namespace, because this page lists across namespaces and narrows them.
+#[derive(Deserialize)]
+struct RetiredListQuery {
+    #[serde(default)]
+    ns: Option<String>,
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    before: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
 #[derive(Deserialize)]
 struct SearchQuery {
     #[serde(default)]
@@ -930,7 +944,11 @@ async fn registry(State(app): State<Console>, headers: HeaderMap) -> Response {
 ///
 /// Read-only, and the owner's own view: no grant narrower than theirs reaches this console, and the
 /// query still runs both axes rather than trusting that.
-async fn retired(State(app): State<Console>, headers: HeaderMap) -> Response {
+async fn retired(
+    State(app): State<Console>,
+    headers: HeaderMap,
+    Query(q): Query<RetiredListQuery>,
+) -> Response {
     if let Err(response) = app.guard(&headers, "/console/retired") {
         return response;
     }
@@ -947,11 +965,20 @@ async fn retired(State(app): State<Console>, headers: HeaderMap) -> Response {
     };
     health.last_write = contents.last_write;
 
-    let rows = match data::retired(&ctx, &readable).await {
+    let filter = data::RetiredFilter::new(q.ns.as_deref(), q.q.as_deref());
+    let listing = match data::retired(
+        &ctx,
+        &readable,
+        &filter,
+        q.before.as_deref().and_then(Cursor::parse),
+        data::page_size(q.limit),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return failed(&app, "the retired list did not load", &e),
     };
-    page(StatusCode::OK, pages::retired(&rows, &contents, &health))
+    page(StatusCode::OK, pages::retired(&listing, &filter, &contents, &health))
 }
 
 async fn queue(
