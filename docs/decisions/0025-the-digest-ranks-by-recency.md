@@ -1,6 +1,6 @@
 # 25. The digest ranks by recency, and embeddings only drop near-duplicates
 
-**Date:** 6 October 2026 · **Status:** decided by the owner, implemented on branch `feat/digest-ranking`, not merged · **Decided by:** the owner, 6 October 2026, after an offline evaluation (issue #109)
+**Date:** 6 October 2026 · **Status:** decided by the owner, implemented and merged in #123 on 6 October 2026 · **Decided by:** the owner, 6 October 2026, after an offline evaluation (issue #109)
 
 ## Decision
 
