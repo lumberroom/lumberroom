@@ -3,7 +3,7 @@
 #
 #   ./scripts/cleanup-test.sh [--port N] [--keep]
 #
-# The server side is covered by tests/cleanup.rs. What this covers is the half that file cannot
+# The server side is covered by tests/it/cleanup.rs. What this covers is the half that file cannot
 # reach: the CLI reading the candidate list, the queue printing something a person can act on, and
 # apply moving rows through the routes rather than through a service call in the same process.
 #

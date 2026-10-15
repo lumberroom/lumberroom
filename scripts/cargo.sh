@@ -4,11 +4,12 @@
 #   ./scripts/cargo.sh check --all-targets
 #   ./scripts/cargo.sh test
 #   ./scripts/cargo.sh test-fast        # the same binaries, six at a time: scripts/lib/test-fast.sh
+#   ./scripts/cargo.sh nextest          # cargo nextest run: every test in a process of its own
 #
 # The builder image carries g++ (ONNX Runtime links libstdc++) and the OpenSSL headers; a bare
 # rust:slim does not. Build it once with:  docker build -t lumberroom-builder -f Dockerfile.builder .
 # The integration suite needs a Postgres on the compose network, which is why the container joins
-# it: the `testdb` service for `test` and `test-fast`, the `db` service for everything else.
+# it: the `testdb` service for `test`, `test-fast` and `nextest`, the `db` service for everything else.
 # scripts/cargo-sh-test.sh checks both choices below against a fake docker.
 set -e
 cd "$(dirname "$0")/.."
@@ -28,21 +29,38 @@ cd "$(dirname "$0")/.."
 #
 # `test-fast` builds like `test`, so it takes the same default, and then runs the built binaries N at
 # a time through scripts/lib/test-fast.sh.
+#
+# `nextest` becomes `cargo nextest run` and takes the same default, spelled `--build-jobs`. nextest
+# reads `-j` as `--test-threads`, so a caller's `-j` there sets how many tests run at once and leaves
+# the build to this default.
 FAST=
 if [ "${1:-}" = "test-fast" ]; then
   FAST=1
 fi
+NEXTEST=
+if [ "${1:-}" = "nextest" ]; then
+  NEXTEST=1
+fi
 TESTING=
-if [ "${1:-}" = "test" ] || [ "$FAST" = 1 ]; then
+if [ "${1:-}" = "test" ] || [ "$FAST" = 1 ] || [ "$NEXTEST" = 1 ]; then
   TESTING=1
 fi
 if [ "$TESTING" = 1 ]; then
   has_j=0
   for arg in "$@"; do
-    case "$arg" in
-      -j*|--jobs*) has_j=1 ;;
-    esac
+    if [ "$NEXTEST" = 1 ]; then
+      case "$arg" in
+        --build-jobs*) has_j=1 ;;
+      esac
+    else
+      case "$arg" in
+        -j*|--jobs*) has_j=1 ;;
+      esac
+    fi
   done
+  sub="$1"
+  shift
+  jobs=
   if [ "$has_j" = 0 ]; then
     jobs=1
     mem="$(docker info --format '{{.MemTotal}}' 2>/dev/null || true)"
@@ -50,16 +68,18 @@ if [ "$TESTING" = 1 ]; then
       '' | *[!0-9]*) ;;
       *) [ "$mem" -ge $((12 * 1024 * 1024 * 1024)) ] && jobs=4 ;;
     esac
-    sub="$1"
-    shift
-    set -- "$sub" -j "$jobs" "$@"
+  fi
+  if [ "$NEXTEST" = 1 ]; then
+    set -- nextest run ${jobs:+--build-jobs "$jobs"} "$@"
+  else
+    set -- "$sub" ${jobs:+-j "$jobs"} "$@"
   fi
 fi
 
 # ── which Postgres the suite gets ────────────────────────────────────────────────────────────────
 #
-# The test binaries create and truncate databases on whatever DATABASE_URL names, so `test` and
-# `test-fast` never get the developer's store. They get the `testdb` compose service, a throwaway
+# The test binaries create and truncate databases on whatever DATABASE_URL names, so `test`,
+# `test-fast` and `nextest` never get the developer's store. They get the `testdb` compose service, a throwaway
 # cluster with durability off (docker-compose.yml says why), started here when it is not already
 # healthy. LUMBERROOM_TEST_DATABASE_URL points them somewhere else instead, and is refused when its
 # database is the store's own name or missing, since a missing name connects to a database named
@@ -125,6 +145,17 @@ if [ "$builder_linker" != mold ]; then
   exit 1
 fi
 RUSTFLAGS_MOLD="-C link-arg=-fuse-ld=mold"
+
+# The same refusal for cargo-nextest, which Dockerfile.builder installs and labels. Only `nextest`
+# needs it, so an older image still runs everything else.
+if [ "$NEXTEST" = 1 ]; then
+  builder_nextest="$(docker image inspect -f '{{ index .Config.Labels "lumberroom.nextest" }}' lumberroom-builder 2>/dev/null || true)"
+  if [ -z "$builder_nextest" ]; then
+    echo "cargo.sh: the lumberroom-builder image carries no cargo-nextest. Rebuild it from this checkout:" >&2
+    echo "  docker build -t lumberroom-builder -f Dockerfile.builder ." >&2
+    exit 1
+  fi
+fi
 
 # ── the container outlives the command that started it, unless something stops it ────────────────
 #
@@ -212,8 +243,8 @@ fi
 # "could not find native static library `onnxruntime`", which reads like a toolchain fault. A target volume that already holds the stale output needs
 # `./scripts/cargo.sh clean -p ort-sys` once, because the build script does not rerun on this variable.
 #
-# LUMBERROOM_TEST_REQUIRE_DB turns a database test that would skip into a failure. `test` and
-# `test-fast` always attach testdb, so a skip under them hides a broken run behind an ok. See
+# LUMBERROOM_TEST_REQUIRE_DB turns a database test that would skip into a failure. `test`,
+# `test-fast` and `nextest` always attach testdb, so a skip under them hides a broken run behind an ok. See
 # tests/common/mod.rs.
 docker run --rm --name "$NAME" \
   --label "lumberroom.cargo.owner=$$" \

@@ -58,6 +58,30 @@ RUN arch="$(uname -m)" \
  && rm -rf /tmp/we.tar.xz /tmp/we.sha256 "/tmp/${base}" \
  && watchexec --version
 
+# cargo-nextest runs the suite under `scripts/cargo.sh nextest`, each test in a process of its own.
+# A prebuilt musl binary for the same reason as watchexec. The checksums are pinned here rather
+# than fetched beside the tarball, so a replaced release asset fails the build. To bump the version,
+# take both hashes from the release's `.sha256` assets.
+ARG NEXTEST_VERSION=0.9.148
+ARG NEXTEST_SHA256_AARCH64=94676506ceaed01746d78cfe9ed124ee841b2932fd18d9d10f438a347bd9ba5e
+ARG NEXTEST_SHA256_X86_64=bf92cb81450872d960ffa13857a83084d557ec0cdc141663d263bb23ef756f97
+RUN arch="$(uname -m)" \
+ && case "$arch" in \
+      aarch64) sum="$NEXTEST_SHA256_AARCH64" ;; \
+      x86_64) sum="$NEXTEST_SHA256_X86_64" ;; \
+      *) echo "no cargo-nextest checksum for $arch" >&2; exit 1 ;; \
+    esac \
+ && url="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-${arch}-unknown-linux-musl.tar.gz" \
+ && curl -fsSL -o /tmp/nextest.tar.gz "$url" \
+ && echo "${sum}  /tmp/nextest.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/nextest.tar.gz -C /tmp \
+ && install -m 0755 /tmp/cargo-nextest /usr/local/bin/cargo-nextest \
+ && rm -f /tmp/nextest.tar.gz /tmp/cargo-nextest \
+ && cargo nextest --version
+# scripts/cargo.sh reads this and refuses `nextest` on an image without it, rather than leaving
+# cargo to answer "no such command" from inside the container.
+LABEL lumberroom.nextest=${NEXTEST_VERSION}
+
 
 # ── cargo does not run as root here ───────────────────────────────────────────────────────────────
 #

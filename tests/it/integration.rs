@@ -1,7 +1,7 @@
 //! Integration suite. Talks to a real Postgres with pgvector, in its own database, using the hash
 //! embedder so nothing downloads. Skipped when no database is reachable.
 //!
-//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test --test integration
+//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test --test it integration::
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,8 +20,7 @@ use lumberroom_server::services::{
 };
 use sqlx::{PgPool, Row};
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 
@@ -31,10 +30,7 @@ const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567
 const TEST_KEK_VAR: &str = "LUMBERROOM_TEST_KEK";
 const TEST_KEK_ID: &str = "kek-test";
 
-/// Cargo runs tests in parallel and each of these truncates the shared test database, so they
-/// serialise themselves rather than depending on `--test-threads=1` being remembered. The guard
-/// is held for the lifetime of the test.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 /// Returns None when no database is reachable, so the suite skips rather than fails on a machine
 /// without one.
@@ -62,7 +58,7 @@ async fn setup_with(
     std::env::set_var("EMBED_PROVIDER", "hash");
     std::env::set_var(TEST_KEK_VAR, TEST_KEK_HEX);
 
-    // Before the truncate below, and before anything reads. Every other binary
+    // Before the truncate below, and before anything reads. Every other test
     // targeting this database waits here.
     let db_lock = common::lock_database(&url).await;
     let pool = step!("connecting to the test database", postgres::connect(&url).await);
@@ -132,7 +128,7 @@ macro_rules! ctx_or_skip {
     () => {
         match setup().await {
             // Both guards are bound so they live as long as the test body. The mutex serialises
-            // this binary's threads; the DbGuard holds the advisory lock the other five wait on.
+            // this process's threads; the DbGuard holds the advisory lock every other process waits on.
             Some((ctx, pool, guard, db)) => (ctx, pool, (guard, db)),
             None => {
                 common::skipping();

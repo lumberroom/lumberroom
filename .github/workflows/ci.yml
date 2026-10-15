@@ -59,7 +59,7 @@ jobs:
           --health-retries 20
     env:
       # Points at the admin database. The integration suite creates and connects to
-      # lumberroom_rust_test itself; see tests/integration.rs.
+      # lumberroom_rust_test itself; see tests/it/integration.rs.
       DATABASE_URL: postgres://lumberroom:lumberroom@localhost:5432/lumberroom
       # The service above always runs, so a database test that would skip fails instead. See
       # tests/common/mod.rs.
@@ -70,29 +70,33 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libssl-dev pkg-config g++
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Pinned to the version Dockerfile.builder installs, so CI and `scripts/cargo.sh nextest` run
+      # the same runner. Bump both together.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.148
       - name: server tests
         # An explicit `shell: bash` is what adds pipefail. The default runs `bash -e` without it,
-        # so the step took tee's exit status and passed whatever cargo test reported.
+        # so the step took tee's exit status and passed whatever the runner reported.
+        # nextest runs every test in a process of its own. --build-jobs is cargo's -j there; nextest
+        # reads -j as the number of tests at once.
         shell: bash
-        run: cargo test -j 1 --color never 2>&1 | tee /tmp/server-test.log
+        run: cargo nextest run --build-jobs 1 --no-fail-fast --color never 2>&1 | tee /tmp/server-test.log
+      - name: doctests
+        # nextest does not run doctests.
+        run: cargo test -j 1 --doc
       - name: assert the integration suite actually ran
         # LUMBERROOM_TEST_REQUIRE_DB already fails a test that cannot reach the database. This
-        # catches the other way to run nothing: a binary that reports 0 tests. cargo prints a "Running <path>" line before each
-        # binary's own report; this takes the report that follows tests/integration.rs and reads
-        # the "running N tests" header it opens with. --color never above keeps escape codes out of
-        # the line, which is what broke the first version of this check.
+        # catches the other way to run nothing: an integration binary that reports no tests. nextest
+        # prints one PASS line per test, naming the binary as `lumberroom-server::it`, and this
+        # counts them. --color never above keeps escape codes out of the lines.
         run: |
-          block=$(awk '/Running .*tests\/integration\.rs/{flag=1} flag{print} flag && /^test result:/{exit}' /tmp/server-test.log)
-          if [ -z "$block" ]; then
-            echo "no output block found for tests/integration.rs" >&2
-            exit 1
-          fi
-          count=$(echo "$block" | grep -oE 'running [0-9]+ tests?' | head -1 | grep -oE '[0-9]+')
+          count=$(grep -cE '^ +PASS .* lumberroom-server::it ' /tmp/server-test.log || true)
           if [ -z "$count" ] || [ "$count" -eq 0 ]; then
-            echo "tests/integration.rs reported 0 tests; the database service is not being reached" >&2
+            echo "tests/it ran 0 tests; the database service is not being reached" >&2
             exit 1
           fi
-          echo "tests/integration.rs ran $count tests"
+          echo "tests/it passed $count tests"
       - name: client tests
         run: cargo test -j 1 -p lumberroom
 

@@ -20,8 +20,7 @@ use lumberroom_server::domain::types::Sensitivity;
 use lumberroom_server::ports::{MemoryRepository, SearchQuery, Weights};
 use sqlx::{AssertSqlSafe, PgPool};
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TENANT: &str = "touch_hot";
 const DIMS: usize = 768;

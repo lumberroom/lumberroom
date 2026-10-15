@@ -1,7 +1,7 @@
 //! Returning a refused cleanup finding to the queue, against a real database. Skipped when none is
 //! reachable.
 //!
-//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test -j 1 --test cleanup_unreject
+//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test -j 1 --test it cleanup_unreject::
 //!
 //! One property carries this file: a cluster the owner refused stays out of the queue however many
 //! times the pass finds it again, and comes back when he says so.
@@ -30,24 +30,20 @@ use lumberroom_server::ports::cleanup::{CleanupRepository, NewMember, NewProposa
 use lumberroom_server::services::{cleanup, Ctx, Repos};
 use sqlx::PgPool;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const OWNER_TOKEN: &str = "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu";
 
-/// Every test here truncates the shared test database, so they serialise themselves rather than
-/// relying on `--test-threads=1` being remembered. Cargo runs one test binary at a time, so this
-/// mutex and the ones in the other binaries do not have to know about each other.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 struct Harness {
     ctx: Ctx,
     repo: Arc<dyn CleanupRepository>,
     pool: PgPool,
     _serial: tokio::sync::MutexGuard<'static, ()>,
-    /// Held for the whole test. The mutex above serialises this binary's own threads; this is what
-    /// keeps the other test binaries out of the same database.
+    /// Held for the whole test. `common::SERIAL` serialises this process's threads; this is what
+    /// keeps every other process out of the same database.
     _db: common::DbGuard,
 }
 
@@ -82,7 +78,7 @@ async fn setup() -> Option<Harness> {
     );
     std::env::set_var("EMBED_PROVIDER", "hash");
 
-    // Before the truncate below, and before anything reads. Every other binary targeting this
+    // Before the truncate below, and before anything reads. Every other test targeting this
     // database waits here.
     let db_lock = common::lock_database(&url).await;
     let pool = step!("connecting to the test database", postgres::connect(&url).await);

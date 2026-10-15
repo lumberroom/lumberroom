@@ -105,7 +105,7 @@ Routes in `src/console/mod.rs::router`: login, reading, namespace, fact detail, 
 (compose), registry, queue (approve/reject/unreject), cleanup (index/apply/reject/resolve/unreject),
 clients (create/access/revoke), aliases (record/forget). That is eleven distinct screens plus their
 mutating actions, up from the handful the console started with; `pages.rs` renders each as a
-self-contained HTML string, and a test (`tests/console.rs`,
+self-contained HTML string, and a test (`tests/it/console.rs`,
 `every_page_is_self_contained`) asserts that shape holds. It depends on `services/` the same way the
 MCP tool layer does: through the service constructors, never through `adapters::postgres` directly.
 

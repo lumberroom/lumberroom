@@ -1,7 +1,7 @@
 //! The cleanup page, over HTTP. Same real Postgres and hash embedder as the rest of the suite, in
 //! the same `lumberroom_rust_test` database, skipped when no database is reachable.
 //!
-//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test -j 1 --test console_cleanup
+//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test -j 1 --test it console_cleanup::
 //!
 //! Every request goes through `http::router`, so the mount is under test: a route the composition
 //! root failed to merge answers 404 and every case below fails.
@@ -35,8 +35,7 @@ use lumberroom_server::ports::OauthStore;
 use lumberroom_server::services::{bootstrap, write, Ctx, Repos};
 use sqlx::PgPool;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
@@ -46,10 +45,7 @@ const TEST_KEK_ID: &str = "kek-test";
 /// 32 characters, the length the cookie signer wants.
 const COOKIE_SECRET: &str = "console-test-cookie-secret-32ch!";
 
-/// Every test here truncates the shared test database, so they serialise themselves rather than
-/// relying on `--test-threads=1` being remembered. Cargo runs one test binary at a time, so this
-/// mutex and the ones in `console.rs` and `integration.rs` do not have to know about each other.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 struct Harness {
     ctx: Ctx,
@@ -58,8 +54,8 @@ struct Harness {
     base: String,
     cookie: String,
     _serial: tokio::sync::MutexGuard<'static, ()>,
-    /// Held for the whole test. The mutex above serialises this binary's own threads; this is what
-    /// keeps the other five binaries out of the same database.
+    /// Held for the whole test. `common::SERIAL` serialises this process's threads; this is what
+    /// keeps every other process out of the same database.
     _db: common::DbGuard,
 }
 
@@ -129,7 +125,7 @@ async fn setup() -> Option<Harness> {
     std::env::set_var("EMBED_PROVIDER", "hash");
     std::env::set_var(TEST_KEK_VAR, TEST_KEK_HEX);
 
-    // Before the truncate below, and before anything reads. Every other binary
+    // Before the truncate below, and before anything reads. Every other test
     // targeting this database waits here.
     let db_lock = common::lock_database(&url).await;
     let pool = step!("connecting to the test database", postgres::connect(&url).await);

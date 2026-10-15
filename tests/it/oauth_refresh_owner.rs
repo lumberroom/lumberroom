@@ -14,8 +14,7 @@ use lumberroom_server::ports::oauth::{NewOauthClient, NewRefreshToken};
 use lumberroom_server::ports::OauthStore;
 use sqlx::PgPool;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const CLIENT: &str = "client-owner-test";

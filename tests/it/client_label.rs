@@ -1,12 +1,12 @@
 //! The owner names a client (decision 0023), over HTTP against the real router and a real Postgres,
 //! in the shared `lumberroom_rust_test` database. Skipped when no database is reachable.
 //!
-//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test --test client_label
+//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test --test it client_label::
 //!
 //! Every label here reaches the store through a surface the owner uses: the consent form, the
 //! bearer route or the console. The consent driver below walks the authorization flow the way
 //! `scripts/oauth-flow-test.sh` does, minus the password form: the session cookie comes from the
-//! same signer the server verifies with, as in `tests/console.rs`, because what is under test is
+//! same signer the server verifies with, as in `tests/it/console.rs`, because what is under test is
 //! what a signed-in owner's Allow writes, not how the signing happens.
 
 use std::net::SocketAddr;
@@ -33,8 +33,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
@@ -53,7 +52,7 @@ const REDIRECT_URI: &str = "http://127.0.0.1:9/callback";
 /// The domain's refusal for a name over 200 bytes, as every surface prints it.
 const TOO_LONG: &str = "that name is too long: the limit is 200 bytes";
 
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 struct Harness {
     ctx: Ctx,

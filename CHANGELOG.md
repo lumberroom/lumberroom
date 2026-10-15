@@ -51,6 +51,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The integration tests build as one binary, and CI runs them with cargo-nextest.** The 29 files
+  under `tests/` are modules of `tests/it/main.rs`, so `--test integration <name>` is now
+  `--test it integration::<name>`. `./scripts/cargo.sh nextest` runs the suite with each test in its
+  own process; the builder image carries cargo-nextest 0.9.148 and needs a rebuild. On a Mac with a
+  7.7 GiB Docker VM, a rebuild after touching one source file went from about 37s to 12s and the
+  target directory from 6.7G to 3.8G, with the same 1857 tests passing. Tests that set an
+  environment variable or load the config share `common::SERIAL`, because the modules now share a
+  process under `cargo test`, and `tests/it/shared_process.rs` fails a module that skips it. The
+  `postgres::memory` timeline unit tests each use their own tenant, since nextest gave the mutex
+  they shared a process per test.
 - **Staleness counts from the last write or confirmation, and reads no longer matter.** The review
   queue's stale source lists a live row written more than `STALE_DAYS` ago (365 by default) and not
   confirmed within that span. It used to list only rows nobody had ever read, and every

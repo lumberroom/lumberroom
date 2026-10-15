@@ -2990,7 +2990,7 @@ impl MemoryRepository for PgMemoryRepository {
     /// Both columns it writes stay out of every index on `memory`, key and predicate alike, so the
     /// update takes the HOT path and writes no index entry. One partial index on
     /// `last_accessed_at` once made each search a write to every index, HNSW graph included;
-    /// `tests/search_touch_hot.rs` reads the catalog to keep it that way.
+    /// `tests/it/search_touch_hot.rs` reads the catalog to keep it that way.
     fn touch_accessed(&self, tenant: &str, ids: Vec<uuid::Uuid>) {
         if ids.is_empty() {
             return;
@@ -4702,8 +4702,8 @@ mod tests {
         assert!(!body.contains("Transaction"));
     }
 
-    /// `tests/integration.rs` builds its hub fixtures from this number and cannot read the private
-    /// constant, so a change here has to fail somewhere until that copy moves with it.
+    /// `tests/it/integration.rs` builds its hub fixtures from this number and cannot read the
+    /// private constant, so a change here has to fail somewhere until that copy moves with it.
     #[test]
     fn the_hub_limits_are_the_numbers_the_integration_suite_builds_on() {
         assert_eq!((ALIAS_HUB_LIMIT, TAG_HUB_LIMIT), (40, 40));
@@ -5031,16 +5031,15 @@ mod tests {
     /// `scripts/cargo.sh test` and CI set. A skipped test still counts as passed. Once a database
     /// answers, every later failure panics, the rule `tests/common/mod.rs` holds for the
     /// integration binaries; a lib unit test cannot reach that module, so the rule is restated here.
+    ///
+    /// Each test passes `setup` a tenant of its own and touches only that tenant's rows, so the
+    /// tests need no lock. A process-local mutex used to stand in for that, and under
+    /// `cargo nextest run`, where every test is its own process, it serialised nothing.
     mod timeline {
         use super::*;
         use sqlx::PgPool;
 
         const TEST_DB: &str = "lumberroom_timeline_test";
-        const TENANT: &str = "timeline_track_c";
-
-        /// Each test writes and deletes rows in one shared database, so they take turns. The guard
-        /// lives as long as the test that holds it.
-        static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
         /// Prints why and returns `None`, or panics when the switch says a database must exist.
         fn skip<T>(what: &str, why: impl std::fmt::Debug) -> Option<T> {
@@ -5051,9 +5050,8 @@ mod tests {
             None
         }
 
-        async fn setup(
-        ) -> Option<(PgMemoryRepository, PgPool, tokio::sync::MutexGuard<'static, ()>)> {
-            let guard = SERIAL.lock().await;
+        /// `tenant` has to be unique to the calling test: setup deletes every row it owns.
+        async fn setup(tenant: &str) -> Option<(PgMemoryRepository, PgPool)> {
             let admin_url = match std::env::var("DATABASE_URL") {
                 Ok(url) => url,
                 Err(e) => return skip("reading DATABASE_URL", e),
@@ -5105,17 +5103,18 @@ mod tests {
                 );
             }
             sqlx::query("DELETE FROM memory WHERE tenant_id = $1")
-                .bind(TENANT)
+                .bind(tenant)
                 .execute(&pool)
                 .await
                 .expect("clearing the test tenant");
-            Some((PgMemoryRepository::new(pool.clone()), pool, guard))
+            Some((PgMemoryRepository::new(pool.clone()), pool))
         }
 
         /// One plaintext row. `minute` spaces the rows in creation order, so the ordering tiebreak
         /// is fixed rather than whatever `now()` returned twice in the same microsecond.
         async fn insert(
             pool: &PgPool,
+            tenant: &str,
             namespace: &str,
             level: &str,
             content: &str,
@@ -5128,7 +5127,7 @@ mod tests {
                  VALUES ($1, $2, $3, $4, 'track-c-test', $5, now() + $6::int * interval '1 minute')",
             )
             .bind(id)
-            .bind(TENANT)
+            .bind(tenant)
             .bind(namespace)
             .bind(content)
             .bind(level)
@@ -5142,19 +5141,19 @@ mod tests {
         /// Retire `old` in favour of `new`, both directions, the way `supersede` writes it. Written
         /// here rather than called through the repository because two of these tests build shapes
         /// the repository refuses on purpose, a cycle among them.
-        async fn link(pool: &PgPool, old: uuid::Uuid, new: uuid::Uuid) {
+        async fn link(pool: &PgPool, tenant: &str, old: uuid::Uuid, new: uuid::Uuid) {
             sqlx::query(
                 "UPDATE memory SET superseded_by = $2, superseded_at = now()
                   WHERE tenant_id = $1 AND id = $3",
             )
-            .bind(TENANT)
+            .bind(tenant)
             .bind(new)
             .bind(old)
             .execute(pool)
             .await
             .expect("retire");
             sqlx::query("UPDATE memory SET supersedes = $2 WHERE tenant_id = $1 AND id = $3")
-                .bind(TENANT)
+                .bind(tenant)
                 .bind(old)
                 .bind(new)
                 .execute(pool)
@@ -5170,16 +5169,17 @@ mod tests {
         /// namespace used to stop at the boundary and call three versions two.
         #[tokio::test]
         async fn a_chain_crossing_two_readable_namespaces_returns_every_version() {
-            let Some((repo, pool, _guard)) = setup().await else { return };
-            let first = insert(&pool, "project:alpha", "open", "port 8080", 0).await;
-            let second = insert(&pool, "project:beta", "open", "port 8787", 1).await;
-            let third = insert(&pool, "project:beta", "open", "port 9000", 2).await;
-            link(&pool, first, second).await;
-            link(&pool, second, third).await;
+            let tenant = "timeline_crossing";
+            let Some((repo, pool)) = setup(tenant).await else { return };
+            let first = insert(&pool, tenant, "project:alpha", "open", "port 8080", 0).await;
+            let second = insert(&pool, tenant, "project:beta", "open", "port 8787", 1).await;
+            let third = insert(&pool, tenant, "project:beta", "open", "port 9000", 2).await;
+            link(&pool, tenant, first, second).await;
+            link(&pool, tenant, second, third).await;
 
             // Anchored on the middle version, so both walks have to work to answer at all.
             let grants = vec![NamespaceGrant::open("project:*")];
-            let timeline = repo.subject_history(TENANT, &grants, second).await.unwrap();
+            let timeline = repo.subject_history(tenant, &grants, second).await.unwrap();
 
             assert_eq!(contents(&timeline), vec!["port 8080", "port 8787", "port 9000"]);
             assert_eq!(timeline.withheld, 0);
@@ -5190,15 +5190,18 @@ mod tests {
         /// behind it survive, and the count says one is missing.
         #[tokio::test]
         async fn a_version_the_grant_refuses_leaves_a_counted_gap() {
-            let Some((repo, pool, _guard)) = setup().await else { return };
-            let first = insert(&pool, "project:alpha", "open", "salary was public", 0).await;
-            let middle = insert(&pool, "personal:finance", "private", "the actual number", 1).await;
-            let last = insert(&pool, "project:alpha", "open", "public again", 2).await;
-            link(&pool, first, middle).await;
-            link(&pool, middle, last).await;
+            let tenant = "timeline_gap";
+            let Some((repo, pool)) = setup(tenant).await else { return };
+            let first =
+                insert(&pool, tenant, "project:alpha", "open", "salary was public", 0).await;
+            let middle =
+                insert(&pool, tenant, "personal:finance", "private", "the actual number", 1).await;
+            let last = insert(&pool, tenant, "project:alpha", "open", "public again", 2).await;
+            link(&pool, tenant, first, middle).await;
+            link(&pool, tenant, middle, last).await;
 
             let grants = vec![NamespaceGrant::open("project:*")];
-            let timeline = repo.subject_history(TENANT, &grants, first).await.unwrap();
+            let timeline = repo.subject_history(tenant, &grants, first).await.unwrap();
 
             assert_eq!(contents(&timeline), vec!["salary was public", "public again"]);
             assert_eq!(timeline.withheld, 1, "the gap is reported rather than papered over");
@@ -5208,14 +5211,15 @@ mod tests {
         /// repository, which refuses it; a table that already holds one still has to be readable.
         #[tokio::test]
         async fn the_depth_cap_still_terminates_a_cycle() {
-            let Some((repo, pool, _guard)) = setup().await else { return };
-            let one = insert(&pool, "project:alpha", "open", "round and round", 0).await;
-            let two = insert(&pool, "project:alpha", "open", "and back again", 1).await;
-            link(&pool, one, two).await;
-            link(&pool, two, one).await;
+            let tenant = "timeline_cycle";
+            let Some((repo, pool)) = setup(tenant).await else { return };
+            let one = insert(&pool, tenant, "project:alpha", "open", "round and round", 0).await;
+            let two = insert(&pool, tenant, "project:alpha", "open", "and back again", 1).await;
+            link(&pool, tenant, one, two).await;
+            link(&pool, tenant, two, one).await;
 
             let grants = vec![NamespaceGrant::open("project:*")];
-            let timeline = repo.subject_history(TENANT, &grants, one).await.unwrap();
+            let timeline = repo.subject_history(tenant, &grants, one).await.unwrap();
 
             assert_eq!(timeline.versions.len(), 2, "one row per version, however many hops");
             assert!(timeline.depth_capped, "the walk ran out of hops rather than out of chain");
@@ -5224,11 +5228,12 @@ mod tests {
         /// The common row in the store: no predecessor, no successor, its own whole history.
         #[tokio::test]
         async fn a_single_row_chain_is_the_row_itself() {
-            let Some((repo, pool, _guard)) = setup().await else { return };
-            let only = insert(&pool, "global", "open", "the only version", 0).await;
+            let tenant = "timeline_single";
+            let Some((repo, pool)) = setup(tenant).await else { return };
+            let only = insert(&pool, tenant, "global", "open", "the only version", 0).await;
 
             let grants = vec![NamespaceGrant::open("*")];
-            let timeline = repo.subject_history(TENANT, &grants, only).await.unwrap();
+            let timeline = repo.subject_history(tenant, &grants, only).await.unwrap();
 
             assert_eq!(contents(&timeline), vec!["the only version"]);
             assert_eq!(timeline.withheld, 0);
@@ -5239,13 +5244,16 @@ mod tests {
         /// the row exists to a caller who may not know that.
         #[tokio::test]
         async fn an_anchor_the_grant_refuses_answers_nothing() {
-            let Some((repo, pool, _guard)) = setup().await else { return };
-            let public = insert(&pool, "project:alpha", "open", "the readable half", 0).await;
-            let secret = insert(&pool, "personal:finance", "private", "the other half", 1).await;
-            link(&pool, public, secret).await;
+            let tenant = "timeline_refused_anchor";
+            let Some((repo, pool)) = setup(tenant).await else { return };
+            let public =
+                insert(&pool, tenant, "project:alpha", "open", "the readable half", 0).await;
+            let secret =
+                insert(&pool, tenant, "personal:finance", "private", "the other half", 1).await;
+            link(&pool, tenant, public, secret).await;
 
             let grants = vec![NamespaceGrant::open("project:*")];
-            let timeline = repo.subject_history(TENANT, &grants, secret).await.unwrap();
+            let timeline = repo.subject_history(tenant, &grants, secret).await.unwrap();
 
             assert!(timeline.is_empty());
             assert_eq!(timeline.withheld, 0);

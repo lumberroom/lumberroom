@@ -1,7 +1,7 @@
 //! The capability gate on the MCP surface, against a real database and a real server. Skipped
 //! when no database is reachable.
 //!
-//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test --test mcp_capability
+//!   DATABASE_URL=postgres://lumberroom:pw@127.0.0.1:5432/lumberroom cargo test --test it mcp_capability::
 //!
 //! Both directions of the gate, because they are two mechanisms and only one of them is a filter.
 //! `list_tools` decides what a model ever tries. The service decides what happens when a client
@@ -33,8 +33,7 @@ use lumberroom_server::mcp::AppState;
 use lumberroom_server::ports::OauthStore;
 use lumberroom_server::services::{alias, bootstrap, write, Ctx, Repos};
 
-#[macro_use]
-mod common;
+use crate::common;
 
 const TEST_DB: &str = "lumberroom_rust_test";
 const TEST_KEK_HEX: &str = "5375747254657374204b454b20666f722074686520696e746567726174696f6e";
@@ -67,19 +66,15 @@ const OPEN_TOOLS: [&str; 7] = [
     "review_queue",
 ];
 
-/// Every test here truncates the shared test database, so they serialise themselves rather than
-/// relying on `--test-threads=1` being remembered. Cargo runs one test binary at a time, so this
-/// mutex and the ones in `integration.rs`, `ingest.rs` and `console.rs` do not have to know about
-/// each other.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::common::SERIAL;
 
 struct Harness {
     /// The owner's context, for seeding through the services rather than through SQL.
     ctx: Ctx,
     base: String,
     _serial: tokio::sync::MutexGuard<'static, ()>,
-    /// Held for the whole test. The mutex above serialises this binary's own threads; this is what
-    /// keeps the other five binaries out of the same database.
+    /// Held for the whole test. `common::SERIAL` serialises this process's threads; this is what
+    /// keeps every other process out of the same database.
     _db: common::DbGuard,
 }
 
@@ -217,7 +212,7 @@ async fn setup_with(tune: impl FnOnce(&mut Config)) -> Option<Harness> {
     // another cap tunes the loaded struct; `an_unset_write_cap_loads_as_2000` reads the default.
     std::env::remove_var("WRITE_MAX_CONTENT_CHARS");
 
-    // Before the truncate below, and before anything reads. Every other binary
+    // Before the truncate below, and before anything reads. Every other test
     // targeting this database waits here.
     let db_lock = common::lock_database(&url).await;
     let pool = step!("connecting to the test database", postgres::connect(&url).await);
@@ -794,8 +789,8 @@ async fn listed_description(h: &Harness, name: &str) -> String {
     tool["description"].as_str().unwrap_or_default().to_string()
 }
 
-/// The result size a client reads, off the wire. `tests/mcp_tool_annotations.rs` checks every tool
-/// on the router; only this one proves the key leaves the server under `_meta` and that the
+/// The result size a client reads, off the wire. `tests/it/mcp_tool_annotations.rs` checks every
+/// tool on the router; only this one proves the key leaves the server under `_meta` and that the
 /// rest of each served entry matches the registered tool.
 #[tokio::test]
 async fn tools_list_serves_the_result_size_under_meta_and_the_rest_of_each_entry_unchanged() {
@@ -839,8 +834,8 @@ async fn tools_list_serves_the_result_size_under_meta_and_the_rest_of_each_entry
         assert_eq!(got, wanted, "{name} is served differently from its definition");
     }
 
-    // Spelled out as in tests/mcp_tool_annotations.rs, so a read that loses its declaration fails
-    // on the wire too, where the walk above compares it only with its own definition.
+    // Spelled out as in tests/it/mcp_tool_annotations.rs, so a read that loses its declaration
+    // fails on the wire too, where the walk above compares it only with its own definition.
     for name in [
         "context_bootstrap",
         "memory_search",

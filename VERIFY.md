@@ -105,7 +105,7 @@ matches an inline correction.
 
 ### `scripts/cleanup-test.sh`
 
-The half `tests/cleanup.rs` cannot reach: the CLI reading the candidate list, the queue printing
+The half `tests/it/cleanup.rs` cannot reach: the CLI reading the candidate list, the queue printing
 something a person can act on, and apply moving rows through the HTTP routes. Six steps, `--no-model`
 throughout, so nothing calls a provider and no key is needed.
 Step 3 is the one that makes a cadence safe: a second run over the same store queues nothing. Step 5

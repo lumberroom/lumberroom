@@ -37,7 +37,11 @@ cat >"$WORK/bin/docker" <<'EOF'
 #!/bin/sh
 echo "docker $*" >>"$FAKE_LOG"
 case "$1" in
-  image) echo mold ;;
+  image)
+    case "$*" in
+      *lumberroom.nextest*) echo "${FAKE_NEXTEST-0.9.148}" ;;
+      *) echo mold ;;
+    esac ;;
   info) [ -n "${FAKE_MEM:-}" ] || exit 1; echo "$FAKE_MEM" ;;
   inspect) echo "${FAKE_TESTDB_HEALTH:-}" ;;
   compose)
@@ -91,6 +95,30 @@ run FAKE_MEM=$((16 * GIB)) FAKE_TESTDB_HEALTH=healthy -- test-fast
 ran "sh /app/scripts/lib/test-fast.sh -j 4" && pass "test-fast -j 4" || fail "test-fast: $RUNLINE"
 ran "DATABASE_URL=postgres://u:p@testdb:5432/lumberroom_test" && pass "test-fast on testdb" \
   || fail "test-fast url: $RUNLINE"
+
+say "nextest takes the build -j as --build-jobs, the same database and the same switch"
+run FAKE_MEM=$((16 * GIB)) FAKE_TESTDB_HEALTH=healthy -- nextest
+ran "cargo nextest run --build-jobs 4" && pass "16 GiB gives --build-jobs 4" || fail "nextest 16 GiB: $RUNLINE"
+run FAKE_MEM=$((8 * GIB)) FAKE_TESTDB_HEALTH=healthy -- nextest
+ran "cargo nextest run --build-jobs 1" && pass "8 GiB gives --build-jobs 1" || fail "nextest 8 GiB: $RUNLINE"
+ran "DATABASE_URL=postgres://u:p@testdb:5432/lumberroom_test" && pass "nextest on testdb" \
+  || fail "nextest url: $RUNLINE"
+ran "LUMBERROOM_TEST_REQUIRE_DB=1" && pass "nextest requires the database" || fail "nextest switch: $RUNLINE"
+# nextest reads -j as --test-threads, so a caller's -j says nothing about the build.
+run FAKE_MEM=$((8 * GIB)) FAKE_TESTDB_HEALTH=healthy -- nextest -j 3
+ran "cargo nextest run --build-jobs 1 -j 3" && pass "-j stays the caller's thread count" \
+  || fail "nextest -j 3: $RUNLINE"
+run FAKE_MEM=$((16 * GIB)) FAKE_TESTDB_HEALTH=healthy -- nextest --build-jobs 2
+ran "cargo nextest run --build-jobs 2" && pass "--build-jobs 2 kept" || fail "--build-jobs 2: $RUNLINE"
+ran "--build-jobs 4" && fail "a second --build-jobs added: $RUNLINE" || pass "no second --build-jobs"
+
+say "nextest on an image without it is refused before cargo runs"
+run FAKE_MEM=$((16 * GIB)) FAKE_TESTDB_HEALTH=healthy FAKE_NEXTEST= -- nextest
+[ "$STATUS" != 0 ] && [ -z "$RUNLINE" ] && pass "refused ($STATUS)" || fail "ran: $STATUS $RUNLINE"
+printf '%s' "$OUT" | grep -F "docker build -t lumberroom-builder" >/dev/null && pass "the fix is named" \
+  || fail "message: $OUT"
+run FAKE_MEM=$((16 * GIB)) FAKE_TESTDB_HEALTH=healthy FAKE_NEXTEST= -- test
+[ "$STATUS" = 0 ] && ran "cargo test -j 4" && pass "test does not need it" || fail "test: $STATUS $RUNLINE"
 
 say "test runs on testdb"
 run FAKE_MEM=$((16 * GIB)) FAKE_TESTDB_HEALTH=healthy -- test
