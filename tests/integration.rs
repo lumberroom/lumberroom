@@ -3320,7 +3320,7 @@ async fn an_expired_row_reaches_the_retired_list_marked_as_expired() {
         max: Sensitivity::Sealed,
     }];
     let since = chrono::Utc::now() - chrono::Duration::days(7);
-    let rows = ctx.repos.memories.retired_since(ctx.tenant(), &readable, since, 100).await.unwrap();
+    let rows = retired_page(&ctx, &readable, since, None, None, None, 100).await;
 
     let found = rows
         .iter()
@@ -3374,7 +3374,7 @@ async fn a_retirement_whose_successor_is_missing_reads_as_retired_rather_than_ex
         max: Sensitivity::Sealed,
     }];
     let since = chrono::Utc::now() - chrono::Duration::days(7);
-    let rows = ctx.repos.memories.retired_since(ctx.tenant(), &readable, since, 100).await.unwrap();
+    let rows = retired_page(&ctx, &readable, since, None, None, None, 100).await;
     let listed = rows
         .iter()
         .find(|r| r.id.to_string() == orphan.id)
@@ -5038,4 +5038,237 @@ async fn the_tag_count_counts_only_live_rows_the_caller_may_see() {
             ("payroll".to_string(), 1),
         ]
     );
+}
+
+/// One call to the retired list, with the fields the tests vary spelled as arguments.
+async fn retired_page(
+    ctx: &Ctx,
+    readable: &[lumberroom_server::domain::policy::NamespaceCeiling],
+    since: chrono::DateTime<chrono::Utc>,
+    after: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
+    namespace_prefix: Option<&str>,
+    contains: Option<&str>,
+    limit: i64,
+) -> Vec<lumberroom_server::ports::memory::Retired> {
+    ctx.repos
+        .memories
+        .retired_since(lumberroom_server::ports::RetiredQuery {
+            tenant_id: ctx.tenant().to_string(),
+            readable: readable.to_vec(),
+            since,
+            after,
+            namespace_prefix: namespace_prefix.map(str::to_string),
+            contains: contains.map(str::to_string),
+            limit,
+        })
+        .await
+        .unwrap()
+}
+
+/// Stamps a supersession instant straight onto a row. The service stamps `now()` per call, so this
+/// is the only way to give several rows the same instant, which is the case a keyset cursor gets
+/// wrong when it compares on the instant alone.
+async fn retire_at(pool: &PgPool, id: &str, at: chrono::DateTime<chrono::Utc>) {
+    sqlx::query("UPDATE memory SET superseded_at = $2 WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(id).unwrap())
+        .bind(at)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+fn ceiling(
+    namespace: &str,
+    max: Sensitivity,
+) -> lumberroom_server::domain::policy::NamespaceCeiling {
+    lumberroom_server::domain::policy::NamespaceCeiling { namespace: namespace.into(), max }
+}
+
+/// Five rows share one instant and two more sit either side of it. A page of two cuts through the
+/// tie twice, so a cursor that compared on the instant alone would drop or repeat a row there.
+#[tokio::test]
+async fn the_retired_list_pages_through_tied_instants_returning_every_row_once() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let tie: chrono::DateTime<chrono::Utc> = chrono::Utc::now() - chrono::Duration::hours(2);
+    let facts = [
+        "the staging bucket lives in Frankfurt",
+        "the nightly backup starts at two",
+        "the billing webhook retries five times",
+        "the support rota changes on Mondays",
+        "the search cluster runs three replicas",
+        "the release branch freezes on Thursdays",
+        "the office plants get watered on Fridays",
+    ];
+    let mut expected = std::collections::BTreeSet::new();
+    for (i, fact) in facts.iter().enumerate() {
+        let row = write::run(&ctx, fact, "global", None, None, None, None).await.unwrap();
+        let at = match i {
+            0 => tie + chrono::Duration::minutes(5),
+            6 => tie - chrono::Duration::minutes(5),
+            _ => tie,
+        };
+        retire_at(&pool, &row.id, at).await;
+        expected.insert(row.id);
+    }
+
+    let readable = vec![ceiling("global", Sensitivity::Sealed)];
+    let since = chrono::Utc::now() - chrono::Duration::days(7);
+    let mut seen = Vec::new();
+    let mut after = None;
+    for _ in 0..10 {
+        let page = retired_page(&ctx, &readable, since, after, None, None, 2).await;
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2, "a page holds at most its limit");
+        let last = page.last().unwrap();
+        after = Some((last.retired_at, last.id));
+        seen.extend(page.iter().map(|r| r.id.to_string()));
+    }
+
+    let unique: std::collections::BTreeSet<String> = seen.iter().cloned().collect();
+    assert_eq!(unique.len(), seen.len(), "no row came back twice: {seen:?}");
+    assert_eq!(unique, expected, "every retired row came back across the pages");
+    let whole = retired_page(&ctx, &readable, since, None, None, None, 100).await;
+    let order: Vec<String> = whole.iter().map(|r| r.id.to_string()).collect();
+    assert_eq!(seen, order, "the pages read in the order one long page does");
+}
+
+/// The prefix narrows the readable list and cannot widen it. `project:` covers both namespaces by
+/// spelling, and the reader holds only one of them.
+#[tokio::test]
+async fn a_namespace_prefix_on_the_retired_list_cannot_reach_past_the_readable_list() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let at = chrono::Utc::now() - chrono::Duration::hours(1);
+    let held = write::run(
+        &ctx,
+        "the alpha deploy uses blue green",
+        "project:alpha",
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let other =
+        write::run(&ctx, "the beta deploy uses canaries", "project:beta", None, None, None, None)
+            .await
+            .unwrap();
+    let elsewhere =
+        write::run(&ctx, "the global deploy window is Tuesday", "global", None, None, None, None)
+            .await
+            .unwrap();
+    for id in [&held.id, &other.id, &elsewhere.id] {
+        retire_at(&pool, id, at).await;
+    }
+
+    let readable =
+        vec![ceiling("project:alpha", Sensitivity::Sealed), ceiling("global", Sensitivity::Sealed)];
+    let since = chrono::Utc::now() - chrono::Duration::days(7);
+
+    let wide = retired_page(&ctx, &readable, since, None, Some("project:"), None, 100).await;
+    let ids: Vec<String> = wide.iter().map(|r| r.id.to_string()).collect();
+    assert_eq!(
+        ids,
+        vec![held.id.clone()],
+        "the prefix keeps the held project and nothing outside the list"
+    );
+
+    let beta = retired_page(&ctx, &readable, since, None, Some("project:b"), None, 100).await;
+    assert!(
+        beta.is_empty(),
+        "a prefix naming only an unreadable namespace matches nothing: {beta:?}"
+    );
+
+    let all = retired_page(&ctx, &readable, since, None, None, None, 100).await;
+    assert_eq!(all.len(), 2, "with no prefix the list is the readable list: {all:?}");
+}
+
+/// `contains` is a substring test a person types into a box. Case should not matter, and a `%` or
+/// `_` in what they typed is a character to find rather than a wildcard.
+#[tokio::test]
+async fn retired_contains_matches_case_insensitively_and_reads_wildcards_literally() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let at = chrono::Utc::now() - chrono::Duration::hours(1);
+    let rows = [
+        "the Deploy Target is fly.io",
+        "the spring promo takes 50% off annual plans",
+        "a 50 point bonus lands with each referral",
+        "the env var is DATABASE_URL",
+        "the legacy key DATABASEXURL is gone",
+        "exports land in C:\\temp on the build box",
+    ];
+    let mut ids = Vec::new();
+    for content in rows {
+        let row = write::run(&ctx, content, "global", None, None, None, None).await.unwrap();
+        retire_at(&pool, &row.id, at).await;
+        ids.push(row.id);
+    }
+    let readable = vec![ceiling("global", Sensitivity::Sealed)];
+    let since = chrono::Utc::now() - chrono::Duration::days(7);
+    let found = |rows: Vec<lumberroom_server::ports::memory::Retired>| -> Vec<String> {
+        let mut v: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
+        v.sort();
+        v
+    };
+    let one = |i: usize| vec![ids[i].clone()];
+
+    let case = retired_page(&ctx, &readable, since, None, None, Some("deploy TARGET"), 100).await;
+    assert_eq!(found(case), one(0), "case does not matter");
+
+    let percent = retired_page(&ctx, &readable, since, None, None, Some("50%"), 100).await;
+    assert_eq!(found(percent), one(1), "a percent sign is a percent sign");
+
+    let underscore =
+        retired_page(&ctx, &readable, since, None, None, Some("DATABASE_URL"), 100).await;
+    assert_eq!(found(underscore), one(3), "an underscore matches an underscore and nothing else");
+
+    let backslash = retired_page(&ctx, &readable, since, None, None, Some("c:\\TEMP"), 100).await;
+    assert_eq!(found(backslash), one(5), "a backslash is a character, not an escape");
+
+    let empty = retired_page(&ctx, &readable, since, None, None, Some(""), 100).await;
+    assert_eq!(empty.len(), rows.len(), "an empty box is no filter");
+}
+
+/// A private row is encrypted, so its content column is NULL and `contains` has nothing to read.
+/// The row still belongs on the unfiltered list for a reader who may see it, with empty content
+/// rather than a failed read, and stays off the list for one who may not.
+#[tokio::test]
+async fn a_private_row_reaches_the_retired_list_by_grant_and_never_through_contains() {
+    let (ctx, pool, _serial) = ctx_or_skip!();
+    let at = chrono::Utc::now() - chrono::Duration::hours(1);
+    let private = write::run(
+        &ctx,
+        "the landlord's bank sort code is zqxsortzqx",
+        "user:me",
+        None,
+        None,
+        Some("private"),
+        None,
+    )
+    .await
+    .unwrap();
+    retire_at(&pool, &private.id, at).await;
+    let since = chrono::Utc::now() - chrono::Duration::days(7);
+
+    let may = vec![ceiling("user:me", Sensitivity::Private)];
+    let listed = retired_page(&ctx, &may, since, None, None, None, 100).await;
+    let row = listed
+        .iter()
+        .find(|r| r.id.to_string() == private.id)
+        .expect("a reader holding private sees the retired private row");
+    assert_eq!(row.content, "", "the repository hands back no ciphertext and no plaintext");
+
+    let searched = retired_page(&ctx, &may, since, None, None, Some("zqxsortzqx"), 100).await;
+    assert!(searched.is_empty(), "an encrypted row has no text for ILIKE to match: {searched:?}");
+
+    let open_only = vec![ceiling("user:me", Sensitivity::Open)];
+    let hidden = retired_page(&ctx, &open_only, since, None, None, None, 100).await;
+    assert!(
+        hidden.is_empty(),
+        "an open ceiling keeps the private row out of the query: {hidden:?}"
+    );
+    let hidden = retired_page(&ctx, &open_only, since, None, Some("user:"), Some("zqx"), 100).await;
+    assert!(hidden.is_empty(), "and no filter brings it back: {hidden:?}");
 }

@@ -6,6 +6,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The console's retired list pages and filters.** `/console/retired` takes `ns`, a namespace
+  prefix, and `q`, text the fact contains, ignoring case, with `%` and `_` read literally, plus
+  `before` and `limit` for paging. The list still covers seven days and now shows 40 rows a page by
+  default. A private row is stored encrypted, so `q` never matches one; the page says so.
+  `MemoryRepository::retired_since` takes a `RetiredQuery` with `after`, `namespace_prefix` and
+  `contains`; an implementation outside this repository has to move to it.
 - **A per-call recall log, off by default.** `RECALL_EVENT_LOG=true` records one `recall_event` row
   per memory that a `memory_search` or `context_bootstrap` call returned, with the call id, rank,
   digest section and active project, and no content. The cleanup pass deletes rows older than
@@ -140,6 +146,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   10. Decision 0025 has the reasoning (#109).
 
 ### Fixed
+
+- **A retired private row no longer panics the retired list.** Private rows store NULL content, and
+  the list read content as a non-null string. It now reads back empty, and the console marks the row
+  private with a link to the fact page, which decrypts it.
 
 - **The edge rebuild finishes on a store where one alias is everywhere.** An alias that is part of
   its canonical name, said on most rows of a namespace, paired every one of them, and `m` rows make

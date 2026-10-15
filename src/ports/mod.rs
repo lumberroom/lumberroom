@@ -37,8 +37,8 @@ pub use memory::{
     slot_ordered, ChainEdits, ChainLink, ChainNeighbours, ConflictPair, ConflictSweep,
     DeleteOutcome, DeletePlan, DigestData, DigestQuery, DismissedPair, Emission, MemoryRepository,
     ModelVector, NamespaceRows, NamespaceSummary, NeighbourQuery, NewMemory, RecallCall,
-    RecallEvent, RecentQuery, RegistrySummary, RestoreRow, SearchQuery, Staleness, TagCount,
-    Timeline, Weights,
+    RecallEvent, RecentQuery, RegistrySummary, RestoreRow, RetiredQuery, SearchQuery, Staleness,
+    TagCount, Timeline, Weights,
 };
 pub use oauth::{
     AccessTokenRecord, ClientGrantUpdate, CodeOutcome, NewAccessToken, NewAuthCode, NewOauthClient,

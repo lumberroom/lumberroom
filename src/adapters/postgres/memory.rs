@@ -29,7 +29,7 @@ use crate::domain::policy::{NamespaceCeiling, NamespaceGrant};
 use crate::domain::types::{ConflictCandidate, Memory, SearchHit, Sensitivity};
 use crate::ports::memory::{
     slot_ordered, ChainEdits, ChainLink, ChainNeighbours, DeleteOutcome, DeletePlan, GraphEdge,
-    ModelVector, PairCounts, RestoreRow, Retired, Superseded, Timeline, WalkBounds,
+    ModelVector, PairCounts, RestoreRow, Retired, RetiredQuery, Superseded, Timeline, WalkBounds,
 };
 use crate::ports::RecallCall;
 use crate::ports::{
@@ -928,9 +928,34 @@ const RETIRED_SQL: &str = r#"
          -- keeps a supersession out of this arm; it is already in the one above.
          OR (m.superseded_at IS NULL AND m.occurred_until IS NOT NULL
              AND m.occurred_until <= now() AND m.occurred_until >= $4))
+       -- The prefix is one more conjunct after the readable join, so it can only narrow what that
+       -- join admits. `starts_with` rather than LIKE, so a namespace holding `_` needs no escaping.
+       AND ($6::text IS NULL OR starts_with(m.namespace, $6))
+       -- NULL content is an encrypted row, and `NULL ILIKE` is NULL, so a private row never
+       -- matches. Decision 0005 keeps private rows out of the lexical index, so this is ILIKE.
+       AND ($7::text IS NULL OR m.content ILIKE $7 ESCAPE '\')
+       -- The cursor compares on the pair the page orders by. The instant alone would drop or
+       -- repeat rows that share it, and `now()` is one instant for a whole transaction.
+       AND ($8::timestamptz IS NULL
+         OR (COALESCE(m.superseded_at, m.occurred_until), m.id) < ($8, $9::uuid))
      ORDER BY COALESCE(m.superseded_at, m.occurred_until) DESC, m.id DESC
      LIMIT $5
 "#;
+
+/// A `contains` filter as an `ILIKE` pattern, with the three characters `LIKE` treats as syntax
+/// under `ESCAPE '\'` escaped, so a search for `50%` finds the percent sign.
+fn contains_pattern(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len() + 2);
+    out.push('%');
+    for c in needle.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
+}
 
 /// Per-namespace counts and the last write, on both axes.
 ///
@@ -2431,23 +2456,28 @@ impl MemoryRepository for PgMemoryRepository {
     }
 
     /// Rows retired inside a window, newest retirement first.
-    async fn retired_since(
-        &self,
-        tenant: &str,
-        readable: &[NamespaceCeiling],
-        since: chrono::DateTime<chrono::Utc>,
-        limit: i64,
-    ) -> Result<Vec<Retired>> {
-        if readable.is_empty() {
+    async fn retired_since(&self, q: RetiredQuery) -> Result<Vec<Retired>> {
+        if q.readable.is_empty() {
             return Ok(vec![]);
         }
-        let (readable_ns, readable_max) = split_ceilings(readable);
+        let (readable_ns, readable_max) = split_ceilings(&q.readable);
+        let (after_at, after_id) = match q.after {
+            Some((at, id)) => (Some(at), Some(id)),
+            None => (None, None),
+        };
+        // An empty box is no filter. As a pattern it would be `%%`, which still drops every
+        // encrypted row because their content is NULL.
+        let contains = q.contains.as_deref().filter(|c| !c.is_empty()).map(contains_pattern);
         let rows = sqlx::query(RETIRED_SQL)
-            .bind(tenant)
+            .bind(&q.tenant_id)
             .bind(&readable_ns)
             .bind(&readable_max)
-            .bind(since)
-            .bind(limit)
+            .bind(q.since)
+            .bind(q.limit)
+            .bind(&q.namespace_prefix)
+            .bind(contains)
+            .bind(after_at)
+            .bind(after_id)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows
@@ -2455,7 +2485,9 @@ impl MemoryRepository for PgMemoryRepository {
             .map(|r| Retired {
                 id: r.get("id"),
                 namespace: r.get("namespace"),
-                content: r.get("content"),
+                // NULL is an encrypted row, read the way `memory_from_row` reads it. A plain String
+                // here panics on the first retired private row and takes the whole list with it.
+                content: r.get::<Option<String>, _>("content").unwrap_or_default(),
                 // Same rule as `memory_from_row`: an unrecognised level reads as the most
                 // restrictive, and the query already filtered on `sensitivity_rank`.
                 sensitivity: Sensitivity::parse(r.get::<&str, _>("sensitivity"))
@@ -3760,6 +3792,31 @@ impl crate::services::SealedReader for PgMemoryRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `%`, `_` and `\` are the three characters `LIKE` reads as syntax under `ESCAPE '\'`. A
+    /// person searching the retired list for `50%` means the percent sign.
+    #[test]
+    fn a_contains_pattern_reads_like_wildcards_and_the_escape_literally() {
+        assert_eq!(contains_pattern("deploy"), "%deploy%");
+        assert_eq!(contains_pattern("50%"), "%50\\%%");
+        assert_eq!(contains_pattern("DATABASE_URL"), "%DATABASE\\_URL%");
+        assert_eq!(contains_pattern("C:\\temp"), "%C:\\\\temp%");
+        assert_eq!(contains_pattern("%_\\"), "%\\%\\_\\\\%");
+    }
+
+    /// The prefix and the text filter sit beside the readable join rather than replacing it, and
+    /// the cursor compares on the same pair the statement orders by.
+    #[test]
+    fn the_retired_statement_narrows_the_readable_join_and_pages_on_its_own_order() {
+        assert!(RETIRED_SQL.contains("JOIN reachable rg ON rg.namespace = m.namespace"));
+        assert!(RETIRED_SQL.contains("sensitivity_rank(m.sensitivity) <= rg.max_rank"));
+        assert!(RETIRED_SQL.contains("starts_with(m.namespace, $6)"));
+        assert!(RETIRED_SQL.contains("m.content ILIKE $7 ESCAPE '\\'"));
+        assert!(RETIRED_SQL
+            .contains("(COALESCE(m.superseded_at, m.occurred_until), m.id) < ($8, $9::uuid)"));
+        assert!(RETIRED_SQL
+            .contains("ORDER BY COALESCE(m.superseded_at, m.occurred_until) DESC, m.id DESC"));
+    }
 
     /// The statements are constants, so the structural guarantees this file is responsible for can
     /// be asserted without a database. These tests exist because the failure they catch is a

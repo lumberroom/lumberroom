@@ -21,10 +21,10 @@ use chrono::{DateTime, Utc};
 
 use crate::authserver::pages::escape;
 use crate::console::data::{
-    Answer, Contents, Cursor, Entry, Leaf, Page, QueueRow, QueueView, RegistryGroup,
+    Answer, Contents, Cursor, Entry, Leaf, Page, QueueRow, QueueView, RegistryGroup, RetiredFilter,
+    RetiredPage,
 };
 use crate::domain::types::Sensitivity;
-use crate::ports::memory::Retired;
 
 /// The mark, compiled in and served at `/console/logo.svg`.
 ///
@@ -785,8 +785,22 @@ act, because a canonical key is a decision and not a note.</p>\
 ///
 /// Expired rows share the page, because they left the live reads the same way and nothing else
 /// lists them. Each says "expired" and names the day instead of pointing at a successor.
-pub fn retired(rows: &[Retired], contents: &Contents, health: &Health) -> String {
-    let body = if rows.is_empty() {
+///
+/// The filter form narrows by namespace prefix and by text. The text test cannot read an encrypted
+/// row, so the page says so beside the box rather than letting a private row vanish unexplained.
+pub fn retired(
+    listing: &RetiredPage,
+    filter: &RetiredFilter,
+    contents: &Contents,
+    health: &Health,
+) -> String {
+    let rows = &listing.rows;
+    let body = if rows.is_empty() && !filter.is_empty() {
+        "<div class=\"note\"><div class=\"big2\">Nothing retired this week matches.</div>\
+<p>The namespace box matches the start of a namespace. The text box matches anywhere in a fact, \
+ignoring case, and cannot read a private fact, which is stored encrypted.</p></div>"
+            .to_string()
+    } else if rows.is_empty() {
         "<div class=\"note\"><div class=\"big2\">Nothing was retired this week.</div>\
 <p>A fact lands here when something replaced it, whether you pressed Replace, approved a proposal, \
 or a cleanup ran, and when its period closed with nothing replacing it. Seven days, newest \
@@ -828,13 +842,27 @@ first.</p></div>"
 <div class=\"pv\"><span class=\"who\">{ns}</span>{successor}\
 <a class=\"go\" href=\"/console/fact/{id}\">open</a></div></li>",
                     id = escape(&r.id.to_string()),
-                    content = escape(&r.content),
+                    content = match r.content.is_empty() && r.sensitivity.is_encrypted() {
+                        // The repository never hands this page plaintext for an encrypted row.
+                        true => "Private. Open the fact to read it.".to_string(),
+                        false => escape(&r.content),
+                    },
                     ns = escape(&r.namespace),
                     at = date(r.retired_at),
                 )
             })
             .collect();
         format!("<ul class=\"list\">{items}</ul>")
+    };
+
+    let older = match listing.older {
+        Some(cursor) => format!(
+            "<div class=\"pager\"><a href=\"{}\">Older retirements &rarr;</a>\
+<span>Newest first. The page continues from the last row above rather than by counting rows, so \
+a supersession landing while you read cannot show you one twice.</span></div>",
+            escape(&retired_href(filter, cursor))
+        ),
+        None => String::new(),
     };
 
     shell(
@@ -844,11 +872,43 @@ first.</p></div>"
         &format!(
             "<div class=\"c-body\">{rail}<main class=\"page\">\
 <div class=\"pagehead\"><h2>Retired this week</h2>\
-<div class=\"when\">{n} in the last seven days</div></div>{body}</main></div>",
+<div class=\"when\">{n} on this page, from the last seven days</div><div class=\"grow\"></div>\
+{form}</div>{body}{older}</main></div>",
             rail = rail(contents, None),
             n = rows.len(),
+            form = retired_filter_form(filter),
+            older = older,
         ),
     )
+}
+
+/// Two boxes and a button, posted back to this page as a GET so the URL is the filter.
+fn retired_filter_form(filter: &RetiredFilter) -> String {
+    format!(
+        "<form class=\"ask\" method=\"get\" action=\"/console/retired\">\
+<input type=\"text\" name=\"ns\" value=\"{ns}\" placeholder=\"Namespace starts with\" \
+aria-label=\"Namespace starts with\">\
+<input type=\"text\" name=\"q\" value=\"{q}\" placeholder=\"Text contains\" \
+aria-label=\"Text contains, open facts only\"><button type=\"submit\">Filter</button></form>",
+        ns = escape(filter.namespace.as_deref().unwrap_or("")),
+        q = escape(filter.contains.as_deref().unwrap_or("")),
+    )
+}
+
+/// The next retired page, with the filters that produced this one.
+///
+/// Form encoded rather than pasted in: the text box takes anything, and a `&` or `%` typed there
+/// would otherwise split or corrupt the query string.
+fn retired_href(filter: &RetiredFilter, cursor: Cursor) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(ns) = &filter.namespace {
+        query.append_pair("ns", ns);
+    }
+    if let Some(q) = &filter.contains {
+        query.append_pair("q", q);
+    }
+    query.append_pair("before", &cursor.encode());
+    format!("/console/retired?{}", query.finish())
 }
 
 pub fn queue(
@@ -1457,6 +1517,7 @@ fn ago(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use crate::console::data::{NamespaceLine, Revision};
+    use crate::ports::memory::Retired;
 
     fn health() -> Health {
         Health {
@@ -1508,10 +1569,20 @@ mod tests {
 
     #[test]
     fn the_retired_page_marks_a_row_whose_period_never_closed() {
-        let closed = retired(&[retired_row(false, true)], &contents(), &health());
+        let closed = retired(
+            &listed(vec![retired_row(false, true)]),
+            &RetiredFilter::default(),
+            &contents(),
+            &health(),
+        );
         assert!(!closed.contains("end date unknown"), "an ordinary retirement needs no warning");
 
-        let open = retired(&[retired_row(true, true)], &contents(), &health());
+        let open = retired(
+            &listed(vec![retired_row(true, true)]),
+            &RetiredFilter::default(),
+            &contents(),
+            &health(),
+        );
         assert!(open.contains("end date unknown"), "{open}");
         assert!(open.contains("19 Aug 2026"), "the retirement date is what this page sorts on");
     }
@@ -1522,7 +1593,7 @@ mod tests {
     fn an_expired_row_says_it_expired_rather_than_naming_a_successor() {
         let mut row = retired_row(false, false);
         row.expired = true;
-        let html = retired(&[row], &contents(), &health());
+        let html = retired(&listed(vec![row]), &RetiredFilter::default(), &contents(), &health());
         assert!(html.contains("expired 19 Aug 2026"), "{html}");
         assert!(!html.contains("has since been deleted"), "{html}");
     }
@@ -1534,7 +1605,8 @@ mod tests {
     fn a_retirement_whose_successor_was_deleted_says_so_rather_than_linking_nowhere() {
         let orphan = retired_row(false, false);
         assert!(!orphan.expired, "a stamped row with an end is retired, not expired");
-        let html = retired(&[orphan], &contents(), &health());
+        let html =
+            retired(&listed(vec![orphan]), &RetiredFilter::default(), &contents(), &health());
         assert!(html.contains("has since been deleted"), "{html}");
         assert!(!html.contains("expired 19 Aug 2026"), "{html}");
         // One link, to the retired row itself. A missing successor must not render a dead href.
@@ -1543,7 +1615,12 @@ mod tests {
 
     #[test]
     fn the_retired_body_is_prose_and_the_way_in_sits_in_the_last_column() {
-        let html = retired(&[retired_row(false, true)], &contents(), &health());
+        let html = retired(
+            &listed(vec![retired_row(false, true)]),
+            &RetiredFilter::default(),
+            &contents(),
+            &health(),
+        );
         // The anchor that used to wrap the body underlined the whole paragraph. One link per row
         // into the fact, and it carries a short word rather than the memory.
         assert!(html.contains("<div class=\"tx\">the deploy target is fly.io</div>"), "{html}");
@@ -1559,8 +1636,62 @@ mod tests {
 
     #[test]
     fn an_empty_retired_page_says_nothing_happened_rather_than_showing_an_empty_list() {
-        let html = retired(&[], &contents(), &health());
+        let html = retired(&listed(vec![]), &RetiredFilter::default(), &contents(), &health());
         assert!(html.contains("Nothing was retired this week"), "{html}");
+    }
+
+    fn listed(rows: Vec<Retired>) -> RetiredPage {
+        RetiredPage { rows, older: None }
+    }
+
+    /// The older link carries the filters, or page two of a search is page two of everything.
+    /// Typed text goes through form encoding, so a `&` or `%` in it cannot split the query string.
+    #[test]
+    fn the_retired_pager_carries_the_filters_into_the_next_page() {
+        let cursor = Cursor { at: "2026-08-19T14:02:00Z".parse().unwrap(), id: uuid::Uuid::nil() };
+        let page = RetiredPage { rows: vec![retired_row(false, true)], older: Some(cursor) };
+        let filter = RetiredFilter::new(Some("project:"), Some("50% off & more"));
+        let html = retired(&page, &filter, &contents(), &health());
+        let href = format!(
+            "/console/retired?ns=project%3A&amp;q=50%25+off+%26+more&amp;before={}",
+            cursor.encode()
+        );
+        assert!(html.contains(&href), "{html}");
+
+        let last =
+            retired(&listed(vec![retired_row(false, true)]), &filter, &contents(), &health());
+        assert!(!last.contains("class=\"pager\""), "no older link on the last page: {last}");
+    }
+
+    /// The form shows what was typed, escaped, so a reader can see the list is narrowed and why.
+    #[test]
+    fn the_retired_filter_form_keeps_what_was_typed() {
+        let filter = RetiredFilter::new(Some("project:"), Some("<b>\"deploy\""));
+        let html = retired(&listed(vec![]), &filter, &contents(), &health());
+        assert!(html.contains("action=\"/console/retired\""), "{html}");
+        assert!(html.contains("name=\"ns\" value=\"project:\""), "{html}");
+        assert!(html.contains("name=\"q\" value=\"&lt;b&gt;&quot;deploy&quot;\""), "{html}");
+        assert!(!html.contains("<b>\"deploy"), "typed text never reaches the page raw: {html}");
+    }
+
+    #[test]
+    fn an_empty_filtered_retired_page_says_nothing_matched_rather_than_nothing_happened() {
+        let filter = RetiredFilter::new(None, Some("deploy"));
+        let html = retired(&listed(vec![]), &filter, &contents(), &health());
+        assert!(html.contains("Nothing retired this week matches"), "{html}");
+        assert!(!html.contains("Nothing was retired this week"), "{html}");
+    }
+
+    /// The repository hands back no plaintext for an encrypted row, and an empty body reads as a
+    /// fact that said nothing. The row says it is private and where to read it.
+    #[test]
+    fn a_retired_private_row_says_it_is_private_rather_than_printing_nothing() {
+        let mut row = retired_row(false, true);
+        row.content = String::new();
+        row.sensitivity = Sensitivity::Private;
+        let html = retired(&listed(vec![row]), &RetiredFilter::default(), &contents(), &health());
+        assert!(html.contains("Private. Open the fact to read it."), "{html}");
+        assert!(!html.contains("<div class=\"tx\"></div>"), "{html}");
     }
 
     fn contents() -> Contents {
