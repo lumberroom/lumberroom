@@ -89,7 +89,7 @@ fn search_config(fusion: Fusion) -> SearchConfig {
     }
 }
 
-async fn search_ids(repo: &impl MemoryRepository, lexical: f64) -> Vec<String> {
+async fn search_ids(repo: &impl MemoryRepository, text: &str, lexical: f64) -> Vec<String> {
     repo.search(SearchQuery {
         tenant_id: TENANT.into(),
         primary: vec![NamespaceCeiling {
@@ -98,7 +98,7 @@ async fn search_ids(repo: &impl MemoryRepository, lexical: f64) -> Vec<String> {
         }],
         secondary: vec![],
         embedding: vec![1.0f32; DIMS],
-        text: "kestrel".into(),
+        text: text.into(),
         limit: 10,
         weights: Weights { vector: 1.0, lexical, secondary_penalty: 0.85, usage: 0.05 },
         include_superseded: false,
@@ -133,13 +133,48 @@ async fn a_zero_lexical_weight_skips_the_lexical_arm() {
         let repo =
             postgres::PgMemoryRepository::new(pool.clone()).with_search(&search_config(fusion));
 
-        let off = search_ids(&repo, 0.0).await;
+        let off = search_ids(&repo, "kestrel", 0.0).await;
         assert_eq!(off, vec![vector_hit.to_string()], "{fusion:?} at lexical weight 0");
 
-        let on = search_ids(&repo, 0.35).await;
+        let on = search_ids(&repo, "kestrel", 0.35).await;
         assert!(
             on.contains(&lexical_only.to_string()),
             "{fusion:?} at lexical weight 0.35 lost the lexical arm: {on:?}"
+        );
+    }
+    drop_db(pool, admin, DB).await;
+}
+
+/// The store issue 75 describes: Japanese text, where the english parser makes each sentence one
+/// token, so a query word inside it never matches. Weight 0 is the documented setting for it, and at
+/// that weight the row still comes back through the vector arm under both blends.
+///
+/// The second row pins why the setting exists. It holds the query word, has no embedding, and the
+/// lexical arm misses it even at the default weight. If a Postgres upgrade or a parser change starts
+/// splitting these scripts, that assertion fails and the advice in `.env.example` needs revisiting.
+///
+/// Fails if the guard spreads to the vector arm: at weight 0 the result comes back empty.
+#[tokio::test]
+async fn a_japanese_store_at_lexical_weight_zero_still_finds_its_rows_by_vector() {
+    const DB: &str = "lexical_off_cjk_probe";
+    let Some((pool, admin)) = fresh(DB).await else {
+        common::skipping();
+        return;
+    };
+    let vector_hit = insert(&pool, "データベースのポートは5433です", true).await;
+    let lexical_only = insert(&pool, "キャッシュのポートは6379です", false).await;
+
+    for fusion in [Fusion::Linear, Fusion::Rrf] {
+        let repo =
+            postgres::PgMemoryRepository::new(pool.clone()).with_search(&search_config(fusion));
+
+        let off = search_ids(&repo, "ポート", 0.0).await;
+        assert_eq!(off, vec![vector_hit.to_string()], "{fusion:?} at lexical weight 0");
+
+        let on = search_ids(&repo, "ポート", 0.35).await;
+        assert!(
+            !on.contains(&lexical_only.to_string()),
+            "{fusion:?}: the english parser now matches a word inside Japanese text: {on:?}"
         );
     }
     drop_db(pool, admin, DB).await;
