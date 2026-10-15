@@ -12,6 +12,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   default. A private row is stored encrypted, so `q` never matches one; the page says so.
   `MemoryRepository::retired_since` takes a `RetiredQuery` with `after`, `namespace_prefix` and
   `contains`; an implementation outside this repository has to move to it.
+- **Multilingual E5 in the local embedder.** `EMBED_MODEL=multilingual-e5-base` (768 dims) or
+  `multilingual-e5-small` (384, zero-padded) loads fastembed's fp32 export, and the embedder adds
+  E5's `query: ` and `passage: ` prefixes. Stored ids end `@fp32`. E5 has no threshold entry, so it
+  runs on guessed values until `EMBED_THRESHOLDS` sets them, and boot now warns when an old single
+  threshold variable such as `DEDUPE_THRESHOLD` decides a key the model would otherwise guess.
+  English stores keep bge-base-en-v1.5.
+  Moving a store that holds rows goes through `embeddings start` and `flip`; see
+  `docs/switching-embedding-models.md`. Issue #76.
 - **A per-call recall log, off by default.** `RECALL_EVENT_LOG=true` records one `recall_event` row
   per memory that a `memory_search` or `context_bootstrap` call returned, with the call id, rank,
   digest section and active project, and no content. The cleanup pass deletes rows older than
@@ -150,6 +158,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **A retired private row no longer panics the retired list.** Private rows store NULL content, and
   the list read content as a non-null string. It now reads back empty, and the console marks the row
   private with a link to the fact page, which decrypts it.
+- **The image bakes the weights `EMBED_MODEL` names.** `prefetch` loaded bge-base-en-v1.5 whatever
+  the setting said, so an image built for another local model downloaded its weights at first boot.
+  It now fetches the model of each local block, `EMBED_PREVIOUS_MODEL` included.
 
 - **The edge rebuild finishes on a store where one alias is everywhere.** An alias that is part of
   its canonical name, said on most rows of a namespace, paired every one of them, and `m` rows make

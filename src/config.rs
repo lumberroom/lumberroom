@@ -1513,14 +1513,18 @@ fn validate_recall_events(r: &RecallEventConfig, cleanup: &CleanupConfig) -> Res
 
 /// `EMBED_RETIRE` as the stored embedder id the phase rules compare with `model_a` and `model_b`.
 /// The operator may write the id `status` prints or a bare model name. A value that already reads
-/// as an id (`openai:` or `hash-v1-` in front, `@q8` behind) passes as it is. Anything else is a
-/// local model's name and takes the local adapter's id rule, because a remote id always carries its
-/// `openai:` prefix and a bare name cannot say which endpoint it came from. A value naming either
-/// configured block, by name or by id, is refused: retire deletes vectors neither block may hold.
+/// as an id (`openai:` or `hash-v1-` in front, `@q8` or `@fp32` behind) passes as it is. Anything
+/// else is a local model's name and takes the local adapter's id rule, because a remote id always
+/// carries its `openai:` prefix and a bare name cannot say which endpoint it came from. A value
+/// naming either configured block, by name or by id, is refused: retire deletes vectors neither
+/// block may hold.
 fn resolve_retire(raw: &str, blocks: &[EmbedderSpec]) -> Result<String> {
     use crate::adapters::embedding::id_for;
     let raw = raw.trim();
-    let is_id = raw.starts_with("openai:") || raw.starts_with("hash-v1-") || raw.ends_with("@q8");
+    let is_id = raw.starts_with("openai:")
+        || raw.starts_with("hash-v1-")
+        || raw.ends_with("@q8")
+        || raw.ends_with("@fp32");
     let id = if is_id {
         raw.to_string()
     } else {
@@ -2591,7 +2595,12 @@ mod tests {
 
     #[test]
     fn embed_retire_keeps_a_stored_id() {
-        for id in ["openai:text-embedding-3-small", "bge-small-en-v1.5@q8", "hash-v1-768"] {
+        for id in [
+            "openai:text-embedding-3-small",
+            "bge-small-en-v1.5@q8",
+            "hash-v1-768",
+            "multilingual-e5-base@fp32",
+        ] {
             assert_eq!(resolve_retire(id, &two_blocks()).unwrap(), id);
         }
     }

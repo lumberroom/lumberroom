@@ -6,7 +6,7 @@ mod local;
 mod remote;
 
 pub use hash::HashEmbedder;
-pub use local::LocalEmbedder;
+pub use local::{variant_for, LocalEmbedder};
 pub use remote::RemoteEmbedder;
 
 use std::sync::Arc;
@@ -87,6 +87,8 @@ mod tests {
         for (model, want) in [
             ("Xenova/bge-base-en-v1.5", "Xenova/bge-base-en-v1.5@q8"),
             ("bge-small-en-v1.5", "bge-small-en-v1.5@q8"),
+            ("multilingual-e5-base", "multilingual-e5-base@fp32"),
+            ("multilingual-e5-small", "multilingual-e5-small@fp32"),
         ] {
             assert_eq!(id_for(&spec(EmbedProvider::Local, model, 768)), want);
             assert_eq!(local::id(model), want);

@@ -291,7 +291,8 @@ impl Registry {
     /// Each legacy value that decides its key for `model_id` and differs from the value the key
     /// would take without it, paired with that value. An `.env` copied from an older
     /// `.env.example` carries bge's values in the old variables, and they hold any other model on
-    /// bge's scale with nothing in the log.
+    /// bge's scale with nothing in the log. A key the model would guess is named even at an equal
+    /// value: it resolves as legacy, so the guessed-key warning leaves it out.
     pub fn legacy_departures<'a>(
         &self,
         model_id: &str,
@@ -303,8 +304,9 @@ impl Registry {
             .iter()
             .filter(|l| !overrides.iter().any(|(k, _)| k == l.key))
             .filter_map(|l| {
-                let table = without.values.get(l.key)?.value;
-                (table != l.value).then_some((l, table))
+                let table = without.values.get(l.key)?;
+                (table.value != l.value || table.source == Source::Guessed)
+                    .then_some((l, table.value))
             })
             .collect()
     }
@@ -425,6 +427,18 @@ mod tests {
         assert_eq!(r.legacy_departures(GEMMA, &[], &l), vec![(&l[0], 0.995), (&l[1], 0.91)]);
         // An override decides its key, so the legacy value changes nothing there.
         assert_eq!(r.legacy_departures(GEMMA, &ov(&[(DEDUPE, 0.99)]), &l), vec![(&l[1], 0.91)]);
+    }
+
+    #[test]
+    fn a_legacy_value_on_a_model_with_no_entry_is_named_even_when_it_equals_the_guess() {
+        // DEDUPE_THRESHOLD=0.97 on an unlisted model resolves as legacy, so the guessed-key warning
+        // skips it while the value is still bge's.
+        let r = Registry::engine();
+        let l = [legacy(DEDUPE, 0.97), legacy(CONFLICT, 0.5)];
+        assert_eq!(
+            r.legacy_departures("multilingual-e5-base@fp32", &[], &l),
+            vec![(&l[0], 0.97), (&l[1], 0.90)]
+        );
     }
 
     #[test]
