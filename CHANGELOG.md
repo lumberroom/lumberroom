@@ -186,6 +186,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A cleanup scope matches its prefix character for character.** A scope such as `project:my_*`
+  went into a SQL `LIKE`, which reads `_` as any one character and `%` as any run of them, so the
+  pass also read `project:myxapp`. The caller's read grant still bounded every run. The scope now
+  compares with `starts_with`, as the retired list already did, and the alias group lookup does the
+  same.
 - **A retired private row no longer panics the retired list.** Private rows store NULL content, and
   the list read content as a non-null string. It now reads back empty, and the console marks the row
   private with a link to the fact page, which decrypts it.

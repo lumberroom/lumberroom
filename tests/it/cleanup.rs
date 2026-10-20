@@ -788,6 +788,93 @@ async fn a_narrow_client_running_the_pass_reads_nothing_outside_its_grant() {
     assert_eq!(status, 403, "a prefix grant does not cover the whole store: {body}");
 }
 
+/// A scope prefix is matched character for character. It used to go into `LIKE`, which reads `_`
+/// as any one character, so a pass scoped to `project:my_*` also read `project:myxapp`. The
+/// caller's grant still bounded that read.
+#[tokio::test]
+async fn a_scope_prefix_matches_an_underscore_literally() {
+    let h = harness_or_skip!();
+    let mine = [
+        put_raw(&h, "project:my_app", "the worker restarts at midnight").await,
+        put_raw(&h, "project:my_app", "The worker restarts at midnight  ").await,
+    ];
+    let other = [
+        put_raw(&h, "project:myxapp", "the queue drains every hour").await,
+        put_raw(&h, "project:myxapp", "The queue drains every hour  ").await,
+    ];
+    for id in mine.iter().chain(other.iter()) {
+        backdate(&h, id, 30).await;
+    }
+
+    let q = CandidateQuery {
+        namespace: Some("project:my_*".into()),
+        max_sensitivity: lumberroom_server::domain::types::Sensitivity::Sealed,
+        grant: NamespaceGrant::everything(),
+        since: None,
+        limit: 100,
+    };
+    let tenant = &h.ctx.cfg.tenant_id;
+
+    let groups = h.repo.exact_duplicates(tenant, &q).await.unwrap();
+    let seen: Vec<&str> = groups.iter().flatten().map(|c| c.namespace.as_str()).collect();
+    assert!(
+        seen.iter().all(|ns| *ns == "project:my_app"),
+        "the exact query read past the scope's prefix: {seen:?}"
+    );
+    assert_eq!(groups.len(), 1, "the in-scope pair should still group: {seen:?}");
+
+    let pairs = h
+        .repo
+        .similar_pairs(tenant, &q, 0.0, lumberroom_server::domain::embedding_slot::VectorSlot::A)
+        .await
+        .unwrap();
+    let paired: Vec<&str> = pairs.iter().map(|p| p.older.namespace.as_str()).collect();
+    assert!(
+        paired.iter().all(|ns| *ns == "project:my_app"),
+        "the pair query read past the scope's prefix: {paired:?}"
+    );
+    assert!(!pairs.is_empty(), "the in-scope pair should reach the pair query");
+
+    let unread = h.repo.unread(tenant, &q, 7).await.unwrap();
+    let ids: Vec<&str> = unread.iter().map(|c| c.id.as_str()).collect();
+    assert!(
+        ids.iter().all(|id| mine.iter().any(|m| m == id)),
+        "the unread query read past the scope's prefix: {ids:?}"
+    );
+    assert_eq!(unread.len(), 2, "both in-scope rows are unread and 30 days old: {ids:?}");
+}
+
+/// `%` in a scope is a character, and no namespace may contain one, so the scope reaches nothing.
+/// The scope a caller sends is never validated as a namespace, which is how `%` got to `LIKE`.
+#[tokio::test]
+async fn a_percent_sign_in_a_scope_matches_no_namespace() {
+    let h = harness_or_skip!();
+    put_raw(&h, "project:myxapp", "the queue drains every hour").await;
+    put_raw(&h, "project:myxapp", "The queue drains every hour  ").await;
+
+    let (status, body) = h
+        .post(
+            "/admin/cleanup/run",
+            NARROW_TOKEN,
+            serde_json::json!({ "cadence": "hourly", "namespace": "project:m%*" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["report"]["exact_groups"], 0, "a `%` in the scope acted as a wildcard: {body}");
+
+    let (status, body) = h
+        .post(
+            "/admin/cleanup/run",
+            NARROW_TOKEN,
+            serde_json::json!({ "cadence": "hourly", "namespace": "project:m*" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["report"]["exact_groups"], 1, "the control scope should find the pair: {body}");
+}
+
 /// A private pair in the model band is counted and withheld. It used to fail the run with an
 /// internal error, and the exact floor at which a scope flipped from 200 to 500 was the cosine of
 /// its closest private pair.
