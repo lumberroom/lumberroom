@@ -2182,6 +2182,28 @@ async fn an_alias_group_does_not_cross_a_namespace_prefix() {
     );
 }
 
+/// The group scope compares the namespace kind character for character. Search validates every
+/// namespace before it asks, so no caller sends a kind holding `_` or `%` today; this pins the
+/// statement so the next caller of `group` cannot widen a lookup by accident.
+#[tokio::test]
+async fn an_alias_group_reads_its_kind_prefix_literally() {
+    let (ctx, _pool, _serial) = ctx_or_skip!();
+    put_alias(&ctx, "project:goldbox", "leadbox", "goldbox").await;
+    let tenant = &ctx.cfg.tenant_id;
+
+    let control = ctx.repos.aliases.group(tenant, "project:leadbox", "leadbox").await.unwrap();
+    assert_eq!(control, vec!["goldbox".to_string(), "leadbox".to_string()]);
+
+    for namespace in ["pro_ect:leadbox", "%:leadbox"] {
+        let names = ctx.repos.aliases.group(tenant, namespace, "leadbox").await.unwrap();
+        assert_eq!(
+            names,
+            vec!["leadbox".to_string()],
+            "{namespace} reached the project: group through a wildcard"
+        );
+    }
+}
+
 /// The alias runs through the grant, never around it.
 ///
 /// A rename is not a reason to read a namespace the caller was never given. This is the disclosure

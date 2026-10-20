@@ -74,13 +74,17 @@ fn ns_bounds(namespace: Option<&str>) -> (String, bool) {
 /// `$1` tenant, `$2` ceiling, `$3` namespace pattern, `$4` whether that pattern is exact, `$5` to
 /// `$7` the grant as prefix, exactness and ceiling.
 ///
+/// The prefix arm is `starts_with`, the comparison `namespaces::matches` makes in Rust. It was
+/// `LIKE $3 || '%'`, and `LIKE` reads `_` and `%` in the caller's scope as wildcards: `_` is legal
+/// in every slug, so `project:my_*` also took in `project:myxapp`.
+///
 /// `content IS NOT NULL` drops sealed rows whose bytes the server cannot read. A sealed row has no
 /// plaintext to compare and no plaintext to show anyone, so it is not a cleanup candidate at all.
 ///
 /// A test at the bottom of this file asserts the four copies stay identical, because four copies
 /// of a security predicate is exactly the shape where one gets edited and the others do not.
 #[cfg_attr(not(test), allow(dead_code))]
-const IN_SCOPE_PREDICATE: &str = "AND ($3::text = '' OR ($4::bool AND m.namespace = $3) OR (NOT $4::bool AND m.namespace LIKE $3 || '%'))";
+const IN_SCOPE_PREDICATE: &str = "AND ($3::text = '' OR ($4::bool AND m.namespace = $3) OR (NOT $4::bool AND starts_with(m.namespace, $3)))";
 
 /// `policy::admits` in SQL: some grant entry matches the namespace and its ceiling is at or above
 /// the row's stored level. Union across entries, like `policy::ceiling`. An empty grant admits
@@ -113,7 +117,7 @@ const EXACT_DUPLICATES_SQL: &str = concat!(
         ELSE true
       END
     )
-    AND ($3::text = '' OR ($4::bool AND m.namespace = $3) OR (NOT $4::bool AND m.namespace LIKE $3 || '%'))
+    AND ($3::text = '' OR ($4::bool AND m.namespace = $3) OR (NOT $4::bool AND starts_with(m.namespace, $3)))
     AND EXISTS (
       SELECT 1 FROM unnest($5::text[], $6::bool[], $7::text[]) AS g(prefix, exact, max)
        WHERE CASE WHEN g.exact THEN m.namespace = g.prefix
@@ -168,7 +172,7 @@ macro_rules! similar_pairs_sql {
         ELSE true
       END
     )
-    AND ($3::text = '' OR ($4::bool AND m.namespace = $3) OR (NOT $4::bool AND m.namespace LIKE $3 || '%'))
+    AND ($3::text = '' OR ($4::bool AND m.namespace = $3) OR (NOT $4::bool AND starts_with(m.namespace, $3)))
     AND EXISTS (
       SELECT 1 FROM unnest($5::text[], $6::bool[], $7::text[]) AS g(prefix, exact, max)
        WHERE CASE WHEN g.exact THEN m.namespace = g.prefix
@@ -231,7 +235,7 @@ const NEWEST_SQL: &str = concat!(
         ELSE true
       END
     )
-    AND ($3::text = '' OR ($4::bool AND m.namespace = $3) OR (NOT $4::bool AND m.namespace LIKE $3 || '%'))
+    AND ($3::text = '' OR ($4::bool AND m.namespace = $3) OR (NOT $4::bool AND starts_with(m.namespace, $3)))
     AND EXISTS (
       SELECT 1 FROM unnest($5::text[], $6::bool[], $7::text[]) AS g(prefix, exact, max)
        WHERE CASE WHEN g.exact THEN m.namespace = g.prefix
@@ -261,7 +265,7 @@ const UNREAD_SQL: &str = concat!(
         ELSE true
       END
     )
-    AND ($3::text = '' OR ($4::bool AND m.namespace = $3) OR (NOT $4::bool AND m.namespace LIKE $3 || '%'))
+    AND ($3::text = '' OR ($4::bool AND m.namespace = $3) OR (NOT $4::bool AND starts_with(m.namespace, $3)))
     AND EXISTS (
       SELECT 1 FROM unnest($5::text[], $6::bool[], $7::text[]) AS g(prefix, exact, max)
        WHERE CASE WHEN g.exact THEN m.namespace = g.prefix
@@ -1083,6 +1087,7 @@ mod tests {
         for (name, sql) in [
             ("exact_duplicates", EXACT_DUPLICATES_SQL),
             ("similar_pairs", SIMILAR_PAIRS_SQL),
+            ("similar_pairs_b", SIMILAR_PAIRS_B_SQL),
             ("unread", UNREAD_SQL),
             ("newest_in_scope", NEWEST_SQL),
         ] {
@@ -1103,6 +1108,23 @@ mod tests {
                  a model"
             );
         }
+    }
+
+    /// A namespace prefix from a caller must never become a `LIKE` pattern: `_` is legal in a slug
+    /// and `%` reaches here through an unvalidated scope glob. Comment lines are dropped so the
+    /// doc comment that explains the old form does not trip the check.
+    #[test]
+    fn no_statement_builds_a_like_pattern_from_a_namespace() {
+        assert!(IN_SCOPE_PREDICATE.contains("starts_with(m.namespace, $3)"));
+        let head = include_str!("cleanup.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!head.contains("LIKE"), "a statement in cleanup.rs matches with LIKE");
     }
 
     #[test]
