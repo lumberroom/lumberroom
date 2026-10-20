@@ -36,6 +36,9 @@ impl PgAliasRepository {
 /// `project:warden` and stays one. A namespace with no colon falls back to matching itself, since
 /// there is no prefix to widen to.
 ///
+/// The prefix comparison is `starts_with`. Every kind the engine accepts today is plain letters,
+/// and `LIKE` would read a `_` or `%` in one as a wildcard and widen the group.
+///
 /// The first arm resolves the name asked for to its canonical name, or keeps it when the name is
 /// canonical already or unknown. The second arm collects every other name pointing at that
 /// canonical. The `COALESCE` is what makes the statement total: an unknown name still produces one
@@ -65,7 +68,7 @@ const GROUP_SQL: &str = r#"
           FROM entity_alias a, scope
          WHERE a.tenant_id = $1
            AND (scope.prefix IS NULL AND a.namespace = $2
-                OR scope.prefix IS NOT NULL AND a.namespace LIKE scope.prefix || '%')
+                OR scope.prefix IS NOT NULL AND starts_with(a.namespace, scope.prefix))
     ),
     root AS (
         -- LIMIT 1, because a scalar subquery returning two rows is an error rather than a wrong
@@ -313,6 +316,13 @@ impl AliasRepository for PgAliasRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kind prefix is compared literally. `LIKE` would read `_` or `%` in it as a wildcard.
+    #[test]
+    fn the_group_scope_matches_its_prefix_literally() {
+        assert!(GROUP_SQL.contains("starts_with(a.namespace, scope.prefix)"));
+        assert!(!GROUP_SQL.contains("LIKE"));
+    }
 
     #[test]
     fn a_name_cannot_be_its_own_alias() {
