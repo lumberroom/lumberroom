@@ -789,8 +789,8 @@ async fn a_narrow_client_running_the_pass_reads_nothing_outside_its_grant() {
 }
 
 /// A scope prefix is matched character for character. It used to go into `LIKE`, which reads `_`
-/// as any one character, so a pass scoped to `project:my_*` also read `project:myxapp`. The grant
-/// still bounded it; the scope did not.
+/// as any one character, so a pass scoped to `project:my_*` also read `project:myxapp`. The
+/// caller's grant still bounded that read.
 #[tokio::test]
 async fn a_scope_prefix_matches_an_underscore_literally() {
     let h = harness_or_skip!();
