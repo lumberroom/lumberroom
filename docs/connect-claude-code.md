@@ -244,6 +244,11 @@ flattened onto one bullet before it is rendered. One more line sits under the `S
 active project namespace and telling the model to pass it to `memory_search`. A pass here means facts and a count. Section 6 covers a digest that
 comes back with a count and no facts.
 
+This sample also predates decision 0034. A digest today prints the active project first, and
+recent keeps to that project and the rule-tagged rows in `user:me` and `global`. A session whose
+directory is not `lumberroom` would see the `project:lumberroom` nonce above only as a count on the
+inventory line, unless the caller sends a query that matches it.
+
 ### scripts/done-when-test.sh
 
 The real proof, because it drives the `claude` binary rather than the CLI. Session A states a fact

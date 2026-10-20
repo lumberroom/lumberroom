@@ -363,7 +363,7 @@ pub fn digest(d: &Digest, rows: bool) -> serde_json::Value {
         "text": d.text,
     });
     let o = answer.as_object_mut().expect("a json! object literal");
-    let facts = || d.profile.iter().chain(&d.project_context).chain(&d.recent);
+    let facts = || d.project_context.iter().chain(&d.related).chain(&d.profile).chain(&d.recent);
     // An id the sections do not hold has nothing to carry, so it drops out here. `render_report`
     // takes its ids from these same sections, so that means a digest built by hand.
     let left_out: Vec<serde_json::Value> = d
@@ -388,6 +388,11 @@ pub fn digest(d: &Digest, rows: bool) -> serde_json::Value {
     }
     if facts().next().is_some() {
         o.insert("more".into(), DIGEST_MORE.into());
+    }
+    // The text says nothing about a missing related section, so the structured copy is the one
+    // place a client learns why its query added no rows.
+    if let Some(why) = &d.related_unavailable {
+        o.insert("related_unavailable".into(), why.clone().into());
     }
     answer
 }
@@ -784,6 +789,8 @@ mod tests {
             sealed_inventory: HashMap::from([("user:me".to_string(), 1)]),
             profile: vec![fact("p1", "user:me"), p2],
             project_context: vec![],
+            related: vec![],
+            related_unavailable: None,
             recent: vec![fact("r1", "global")],
             registry: vec![RegistrySummary {
                 namespace: "global".into(),
@@ -822,6 +829,25 @@ mod tests {
         assert_eq!(brief["sealed_inventory"], serde_json::to_value(&d.sealed_inventory).unwrap());
         assert_eq!(brief["text"], d.text.as_str());
         assert_eq!(brief["more"], DIGEST_MORE);
+    }
+
+    #[test]
+    fn a_left_out_related_row_rides_in_the_brief_left_out() {
+        let mut d = digest_fixture();
+        d.related = vec![fact("x1", "project:beta")];
+        d.left_out = vec!["x1".into()];
+        let brief = digest(&d, false);
+        assert_eq!(brief["left_out"][0]["id"], "x1");
+        assert_eq!(brief["left_out"][0]["namespace"], "project:beta");
+    }
+
+    #[test]
+    fn a_brief_digest_names_why_the_related_section_is_missing() {
+        let mut d = digest_fixture();
+        d.related_unavailable = Some("embed_failed".into());
+        assert_eq!(digest(&d, false)["related_unavailable"], "embed_failed");
+        d.related_unavailable = None;
+        assert!(digest(&d, false).get("related_unavailable").is_none());
     }
 
     #[test]

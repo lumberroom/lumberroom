@@ -51,6 +51,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The digest leads with the active project and follows the request.** `context_bootstrap` prints
+  the project first, with 55 percent of the budget and first claim on what the other sections
+  leave; related, profile, recent and the registry follow at 10, 15, 5 and 15 percent. An optional
+  `query`, the person's request, adds up to four rows from any readable namespace whose cosine to
+  it reaches the model's `route_max_top`. Profile prints rows tagged with a `BOOTSTRAP_RULE_TAGS`
+  tag (default `preference,rule,convention`) ahead of newer untagged rows, with or without a query,
+  and a query orders each group by relevance. An untagged restatement that drops its tagged twin as
+  a near-duplicate takes the twin's place among the rules. Profile keeps one whole rule ahead of
+  the shares at any budget where one fits in half the room. Recent keeps to the active project and
+  the tagged rows in `user:me` and `global`, so personal facts and a burst of writes elsewhere no
+  longer fill it. When the query cannot be embedded, or the model's `route_max_top` was carried or
+  guessed from bge-base, the related section stays out, the digest serves, and the structured
+  answer names why in `related_unavailable`, unless `BOOTSTRAP_RELATED_LIMIT` is 0. Defaults move:
+  `BOOTSTRAP_PROJECT_LIMIT` 5 to 10, `BOOTSTRAP_PROFILE_LIMIT` 10 to 8, `BOOTSTRAP_RECENT_LIMIT` 8
+  to 5, and the new `BOOTSTRAP_RELATED_LIMIT` 4, refused at boot outside 0 to 10, and the new
+  `BOOTSTRAP_RULE_TAGS`, which a single comma turns off. A deployment that set the old limits keeps
+  them. Compose forwards `BOOTSTRAP_RECENT_LIMIT`, `BOOTSTRAP_RECENT_DAYS`,
+  `BOOTSTRAP_RELATED_LIMIT` and `BOOTSTRAP_RULE_TAGS`. The digest cache key carries the query, and
+  each insert sweeps expired entries. `bootstrap::run_with_query` sits beside an unchanged
+  `bootstrap::run`. A shortened bullet keeps at least its first word, so a body that opens with a
+  URL longer than the room stays out. Decision 0034, which supersedes 0025.
 - **The integration tests build as one binary, and CI runs them with cargo-nextest.** The 29 files
   under `tests/` are modules of `tests/it/main.rs`, so `--test integration <name>` is now
   `--test it integration::<name>`. `./scripts/cargo.sh nextest` runs the suite with each test in its

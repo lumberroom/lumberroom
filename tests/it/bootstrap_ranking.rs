@@ -1,7 +1,10 @@
-//! How `context_bootstrap` chooses its rows, pinned against a real Postgres (decision 0025).
+//! How `context_bootstrap` chooses its rows, pinned against a real Postgres (decisions 0025 and
+//! 0034).
 //!
-//! Profile and project are newest first, recent skips what they printed, and a row that restates
-//! one already chosen gives up its slot. Rows go in through SQL rather than `write::run` so each
+//! Project is newest first, profile puts standing rules first and is newest first inside each
+//! group, recent keeps to the active project and the caller's standing rules and skips what they
+//! printed, a query adds related rows and orders the profile, and a row that restates one already
+//! chosen gives up its slot. Rows go in through SQL rather than `write::run` so each
 //! test controls `created_at` and the vector exactly; the hash embedder would make a near-duplicate
 //! a matter of luck.
 //!
@@ -14,8 +17,12 @@ use std::sync::Arc;
 use lumberroom_server::adapters::embedding::HashEmbedder;
 use lumberroom_server::adapters::postgres;
 use lumberroom_server::config::{self, Config};
+use lumberroom_server::domain::errors::{DomainError, Result};
 use lumberroom_server::domain::policy::NamespaceGrant;
+use lumberroom_server::domain::similarity;
 use lumberroom_server::domain::types::{Invocation, Principal};
+use lumberroom_server::mcp::views;
+use lumberroom_server::ports::Embedder;
 use lumberroom_server::services::bootstrap::{self, Digest};
 use lumberroom_server::services::{Ctx, Repos};
 use sqlx::{AssertSqlSafe, PgPool};
@@ -106,6 +113,9 @@ impl Store {
         // The digest cache is process-wide and keyed without a database, so a cached digest from
         // one test would answer another that shares a client and grant.
         cfg.bootstrap.cache_ms = 0;
+        // The hash embedder has no family entry, so its route_max_top is a guess and the related
+        // section would stay out. A test that wants the guessed floor clears this in `tune`.
+        cfg.embed.thresholds = similarity::parse_overrides("route_max_top=0.65").unwrap();
         tune(&mut cfg);
         let memories = Arc::new(postgres::PgMemoryRepository::new(self.pool.clone()));
         let cfg = Arc::new(cfg);
@@ -160,6 +170,19 @@ fn near(i: usize, j: usize) -> Vec<f32> {
     v
 }
 
+/// A copy of `v` with 0.1 added at `j`: cosine about 0.995 with `v`.
+fn tilted(v: &[f32], j: usize) -> Vec<f32> {
+    let mut v = v.to_vec();
+    v[j] += 0.1;
+    v
+}
+
+/// The hash embedder's query vector for `text`. A row stored with it has cosine 1.0 to a query of
+/// the same text.
+async fn qvec(text: &str) -> Vec<f32> {
+    HashEmbedder::new(DIMS).embed_query(text).await.unwrap()
+}
+
 fn ids(section: &[bootstrap::Fact]) -> Vec<String> {
     section.iter().map(|f| f.id.clone()).collect()
 }
@@ -168,7 +191,27 @@ fn every_id(d: &Digest) -> Vec<String> {
     let mut all = ids(&d.profile);
     all.extend(ids(&d.project_context));
     all.extend(ids(&d.recent));
+    all.extend(ids(&d.related));
     all
+}
+
+/// Fails every query embed and embeds documents as the hash embedder does, under its id.
+struct QueryEmbedFails(HashEmbedder);
+
+#[async_trait::async_trait]
+impl Embedder for QueryEmbedFails {
+    fn id(&self) -> String {
+        self.0.id()
+    }
+    fn dim(&self) -> usize {
+        self.0.dim()
+    }
+    async fn embed_documents(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        self.0.embed_documents(texts).await
+    }
+    async fn embed_query(&self, _text: &str) -> Result<Vec<f32>> {
+        Err(DomainError::internal("embedder down"))
+    }
 }
 
 macro_rules! store_or_skip {
@@ -183,16 +226,15 @@ macro_rules! store_or_skip {
     };
 }
 
-/// (a) The owner's ruling: recency alone orders profile, and it holds ten rows. An old row tagged
-/// `preference` used to sort above every newer one.
+/// (a) Without a query and without a rule tag, recency orders profile, and it holds eight rows.
+/// An old row with a tag outside `BOOTSTRAP_RULE_TAGS` does not jump the queue.
 ///
-/// Fails if the tag-first ORDER BY returns, or if the default profile limit moves off 10.
+/// Fails if any tag sorts a row first, or if the default profile limit moves off 8.
 #[tokio::test]
-async fn the_profile_shows_the_ten_newest_rows_and_no_tag_jumps_the_queue() {
+async fn the_profile_shows_the_eight_newest_rows_without_a_query_or_a_rule_tag() {
     let s = store_or_skip!("bootstrap_ranking_a");
-    let old = s
-        .put("user:me", "old tagged preference", &["preference"], Some(axis(0)), 24.0 * 30.0)
-        .await;
+    let old =
+        s.put("user:me", "old tagged identity", &["identity"], Some(axis(0)), 24.0 * 30.0).await;
     let mut newer = Vec::new();
     for i in 0..50 {
         // Written after the old one, the last of them newest.
@@ -208,12 +250,74 @@ async fn the_profile_shows_the_ten_newest_rows_and_no_tag_jumps_the_queue() {
         newer.push(id);
     }
     let ctx = s.ctx(|_| {});
-    assert_eq!(ctx.cfg.bootstrap.profile_limit, 10, "the default profile limit");
+    assert_eq!(ctx.cfg.bootstrap.profile_limit, 8, "the default profile limit");
 
     let d = bootstrap::run(&ctx, None).await.unwrap();
-    let want: Vec<String> = newer.iter().rev().take(10).cloned().collect();
-    assert_eq!(ids(&d.profile), want, "the ten newest, newest first");
+    let want: Vec<String> = newer.iter().rev().take(8).cloned().collect();
+    assert_eq!(ids(&d.profile), want, "the eight newest, newest first");
     assert!(!every_id(&d).contains(&old), "the old tagged row stays out of every section");
+    s.drop().await;
+}
+
+/// The incident behind decision 0034: another surface wrote a burst of personal facts after the
+/// owner's standing rules, and the session-start digest, which carries no query, printed the facts.
+///
+/// Fails if profile goes back to recency alone, if the pool stops reading rules first, or if
+/// recent prints an untagged personal row again.
+#[tokio::test]
+async fn standing_rules_lead_the_profile_over_newer_personal_rows_without_a_query() {
+    let s = store_or_skip!("bootstrap_ranking_y");
+    let mut rules = Vec::new();
+    for (i, tag) in ["preference", "rule", "convention"].into_iter().enumerate() {
+        let at = 24.0 * 20.0 + i as f64;
+        rules
+            .push(s.put("user:me", &format!("standing rule {i}"), &[tag], Some(axis(i)), at).await);
+    }
+    let mut facts = Vec::new();
+    for i in 0..30 {
+        let at = 1.0 + i as f64;
+        let body = format!("personal fact {i}");
+        facts.push(s.put("user:me", &body, &["household"], Some(axis(10 + i)), at).await);
+    }
+    s.put(&format!("project:{PROJECT}"), "alpha fact", &[], Some(axis(60)), 2.0).await;
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
+    assert_eq!(ids(&d.profile)[..3], rules[..], "the rules first, newest first");
+    assert_eq!(ids(&d.profile)[3..], facts[..5], "then the newest facts fill the limit");
+    for id in ids(&d.recent) {
+        assert!(!facts.contains(&id), "recent printed an untagged personal row");
+    }
+    let text = &d.text;
+    let first_rule = text.find("standing rule 0").expect("a rule printed");
+    assert!(text.find("personal fact").is_none_or(|at| at > first_rule), "{text}");
+    s.drop().await;
+}
+
+/// Another surface restates a rule without its tag. The pass drops the older tagged twin, and the
+/// untagged survivor used to sort behind nine other rules and fall past the profile limit, so the
+/// fact vanished from every section.
+///
+/// Fails if a survivor stops taking the standing mark of the tagged twin it dropped.
+#[tokio::test]
+async fn an_untagged_restatement_of_a_rule_keeps_the_rule_in_the_profile() {
+    let s = store_or_skip!("bootstrap_ranking_rule_twin");
+    for i in 0..9 {
+        let at = 10.0 + i as f64;
+        s.put("user:me", &format!("standing rule {i}"), &["rule"], Some(axis(10 + i)), at).await;
+    }
+    let tagged =
+        s.put("user:me", "stage files by explicit path", &["rule"], Some(axis(0)), 5.0).await;
+    let untagged =
+        s.put("user:me", "always stage files by explicit path", &[], Some(near(0, 1)), 1.0).await;
+    let ctx = s.ctx(|_| {});
+    assert_eq!(ctx.cfg.bootstrap.profile_limit, 8, "the default profile limit");
+
+    let d = bootstrap::run(&ctx, None).await.unwrap();
+    let profile = ids(&d.profile);
+    assert!(!every_id(&d).contains(&tagged), "the older twin drops");
+    assert_eq!(profile.first(), Some(&untagged), "the survivor leads as the newest rule");
+    assert!(d.text.contains("stage files by explicit path"), "{}", d.text);
     s.drop().await;
 }
 
@@ -228,56 +332,65 @@ async fn two_near_duplicates_take_one_slot_and_the_newer_one_keeps_it() {
     let newer = s.put(&ns, "deploys go through make cloud-up", &[], Some(axis(0)), 1.0).await;
     let older = s.put(&ns, "deploy with make cloud-up", &[], Some(near(0, 1)), 2.0).await;
     let mut rest = Vec::new();
-    for i in 0..6 {
+    for i in 0..10 {
         rest.push(
             s.put(&ns, &format!("project fact {i}"), &[], Some(axis(10 + i)), 3.0 + i as f64).await,
         );
     }
     let ctx = s.ctx(|_| {});
-    assert_eq!(ctx.cfg.bootstrap.project_limit, 5, "the default project limit");
+    assert_eq!(ctx.cfg.bootstrap.project_limit, 10, "the default project limit");
 
     let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
     let mut want = vec![newer.clone()];
-    want.extend(rest.iter().take(4).cloned());
+    want.extend(rest.iter().take(9).cloned());
     assert_eq!(ids(&d.project_context), want, "the twin's slot goes to the next row");
     assert!(!every_id(&d).contains(&older), "the older twin is in no section, recent included");
     s.drop().await;
 }
 
-/// (c) Recent spans every namespace, so it overlaps the two sections above it. It prints what they
-/// did not.
+/// (c) Recent keeps to the active project and the rule-tagged rows in `user:me` and `global`, and
+/// prints what project and profile did not. The `project:beta` rows and an untagged user row are
+/// the newest in the store and still stay out of it.
 ///
-/// Fails if recent stops skipping ids profile or project already chose.
+/// Fails if recent reads every readable namespace again, admits untagged user rows, or stops
+/// skipping chosen rows.
 #[tokio::test]
-async fn recent_never_repeats_a_row_from_profile_or_project() {
+async fn recent_keeps_to_the_active_project_and_the_callers_own_namespaces() {
     let s = store_or_skip!("bootstrap_ranking_c");
     let ns = format!("project:{PROJECT}");
-    let mut axis_no = 0;
-    let mut next = || {
-        axis_no += 1;
-        axis(axis_no)
-    };
-    for i in 0..4 {
-        s.put("user:me", &format!("rule {i}"), &[], Some(next()), 1.0 + i as f64).await;
-        s.put(&ns, &format!("alpha fact {i}"), &[], Some(next()), 1.5 + i as f64).await;
+    let mut alpha = Vec::new();
+    for i in 0..12 {
+        let at = 1.0 + i as f64 * 0.5;
+        alpha.push(s.put(&ns, &format!("alpha fact {i}"), &[], Some(axis(i)), at).await);
     }
-    let mut elsewhere = Vec::new();
+    let mut mine = Vec::new();
+    for i in 0..9 {
+        let at = 1.25 + i as f64 * 0.5;
+        mine.push(s.put("user:me", &format!("rule {i}"), &["rule"], Some(axis(20 + i)), at).await);
+    }
+    let untagged = s.put("user:me", "an untagged personal row", &[], Some(axis(50)), 0.05).await;
+    let mut beta = Vec::new();
     for i in 0..3 {
-        elsewhere.push(
-            s.put("project:beta", &format!("beta fact {i}"), &[], Some(next()), 10.0 + i as f64)
-                .await,
+        let at = 0.1 + i as f64 * 0.1;
+        beta.push(
+            s.put("project:beta", &format!("beta fact {i}"), &[], Some(axis(40 + i)), at).await,
         );
     }
     let ctx = s.ctx(|_| {});
 
     let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
-    let above: Vec<String> = ids(&d.profile).into_iter().chain(ids(&d.project_context)).collect();
-    assert_eq!(above.len(), 8, "every profile and project row fits");
-    let recent = ids(&d.recent);
-    for id in &recent {
-        assert!(!above.contains(id), "recent repeated {id}");
+    assert_eq!(ids(&d.project_context), alpha[..10].to_vec());
+    assert_eq!(ids(&d.profile), mine[..8].to_vec());
+    assert_eq!(
+        ids(&d.recent),
+        vec![mine[8].clone(), alpha[10].clone(), alpha[11].clone()],
+        "the overflow of the scoped namespaces, newest first"
+    );
+    let all = every_id(&d);
+    for id in &beta {
+        assert!(!all.contains(id), "a project:beta row reached a section without a query");
     }
-    assert_eq!(recent, elsewhere, "recent holds the rows nothing above printed, newest first");
+    assert!(!ids(&d.recent).contains(&untagged), "recent holds rules, not every user row");
     s.drop().await;
 }
 
@@ -383,22 +496,28 @@ async fn a_newer_project_row_beats_its_older_twin_in_profile() {
     s.drop().await;
 }
 
-/// (h) A correction filed in a namespace no section above recent reads still hides the stale row
-/// it corrects. Recent prints the correction.
+/// (h) A correction filed outside the active project, `user:me` and `global` no longer reaches
+/// the digest without a query, so the stale row it corrects prints. A query that matches the
+/// correction brings it in through related, and the newer row wins as decision 0025 rules.
 ///
-/// Fails if a row profile chose can survive a newer twin from the recent pool.
+/// Fails if the related pool stops joining the near-duplicate pass, or recent widens again.
 #[tokio::test]
-async fn a_newer_correction_in_another_namespace_hides_the_older_twin() {
+async fn a_correction_outside_the_scope_wins_only_through_a_matching_query() {
     let s = store_or_skip!("bootstrap_ranking_h");
-    let stale = s.put("user:me", "deploy from the main branch", &[], Some(axis(0)), 5.0).await;
-    let fix =
-        s.put("project:beta", "deploy from the release branch", &[], Some(near(0, 3)), 1.0).await;
+    let text = "deploy from the release branch";
+    let q = qvec(text).await;
+    let stale =
+        s.put("user:me", "deploy from the main branch", &[], Some(tilted(&q, 3)), 5.0).await;
+    let fix = s.put("project:beta", text, &[], Some(q.clone()), 1.0).await;
     let ctx = s.ctx(|_| {});
 
     let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
-    assert!(d.profile.is_empty(), "the stale rule left profile: {:?}", ids(&d.profile));
-    assert_eq!(ids(&d.recent), vec![fix]);
-    assert!(!every_id(&d).contains(&stale));
+    assert_eq!(ids(&d.profile), vec![stale.clone()], "without a query the stale rule prints");
+    assert!(!every_id(&d).contains(&fix));
+
+    let d = bootstrap::run_with_query(&ctx, Some(PROJECT), Some(text)).await.unwrap();
+    assert!(!every_id(&d).contains(&stale), "the newer correction drops its twin");
+    assert_eq!(ids(&d.related), vec![fix]);
     s.drop().await;
 }
 
@@ -426,5 +545,353 @@ async fn a_pair_at_the_threshold_collapses_and_one_just_below_does_not() {
     let above = s.ctx(|c| c.bootstrap.dedup_cosine = Some(0.960_000_1));
     let d = bootstrap::run(&above, Some(PROJECT)).await.unwrap();
     assert_eq!(ids(&d.project_context), vec![newer, older], "cosine 0.96 under 0.9600001");
+    s.drop().await;
+}
+
+/// The matched row sits in a namespace no other section reads.
+///
+/// Fails if the related arm goes missing, or reads only the primary namespaces.
+#[tokio::test]
+async fn a_query_brings_in_a_related_row_from_any_readable_namespace() {
+    let s = store_or_skip!("bootstrap_ranking_j");
+    let text = "how do we rotate the backup keys";
+    let hit = s.put("project:beta", text, &[], Some(qvec(text).await), 2.0).await;
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run_with_query(&ctx, None, Some(text)).await.unwrap();
+    assert_eq!(ids(&d.related), vec![hit]);
+    assert_eq!(d.related_unavailable, None);
+    s.drop().await;
+}
+
+/// Fails if the floor stops filtering the related arm.
+#[tokio::test]
+async fn a_row_below_the_model_floor_stays_out_of_the_related_section() {
+    let s = store_or_skip!("bootstrap_ranking_k");
+    s.put("project:beta", "an unrelated note", &[], Some(axis(5)), 2.0).await;
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run_with_query(&ctx, None, Some("how do we rotate the backup keys"))
+        .await
+        .unwrap();
+    assert!(d.related.is_empty(), "{:?}", ids(&d.related));
+    s.drop().await;
+}
+
+/// Fails if related picks before profile, or repeats a row profile chose.
+#[tokio::test]
+async fn the_related_section_skips_rows_another_section_chose() {
+    let s = store_or_skip!("bootstrap_ranking_l");
+    let text = "how do we rotate the backup keys";
+    let mine = s.put("user:me", text, &[], Some(qvec(text).await), 1.0).await;
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run_with_query(&ctx, None, Some(text)).await.unwrap();
+    assert!(ids(&d.profile).contains(&mine));
+    assert!(!ids(&d.related).contains(&mine));
+    s.drop().await;
+}
+
+/// Fails if the related pool stays out of the near-duplicate pass.
+#[tokio::test]
+async fn an_older_related_twin_of_a_project_row_gives_up_its_slot() {
+    let s = store_or_skip!("bootstrap_ranking_m");
+    let text = "how do we rotate the backup keys";
+    let q = qvec(text).await;
+    let alpha = s.put(&format!("project:{PROJECT}"), text, &[], Some(q.clone()), 1.0).await;
+    let beta = s.put("project:beta", "rotate the backup keys monthly", &[], Some(q), 2.0).await;
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run_with_query(&ctx, Some(PROJECT), Some(text)).await.unwrap();
+    assert!(ids(&d.project_context).contains(&alpha));
+    assert!(!every_id(&d).contains(&beta));
+    s.drop().await;
+}
+
+/// A unit vector at cosine `c` to `q`, leaning towards axis `k`.
+fn at_cosine(q: &[f32], k: usize, c: f32) -> Vec<f32> {
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let q: Vec<f32> = q.iter().map(|x| x / norm(q)).collect();
+    let mut e: Vec<f32> = q.iter().map(|x| -q[k] * x).collect();
+    e[k] += 1.0;
+    let n = norm(&e);
+    q.iter().zip(&e).map(|(a, b)| c * a + (1.0 - c * c).sqrt() * b / n).collect()
+}
+
+/// Two restatements of each other sit below a nearer row, and no other section holds either. The
+/// newer drops the older, which would never have printed, so the nearer row keeps the lead.
+///
+/// Fails if any related row that dropped a twin jumps the order, whatever section the twin was in.
+#[tokio::test]
+async fn a_related_twin_that_replaced_nothing_printed_keeps_its_nearness_order() {
+    let s = store_or_skip!("bootstrap_ranking_z");
+    let text = "how do we rotate the backup keys";
+    let q = qvec(text).await;
+    let nearest = s.put("project:beta", text, &[], Some(q.clone()), 3.0).await;
+    // Both lean the same way from the query, so they sit at cosine 0.9999 to each other and 0.8
+    // or less to the nearest row, which keeps that row out of their pair.
+    let newer = s
+        .put("project:gamma", "rotate keys monthly", &[], Some(at_cosine(&q, 500, 0.80)), 1.0)
+        .await;
+    let older = s
+        .put("project:gamma", "rotate keys each month", &[], Some(at_cosine(&q, 500, 0.79)), 2.0)
+        .await;
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run_with_query(&ctx, None, Some(text)).await.unwrap();
+    assert_eq!(ids(&d.related), vec![nearest, newer]);
+    assert!(!every_id(&d).contains(&older));
+    s.drop().await;
+}
+
+/// A newer correction in another project replaces the project row and leads related, so the fact
+/// stays on the page.
+///
+/// Fails if a displacing related row loses its place at the front of the related pool.
+#[tokio::test]
+async fn a_newer_related_twin_replaces_the_project_row_and_leads_the_related_section() {
+    let s = store_or_skip!("bootstrap_ranking_n");
+    let text = "how do we rotate the backup keys";
+    let q = qvec(text).await;
+    let alpha = s.put(&format!("project:{PROJECT}"), text, &[], Some(q.clone()), 2.0).await;
+    let beta = s.put("project:beta", "rotate the backup keys monthly", &[], Some(q), 1.0).await;
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run_with_query(&ctx, Some(PROJECT), Some(text)).await.unwrap();
+    assert!(!every_id(&d).contains(&alpha));
+    assert_eq!(d.related.first().map(|f| f.id.clone()), Some(beta));
+    s.drop().await;
+}
+
+/// Thirty newer rows, then one older row that matches the query.
+async fn thirty_rows_and_an_older_match(s: &Store, text: &str) -> String {
+    for i in 0..30 {
+        s.put("user:me", &format!("rule {i}"), &[], Some(axis(100 + i)), 1.0 + i as f64).await;
+    }
+    s.put("user:me", text, &[], Some(qvec(text).await), 31.0).await
+}
+
+/// Fails if the profile pool stays at three times the limit under a query, or the service stops
+/// ordering it by the scores.
+#[tokio::test]
+async fn a_query_reorders_the_profile_pool_by_similarity() {
+    let s = store_or_skip!("bootstrap_ranking_o");
+    let text = "how do we rotate the backup keys";
+    let matched = thirty_rows_and_an_older_match(&s, text).await;
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run_with_query(&ctx, None, Some(text)).await.unwrap();
+    assert_eq!(d.profile.first().map(|f| f.id.clone()), Some(matched));
+    s.drop().await;
+}
+
+/// Fails if recent brings back profile-pool rows the query rank left out.
+#[tokio::test]
+async fn with_a_query_recent_skips_profile_rows_the_query_ranked_out() {
+    let s = store_or_skip!("bootstrap_ranking_p");
+    let mut mine = Vec::new();
+    for i in 0..20 {
+        let at = 1.0 + i as f64;
+        mine.push(s.put("user:me", &format!("rule {i}"), &["rule"], Some(axis(i)), at).await);
+    }
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run_with_query(&ctx, None, Some("zebra quokka marmalade")).await.unwrap();
+    for id in ids(&d.recent) {
+        assert!(!mine.contains(&id), "recent printed a profile-pool row {id}");
+    }
+    s.drop().await;
+}
+
+/// Sixty newer rows in another namespace used to fill the recent pool on their own.
+///
+/// Fails if recent reads every readable namespace again.
+#[tokio::test]
+async fn a_flood_in_another_namespace_leaves_recent_to_the_project() {
+    let s = store_or_skip!("bootstrap_ranking_q");
+    let mut flood = Vec::new();
+    for i in 0..60 {
+        let at = 0.01 + i as f64 * 0.01;
+        flood.push(s.put("project:beta", &format!("note {i}"), &[], Some(axis(i)), at).await);
+    }
+    let ns = format!("project:{PROJECT}");
+    let mut alpha = Vec::new();
+    for i in 0..13 {
+        let at = 2.0 + i as f64 * 0.05;
+        alpha.push(s.put(&ns, &format!("alpha fact {i}"), &[], Some(axis(100 + i)), at).await);
+    }
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
+    assert_eq!(ids(&d.project_context), alpha[..10].to_vec());
+    assert_eq!(ids(&d.recent), alpha[10..].to_vec());
+    let all = every_id(&d);
+    assert!(flood.iter().all(|id| !all.contains(id)));
+    s.drop().await;
+}
+
+/// Decision 0034 narrows 0028 for this one optional section.
+///
+/// Fails if a failed query embed fails the digest, or leaves the profile in query order.
+#[tokio::test]
+async fn a_failed_query_embed_leaves_the_related_section_out_and_serves_the_rest() {
+    let s = store_or_skip!("bootstrap_ranking_r");
+    let text = "how do we rotate the backup keys";
+    let matched = s.put("user:me", text, &[], Some(qvec(text).await), 5.0).await;
+    let newer = s.put("user:me", "tabs over spaces", &[], Some(axis(1)), 1.0).await;
+    s.put("project:beta", text, &[], Some(qvec(text).await), 2.0).await;
+    let mut ctx = s.ctx(|_| {});
+    ctx.embedders =
+        common::test_embedders(Arc::new(QueryEmbedFails(HashEmbedder::new(DIMS))), &ctx.cfg);
+
+    let d = bootstrap::run_with_query(&ctx, None, Some(text)).await.expect("the digest serves");
+    assert!(d.related.is_empty());
+    assert_eq!(d.related_unavailable.as_deref(), Some("embed_failed"));
+    assert_eq!(ids(&d.profile), vec![newer, matched], "recency order");
+    s.drop().await;
+}
+
+/// Fails if a guessed floor turns the section on, or turns the profile order off with it.
+#[tokio::test]
+async fn a_model_without_a_measured_floor_leaves_the_related_section_out() {
+    let s = store_or_skip!("bootstrap_ranking_s");
+    let text = "how do we rotate the backup keys";
+    s.put("project:beta", text, &[], Some(qvec(text).await), 2.0).await;
+    let matched = thirty_rows_and_an_older_match(&s, text).await;
+    let ctx = s.ctx(|c| c.embed.thresholds.clear());
+
+    let d = bootstrap::run_with_query(&ctx, None, Some(text)).await.unwrap();
+    assert!(d.related.is_empty());
+    assert_eq!(d.related_unavailable.as_deref(), Some("no_measured_floor"));
+    assert_eq!(d.profile.first().map(|f| f.id.clone()), Some(matched));
+    s.drop().await;
+}
+
+/// A narrow client's query matches a row in a namespace it holds no grant on and a row above its
+/// ceiling, both nearer than the readable twin.
+///
+/// Fails if the related arm loses its `reachable` join or its ceiling.
+#[tokio::test]
+async fn the_related_section_honours_the_grant_and_the_ceiling() {
+    let s = store_or_skip!("bootstrap_ranking_t");
+    let text = "how do we rotate the backup keys";
+    let q = qvec(text).await;
+    let nogrant = s.put("project:secret", "SENTINEL-NOGRANT", &[], Some(q.clone()), 1.0).await;
+    let private = s.put("user:me", "SENTINEL-PRIVATE", &[], Some(q.clone()), 1.0).await;
+    sqlx::query("UPDATE memory SET sensitivity = 'private' WHERE id = $1::uuid")
+        .bind(&private)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+    let twin = s.put("project:beta", "readable twin", &[], Some(tilted(&q, 3)), 3.0).await;
+    let mut ctx = s.ctx(|_| {});
+    ctx.principal = reader(
+        "narrow",
+        vec![
+            NamespaceGrant::open("user:me"),
+            NamespaceGrant::open(format!("project:{PROJECT}")),
+            NamespaceGrant::open("project:beta"),
+        ],
+    );
+
+    let d = bootstrap::run_with_query(&ctx, Some(PROJECT), Some(text)).await.unwrap();
+    let all = every_id(&d);
+    assert!(!all.contains(&nogrant) && !all.contains(&private), "{all:?}");
+    let full = serde_json::to_string(&views::digest(&d, true)).unwrap();
+    for sentinel in ["SENTINEL-NOGRANT", "SENTINEL-PRIVATE"] {
+        assert!(!d.text.contains(sentinel), "{sentinel} in the text");
+        assert!(!full.contains(sentinel), "{sentinel} in the rows: true JSON");
+    }
+    assert_eq!(ids(&d.related), vec![twin]);
+    s.drop().await;
+}
+
+/// The vector copy opens for a query even with the dedup pass off.
+///
+/// Fails if `pooled_vectors` stays gated on the dedup threshold alone.
+#[tokio::test]
+async fn a_dedup_cosine_of_one_still_orders_the_profile_by_the_query() {
+    let s = store_or_skip!("bootstrap_ranking_u");
+    let text = "how do we rotate the backup keys";
+    let matched = thirty_rows_and_an_older_match(&s, text).await;
+    let ctx = s.ctx(|c| c.bootstrap.dedup_cosine = Some(1.0));
+
+    let d = bootstrap::run_with_query(&ctx, None, Some(text)).await.unwrap();
+    assert_eq!(d.profile.first().map(|f| f.id.clone()), Some(matched));
+    s.drop().await;
+}
+
+/// Fails if recent's pool is sized without room for every profile-pool row it drops.
+#[tokio::test]
+async fn recent_still_fills_when_the_newest_rows_are_all_user_rows_under_a_query() {
+    let s = store_or_skip!("bootstrap_ranking_v");
+    for i in 0..30 {
+        let at = 0.01 + i as f64 * 0.01;
+        s.put("user:me", &format!("rule {i}"), &["rule"], Some(axis(i)), at).await;
+    }
+    let ns = format!("project:{PROJECT}");
+    let mut alpha = Vec::new();
+    for i in 0..13 {
+        let at = 2.0 + i as f64 * 0.05;
+        alpha.push(s.put(&ns, &format!("alpha fact {i}"), &[], Some(axis(100 + i)), at).await);
+    }
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run_with_query(&ctx, Some(PROJECT), Some("zebra quokka marmalade"))
+        .await
+        .unwrap();
+    assert_eq!(ids(&d.project_context), alpha[..10].to_vec());
+    assert_eq!(ids(&d.recent), alpha[10..].to_vec());
+    s.drop().await;
+}
+
+/// Checks the output only: whether the related arm still scans at a limit of 0 is not visible
+/// here.
+///
+/// Fails if a related limit of 0 prints a related row, switches off the profile order with it, or
+/// still reports a reason for a section the operator turned off.
+#[tokio::test]
+async fn with_related_limit_zero_a_query_adds_no_related_rows() {
+    let s = store_or_skip!("bootstrap_ranking_w");
+    let text = "how do we rotate the backup keys";
+    s.put("project:beta", text, &[], Some(qvec(text).await), 2.0).await;
+    let matched = thirty_rows_and_an_older_match(&s, text).await;
+    let ctx = s.ctx(|c| c.bootstrap.related_limit = 0);
+
+    let d = bootstrap::run_with_query(&ctx, None, Some(text)).await.unwrap();
+    assert!(d.related.is_empty());
+    assert_eq!(d.related_unavailable, None);
+    assert_eq!(d.profile.first().map(|f| f.id.clone()), Some(matched));
+
+    let guessed = s.ctx(|c| {
+        c.bootstrap.related_limit = 0;
+        c.embed.thresholds.clear();
+    });
+    let d = bootstrap::run_with_query(&guessed, None, Some(text)).await.unwrap();
+    assert_eq!(d.related_unavailable, None, "a guessed floor with the section off");
+
+    let mut failing = s.ctx(|c| c.bootstrap.related_limit = 0);
+    failing.embedders =
+        common::test_embedders(Arc::new(QueryEmbedFails(HashEmbedder::new(DIMS))), &failing.cfg);
+    let d = bootstrap::run_with_query(&failing, None, Some(text)).await.unwrap();
+    assert_eq!(d.related_unavailable, None, "a failed embed with the section off");
+    s.drop().await;
+}
+
+/// Fails if the cache key leaves the query out.
+#[tokio::test]
+async fn two_queries_do_not_share_a_cache_entry() {
+    let s = store_or_skip!("bootstrap_ranking_x");
+    s.put("user:me", "a rule", &[], Some(axis(1)), 1.0).await;
+    let mut ctx = s.ctx(|c| c.bootstrap.cache_ms = 30_000);
+    ctx.principal = reader("cache-queries-test", NamespaceGrant::everything());
+    bootstrap::clear_cache();
+
+    let a = bootstrap::run_with_query(&ctx, None, Some("first request")).await.unwrap();
+    let b = bootstrap::run_with_query(&ctx, None, Some("second request")).await.unwrap();
+    let again = bootstrap::run_with_query(&ctx, None, Some("second request")).await.unwrap();
+    assert!(!a.cached && !b.cached, "a new query builds its own digest");
+    assert!(again.cached, "the same query reads the cache");
+    bootstrap::clear_cache();
     s.drop().await;
 }

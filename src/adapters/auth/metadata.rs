@@ -180,6 +180,8 @@ mod tests {
                 recent_limit: 1,
                 recent_days: 1,
                 registry_limit: 1,
+                related_limit: 4,
+                rule_tags: vec![],
                 max_chars: 100,
                 max_chars_by_client: std::collections::HashMap::new(),
                 dedup_cosine: None,

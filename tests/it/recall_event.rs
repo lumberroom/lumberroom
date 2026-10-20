@@ -17,6 +17,7 @@ use lumberroom_server::adapters::postgres;
 use lumberroom_server::config::{self, Config};
 use lumberroom_server::crypto::kek::{EnvKeyProvider, KeyProvider};
 use lumberroom_server::domain::policy::NamespaceGrant;
+use lumberroom_server::domain::similarity;
 use lumberroom_server::domain::types::{Invocation, Principal};
 use lumberroom_server::ports::{Emission, RecallCall, RecallEvent};
 use lumberroom_server::services::{bootstrap, forget, recall_events, search, write, Ctx, Repos};
@@ -267,28 +268,43 @@ async fn a_search_logs_each_returned_row_with_its_rank_under_one_call_id() {
 /// payload goes unlogged.
 #[tokio::test]
 async fn a_bootstrap_tags_each_row_with_its_section() {
-    let Some(p) = probe("recall_event_digest_probe", log_on).await else {
+    // One profile slot, so the older user:me row overflows into recent. Since decision 0034
+    // recent no longer reads project:beta, and it reads user rows only when they carry a rule tag,
+    // so both user rows carry one.
+    let tune = |cfg: &mut Config| {
+        log_on(cfg);
+        cfg.bootstrap.profile_limit = 1;
+    };
+    let Some(p) = probe("recall_event_digest_probe", tune).await else {
         common::skipping();
         return;
     };
-    remember(&p.ctx, "Dana prefers TypeScript for tooling", "user:me", &["preference"]).await;
-    remember(&p.ctx, "Dana reviews pull requests before lunch", "user:me", &[]).await;
-    remember(&p.ctx, "alpha ships from the main branch", "project:alpha", &[]).await;
-    remember(&p.ctx, "beta has its own staging database", "project:beta", &[]).await;
+    let older =
+        remember(&p.ctx, "Dana prefers TypeScript for tooling", "user:me", &["preference"]).await;
+    let newer =
+        remember(&p.ctx, "Dana reviews pull requests before lunch", "user:me", &["rule"]).await;
+    let alpha = remember(&p.ctx, "alpha ships from the main branch", "project:alpha", &[]).await;
+    let beta = remember(&p.ctx, "beta has its own staging database", "project:beta", &[]).await;
 
     let digest = bootstrap::run(&p.ctx, Some("alpha")).await.expect("bootstrap");
+    let ids =
+        |facts: &[bootstrap::Fact]| -> Vec<String> { facts.iter().map(|f| f.id.clone()).collect() };
+    assert_eq!(ids(&digest.profile), vec![newer.to_string()]);
+    assert_eq!(ids(&digest.project_context), vec![alpha.to_string()]);
+    assert_eq!(ids(&digest.recent), vec![older.to_string()]);
+    assert!(digest.related.is_empty());
     let mut want: Vec<(String, String, i32)> = Vec::new();
     for (section, facts) in [
         ("profile", &digest.profile),
         ("project", &digest.project_context),
         ("recent", &digest.recent),
+        ("related", &digest.related),
     ] {
         for (i, f) in facts.iter().enumerate() {
+            assert_ne!(f.id, beta.to_string(), "the beta row reached {section}");
             want.push((section.to_string(), f.id.clone(), i as i32 + 1));
         }
     }
-    assert!(!digest.profile.is_empty() && !digest.project_context.is_empty());
-    assert!(!digest.recent.is_empty());
 
     let n = want.len() as i64;
     assert_eq!(wait_for(&p.pool, "SELECT count(*) FROM recall_event", n).await, n);
@@ -303,6 +319,39 @@ async fn a_bootstrap_tags_each_row_with_its_section() {
     assert!(rows.iter().all(|r| r.1 == "context_bootstrap"));
     assert!(rows.iter().all(|r| r.4.as_deref() == Some("project:alpha")));
     assert_eq!(count(&p.pool, "SELECT count(DISTINCT call_id) FROM recall_event").await, 1);
+    p.drop_db().await;
+}
+
+/// A queried digest logs its related rows under their own section, which is how an evaluation
+/// tells a queried digest apart without a column of its own (decision 0034).
+///
+/// Fails if `digest_call` leaves the related section out.
+#[tokio::test]
+async fn a_queried_digest_logs_its_related_rows_under_their_own_section() {
+    let tune = |cfg: &mut Config| {
+        log_on(cfg);
+        // The hash embedder's floor is a guess, which leaves the related section out.
+        cfg.embed.thresholds = similarity::parse_overrides("route_max_top=0.65").unwrap();
+    };
+    let Some(p) = probe("recall_event_related_probe", tune).await else {
+        common::skipping();
+        return;
+    };
+    let text = "beta has its own staging database";
+    let beta = remember(&p.ctx, text, "project:beta", &[]).await;
+
+    let digest =
+        bootstrap::run_with_query(&p.ctx, Some("alpha"), Some(text)).await.expect("bootstrap");
+    assert_eq!(
+        digest.related.iter().map(|f| f.id.clone()).collect::<Vec<_>>(),
+        vec![beta.to_string()]
+    );
+    assert_eq!(wait_for(&p.pool, "SELECT count(*) FROM recall_event", 1).await, 1);
+    let rows = events(&p.pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].5, beta);
+    assert_eq!(rows[0].7.as_deref(), Some("related"));
+    assert_eq!(rows[0].8, 1);
     p.drop_db().await;
 }
 

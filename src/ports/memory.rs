@@ -87,7 +87,7 @@ pub struct RecallCall {
 pub struct RecallEvent {
     pub memory_id: uuid::Uuid,
     pub namespace: String,
-    /// The digest section, `profile`, `project` or `recent`. `None` for a search.
+    /// The digest section, `profile`, `project`, `recent` or `related`. `None` for a search.
     pub section: Option<&'static str>,
     /// From 1, within the search result or within the digest section.
     pub rank: i32,
@@ -502,6 +502,18 @@ pub struct DigestQuery {
     /// Pooled rows at or above this cosine come back as a pair in `near_duplicates`. At 1.0 or
     /// above the adapter compares nothing.
     pub dedup_cosine: f64,
+    /// The caller's request, embedded by the unit's model. `None` when the caller sent no query or
+    /// the embed failed; the related arm and the profile scores then return nothing.
+    pub query_embedding: Option<Vec<f32>>,
+    /// Query-to-row cosine a related row must reach: the model's `route_max_top` (decision 0034).
+    pub related_floor: f64,
+    /// Candidates the related arm returns, nearest first, before the service drops rows another
+    /// section chose. 0 with no query or no measured floor.
+    pub related_limit: i64,
+    /// Tags that mark a standing rule, in the store's spelling. Profile puts rows carrying one
+    /// first; recent admits user and global rows only when they carry one. Empty admits every
+    /// row and orders by recency alone.
+    pub rule_tags: Vec<String>,
     /// The column this unit reads. Statements carry their column as a literal; the adapter picks
     /// the statement by slot (decision 0027).
     pub slot: crate::domain::embedding_slot::VectorSlot,
@@ -519,6 +531,10 @@ pub struct DigestData {
     /// Pairs of pooled row ids whose stored vectors sit at or above `dedup_cosine`, each pair once
     /// and in no set order. A row without a vector is in no pair.
     pub near_duplicates: Vec<(String, String)>,
+    /// Live rows nearest the query at or above `related_floor`, nearest first. Empty without one.
+    pub related: Vec<Memory>,
+    /// Each profile-pool row's cosine to the query, by id. A row without a usable vector is absent.
+    pub profile_similarity: HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

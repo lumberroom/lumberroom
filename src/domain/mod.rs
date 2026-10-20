@@ -2,6 +2,7 @@ pub mod canonical;
 pub mod cleanup;
 pub mod dates;
 pub mod digest_dedup;
+pub mod digest_rank;
 pub mod embedding_command;
 pub mod embedding_migration;
 pub mod embedding_phase;

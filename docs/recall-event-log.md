@@ -16,7 +16,7 @@ it exists and what lost.
 | `project` | the active project namespace, such as `project:alpha`, when the call named a project |
 | `memory_id` | the row returned |
 | `namespace` | that row's namespace |
-| `section` | `profile`, `project` or `recent` for a digest; empty for a search |
+| `section` | `profile`, `project`, `recent` or `related` for a digest; empty for a search. A digest call with a `related` row carried a query (decision 0034). The converse does not hold: a queried call with no row above the floor logs none |
 | `rank` | position from 1, within the search result or within the digest section |
 | `emitted_at` | when the server wrote the event |
 
