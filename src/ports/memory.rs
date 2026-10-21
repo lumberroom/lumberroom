@@ -491,8 +491,9 @@ pub struct DigestQuery {
     /// Phase 1 shipped a bug where the profile and project subqueries skipped the namespace filter,
     /// and the leak path in a memory system is the convenience surface, not the obvious one.
     pub readable: Vec<NamespaceCeiling>,
-    /// The three memory limits size candidate pools, newest first, and the service trims each pool
-    /// to its section after collapsing near-duplicates. An adapter returns up to this many rows
+    /// `profile_limit` sizes the nearest and the newest profile arms; the project and recent limits
+    /// size their pools, newest first. The service trims each pool to its section after collapsing
+    /// near-duplicates. An adapter returns up to this many rows
     /// and applies no limit of its own.
     pub profile_limit: i64,
     pub project_limit: i64,
@@ -503,17 +504,21 @@ pub struct DigestQuery {
     /// above the adapter compares nothing.
     pub dedup_cosine: f64,
     /// The caller's request, embedded by the unit's model. `None` when the caller sent no query or
-    /// the embed failed; the related arm and the profile scores then return nothing.
+    /// the embed failed; the related arm then returns nothing, and profile scores against the
+    /// active project's centroid instead.
     pub query_embedding: Option<Vec<f32>>,
     /// Query-to-row cosine a related row must reach: the model's `route_max_top` (decision 0034).
     pub related_floor: f64,
     /// Candidates the related arm returns, nearest first, before the service drops rows another
     /// section chose. 0 with no query or no measured floor.
     pub related_limit: i64,
-    /// Tags that mark a standing rule, in the store's spelling. Profile puts rows carrying one
-    /// first; recent admits user and global rows only when they carry one. Empty admits every
-    /// row and orders by recency alone.
+    /// Tags that mark a standing rule, in the store's spelling. The adapter reads up to
+    /// `preference_limit` `user:me` rows carrying one; recent admits user and global rows only when
+    /// they carry one. Empty reads no preferences and admits every row.
     pub rule_tags: Vec<String>,
+    /// Candidates for profile's leading preferences: `user:me` rows carrying one of `rule_tags`,
+    /// newest first. 0 reads none.
+    pub preference_limit: i64,
     /// The column this unit reads. Statements carry their column as a literal; the adapter picks
     /// the statement by slot (decision 0027).
     pub slot: crate::domain::embedding_slot::VectorSlot,
@@ -533,7 +538,9 @@ pub struct DigestData {
     pub near_duplicates: Vec<(String, String)>,
     /// Live rows nearest the query at or above `related_floor`, nearest first. Empty without one.
     pub related: Vec<Memory>,
-    /// Each profile-pool row's cosine to the query, by id. A row without a usable vector is absent.
+    /// Each profile-pool row's cosine to the anchor, by id: the query, or with none the centroid of
+    /// the active project's pooled rows. Empty with neither. A row without a usable vector is
+    /// absent.
     pub profile_similarity: HashMap<String, f64>,
 }
 

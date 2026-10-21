@@ -1,10 +1,10 @@
 //! How `context_bootstrap` chooses its rows, pinned against a real Postgres (decisions 0025 and
 //! 0034).
 //!
-//! Project is newest first, profile puts standing rules first and is newest first inside each
-//! group, recent keeps to the active project and the caller's standing rules and skips what they
-//! printed, a query adds related rows and orders the profile, and a row that restates one already
-//! chosen gives up its slot. Rows go in through SQL rather than `write::run` so each
+//! Project is newest first, profile leads with the newest rule-tagged user rows and ranks the rest
+//! by the query or the active project, recent keeps to the active project and the caller's
+//! standing rules and skips what they printed, a query adds related rows, and a row that restates
+//! one already chosen gives up its slot. Rows go in through SQL rather than `write::run` so each
 //! test controls `created_at` and the vector exactly; the hash embedder would make a near-duplicate
 //! a matter of luck.
 //!
@@ -104,6 +104,16 @@ impl Store {
         id.to_string()
     }
 
+    /// Flips a row to private and leaves its plaintext in `content`. The digest decrypts only
+    /// private rows whose content is empty, so a row that leaks through an arm prints as written.
+    async fn make_private(&self, id: &str) {
+        sqlx::query("UPDATE memory SET sensitivity = 'private' WHERE id = $1::uuid")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+    }
+
     /// A Ctx over this database, shaped by `tune` before anything reads the config.
     fn ctx(&self, tune: impl FnOnce(&mut Config)) -> Ctx {
         std::env::set_var("AUTH_TOKENS", format!("mac:{}", "m".repeat(32)));
@@ -167,6 +177,15 @@ fn axis(i: usize) -> Vec<f32> {
 fn near(i: usize, j: usize) -> Vec<f32> {
     let mut v = axis(i);
     v[j] = 0.1;
+    v
+}
+
+/// Axis `i` and axis `j` at equal weight: cosine about 0.707 with `axis(i)` and 0.5 with another
+/// `toward(i, k)`. Near an anchor on axis `i`, and clear of the 0.90 near-duplicate pass, which
+/// `near` and `tilted` (0.995) would trip against the project rows.
+fn toward(i: usize, j: usize) -> Vec<f32> {
+    let mut v = axis(i);
+    v[j] = 1.0;
     v
 }
 
@@ -262,10 +281,10 @@ async fn the_profile_shows_the_eight_newest_rows_without_a_query_or_a_rule_tag()
 /// The incident behind decision 0034: another surface wrote a burst of personal facts after the
 /// owner's standing rules, and the session-start digest, which carries no query, printed the facts.
 ///
-/// Fails if profile goes back to recency alone, if the pool stops reading rules first, or if
-/// recent prints an untagged personal row again.
+/// Fails if profile stops leading with the newest rule-tagged user rows, or if recent prints an
+/// untagged personal row again.
 #[tokio::test]
-async fn standing_rules_lead_the_profile_over_newer_personal_rows_without_a_query() {
+async fn preferences_lead_the_profile_over_newer_personal_rows_without_a_query() {
     let s = store_or_skip!("bootstrap_ranking_y");
     let mut rules = Vec::new();
     for (i, tag) in ["preference", "rule", "convention"].into_iter().enumerate() {
@@ -298,7 +317,7 @@ async fn standing_rules_lead_the_profile_over_newer_personal_rows_without_a_quer
 /// untagged survivor used to sort behind nine other rules and fall past the profile limit, so the
 /// fact vanished from every section.
 ///
-/// Fails if a survivor stops taking the standing mark of the tagged twin it dropped.
+/// Fails if a survivor stops taking the preference mark of the tagged twin it dropped.
 #[tokio::test]
 async fn an_untagged_restatement_of_a_rule_keeps_the_rule_in_the_profile() {
     let s = store_or_skip!("bootstrap_ranking_rule_twin");
@@ -352,6 +371,10 @@ async fn two_near_duplicates_take_one_slot_and_the_newer_one_keeps_it() {
 /// prints what project and profile did not. The `project:beta` rows and an untagged user row are
 /// the newest in the store and still stay out of it.
 ///
+/// The five newest rules lead profile. The four older ones lean toward the project at about 0.20
+/// and the untagged row scores 0, so the three newest leaning rules fill profile and the fourth
+/// spills into recent.
+///
 /// Fails if recent reads every readable namespace again, admits untagged user rows, or stops
 /// skipping chosen rows.
 #[tokio::test]
@@ -366,7 +389,10 @@ async fn recent_keeps_to_the_active_project_and_the_callers_own_namespaces() {
     let mut mine = Vec::new();
     for i in 0..9 {
         let at = 1.25 + i as f64 * 0.5;
-        mine.push(s.put("user:me", &format!("rule {i}"), &["rule"], Some(axis(20 + i)), at).await);
+        // The five newest rules lead; the older four lean on one project axis each, so they
+        // outrank the untagged row (cosine 0) and the three newest of them fill profile.
+        let v = if i < 5 { axis(20 + i) } else { toward(20 + i, i - 5) };
+        mine.push(s.put("user:me", &format!("rule {i}"), &["rule"], Some(v), at).await);
     }
     let untagged = s.put("user:me", "an untagged personal row", &[], Some(axis(50)), 0.05).await;
     let mut beta = Vec::new();
@@ -671,8 +697,8 @@ async fn thirty_rows_and_an_older_match(s: &Store, text: &str) -> String {
     s.put("user:me", text, &[], Some(qvec(text).await), 31.0).await
 }
 
-/// Fails if the profile pool stays at three times the limit under a query, or the service stops
-/// ordering it by the scores.
+/// Fails if the nearest arm stops ordering before its LIMIT, or the service stops ordering by the
+/// scores.
 #[tokio::test]
 async fn a_query_reorders_the_profile_pool_by_similarity() {
     let s = store_or_skip!("bootstrap_ranking_o");
@@ -821,11 +847,14 @@ async fn a_dedup_cosine_of_one_still_orders_the_profile_by_the_query() {
     s.drop().await;
 }
 
+/// Twenty-four rule rows, three times the profile limit, so the newest profile arm holds every one
+/// and the outcome does not hang on which rows the hash query ranks near.
+///
 /// Fails if recent's pool is sized without room for every profile-pool row it drops.
 #[tokio::test]
 async fn recent_still_fills_when_the_newest_rows_are_all_user_rows_under_a_query() {
     let s = store_or_skip!("bootstrap_ranking_v");
-    for i in 0..30 {
+    for i in 0..24 {
         let at = 0.01 + i as f64 * 0.01;
         s.put("user:me", &format!("rule {i}"), &["rule"], Some(axis(i)), at).await;
     }
@@ -893,5 +922,301 @@ async fn two_queries_do_not_share_a_cache_entry() {
     assert!(!a.cached && !b.cached, "a new query builds its own digest");
     assert!(again.cached, "the same query reads the cache");
     bootstrap::clear_cache();
+    s.drop().await;
+}
+
+/// What `anchor_fixture` wrote: the user and global rows near the project, and the chat facts,
+/// newest first.
+struct AnchorRows {
+    near_user: String,
+    near_global: String,
+    chat: Vec<String>,
+}
+
+/// Four project rows that share axis 0, one `user:me` and one `global` row 40 days old that lean
+/// on the same axis, and sixty newer off-topic `user:me` rows. The centroid of the project rows
+/// sits at cosine about 0.63 to each near row and 0 to every chat fact.
+async fn anchor_fixture(s: &Store) -> AnchorRows {
+    let ns = format!("project:{PROJECT}");
+    for i in 0..4 {
+        let at = 1.0 + i as f64;
+        s.put(&ns, &format!("alpha fact {i}"), &[], Some(toward(0, 1 + i)), at).await;
+    }
+    let near_user =
+        s.put("user:me", "older row near the project", &[], Some(toward(0, 10)), 24.0 * 40.0).await;
+    let near_global = s
+        .put("global", "older global row near the project", &[], Some(toward(0, 11)), 24.0 * 41.0)
+        .await;
+    let mut chat = Vec::new();
+    for i in 0..60 {
+        let at = 0.5 + i as f64 * 0.1;
+        chat.push(s.put("user:me", &format!("chat fact {i}"), &[], Some(axis(100 + i)), at).await);
+    }
+    AnchorRows { near_user, near_global, chat }
+}
+
+fn as_set(v: &[String]) -> std::collections::BTreeSet<String> {
+    v.iter().cloned().collect()
+}
+
+/// The owner's ruling of 20 October 2026: without a query, profile ranks by the active project.
+/// Sixty off-topic personal rows are newer than the two rows near the project, and the near rows
+/// still take the first two slots. Without a project the same store prints the newest rows.
+///
+/// Fails if profile goes back to newest first without a query, or the nearest arm stops ordering
+/// by the anchor before its LIMIT: sixty rows outgrow every newest-first pool.
+#[tokio::test]
+async fn without_a_query_older_rows_near_the_project_beat_a_burst_of_newer_off_topic_rows() {
+    let s = store_or_skip!("bootstrap_ranking_anchor");
+    let rows = anchor_fixture(&s).await;
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
+    let profile = ids(&d.profile);
+    assert_eq!(profile.len(), 8, "{profile:?}");
+    assert_eq!(as_set(&profile[..2]), as_set(&[rows.near_user, rows.near_global]));
+    let text = &d.text;
+    let near = text.find("older row near the project").expect("the near row printed");
+    assert!(text.find("chat fact").is_none_or(|at| at > near), "{text}");
+
+    let d = bootstrap::run(&ctx, None).await.unwrap();
+    assert_eq!(ids(&d.profile), rows.chat[..8].to_vec(), "no project: the newest, newest first");
+    s.drop().await;
+}
+
+/// A project whose rows carry no vector has no centroid, so profile stays on recency.
+///
+/// Fails if a project without vectors fails the digest or moves an older row ahead.
+#[tokio::test]
+async fn a_project_without_vectors_leaves_the_profile_on_recency() {
+    let s = store_or_skip!("bootstrap_ranking_anchor_none");
+    let ns = format!("project:{PROJECT}");
+    for i in 0..3 {
+        s.put(&ns, &format!("alpha fact {i}"), &[], None, 1.0 + i as f64).await;
+    }
+    s.put("user:me", "older row near axis 0", &[], Some(toward(0, 10)), 24.0 * 40.0).await;
+    let mut newer = Vec::new();
+    for i in 0..10 {
+        let at = 0.5 + i as f64 * 0.1;
+        newer.push(s.put("user:me", &format!("chat fact {i}"), &[], Some(axis(100 + i)), at).await);
+    }
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run(&ctx, Some(PROJECT)).await.expect("the digest serves");
+    assert_eq!(ids(&d.profile), newer[..8].to_vec());
+    s.drop().await;
+}
+
+/// The rows `preference_fixture` returns, each group newest first.
+struct PreferenceRows {
+    prefs: Vec<String>,
+    global_rule: String,
+    near: Vec<String>,
+}
+
+/// One project row on axis 0. Seven rule-tagged `user:me` rows, 10 to 16 days old, on axes of
+/// their own. A rule-tagged `global` row two hours old. Three untagged `user:me` rows 60 days old
+/// that lean on axis 0, and twenty chat facts newer than all of them.
+async fn preference_fixture(s: &Store) -> PreferenceRows {
+    s.put(&format!("project:{PROJECT}"), "alpha fact", &[], Some(axis(0)), 1.0).await;
+    let tags = ["preference", "rule", "convention"];
+    let mut prefs = Vec::new();
+    for i in 0..7 {
+        let at = 24.0 * (10 + i) as f64;
+        let body = format!("standing preference {i}");
+        prefs.push(s.put("user:me", &body, &[tags[i % 3]], Some(axis(10 + i)), at).await);
+    }
+    let global_rule = s.put("global", "global rule", &["rule"], Some(axis(30)), 2.0).await;
+    let mut near = Vec::new();
+    for i in 0..3 {
+        let at = 24.0 * 60.0 + i as f64;
+        let body = format!("near the project {i}");
+        near.push(s.put("user:me", &body, &[], Some(toward(0, 40 + i)), at).await);
+    }
+    for i in 0..20 {
+        let at = 0.5 + i as f64 * 0.1;
+        s.put("user:me", &format!("chat fact {i}"), &[], Some(axis(100 + i)), at).await;
+    }
+    PreferenceRows { prefs, global_rule, near }
+}
+
+/// The five newest rule-tagged user rows lead, newest first, and the three rows nearest the
+/// project fill the rest of the eight slots. Older preferences and the global rule rank on the
+/// anchor with everything else and score 0 here.
+///
+/// Fails if the lead grows past `BOOTSTRAP_PREFERENCE_LIMIT`, admits a `global` row, or if every
+/// tagged row sorts first again, which fills all eight slots with the seven preferences and the
+/// global rule.
+#[tokio::test]
+async fn the_five_newest_user_preferences_lead_the_profile_and_count_against_its_limit() {
+    let s = store_or_skip!("bootstrap_ranking_prefs");
+    let rows = preference_fixture(&s).await;
+    let ctx = s.ctx(|_| {});
+    assert_eq!(ctx.cfg.bootstrap.preference_limit, 5, "the default preference limit");
+
+    let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
+    let profile = ids(&d.profile);
+    assert_eq!(profile.len(), 8, "{profile:?}");
+    assert_eq!(profile[..5], rows.prefs[..5], "the five newest preferences, newest first");
+    assert_eq!(as_set(&profile[5..]), as_set(&rows.near));
+    for id in [&rows.global_rule, &rows.prefs[5], &rows.prefs[6]] {
+        assert!(!profile.contains(id), "{id} took a slot from a row near the project");
+    }
+    s.drop().await;
+}
+
+/// Fails if a preference leads profile when the operator set the preference limit to 0. The first
+/// case pins the order inside a narrow profile limit, and it would still pass without the clamp.
+#[tokio::test]
+async fn a_preference_limit_above_the_profile_limit_stays_inside_it() {
+    let s = store_or_skip!("bootstrap_ranking_prefs_cap");
+    let rows = preference_fixture(&s).await;
+
+    let narrow = s.ctx(|c| {
+        c.bootstrap.profile_limit = 3;
+        c.bootstrap.preference_limit = 5;
+    });
+    let d = bootstrap::run(&narrow, Some(PROJECT)).await.unwrap();
+    assert_eq!(ids(&d.profile), rows.prefs[..3].to_vec());
+
+    let off = s.ctx(|c| c.bootstrap.preference_limit = 0);
+    let d = bootstrap::run(&off, Some(PROJECT)).await.unwrap();
+    assert_eq!(as_set(&ids(&d.profile)[..3]), as_set(&rows.near), "no lead: the anchor decides");
+    s.drop().await;
+}
+
+/// The lead ignores the query. The older preference sits at cosine 0.6 to the query and the newer
+/// one near 0, so the old code, which sorted the standing group by score, printed the older one
+/// first. 0.6 also keeps it clear of the matched row's 0.90 twin test; `tilted` would sit at 0.995
+/// to the match and the pass would drop the preference.
+///
+/// Fails if the lead sorts by query score, or the rest stops following the query.
+#[tokio::test]
+async fn with_a_query_the_preferences_lead_and_the_rest_follow_the_query() {
+    let s = store_or_skip!("bootstrap_ranking_prefs_query");
+    let text = "how do we rotate the backup keys";
+    let q = qvec(text).await;
+    let newer_pref =
+        s.put("user:me", "newer preference", &["preference"], Some(axis(10)), 24.0 * 20.0).await;
+    let older_pref = s
+        .put("user:me", "older preference", &["rule"], Some(at_cosine(&q, 11, 0.6)), 24.0 * 21.0)
+        .await;
+    let matched = thirty_rows_and_an_older_match(&s, text).await;
+    let ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run_with_query(&ctx, None, Some(text)).await.unwrap();
+    assert_eq!(ids(&d.profile)[..3], [newer_pref, older_pref, matched]);
+    s.drop().await;
+}
+
+/// A failed query embed leaves profile where a call without a query puts it: on the project.
+///
+/// Fails if a failed embed sends profile back to recency while a project is active.
+#[tokio::test]
+async fn a_failed_query_embed_with_a_project_ranks_the_profile_by_the_project() {
+    let s = store_or_skip!("bootstrap_ranking_r2");
+    let rows = anchor_fixture(&s).await;
+    let mut ctx = s.ctx(|_| {});
+    ctx.embedders =
+        common::test_embedders(Arc::new(QueryEmbedFails(HashEmbedder::new(DIMS))), &ctx.cfg);
+
+    let d = bootstrap::run_with_query(&ctx, Some(PROJECT), Some("anything")).await.unwrap();
+    assert_eq!(d.related_unavailable.as_deref(), Some("embed_failed"));
+    assert_eq!(as_set(&ids(&d.profile)[..2]), as_set(&[rows.near_user, rows.near_global]));
+    s.drop().await;
+}
+
+/// The reminder rides the profile heading. It prints right under it whenever profile prints, and
+/// neither payload carries it outside the text.
+///
+/// Fails if the note drops from the heading, becomes a row, or prints over an empty profile.
+#[tokio::test]
+async fn the_profile_reminder_prints_with_the_profile_and_never_as_a_row() {
+    let s = store_or_skip!("bootstrap_ranking_note");
+    s.put("user:me", "stage files by explicit path", &["preference"], Some(axis(1)), 1.0).await;
+    s.put(&format!("project:{PROJECT}"), "alpha fact", &[], Some(axis(2)), 1.0).await;
+    let mut ctx = s.ctx(|_| {});
+
+    let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
+    let heading =
+        format!("### About the user and standing preferences\n{}", bootstrap::PROFILE_NOTE);
+    assert!(d.text.contains(&heading), "{}", d.text);
+    for rows in [true, false] {
+        let mut view = views::digest(&d, rows);
+        view.as_object_mut().expect("an object").remove("text");
+        let rest = serde_json::to_string(&view).unwrap();
+        assert!(!rest.contains(bootstrap::PROFILE_NOTE), "rows: {rows}: {rest}");
+    }
+
+    ctx.principal =
+        reader("project-only", vec![NamespaceGrant::open(format!("project:{PROJECT}"))]);
+    let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
+    assert!(d.profile.is_empty());
+    assert!(!d.text.contains(bootstrap::PROFILE_NOTE), "{}", d.text);
+    s.drop().await;
+}
+
+/// The three profile arms and the centroid read only what the client may read. Two project rows
+/// above the ceiling would pull the centroid toward a user row that leans on them: the readable
+/// centroid is axis 0 and scores that row 0, while one that read the private rows scores it about
+/// 0.53 and the readable near row about 0.27.
+///
+/// Each sentinel sits where a leak reaches the trimmed profile. A private `SENTINEL-PRIVATE-PREF`
+/// is the newest preference, so a leak from the preference arm leads profile. `SENTINEL-GLOBAL`
+/// sits in a namespace the client holds no grant on, scores 0.707 to the anchor and is the newest
+/// row in the store, so a leak from the nearest or the newest arm tops the ranked rows.
+///
+/// Fails if any profile arm or the anchor loses its `reachable` join, or the preference or newest
+/// arm loses its ceiling. The nearest arm's ceiling rests on how Postgres orders the rows tied at 0
+/// to the anchor, so this test does not pin it.
+#[tokio::test]
+async fn the_profile_arms_and_the_project_anchor_honour_the_grant_and_the_ceiling() {
+    let s = store_or_skip!("bootstrap_ranking_anchor_grant");
+    let ns = format!("project:{PROJECT}");
+    s.put(&ns, "alpha open fact", &[], Some(axis(0)), 3.0).await;
+    for (j, at) in [(6, 1.0), (7, 2.0)] {
+        let id = s.put(&ns, &format!("alpha private fact {j}"), &[], Some(toward(5, j)), at).await;
+        s.make_private(&id).await;
+    }
+    let month = 24.0 * 30.0;
+    let readable_near =
+        s.put("user:me", "near the readable project rows", &[], Some(toward(0, 20)), month).await;
+    let private_near = s
+        .put("user:me", "near the private project rows", &[], Some(toward(5, 21)), month + 1.0)
+        .await;
+    for i in 0..30 {
+        let at = 1.0 + i as f64 * 0.1;
+        s.put("user:me", &format!("chat fact {i}"), &[], Some(axis(100 + i)), at).await;
+    }
+    let pref =
+        s.put("user:me", "SENTINEL-PRIVATE-PREF", &["preference"], Some(axis(50)), 0.5).await;
+    s.make_private(&pref).await;
+    let global = s.put("global", "SENTINEL-GLOBAL", &["rule"], Some(toward(0, 22)), 0.05).await;
+
+    let mut ctx = s.ctx(|_| {});
+    ctx.principal =
+        reader("narrow", vec![NamespaceGrant::open("user:me"), NamespaceGrant::open(ns.clone())]);
+    let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
+    let profile = ids(&d.profile);
+    assert!(profile.contains(&readable_near), "{profile:?}");
+    assert!(!profile.contains(&private_near), "a private project row moved the centroid");
+    let all = every_id(&d);
+    assert!(!all.contains(&pref) && !all.contains(&global), "{all:?}");
+    let full = serde_json::to_string(&views::digest(&d, true)).unwrap();
+    for sentinel in ["SENTINEL-PRIVATE-PREF", "SENTINEL-GLOBAL"] {
+        assert!(!d.text.contains(sentinel), "{sentinel} in the text");
+        assert!(!full.contains(sentinel), "{sentinel} in the rows: true JSON");
+    }
+
+    ctx.principal = reader("project-only", vec![NamespaceGrant::open(ns.clone())]);
+    let d = bootstrap::run(&ctx, Some(PROJECT)).await.unwrap();
+    assert!(d.profile.is_empty(), "{:?}", ids(&d.profile));
+    let all = every_id(&d);
+    assert!(!all.contains(&pref) && !all.contains(&global), "{all:?}");
+    assert!(!d.text.contains(bootstrap::PROFILE_NOTE), "{}", d.text);
+    let full = serde_json::to_string(&views::digest(&d, true)).unwrap();
+    for sentinel in ["SENTINEL-PRIVATE-PREF", "SENTINEL-GLOBAL"] {
+        assert!(!full.contains(sentinel), "{sentinel} reached a client with no profile grant");
+    }
     s.drop().await;
 }

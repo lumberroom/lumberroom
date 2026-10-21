@@ -113,6 +113,9 @@ pub const DEFAULT_BOOTSTRAP_DEDUP_COSINE: f64 = 0.90;
 /// these words for rules and preferences that hold across projects.
 pub const DEFAULT_BOOTSTRAP_RULE_TAGS: &str = "preference,rule,convention";
 
+/// `BOOTSTRAP_PREFERENCE_LIMIT` unset: how many rule-tagged `user:me` rows lead profile.
+pub const DEFAULT_BOOTSTRAP_PREFERENCE_LIMIT: i64 = 5;
+
 /// How old an `occurred_at` must be before `memory_write` accepts it. One day.
 ///
 /// Named so the write path's refusal and the boot-time check read one number, and so a test can
@@ -567,10 +570,14 @@ pub struct BootstrapConfig {
     /// Rows related to the caller's query, from any namespace it may read (decision 0034). 0 turns
     /// the section off; boot refuses anything outside 0 to 10.
     pub related_limit: i64,
-    /// `BOOTSTRAP_RULE_TAGS`, normalised. Profile rows carrying one of these print ahead of newer
-    /// rows without one, and recent prints user and global rows only when they carry one
-    /// (decision 0034). An empty value reads as the default, because compose forwards an unset
-    /// variable as empty. A single comma parses to no tags, which turns the rule off.
+    /// `BOOTSTRAP_PREFERENCE_LIMIT`: the newest `user:me` rows carrying a rule tag that lead
+    /// profile, ahead of the ranked rows and inside `profile_limit` (decision 0034). Boot refuses
+    /// anything outside 0 to 10; 0 turns the lead off.
+    pub preference_limit: i64,
+    /// `BOOTSTRAP_RULE_TAGS`, normalised. The newest `user:me` rows carrying one of these lead
+    /// profile, up to `preference_limit`, and recent prints user and global rows only when they
+    /// carry one (decision 0034). An empty value reads as the default, because compose forwards an
+    /// unset variable as empty. A single comma parses to no tags, which turns both rules off.
     pub rule_tags: Vec<String>,
     /// Hard ceiling on the rendered digest so a large store cannot blow a client's context.
     pub max_chars: usize,
@@ -1292,6 +1299,10 @@ pub fn load() -> Result<Config> {
             recent_days: env_num("BOOTSTRAP_RECENT_DAYS", 14i32)?,
             registry_limit: env_num("BOOTSTRAP_REGISTRY_LIMIT", 25i64)?,
             related_limit: env_num("BOOTSTRAP_RELATED_LIMIT", 4i64)?,
+            preference_limit: env_num(
+                "BOOTSTRAP_PREFERENCE_LIMIT",
+                DEFAULT_BOOTSTRAP_PREFERENCE_LIMIT,
+            )?,
             rule_tags: parse_rule_tags(&env("BOOTSTRAP_RULE_TAGS", DEFAULT_BOOTSTRAP_RULE_TAGS)),
             max_chars: env_num("BOOTSTRAP_MAX_CHARS", 6000usize)?,
             max_chars_by_client: parse_client_budgets(&env("BOOTSTRAP_MAX_CHARS_BY_CLIENT", ""))?,
@@ -1612,6 +1623,13 @@ fn validate_bootstrap(b: &BootstrapConfig) -> Result<()> {
         return Err(DomainError::validation(format!(
             "BOOTSTRAP_RELATED_LIMIT must be from 0 to 10, got {}. 0 leaves the related section out.",
             b.related_limit
+        )));
+    }
+    if !(0..=10).contains(&b.preference_limit) {
+        return Err(DomainError::validation(format!(
+            "BOOTSTRAP_PREFERENCE_LIMIT must be from 0 to 10, got {}. 0 turns the leading \
+             preferences off.",
+            b.preference_limit
         )));
     }
     // Zero or below calls every pair of rows that points the same general way a duplicate, so each
@@ -2342,6 +2360,7 @@ mod tests {
             recent_days: 1,
             registry_limit: 1,
             related_limit: 4,
+            preference_limit: DEFAULT_BOOTSTRAP_PREFERENCE_LIMIT,
             rule_tags: parse_rule_tags(DEFAULT_BOOTSTRAP_RULE_TAGS),
             max_chars: 6000,
             max_chars_by_client: parse_client_budgets("chatgpt=3000").unwrap(),
@@ -2360,6 +2379,7 @@ mod tests {
             recent_days: 14,
             registry_limit: 25,
             related_limit: 4,
+            preference_limit: DEFAULT_BOOTSTRAP_PREFERENCE_LIMIT,
             rule_tags: parse_rule_tags(DEFAULT_BOOTSTRAP_RULE_TAGS),
             max_chars: 6000,
             max_chars_by_client: HashMap::new(),
@@ -2396,6 +2416,26 @@ mod tests {
         assert!(validate_bootstrap(&b).is_err());
         b.related_limit = 0;
         assert!(validate_bootstrap(&b).is_ok(), "0 turns the section off and boots");
+    }
+
+    #[test]
+    fn a_preference_limit_outside_zero_to_ten_is_refused() {
+        for bad in [-1, 11] {
+            let mut b = bootstrap_with_dedup(DEFAULT_BOOTSTRAP_DEDUP_COSINE);
+            b.preference_limit = bad;
+            let e = validate_bootstrap(&b).unwrap_err();
+            assert!(e.client_message().contains("BOOTSTRAP_PREFERENCE_LIMIT"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_preference_limit_is_checked_when_the_dedup_cosine_is_unset() {
+        let mut b = bootstrap_with_dedup(DEFAULT_BOOTSTRAP_DEDUP_COSINE);
+        b.dedup_cosine = None;
+        b.preference_limit = 99;
+        assert!(validate_bootstrap(&b).is_err());
+        b.preference_limit = 0;
+        assert!(validate_bootstrap(&b).is_ok(), "0 turns the lead off and boots");
     }
 
     /// The constant survives only for the boot error's text, which names bge's value. If the

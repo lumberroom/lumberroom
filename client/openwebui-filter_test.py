@@ -76,8 +76,9 @@ def module_function(name: str):
     raise AssertionError(f"{name} is gone from openwebui-filter.py")
 
 
+NOTE = "lumberroom stores more standing preferences than this list, and memory_search finds the one that covers a convention."
 DIGEST = "\n".join(
-    ["## Memory digest", "Store: 9 memories.", "", "### About the user and standing preferences"]
+    ["## Memory digest", "Store: 9 memories.", "", "### About the user and standing preferences", NOTE]
     + [f"- Standing rule {i} says something worth keeping _(user:me, 2026-10-06, via mac)_" for i in range(9)]
     + ["", "_(3 more recent entries left out at 6,000 chars; use memory_search for the rest)_"]
 )
@@ -114,8 +115,31 @@ class FilterCutsAtWholeLines(unittest.TestCase):
             lines = self.fit(DIGEST, cap).splitlines()
             for i, line in enumerate(lines):
                 if line.startswith("###"):
-                    following = lines[i + 1] if i + 1 < len(lines) else ""
-                    self.assertTrue(following.startswith("- "), (cap, lines))
+                    rest = lines[i + 1 : i + 3]
+                    # One line of text may sit under a heading, as the profile note does, when a
+                    # bullet follows it.
+                    if rest and not rest[0].startswith("- "):
+                        rest = rest[1:]
+                    self.assertTrue(rest and rest[0].startswith("- "), (cap, lines))
+
+    def test_a_cut_keeps_a_text_block_that_never_had_bullets(self):
+        # The Not shown block carries one line of text and no bullets, and the cut lands right
+        # after it once the Sealed block goes. That line is no note over dropped bullets.
+        not_shown = ["", "### Not shown above", "These namespaces also hold memories: project:orbit (3)."]
+        sealed = ["", "### Sealed", "Encrypted by the client and unreadable by this server: credentials:aws (2)."]
+        footer = DIGEST.splitlines()[-1]
+        body = DIGEST.splitlines()[:-2] + not_shown
+        digest = "\n".join(body + sealed + ["", footer])
+        cap = len("\n".join(body + ["", footer]) + "\n\n[digest truncated by the OpenWebUI filter]")
+        out = self.fit(digest, cap)
+        self.assertIn("project:orbit (3).", out)
+        self.assertNotIn("credentials:aws", out)
+
+    def test_a_cut_never_ends_on_a_heading_and_its_note(self):
+        for cap in range(len(DIGEST)):
+            out = self.fit(DIGEST, cap)
+            if NOTE in out:
+                self.assertIn(NOTE + "\n- ", out, cap)
 
 
 if __name__ == "__main__":

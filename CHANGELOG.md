@@ -55,11 +55,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the project first, with 55 percent of the budget and first claim on what the other sections
   leave; related, profile, recent and the registry follow at 10, 15, 5 and 15 percent. An optional
   `query`, the person's request, adds up to four rows from any readable namespace whose cosine to
-  it reaches the model's `route_max_top`. Profile prints rows tagged with a `BOOTSTRAP_RULE_TAGS`
-  tag (default `preference,rule,convention`) ahead of newer untagged rows, with or without a query,
-  and a query orders each group by relevance. An untagged restatement that drops its tagged twin as
-  a near-duplicate takes the twin's place among the rules. Profile keeps one whole rule ahead of
-  the shares at any budget where one fits in half the room. Recent keeps to the active project and
+  it reaches the model's `route_max_top`. Profile leads with up to five preferences, the newest
+  `user:me` rows carrying a `BOOTSTRAP_RULE_TAGS` tag (default `preference,rule,convention`), set
+  by the new `BOOTSTRAP_PREFERENCE_LIMIT` (default 5, refused at boot outside 0 to 10) and counted
+  inside the profile limit. The rest of profile ranks by similarity to the query, or with no query
+  to the centroid of the active project's newest rows, and by recency with neither. An untagged
+  restatement that drops a preference as a near-duplicate takes its place in the lead. A fixed line
+  under the profile heading says lumberroom stores more standing preferences and `memory_search`
+  finds them; it prints whenever profile prints and is no row. Profile keeps its first entry that
+  fits in half the room ahead of the shares, which is a leading preference whenever one of them
+  fits. Recent keeps to the active project and
   the tagged rows in `user:me` and `global`, so personal facts and a burst of writes elsewhere no
   longer fill it. When the query cannot be embedded, or the model's `route_max_top` was carried or
   guessed from bge-base, the related section stays out, the digest serves, and the structured
@@ -68,7 +73,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   to 5, and the new `BOOTSTRAP_RELATED_LIMIT` 4, refused at boot outside 0 to 10, and the new
   `BOOTSTRAP_RULE_TAGS`, which a single comma turns off. A deployment that set the old limits keeps
   them. Compose forwards `BOOTSTRAP_RECENT_LIMIT`, `BOOTSTRAP_RECENT_DAYS`,
-  `BOOTSTRAP_RELATED_LIMIT` and `BOOTSTRAP_RULE_TAGS`. The digest cache key carries the query, and
+  `BOOTSTRAP_RELATED_LIMIT`, `BOOTSTRAP_PREFERENCE_LIMIT` and `BOOTSTRAP_RULE_TAGS`. The digest cache key carries the query, and
   each insert sweeps expired entries. `bootstrap::run_with_query` sits beside an unchanged
   `bootstrap::run`. A shortened bullet keeps at least its first word, so a body that opens with a
   URL longer than the room stays out. Decision 0034, which supersedes 0025.
@@ -186,6 +191,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The OpenWebUI filter no longer ends a cut on a heading and the note under it whose bullets the
+  cut dropped.** The server now puts one line of text under the profile heading, and a cut that
+  kept that line and dropped every bullet below it left the model a heading and a note about
+  nothing. The Not shown and Sealed blocks, which carry a line of text and no bullets, still stay.
 - **A cleanup scope matches its prefix character for character.** A scope such as `project:my_*`
   went into a SQL `LIKE`, which reads `_` as any one character and `%` as any run of them, so the
   pass also read `project:myxapp`. The caller's read grant still bounded every run. The scope now

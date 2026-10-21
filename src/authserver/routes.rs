@@ -2494,6 +2494,7 @@ mod tests {
                     recent_days: 1,
                     registry_limit: 1,
                     related_limit: 4,
+                    preference_limit: 5,
                     rule_tags: vec![],
                     max_chars: 100,
                     max_chars_by_client: HashMap::new(),

@@ -1,6 +1,6 @@
 # 34. The digest leads with the project and adds rows related to the request
 
-**Date:** 20 October 2026 · **Status:** accepted; implemented, cargo check clean, integration suite not yet run · **Decided by:** the owner, 20 October 2026
+**Date:** 20 October 2026 · **Status:** accepted; implemented, `./scripts/cargo.sh nextest` 1940 passed on 21 October 2026, not merged · **Decided by:** the owner, 20 October 2026
 
 This record supersedes [0025](0025-the-digest-ranks-by-recency.md). 0025's near-duplicate pass and
 its rule that the newer row wins stay, now over every row the digest can print. It narrows
@@ -12,37 +12,63 @@ its rule that the newer row wins stay, now over every row the digest can print. 
 related, profile, recent, registry, and `SHARES` is `[55, 10, 15, 5, 15]` in that order. A share is
 a budget: each section spends its own before leftovers move, and project, as the first section,
 also takes first claim on the leftover pass. The other shares act as floors. At 6,000 characters
-profile gets about 700 to 800 characters and the registry about a dozen lines. A rule line with its
-suffix often runs 300 characters or more under the 2,000-character write cap, so profile's share
-holds two long rules or about five short ones.
+profile gets about 700 to 800 characters, of which its heading and reminder line take about 160,
+and the registry about a dozen lines. A preference line with its suffix often runs 300 characters
+or more under the 2,000-character write cap. On the render tests' fixture of five long preferences
+and ten full project rows, five of the five print without a related section and three with four
+related rows; `the_default_budget_prints_the_observed_count_of_five_realistic_preferences` pins
+both counts.
 
-**Profile keeps one whole rule at any budget.** Before any share is cut, the layout reserves the
-first profile entry, in rank order, that fits in half of the room the header and tail leave. The
-project's share shrinks by that entry. Without the reserve, profile's 15 percent printed no rule
-below about 1,400 characters on the render tests' crowded fixture, and per-client budgets have no
-lower bound.
+**Profile keeps one whole entry ahead of the shares.** Before any share is cut, the layout reserves
+the first profile entry, in rank order, that fits in half of the room the header and tail leave.
+The lead preferences rank first, so that entry is a leading preference whenever one of them fits.
+The project's share shrinks by that entry and by the profile heading, which carries the reminder
+line. Without the reserve, profile's 15 percent printed no entry below about 1,400 characters on
+the render tests' crowded fixture, and per-client budgets have no lower bound.
+`every_budget_with_room_for_the_tail_prints_profile` pins every budget from 1,200 characters on
+that fixture.
 
 **Limits move.** `BOOTSTRAP_PROJECT_LIMIT` goes from 5 to 10, `BOOTSTRAP_PROFILE_LIMIT` from 10 to 8
 and `BOOTSTRAP_RECENT_LIMIT` from 8 to 5. A new `BOOTSTRAP_RELATED_LIMIT` defaults to 4; boot
 refuses a value outside 0 to 10, and 0 turns the section off. Compose now forwards
-`BOOTSTRAP_RECENT_LIMIT`, `BOOTSTRAP_RECENT_DAYS`, `BOOTSTRAP_RELATED_LIMIT` and
-`BOOTSTRAP_RULE_TAGS`, empty by default, which `config.rs` reads as its own default. A deployment
+`BOOTSTRAP_RECENT_LIMIT`, `BOOTSTRAP_RECENT_DAYS`, `BOOTSTRAP_RELATED_LIMIT`,
+`BOOTSTRAP_PREFERENCE_LIMIT` and `BOOTSTRAP_RULE_TAGS`, empty by default, which `config.rs` reads as its own default. A deployment
 that set the old limits keeps them.
 
-**Profile puts standing rules first.** A new `BOOTSTRAP_RULE_TAGS`, default
-`preference,rule,convention`, names the tags that mark a rule. The profile arm orders its pool by
-whether a row carries one of those tags, then by age, so the rules reach the service even after a
-burst of newer personal rows. The service prints tagged rows ahead of untagged ones. Inside each
-group the order is newest first, or nearest the query first when a query came. Untagged rows fill
-whatever the rules leave of the profile limit. This holds on every path, with or without a query,
-so the session-start digest, CLI hook clients and ChatGPT get it too. Because `config.rs` reads an
-empty value as the default, a single comma (`BOOTSTRAP_RULE_TAGS=,`) is the way to name no tags
-and turn the rule off.
+**Profile follows the active project when no query comes.** The owner ruled on 20 October 2026 how
+profile picks its `user:me` and `global` rows on the paths that send no query: the session-start
+digest, CLI hooks, ChatGPT and any client that never sends one. Profile ranks its pool by cosine to
+the centroid of the active project's pooled rows, the newest `3 × BOOTSTRAP_PROJECT_LIMIT` rows the
+caller may read there. With a query, the query's vector takes the centroid's place. With neither an
+active project nor a query, or a project whose rows carry no vector, profile runs on recency. A row
+without a vector sorts after every scored row, and equal scores fall back to newest first.
 
-**A survivor of the near-duplicate pass takes its twin's standing mark.** When a newer untagged row
-restates a tagged rule, the pass drops the rule, as the newer-wins rule says. The survivor then
-counts as standing for the profile order. Without that, the restatement sorted behind every other
-rule, fell past the profile limit, and the fact left the digest, since recent admits no untagged
+**Up to five preferences lead profile.** A preference is a `user:me` row carrying a
+`BOOTSTRAP_RULE_TAGS` tag, default `preference,rule,convention`. The newest
+`BOOTSTRAP_PREFERENCE_LIMIT` of them, default 5, lead profile, newest first, on every path, and count
+against `BOOTSTRAP_PROFILE_LIMIT`. Boot refuses a value outside 0 to 10, and the service uses at most
+the profile limit. Preferences past that count, and rule-tagged `global` rows, rank with the rest.
+The structured rows always carry the lead; the text prints as many as profile's share holds.
+Because `config.rs` reads an empty value as the default, a single comma (`BOOTSTRAP_RULE_TAGS=,`)
+names no tags; profile then leads with nothing and recent admits every `user:me` and `global` row.
+
+**The profile heading carries one reminder line:** "lumberroom stores more standing preferences
+than this list, and memory_search finds the one that covers a convention." It sits in the heading,
+so it prints whenever a profile entry prints and takes room the way the heading does. It is no row:
+the structured rows, `left_out` and the recall log never carry it. It names what the store holds
+and the tool that reaches it, and gives no order, because the MCP directory review rejects tool
+text that tells a model how to behave.
+
+**Profile reads three arms in the one statement:** the newest preferences, the rows nearest the
+anchor and the newest rows, each at three times its limit. The nearest arm orders by distance
+before its LIMIT, so a burst of newer rows cannot push an older near row out of the pool. The
+centroid is `avg` over the project pool's stored vectors inside the statement, and no select list
+carries a vector, so 0025's vectors-in-the-pools cost does not return.
+
+**A survivor of the near-duplicate pass takes its twin's preference mark.** When a newer untagged
+row restates a preference, the pass drops the preference, as the newer-wins rule says. The survivor
+then counts as a preference for the lead. Without that, the restatement ranked with the untagged
+rows, fell past the profile limit, and the fact left the digest, since recent admits no untagged
 user row. The mark is all it inherits.
 
 **Recent keeps to the active project and the caller's standing rules.** The filter sits in SQL:
@@ -62,7 +88,8 @@ never repeats there.
 **The floor is the model's `route_max_top`, read as a pure cosine.** Decision 0029 says thresholds
 belong to the model, and `route_max_top` is the key the graph router already compares with a
 query's scores. Neither shipped value was measured as a query-to-row cosine. bge-base-en-v1.5's
-0.65 is the value production ran the router on before 0029, tuned and never measured.
+0.65 has basis `shipped` in 0029: the value the router ran on before that record, tuned and never
+measured.
 EmbeddingGemma 2's 0.76 comes from the LongMemEval fusion sweep, on fused scores, and the costs
 below say what reading it as a cosine does. The section runs when the value's source is
 `override`, `legacy`, `shipped`, `study` or `sweep`. A `carried` or `guessed` value is bge's number
@@ -74,15 +101,13 @@ key. The digest reports `related_unavailable: "no_measured_floor"`. Profile orde
 because it needs no threshold.
 
 **A failed query embed leaves the related section out and the digest serves.** The service logs a
-warning, orders the profile without scores, and reports `related_unavailable: "embed_failed"`.
+warning, ranks the profile by the active project, as a call without a query does, and reports
+`related_unavailable: "embed_failed"`.
 
 **`Digest` gains `related` and `related_unavailable`.** `related_unavailable` is `None` when no
 query came, when the section ran, or when `BOOTSTRAP_RELATED_LIMIT` is 0; otherwise it is
 `embed_failed` or `no_measured_floor`. The brief MCP view carries it when set, and `rows: true`
 carries it through serde. The rendered text says nothing about it.
-
-**Under a query profile widens its pool** to the `profile_limit * 5` rows the arm ranks first, and
-the service orders each group by cosine to the query, rows with no score last in recency order.
 
 **The near-duplicate pass runs over every pool the digest prints from:** profile, project, recent
 and related. Newer still wins across sections. Project, profile and recent each note the dropped
@@ -130,22 +155,33 @@ handful of rows ranked by the caller's own request, above a floor, beside recenc
 request is a signal 0025's rankers never had: they ranked by the project's centroid, its recent rows
 or its slug.
 
-The owner's ruling narrows 0025 for profile. 0025 dropped the tag-first rule because it lost to
-plain recency on proxy labels: which rows `memory_search` returned in the hours after a digest, and
-which rows a session superseded. The ruling names a different goal for profile, the standing rules
-that bind a session in every project, and the incident shows recency failing that goal. The rule
-returns with two changes. It reads the tags writers already use for rules, `preference`, `rule`
-and `convention`, instead of `profile` and `identity`, which mark personal facts. And it governs
-recent's user rows too, so the facts it holds back from profile cannot print one section lower.
+The owner's ruling narrows 0025 for profile. 0025's evaluation saw project-similarity ranking lose
+to recency for the whole digest: cosine to the project's centroid, the same weighted by age, cosine
+to the last few project rows, and cosine to the slug each lost, and the rows recency found and they
+missed were mostly less than a day old. 0025 never tested the centroid on profile alone. This
+record applies it there by the owner's ruling, because recency let one busy chat surface fill the
+section with personal facts the session had no use for. Project and recent stay on recency. 0025 also dropped
+the tag-first rule after it lost to recency on proxy labels. The preference lead brings back a
+narrow form of it: five rows, `user:me` only, newest first, read from the tags writers already use
+for rules instead of `profile` and `identity`, which mark personal facts. The reversal condition
+says how the recall log would show the ruling losing the same way.
 
 ## What lost, and why
 
 **Ranking the whole digest by embeddings.** 0025's evidence stands.
 
-**Ordering profile by cosine to the project's rows.** It rewards personal facts that share the
-project's topic and holds back the rules that apply everywhere. "Never stage with `git add -A`"
-scores low against a store of engine rows. 0025's evaluation also found the centroid and the
-recent-rows variants losing to recency.
+**Embedding the project slug as the anchor.** It costs one embed on every query-less cache miss, a
+path that had none, and a slug carries a word or two of meaning. 0025 saw it lose too. The centroid
+needs no embed.
+
+**Ranking inside a recency pool.** Reordering the newest 24 or 40 rows by the anchor leaves an older
+near row out whenever a burst outgrows the pool, which is the incident.
+
+**Tag-first order for every profile row.** The ruling replaces it with the lead. A store whose rules
+all carry tags would fill profile with rules and leave no room for the rows near the project.
+
+**The reminder as a row.** A row has an id, enters `rows: true`, the recall log and `left_out`,
+competes for the budget, and reads as a stored fact.
 
 **Down-ranking rows written by another surface.** The owner's rules come from several writers,
 including the dreaming pass, so the writer does not separate a rule from a fact.
@@ -176,15 +212,18 @@ optional; the rest of the digest needs no vector.
 ## Costs accepted
 
 - **One embedding call on a path that had none,** only on a cache miss with a query. Decision 0001
-  measured 11 to 16 ms for the local bge model. Production runs EmbeddingGemma 2 on CPU through a
-  remote embedder, which the 9 October 2026 benchmark put at about 0.19 to 0.30 s for 100 tokens
-  and 0.8 to 1.8 s for 500. A 1,000-character request is about 250 tokens, so roughly 0.5 to 0.8 s
-  plus the network round trip. That figure is interpolated, not measured on this path.
-- **The statement grows** by one vector arm, its floor filter and the profile scores, and the
-  profile arm sorts every live `user:me` and `global` row by tag before its LIMIT, where it used to
-  read the newest few. Its latency is not measured yet. The method is 0025's: `pgbench -M prepared`
-  under `plan_cache_mode = force_generic_plan`, three rounds of 20, at 4,500 and 20,000 synthetic
-  rows, with and without a query vector. The observed numbers belong here when that run happens.
+  measured 11 to 16 ms for the local bge model. A remote embedder adds its own inference time and a
+  network round trip, which nobody has measured on this path.
+- **The statement grows** by one vector arm, its floor filter, the profile scores, the project
+  centroid and two profile arms. The nearest arm orders every live `user:me` and `global` row the
+  caller may read by distance before its LIMIT. At the defaults the profile pool reads up to 63 rows
+  (15 preferences, 24 nearest, 24 newest, before the union removes overlap) where it read 24, or 40
+  under a query, and recent's pool reads up to 88 where it read 49, or 65 under a query. Every
+  pooled row enters the vector copy and the near-duplicate join, which compares every pair, so that
+  step grows with the square of the pool, and the decrypt pass opens more private rows. The method
+  is 0025's: `pgbench -M prepared` under `plan_cache_mode = force_generic_plan`, three rounds of
+  20, at 4,500 and 20,000 synthetic rows, with and without a query vector. The observed numbers
+  belong here when that run happens.
 - **The floor is approximate, and on EmbeddingGemma 2 it is probably strict.** 0029 calibrated
   `route_max_top` for that model on the linear fused score, cosine plus a lexical term capped at
   0.35 plus a usage boost, times a penalty below 1 for non-primary namespaces. Read as a pure cosine
@@ -195,26 +234,37 @@ optional; the rest of the digest needs no vector.
   operator who tunes the router moves the digest floor too.
 - **Models whose `route_max_top` is carried or guessed get no related section** until an operator
   sets one.
-- **Rules without a rule tag sort behind tagged rows.** A writer that never tags, or tags rules
-  with another word, gets profile on recency and loses its user rows from recent. The setting takes
-  the store's own words.
+- **Only tagged `user:me` rows lead.** A writer that never tags, or tags rules with another word,
+  gets no lead and loses its user rows from recent. A rule in `global` ranks on the anchor, so a
+  rule about staging files can score low against a store of engine rows. The reminder line points a
+  session at `memory_search` for those.
+- **A surface that tags every row it writes fills the lead.** A burst of `user:me` rows tagged
+  `preference` takes all five lead slots, newest first, whatever the project, which is the
+  incident's shape moved into the lead. The reversal condition watches for it.
+- **The text can print fewer than five.** The structured rows carry the whole lead, and the text
+  prints what profile's share holds: three of five long preferences on the render tests' fixture
+  when four related rows print above them.
+- **Without a query, a personal row written an hour ago can lose to an older row near the
+  project.** 0025 found most of recency's lead in such rows.
+- **The centroid reads up to `3 × BOOTSTRAP_PROJECT_LIMIT` stored vectors** on each query-less cache
+  miss with an active project.
+- **The reminder line costs about 120 characters** whenever profile prints, out of the project's
+  room at small budgets.
 - **Untagged personal rows print only in profile's tail, in related, or as a count.** A personal
   fact a session needs reaches it through a query that matches it or through `memory_search`.
-- **The reserved profile entry takes room from the project** at every budget, one rule's worth.
+- **The reserved profile entry takes room from the project** at every budget, one entry's worth.
 - **A `personal:*` row shows only as a count** on the inventory line unless a query matches it.
 - **A correction outside the active project, `user:me` and `global` no longer hides its stale twin
   without a query.** With a matching query it joins through related and the newer row wins.
 - **More displacing related rows than `related_limit` lose a fact** for one call.
-- **A survivor inherits its twin's standing mark and not its query score.** Under a query a dropped
-  tagged twin that scored higher than its untagged survivor still loses that rank, and the
-  survivor sorts by its own score inside the standing group.
+- **A survivor inherits its twin's preference mark and nothing else.** It takes its place in the
+  lead by its own age.
 - **A fact filed under a project other than the session's directory reaches a fresh session
-  without a query only as a count on the inventory line.** `scripts/done-when-test.sh` plants its
-  fact in session A, wherever the model files it, and asks for it in session B from a temporary
-  directory through the CLI hook, which sends no query. Recent used to carry that fact; it no
-  longer does, even with a rule tag, unless the fact sits in `user:me` or `global`. The gate has
-  not been run against this change and may need session B to run in a directory named for the
-  fact's project, or the hook to send a query.
+  without a query only as a count on the inventory line.** `scripts/done-when-test.sh` runs both
+  sessions from a directory named `lumberroom`, so the hook's digest carries `project:lumberroom`,
+  where the fact's text steers the model, and a `user:me` preference reaches it through the lead.
+  The script prints where session A filed the fact and warns when it sits elsewhere. The gate has
+  not been run against this change.
 - **Under a query recent is mostly project overflow,** because the tagged user rows within 14 days
   mostly sit in the profile pool.
 - **A failed embed shows only in `related_unavailable` and a warning line.**
@@ -231,8 +281,8 @@ embeds anything, so 0028's core rule holds.
 ## What this is not for
 
 It does not change `memory_search` ranking. It does not dedup the store. It does not calibrate the
-floor: `route_max_top` keeps the basis 0029 gave it. The rule tags mark rows; they do not classify
-untagged text as a rule.
+floor: `route_max_top` keeps the basis 0029 gave it. The rule tags mark rows and do not classify
+untagged text, so a rule written without a tag never joins the preference lead.
 
 ## Reversal condition
 
@@ -245,7 +295,21 @@ built for a query` on each queried cache miss, with `related_candidates`, `relat
 
 If related rows rarely recur in later searches, or `related_candidates` is 0 for most queried
 digests, register a `bootstrap_related` key per model in `src/domain/similarity.rs` and measure it
-on query-to-row cosines from a copy of a real store. If the profile rows later searches reach for
-are untagged rows the rule tags held back, return profile to recency, or widen the tag list. The
-shares are one constant, the floor cap is one constant, and the limits and tags are environment
+on query-to-row cosines from a copy of a real store.
+
+The profile ruling reverses on the recall log (decision 0024) joined to the `memory` table. Take
+`context_bootstrap` calls with a `project` and no `related` row; most carried no query, and a
+queried call whose rows all missed the floor lands there too. For each call, read from `memory`, by
+`created_at` and `namespace`, the `BOOTSTRAP_PROFILE_LIMIT` newest `user:me` and `global` rows
+created before the call, and keep those its `profile` events do not name. Those are rows recency
+would have printed and the centroid dropped. A call counts as a miss when a `memory_search` event
+from the same tenant and `client` names one of them within 6 hours after the call. The join uses
+the client and the window because the query-less callers send no session header. If more than one
+call in five is a miss, over at least 100 such calls, return the rest of profile to recency and
+keep the lead and the reminder line. Over the same calls, take the leading `profile` events, from
+rank 1, that name a rule-tagged `user:me` row. If in more than one call in five every one of them
+came from one `source_client` in the 24 hours before the call, a burst from one surface fills the
+lead: lower `BOOTSTRAP_PREFERENCE_LIMIT` or narrow `BOOTSTRAP_RULE_TAGS`. All four numbers are
+design targets, not measurements. `BOOTSTRAP_PREFERENCE_LIMIT=0` removes the lead without a
+release. The shares are one constant, the floor cap is one constant, and the limits and tags are environment
 variables.

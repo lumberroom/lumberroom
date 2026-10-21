@@ -19,6 +19,11 @@ TOKEN="${LUMBERROOM_TOKEN:-}"
 MODEL="${DONE_WHEN_MODEL:-sonnet}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+# Both sessions run from a directory named for the project the fact is about. The hook sends the
+# directory as the project, so session B's digest carries project:lumberroom, where session A
+# usually files the fact. A query-less digest prints other projects only as a count.
+SESSION_DIR="$WORK/lumberroom"
+mkdir -p "$SESSION_DIR"
 
 # AUTH_TOKENS holds either `client:token` pairs or JSON. Handle both.
 if [ -z "$TOKEN" ] && [ -f "$REPO_DIR/.env" ]; then
@@ -51,9 +56,9 @@ MEMCTL="lumberroom"
 # by reading the repo, so answering the question is evidence of memory, not of guessing.
 # The fact is shaped as a stated preference, which is what this system is for. A fact shaped like
 # an authorization claim ("X is signed off") makes a careful model refuse to record it on a bare
-# assertion — correct behaviour, and worth knowing before you wonder why nothing was written.
+# assertion. That is correct behaviour, and worth knowing before you wonder why nothing was written.
 NONCE="$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-FACT="I want the internal nickname for the lumberroom project to be QUARTZLARK-$NONCE — use it in commit messages and status notes"
+FACT="I want the internal nickname for the lumberroom project to be QUARTZLARK-$NONCE. Use it in commit messages and status notes"
 QUESTION="What internal nickname do I use for the lumberroom project?"
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
@@ -100,7 +105,7 @@ JSON
 
 WRITE_RULE="$(cat "$REPO_DIR/client/CLAUDE.md.snippet")"
 
-say "1/4 session A — state the fact, expect an unprompted write"
+say "1/4 session A: state the fact, expect an unprompted write"
 echo "  fact: $FACT"
 # toolStats groups by (tool, client), so filter by client. Without it, a second client's row can
 # satisfy the delta and the test passes on a write that never came from the surface under test.
@@ -115,7 +120,7 @@ unprompted_writes() {
 }
 BEFORE="$(unprompted_writes)"
 
-cd "$WORK"
+cd "$SESSION_DIR"
 claude -p "$FACT. That is settled." \
   --mcp-config "$WORK/mcp.json" --strict-mcp-config \
   --append-system-prompt "$WRITE_RULE" \
@@ -140,8 +145,19 @@ if [ "$AFTER" -gt "$BEFORE" ]; then
 else
   echo "  WARN  the write was recorded as prompted, not model-initiated"
 fi
+FILED="$($MEMCTL search "$QUESTION" --limit 5 --json | NONCE="$NONCE" node -e '
+  let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{
+    const hit=(JSON.parse(s).hits||[]).find(h=>h.content.includes("QUARTZLARK-"+process.env.NONCE));
+    process.stdout.write(hit ? `${hit.namespace} [${(hit.tags||[]).join(",")}]` : "unknown");
+  })')"
+echo "  filed in $FILED"
+case "$FILED" in
+  "project:lumberroom "*) ;;
+  "user:me ["*preference*|"user:me ["*rule*|"user:me ["*convention*) ;;
+  *) echo "  WARN  a query-less digest for project:lumberroom prints that project's rows and the newest rule-tagged user:me rows; session B sees a fact filed here only as a count" ;;
+esac
 
-say "3/4 session B — fresh session, the question never mentions the fact"
+say "3/4 session B: fresh session, the question never mentions the fact"
 echo "  question: $QUESTION"
 claude -p "$QUESTION Answer from what you already know." \
   --mcp-config "$WORK/mcp.json" --strict-mcp-config \

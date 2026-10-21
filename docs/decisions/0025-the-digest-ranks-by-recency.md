@@ -1,8 +1,8 @@
 # 25. The digest ranks by recency, and embeddings only drop near-duplicates
 
 > **20 October 2026:** decision [0034](0034-the-digest-leads-with-the-project.md) supersedes this
-> record. The project section now leads, a query adds related rows, profile puts rows with a
-> standing-rule tag first, and recent keeps to the active project and the tagged rows in `user:me`
+> record. The project section now leads, a query adds related rows, profile leads with up to five
+> rule-tagged `user:me` rows and ranks the rest by the query or the active project, and recent keeps to the active project and the tagged rows in `user:me`
 > and `global`. The near-duplicate pass and its newer-row-wins rule stand.
 
 **Date:** 6 October 2026 · **Status:** decided by the owner, implemented and merged in #123 on 6 October 2026; superseded by 0034 on 20 October 2026 · **Decided by:** the owner, 6 October 2026, after an offline evaluation (issue #109)

@@ -244,10 +244,12 @@ flattened onto one bullet before it is rendered. One more line sits under the `S
 active project namespace and telling the model to pass it to `memory_search`. A pass here means facts and a count. Section 6 covers a digest that
 comes back with a count and no facts.
 
-This sample also predates decision 0034. A digest today prints the active project first, and
-recent keeps to that project and the rule-tagged rows in `user:me` and `global`. A session whose
-directory is not `lumberroom` would see the `project:lumberroom` nonce above only as a count on the
-inventory line, unless the caller sends a query that matches it.
+This sample also predates decision 0034. A digest today prints the active project first, leads
+profile with the newest rule-tagged `user:me` rows under a reminder line, and keeps recent to that
+project and the rule-tagged rows in `user:me` and `global`. A session whose directory is not
+`lumberroom` would see the `project:lumberroom` nonce above only as a count on the inventory line,
+unless the caller sends a query that matches it. `scripts/done-when-test.sh` runs its sessions from
+a directory named `lumberroom` for that reason.
 
 ### scripts/done-when-test.sh
 
@@ -267,11 +269,15 @@ execute it, since every run writes another nickname row):
 2/4 did the fact land?
   PASS  the fact is in the store and retrievable
   PASS  the write was unprompted (memory_write unprompted count <before> -> <after>)
+  filed in project:lumberroom [<tags>]
 4/4 verdict
   PASS  a fresh session recovered the fact without being told it
 
   done-when test PASSED
 ```
+
+The `filed in` line names where session A put the fact; a `WARN` under it means a query-less
+digest for `project:lumberroom` shows that row only as a count.
 
 It ends by printing `lumberroom stats --hours 1`. Two things to read rather than skim. `WARN the write was
 recorded as prompted` means the fact landed and the call carried an invocation header, so it did not
