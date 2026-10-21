@@ -4,6 +4,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The digest's preference lead ranks by the anchor.** With a query, or inside an active project
+  without one, `context_bootstrap` fills its leading preference slots with the rule-tagged
+  `user:me` rows nearest the query or the project, newest first on equal scores. It took the
+  newest, so a client that tagged personal plans `preference` pushed older working rules out of
+  the lead. The statement's preference arm reads the tagged rows nearest the anchor too, so a
+  burst of newer tagged rows no longer pushes the rules out of the pool, and a near-duplicate twin
+  the digest dropped no longer uses up a lead slot. Without an anchor the lead stays newest first.
+  No setting or response shape changes. Decision 0034, amendment of 21 October 2026.
+
 ## [0.6.0] - 2026-10-21
 
 ### Added
