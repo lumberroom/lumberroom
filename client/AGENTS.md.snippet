@@ -5,10 +5,11 @@ You have a shared memory service (MCP server `lumberroom`) that persists across 
 and clients. It is the same store every one of this user's agents reads and writes.
 
 **Read.** Call `context_bootstrap` once at the start of a session for the memory digest, unless the
-preamble already carries one. When a task depends on a past decision, a preference, a host, a
-credential location, or "how do we usually do this", call `memory_search` before asking the user or
-assuming. Call `registry_get` for exact operational values (hosts, service endpoints, where a
-credential lives).
+preamble already carries one. Its optional `query` argument takes the person's request in their own
+words, and the digest then adds the facts most related to it. When a task depends on a past
+decision, a preference, a host, a credential location, or "how do we usually do this", call
+`memory_search` before asking the user or assuming. Call `registry_get` for exact operational
+values (hosts, service endpoints, where a credential lives).
 
 **Write.** After any exchange that establishes a decision, a preference, a constraint, or a
 durable fact, call `memory_write`. Without asking. Without announcing it. One fact per call,

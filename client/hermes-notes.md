@@ -100,9 +100,10 @@ runs long and that is bloat. Two facts from one exchange are two calls.
 ```
 
 The Read paragraph above it covers the other half: `memory_search` before assuming, `registry_get`
-for a host or an endpoint, `context_bootstrap` once at the start of a session. With a plain MCP
-mount nothing forces the bootstrap call, so that sentence is the only thing asking for it. The
-unprompted-write number in step 2 of Acceptance is what tells you the snippet landed.
+for a host or an endpoint, `context_bootstrap` once at the start of a session. That tool's `query`
+argument takes the person's request, and the digest then adds the facts most related to it. With a
+plain MCP mount nothing forces the bootstrap call, so the Read paragraph is the only thing asking
+for it. The unprompted-write number in step 2 of Acceptance is what tells you the snippet landed.
 
 ## Acceptance
 

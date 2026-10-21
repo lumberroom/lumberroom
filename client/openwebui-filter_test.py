@@ -1,18 +1,27 @@
 """
-Regression tests for the single-owner warning and the write rule in openwebui-filter.py.
+Regression tests for openwebui-filter.py: the single-owner warning, the write rule, fit_digest and
+the request the filter sends as context_bootstrap's `query`.
 
 httpx and pydantic (the filter's two runtime dependencies, both supplied by OpenWebUI's own
-backend) are not guaranteed to be installed wherever this repo is checked out, so this test reads
-the file as text rather than importing the Filter class. What it guards is documentation staying
-in place, not runtime behaviour: the filter has exactly one token valve shared by every account it
-runs for, and the warning is the only thing standing between an operator and enabling it on a
-multi-account instance.
+backend) are not guaranteed to be installed wherever this repo is checked out. The warning,
+write-rule and fit_digest tests read the file as text through ast for that reason. The warning
+tests guard documentation staying in place: the filter has exactly one token valve shared by every
+account it runs for, and the warning is the only thing standing between an operator and enabling
+it on a multi-account instance.
 
-Run: python3 client/openwebui-filter_test.py
+RequestQueryPicksThePersonsRequest and FilterSendsTheRequest import the module itself, with
+stand-ins for httpx and pydantic in sys.modules, because the query and the cache are runtime
+behaviour on a Filter instance.
+
+Run: python3 -I client/openwebui-filter_test.py
 """
 
 import ast
+import asyncio
+import importlib.util
 import pathlib
+import sys
+import types
 import unittest
 
 HERE = pathlib.Path(__file__).parent
@@ -140,6 +149,192 @@ class FilterCutsAtWholeLines(unittest.TestCase):
             out = self.fit(DIGEST, cap)
             if NOTE in out:
                 self.assertIn(NOTE + "\n- ", out, cap)
+
+
+class FakeHttpx(types.ModuleType):
+    """httpx as the filter uses it. AsyncClient records every JSON body it posts and answers a
+    tools/call with a digest that names the query it got, so a test can see which request a
+    digest answered."""
+
+    class HTTPError(Exception):
+        pass
+
+    def __init__(self):
+        super().__init__("httpx")
+        self.calls: list[dict] = []
+        self.down = False
+        fake = self
+
+        class Response:
+            status_code = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        class AsyncClient:
+            def __init__(self, timeout=None):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def post(self, url, headers=None, json=None):
+                if fake.down:
+                    raise fake.HTTPError("connection refused")
+                fake.calls.append(json)
+                if json.get("method") != "tools/call":
+                    return Response({"result": {}})
+                query = json["params"]["arguments"].get("query", "-")
+                return Response({"result": {"content": [{"type": "text", "text": f"digest for {query}"}]}})
+
+        self.AsyncClient = AsyncClient
+        self.Timeout = lambda seconds: seconds
+
+    def arguments(self) -> list[dict]:
+        return [c["params"]["arguments"] for c in self.calls if c.get("method") == "tools/call"]
+
+
+def load_filter(fake_httpx: FakeHttpx):
+    """Import the filter with fake httpx and pydantic modules, then put sys.modules back. Field
+    returns its default, so each valve reads as a plain class attribute."""
+    pydantic = types.ModuleType("pydantic")
+    pydantic.BaseModel = type("BaseModel", (), {})
+    pydantic.Field = lambda default=None, **_: default
+    saved = {name: sys.modules.get(name) for name in ("httpx", "pydantic")}
+    sys.modules.update(httpx=fake_httpx, pydantic=pydantic)
+    # The import would otherwise leave client/__pycache__ in the checkout.
+    writes_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec = importlib.util.spec_from_file_location("lumberroom_openwebui_filter", HERE / "openwebui-filter.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = writes_bytecode
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+    return module
+
+
+DEPLOY = "how do we deploy the staging box"
+BACKUPS = "which bucket holds the nightly backups"
+
+
+def chat(*user_texts: str) -> dict:
+    messages: list[dict] = []
+    for text in user_texts:
+        messages += [{"role": "user", "content": text}, {"role": "assistant", "content": "ok"}]
+    return {"messages": messages[:-1]}
+
+
+def injected(body: dict) -> str | None:
+    first = body["messages"][0]
+    return first["content"] if first["role"] == "system" else None
+
+
+class RequestQueryPicksThePersonsRequest(unittest.TestCase):
+    def setUp(self):
+        module = load_filter(FakeHttpx())
+        self.query = lambda messages: module.request_query(
+            messages, module.MIN_QUERY_CHARS, module.QUERY_MAX_CHARS
+        )
+        self.module = module
+
+    def test_the_constants_match_the_claude_code_plugin(self):
+        self.assertEqual((self.module.MIN_QUERY_CHARS, self.module.QUERY_MAX_CHARS), (12, 1000))
+
+    def test_the_last_user_message_is_the_query(self):
+        self.assertEqual(self.query(chat(DEPLOY, BACKUPS)["messages"]), BACKUPS)
+
+    def test_list_content_keeps_text_parts_and_drops_images(self):
+        content = [
+            {"type": "text", "text": BACKUPS},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]
+        self.assertEqual(self.query([{"role": "user", "content": content}]), BACKUPS)
+
+    def test_the_query_is_trimmed_and_cut_at_the_cap(self):
+        out = self.query([{"role": "user", "content": "  " + "x" * 1500 + "  "}])
+        self.assertEqual(out, "x" * 1000)
+
+    def test_a_short_reply_falls_back_to_the_previous_request(self):
+        self.assertEqual(self.query(chat(DEPLOY, "ok do it")["messages"]), DEPLOY)
+
+    def test_nothing_long_enough_gives_no_query(self):
+        self.assertIsNone(self.query(chat("ok", "yes")["messages"]))
+        self.assertIsNone(self.query([]))
+        self.assertIsNone(self.query(["not a dict", {"role": "user", "content": None}, {"role": "user"}]))
+        self.assertIsNone(self.query([{"role": "user", "content": "   " + "a" * 11 + "   "}]))
+        self.assertEqual(self.query([{"role": "user", "content": "a" * 12}]), "a" * 12)
+
+
+class FilterSendsTheRequest(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeHttpx()
+        self.module = load_filter(self.fake)
+        self.clock = [100.0]
+        self.module.time = types.SimpleNamespace(monotonic=lambda: self.clock[0])
+        self.filter = self.module.Filter()
+        self.filter.valves.lumberroom_token = "token"
+
+    def inlet(self, body: dict, user: str = "u1") -> dict:
+        return asyncio.run(self.filter.inlet(body, {"id": user}))
+
+    def test_the_tools_call_carries_the_latest_request_as_query(self):
+        self.inlet(chat(DEPLOY))
+        self.assertEqual(self.fake.arguments(), [{"query": DEPLOY}])
+
+    def test_two_messages_fetch_twice_and_each_gets_its_own_digest(self):
+        first = self.inlet(chat(DEPLOY))
+        second = self.inlet(chat(DEPLOY, BACKUPS))
+        self.assertEqual(self.fake.arguments(), [{"query": DEPLOY}, {"query": BACKUPS}])
+        self.assertIn(f"digest for {DEPLOY}", injected(first))
+        self.assertIn(f"digest for {BACKUPS}", injected(second))
+        self.assertNotIn(f"digest for {DEPLOY}", injected(second))
+
+    def test_a_repeated_request_inside_the_window_reuses_the_digest(self):
+        self.inlet(chat(DEPLOY))
+        self.clock[0] += 10
+        self.inlet(chat(DEPLOY))
+        self.assertEqual(len(self.fake.arguments()), 1)
+
+    def test_the_send_query_valve_off_sends_empty_arguments(self):
+        self.filter.valves.send_query = False
+        self.inlet(chat(DEPLOY))
+        self.assertEqual(self.fake.arguments(), [{}])
+
+    def test_short_replies_alone_send_empty_arguments(self):
+        self.inlet(chat("hi", "ok"))
+        self.assertEqual(self.fake.arguments(), [{}])
+
+    def test_an_outage_on_a_new_request_serves_the_users_last_digest(self):
+        self.inlet(chat(DEPLOY))
+        self.fake.down = True
+        during = self.inlet(chat(DEPLOY, BACKUPS))
+        self.assertIn(f"digest for {DEPLOY}", injected(during))
+        other = self.inlet(chat(BACKUPS), user="u2")
+        self.assertIsNone(injected(other))
+
+    def test_expired_entries_leave_the_cache_when_a_new_one_lands(self):
+        self.inlet(chat(DEPLOY))
+        self.clock[0] += 100
+        self.inlet(chat(BACKUPS))
+        self.assertEqual(set(self.filter._cache), {("u1", BACKUPS)})
+
+    def test_an_outage_with_nothing_cached_returns_the_body_unchanged(self):
+        self.fake.down = True
+        body = chat(DEPLOY)
+        before = [dict(m) for m in body["messages"]]
+        self.assertEqual(self.inlet(body)["messages"], before)
 
 
 if __name__ == "__main__":

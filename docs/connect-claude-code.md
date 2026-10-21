@@ -111,6 +111,11 @@ the preamble. This is what makes recall happen whether or not the model decides 
 Without it, a session begins knowing nothing and `context_bootstrap` is one more tool the model may
 skip.
 
+SessionStart carries no prompt, so the hook's digest goes out without `context_bootstrap`'s `query`
+and holds no facts picked for the person's request. The lumberroom Claude Code plugin refetches the
+digest with the session's first prompt of 12 characters or more as `query`. The hook has no such
+mode: `lumberroom bootstrap` takes no query and names only the SessionStart event.
+
 wire-mac.sh installs the script to `~/.claude/hooks/lumberroom-bootstrap.sh` and appends this to
 `~/.claude/settings.json` through `jq`, skipping the edit when the command is already in the array,
 so hooks you already have survive:
