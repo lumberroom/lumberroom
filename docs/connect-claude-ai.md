@@ -22,7 +22,7 @@ The menu paths come from each vendor's documentation, read on 4 October 2026.
 ## Route 1: paste the instructions
 
 [`client/connector-instructions.md.snippet`](../client/connector-instructions.md.snippet) holds the
-rules in under 1,000 characters, short enough for every field below.
+rules in under 1,100 characters, short enough for every field below.
 
 | Client | Where to paste it |
 | --- | --- |

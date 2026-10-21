@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Claude Code SessionStart hook: pulls the memory digest and injects it into the session.
 #
+# SessionStart carries no prompt, so this digest goes out without context_bootstrap's `query` and
+# holds no facts picked for the person's request. The lumberroom Claude Code plugin sends the
+# session's first prompt of 12 characters or more as `query`. A UserPromptSubmit mode here would
+# need `lumberroom bootstrap` to take a query and to name the hook event; it does neither
+# (crates/lumberroom/src/commands.rs, the `bootstrap` function).
+#
 # Two rules govern this script:
 #   1. It must never block a session. Any failure exits 0 with no output.
 #   2. It must be fast. The bootstrap call is capped at LUMBERROOM_HOOK_TIMEOUT seconds.

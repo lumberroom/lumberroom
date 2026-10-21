@@ -35,6 +35,12 @@ OpenWebUI reads no rules file at all. `client/openwebui-filter.py` carries the f
 of the write rule in its `WRITE_RULE` constant and appends them to the system message it injects,
 which is the only route the rule has to a model there.
 
+The filter also sends the person's latest message as `context_bootstrap`'s `query`, so the digest
+it injects adds the facts most related to that message. A reply under 12 characters falls back to
+the previous request, and the `send_query` valve turns it off. Each new request costs one MCP round
+trip and, on the server, one embedding, where the filter used to call at most once per user every
+30 seconds.
+
 ---
 
 ## 2. Install the snippet
@@ -147,12 +153,14 @@ LUMBERROOM_URL=https://memory.example.com LUMBERROOM_TOKEN=<the token> lumberroo
 ## 4. What the snippet asks for
 
 Two paragraphs. **Read** tells the model to call `context_bootstrap` once at the start of a session
-unless the preamble already carries a digest, `memory_search` before asking or assuming, and
-`registry_get` for a host, an endpoint or the place a credential lives. **Write** tells it to call
-`memory_write` after any exchange that settles a decision, preference, constraint or durable fact,
-without asking and without announcing it, one fact per call, phrased to stand alone in six months
-and carrying the numbers, identifiers, paths and dates the fact turns on. Three bullets name the
-namespaces, and a closing line rules out transient chatter, file contents and secrets.
+unless the preamble already carries a digest, and says that its `query` argument, the person's
+request, adds the facts most related to it. It also asks for `memory_search` before asking or
+assuming, and `registry_get` for a host, an endpoint or the place a credential lives. **Write**
+tells it to call `memory_write` after any exchange that settles a decision, preference, constraint
+or durable fact, without asking and without announcing it, one fact per call, phrased to stand alone
+in six months and carrying the numbers, identifiers, paths and dates the fact turns on. Three
+bullets name the namespaces, and a closing line rules out transient chatter, file contents and
+secrets.
 
 None of these clients has a SessionStart hook. Claude Code pulls the digest through
 `client/lumberroom-bootstrap-hook.sh` whether or not the model cooperates; Codex, Hermes and Cursor

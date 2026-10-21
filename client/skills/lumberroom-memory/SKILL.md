@@ -12,7 +12,8 @@ fact you write here reaches their next conversation anywhere.
 
 - Call `context_bootstrap` once at the start of a conversation, before substantive work and before
   asking a question an earlier conversation may have answered. Pass `project` when you know which
-  project the conversation is about.
+  project the conversation is about. Its `query` argument takes the person's request in their own
+  words, and the digest then adds the facts most related to it.
 - When a task depends on a past decision, a preference, a host, a credential location, or "how do we
   usually do this", call `memory_search` before asking the user or assuming. Ask in full sentences.
 - Call `registry_get` for an exact operational value: a host, an endpoint, where a credential lives.

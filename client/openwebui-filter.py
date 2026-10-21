@@ -1,7 +1,7 @@
 """
 title: lumberroom memory
 author: lumberroom
-version: 0.1.0
+version: 0.2.0
 description: >
     Forces recall on every incoming message by calling lumberroom's context_bootstrap tool and
     prepending the digest as a system message, before the model's tool-choice loop ever runs.
@@ -13,8 +13,8 @@ SINGLE-OWNER ONLY. DO NOT ENABLE THIS ON A MULTI-ACCOUNT OPENWEBUI INSTANCE.
 ----------------------------------------------------------------------------
 lumberroom_token is one valve, set once, shared by every OpenWebUI account this function is enabled
 for. OpenWebUI has no per-user credential valve to key it off instead. `_digest_for`'s cache is
-keyed per `__user__["id"]` purely to keep one fast conversation from calling lumberroom on every
-message; that keying is a cache-locality choice, not an access boundary, and it does not change
+keyed per `__user__["id"]` and per request, to keep a repeated message from calling lumberroom
+twice; that keying is a cache-locality choice, not an access boundary, and it does not change
 which token fetches the digest or what the digest contains. The digest itself is
 `context_bootstrap`'s full render for whatever grant `lumberroom_token` carries: every readable
 registry key with its value, project summaries, everything that credential can see. Enabling this
@@ -41,9 +41,17 @@ CONTRACT
 - Fails open on every error path: a bad URL, a wrong token, a timeout, a malformed response, or
   the server being down all fall through to returning `body` unchanged. A lumberroom outage must never
   break the user's chat, and a filter that raises stops the conversation dead.
-- Caches the digest per user for `cache_seconds`, so a fast back-and-forth conversation does not
-  turn into one lumberroom call per message. The cache lives on the Filter instance, which OpenWebUI
-  keeps alive across requests, so this is a plain dict rather than anything external.
+- Sends the person's latest request as context_bootstrap's `query`, so the digest adds the facts
+  most related to it. The request is the last user message, trimmed and cut at QUERY_MAX_CHARS.
+  OpenWebUI runs inlet filters before it wraps attached sources around that message, so the text
+  is the person's own. A reply under MIN_QUERY_CHARS falls back to the newest earlier user message
+  that reaches it. The `send_query` valve turns this off. The request text leaves this process for
+  the lumberroom server, which holds it in its digest cache, 30 seconds by default.
+- Caches the digest per user and request for `cache_seconds`, so a regenerated answer does not
+  call lumberroom again and one request's digest never answers another. Each insert sweeps the
+  expired entries, since every new request is a new key. The cache lives on the Filter instance,
+  which OpenWebUI keeps alive across requests, so this is a plain dict rather than anything
+  external. On a failed fetch the user's newest digest stands in, whatever request it answered.
 - Sends X-Memory-Invocation: hook, the same header lumberroom's own SessionStart hook sends, so this
   counts as forced recall in `lumberroom stats` rather than the model choosing to call a tool: those
   are different numbers and conflating them would make the Phase 2 measurement meaningless.
@@ -66,6 +74,47 @@ WRITE_RULE = (
     "After any exchange that establishes a decision, a preference, a constraint, or a durable "
     "fact, call `memory_write`. Without asking."
 )
+
+# The Claude Code plugin's MIN_PROMPT_CHARS and QUERY_MAX_CHARS (lumberroom-claude-code
+# src/recall.ts). A shorter reply such as "ok, do it" names no topic, and the server embeds whatever
+# it gets and returns its nearest rows anyway.
+MIN_QUERY_CHARS = 12
+QUERY_MAX_CHARS = 1000
+
+
+def message_text(content) -> str:
+    """The text of one chat message. OpenWebUI sends a string, or a list of parts once an image is
+    attached; an image part carries base64 data and no request."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part["text"]
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def request_query(messages, min_chars: int, max_chars: int) -> str | None:
+    """The person's request, for context_bootstrap's query: the last user message, or, when that
+    one is shorter than min_chars, the newest earlier user message that reaches it. None when no
+    user message does.
+
+    OpenWebUI calls inlet filters before it wraps retrieved sources around the last user message
+    (open_webui/utils/middleware.py, process_chat_payload), so the text here is what the person
+    typed. A version that wrapped first would put source text into the query."""
+    texts = [
+        message_text(m.get("content"))
+        for m in messages
+        if isinstance(m, dict) and m.get("role") == "user"
+    ]
+    for text in reversed(texts):
+        text = text.strip()
+        if len(text) >= min_chars:
+            return text[:max_chars].rstrip()
+    return None
+
 
 def fit_digest(digest: str, max_chars: int) -> str:
     """Cut the digest to max_chars at whole lines, marker included. A slice landed mid-bullet and
@@ -136,6 +185,13 @@ class Filter:
             default=4000,
             description="Hard cap on the injected digest, on top of the server's own budget.",
         )
+        send_query: bool = Field(
+            default=True,
+            description=(
+                "Send the person's latest request, up to 1000 characters, as context_bootstrap's "
+                "query, so the digest adds the facts most related to it. Off sends no query."
+            ),
+        )
         enabled: bool = Field(
             default=True,
             description="Off switch that does not require removing the function.",
@@ -143,10 +199,13 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
-        # {cache_key: (fetched_at_monotonic, digest_text)}. One process-lifetime dict; OpenWebUI
-        # keeps one Filter instance alive across requests, which is what makes this a cache
-        # instead of a per-call fetch.
-        self._cache: dict[str, tuple[float, str]] = {}
+        # {(user_id, query or ""): (fetched_at_monotonic, digest_text)}. One process-lifetime
+        # dict; OpenWebUI keeps one Filter instance alive across requests, which is what makes
+        # this a cache instead of a per-call fetch.
+        self._cache: dict[tuple[str, str], tuple[float, str]] = {}
+        # {user_id: digest_text}: the newest digest each user got. Only a failed fetch reads it. A
+        # new request has no entry of its own during an outage, and a stale digest beats none.
+        self._last: dict[str, str] = {}
 
     def _mcp_url(self) -> str:
         base = self.valves.lumberroom_url.rstrip("/")
@@ -156,7 +215,7 @@ class Filter:
         base = self.valves.lumberroom_url.rstrip("/")
         return base[: -len("/mcp")] if base.endswith("/mcp") else base
 
-    async def _fetch_digest(self) -> str | None:
+    async def _fetch_digest(self, query: str | None) -> str | None:
         """One MCP round trip: initialize, then tools/call context_bootstrap. Returns None on
         any failure so the caller can fail open without inspecting exception types."""
         headers = {
@@ -181,7 +240,7 @@ class Filter:
                         "params": {
                             "protocolVersion": "2026-07-28",
                             "capabilities": {},
-                            "clientInfo": {"name": "lumberroom-openwebui-filter", "version": "0.1.0"},
+                            "clientInfo": {"name": "lumberroom-openwebui-filter", "version": "0.2.0"},
                         },
                     },
                 )
@@ -192,7 +251,10 @@ class Filter:
                         "jsonrpc": "2.0",
                         "id": 2,
                         "method": "tools/call",
-                        "params": {"name": "context_bootstrap", "arguments": {}},
+                        "params": {
+                            "name": "context_bootstrap",
+                            "arguments": {"query": query} if query else {},
+                        },
                     },
                 )
         except httpx.HTTPError:
@@ -214,30 +276,37 @@ class Filter:
         text = "\n".join(p for p in parts if p).strip()
         return text or None
 
-    async def _digest_for(self, cache_key: str) -> str | None:
+    async def _digest_for(self, user: str, query: str | None) -> str | None:
         now = time.monotonic()
-        cached = self._cache.get(cache_key)
+        key = (user, query or "")
+        cached = self._cache.get(key)
         if cached and now - cached[0] < self.valves.cache_seconds:
             return cached[1]
 
-        digest = await self._fetch_digest()
+        digest = await self._fetch_digest(query)
         if digest is None:
             # Do not cache a failure: the next message gets a fresh chance rather than being
             # locked out of recall for the whole cache window because one request hiccuped.
-            return cached[1] if cached else None
+            return cached[1] if cached else self._last.get(user)
 
         digest = fit_digest(digest, self.valves.max_chars)
 
-        self._cache[cache_key] = (now, digest)
+        # Every new request is a new key, so the map would grow by one entry per message.
+        self._cache = {k: v for k, v in self._cache.items() if now - v[0] < self.valves.cache_seconds}
+        self._cache[key] = (now, digest)
+        self._last[user] = digest
         return digest
 
     async def inlet(self, body: dict, __user__: dict | None = None) -> dict:
         if not self.valves.enabled or not self.valves.lumberroom_url or not self.valves.lumberroom_token:
             return body
 
-        cache_key = (__user__ or {}).get("id", "anonymous")
+        user = (__user__ or {}).get("id", "anonymous")
         try:
-            digest = await self._digest_for(cache_key)
+            query = None
+            if self.valves.send_query:
+                query = request_query(body.get("messages") or [], MIN_QUERY_CHARS, QUERY_MAX_CHARS)
+            digest = await self._digest_for(user, query)
         except Exception:
             # Belt and suspenders on top of the narrower except blocks above: nothing in this
             # filter is allowed to propagate and break the chat.

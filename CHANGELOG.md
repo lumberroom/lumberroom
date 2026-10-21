@@ -77,6 +77,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   each insert sweeps expired entries. `bootstrap::run_with_query` sits beside an unchanged
   `bootstrap::run`. A shortened bullet keeps at least its first word, so a body that opens with a
   URL longer than the room stays out. Decision 0034, which supersedes 0025.
+- **The OpenWebUI filter sends the person's request as the digest's query.**
+  `client/openwebui-filter.py` passes the last user message, trimmed and cut at 1,000 characters,
+  as `context_bootstrap`'s `query`. A reply under 12 characters falls back to the newest earlier
+  user message that reaches 12. The new `send_query` valve, on by default, turns it off. The
+  filter's cache keys on the user and the request, sweeps expired entries on each insert, and
+  serves the user's newest digest when a fetch fails. The rules snippets, the connector
+  instructions, the Hermes notes and the `lumberroom-memory` skill describe the argument, and the
+  SessionStart hook's header says why it sends none. The connector instructions now sit under the
+  1,100-character ceiling `docs/connect-claude-ai.md` states.
 - **The integration tests build as one binary, and CI runs them with cargo-nextest.** The 29 files
   under `tests/` are modules of `tests/it/main.rs`, so `--test integration <name>` is now
   `--test it integration::<name>`. `./scripts/cargo.sh nextest` runs the suite with each test in its
