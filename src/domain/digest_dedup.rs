@@ -1,9 +1,10 @@
 //! Near-duplicate collapse for the bootstrap digest.
 //!
-//! The digest ranks by recency and nothing else (decision 0025). Embeddings get one job: a row that
-//! restates a newer row spends a slot on nothing new, so it is dropped and the next candidate takes
-//! the slot. Restatements include corrections, "port 5432" beside "port 5433", which is why the
-//! newer row always wins, whichever section either one would have printed in.
+//! A row that restates a newer row spends a slot on nothing new, so it is dropped and the next
+//! candidate takes the slot (decision 0025). Restatements include corrections, "port 5432" beside
+//! "port 5433", which is why the newer row always wins, whichever section either one would have
+//! printed in. The pass runs over every row the digest can print: the profile, project, recent and
+//! related pools (decision 0034).
 //!
 //! No I/O and no vectors. The adapter compares the stored vectors and hands over the pairs at or
 //! above the threshold; this module decides which member of each pair survives and fills the
@@ -18,6 +19,8 @@ use chrono::{DateTime, Utc};
 pub struct Selection {
     dropped: HashSet<String>,
     chosen: HashSet<String>,
+    /// Each survivor that dropped an older twin, with the twins it dropped.
+    displaced: HashMap<String, Vec<String>>,
 }
 
 impl Selection {
@@ -44,16 +47,48 @@ impl Selection {
 
         let mut kept: HashSet<&str> = HashSet::new();
         let mut dropped = HashSet::new();
+        let mut displaced: HashMap<String, Vec<String>> = HashMap::new();
         for (id, _) in ordered {
-            let restates_a_survivor =
-                twins.get(id).is_some_and(|t| t.iter().any(|other| kept.contains(other)));
-            if restates_a_survivor {
-                dropped.insert(id.to_string());
-            } else {
+            let survivors: Vec<&str> = twins
+                .get(id)
+                .map(|t| t.iter().copied().filter(|other| kept.contains(other)).collect())
+                .unwrap_or_default();
+            if survivors.is_empty() {
                 kept.insert(id);
+            } else {
+                for s in survivors {
+                    displaced.entry(s.to_string()).or_default().push(id.to_string());
+                }
+                dropped.insert(id.to_string());
             }
         }
-        Self { dropped, chosen: HashSet::new() }
+        Self { dropped, chosen: HashSet::new(), displaced }
+    }
+
+    /// The dropped rows that one section would have printed with no near-duplicate pass: those
+    /// among the first `limit` rows of `pool` that no earlier section chose. Call it before that
+    /// section's `pick`, which marks rows chosen.
+    pub fn lost_from(&self, pool: &[&str], limit: usize) -> Vec<String> {
+        pool.iter()
+            .filter(|id| !self.chosen.contains(**id))
+            .take(limit)
+            .filter(|id| self.dropped.contains(**id))
+            .map(|id| (*id).to_string())
+            .collect()
+    }
+
+    /// True when `id` survived and dropped a twin named in `lost`. Such a row restates a fact the
+    /// digest would have printed, so the related section that picks it first keeps the fact on
+    /// the page. A twin that would never have printed, such as a related-only row or one past its
+    /// section's limit, promotes nothing.
+    pub fn displaced_one_of(&self, id: &str, lost: &HashSet<String>) -> bool {
+        self.displaced.get(id).is_some_and(|twins| twins.iter().any(|t| lost.contains(t)))
+    }
+
+    /// The twins `id` dropped, empty for a dropped row and for one that dropped nothing. The
+    /// profile reads it so a survivor carries the standing-rule mark of a tagged twin it replaced.
+    pub fn displaced_by(&self, id: &str) -> &[String] {
+        self.displaced.get(id).map_or(&[], Vec::as_slice)
     }
 
     /// Rows dropped as the older half of a near-duplicate pair.
@@ -154,6 +189,59 @@ mod tests {
         let rows = [("a1", at(1)), ("a2", at(2)), ("a3", at(3)), ("b", at(4))];
         let mut s = Selection::new(rows, &[pair("a1", "a2"), pair("a1", "a3"), pair("a2", "a3")]);
         assert_eq!(s.pick(&["a1", "a2", "a3", "b"], 2), vec![0, 3]);
+    }
+
+    fn set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_survivor_counts_only_for_a_twin_a_section_would_have_printed() {
+        let rows = [("new", at(1)), ("old", at(2)), ("lone", at(3))];
+        let s = Selection::new(rows, &[pair("old", "new")]);
+        assert!(s.displaced_one_of("new", &set(&["old"])));
+        assert!(!s.displaced_one_of("new", &set(&[])), "a related-only twin promotes nothing");
+        assert!(
+            !s.displaced_one_of("old", &set(&["old"]))
+                && !s.displaced_one_of("lone", &set(&["old"]))
+        );
+    }
+
+    #[test]
+    fn a_dropped_row_marks_nothing() {
+        // c restates b alone, b restates a: b drops, and a and c both stay. Only a dropped b.
+        let rows = [("a", at(1)), ("b", at(2)), ("c", at(3))];
+        let s = Selection::new(rows, &[pair("a", "b"), pair("b", "c")]);
+        assert!(s.displaced_one_of("a", &set(&["b"])));
+        assert!(!s.displaced_one_of("c", &set(&["b"])));
+    }
+
+    #[test]
+    fn a_survivor_names_the_twins_it_dropped_and_no_other_row_names_any() {
+        // b restates a and drops; c restates b alone and stays.
+        let rows = [("a", at(1)), ("b", at(2)), ("c", at(3))];
+        let s = Selection::new(rows, &[pair("a", "b"), pair("b", "c")]);
+        assert_eq!(s.displaced_by("a"), ["b".to_string()]);
+        assert!(s.displaced_by("b").is_empty(), "a dropped row");
+        assert!(s.displaced_by("c").is_empty(), "a survivor that dropped nothing");
+        assert!(s.displaced_by("ghost").is_empty());
+    }
+
+    #[test]
+    fn a_section_loses_only_the_dropped_rows_inside_its_limit() {
+        // c restates a and drops. Project's pool is b, c, d.
+        let rows = [("a", at(1)), ("b", at(2)), ("c", at(3)), ("d", at(4))];
+        let s = Selection::new(rows, &[pair("a", "c")]);
+        assert_eq!(s.lost_from(&["b", "c", "d"], 2), vec!["c".to_string()]);
+        assert!(s.lost_from(&["b", "c", "d"], 1).is_empty(), "c sat past the limit");
+    }
+
+    #[test]
+    fn a_row_an_earlier_section_chose_holds_no_slot_in_the_window() {
+        let rows = [("a", at(1)), ("b", at(2)), ("c", at(3))];
+        let mut s = Selection::new(rows, &[pair("a", "c")]);
+        assert_eq!(s.pick(&["b"], 1), vec![0]);
+        assert_eq!(s.lost_from(&["b", "c"], 1), vec!["c".to_string()]);
     }
 
     #[test]

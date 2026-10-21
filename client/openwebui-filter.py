@@ -76,11 +76,29 @@ def fit_digest(digest: str, max_chars: int) -> str:
         return digest
     lines = digest.split("\n")
     footer = [lines.pop()] if lines and lines[-1].startswith("_(") else []
+
+    def dangling(kept: list[str]) -> bool:
+        # True when the last kept line must not end a cut: a blank line, a ### heading, or a line
+        # of text right under a heading whose bullets the cut dropped. The server puts one such
+        # line under the profile heading, and a cut that kept it with no bullet below left the
+        # model a heading and a note about nothing. kept is always a prefix of lines, so the line
+        # after it says whether bullets followed. The Sealed and Not shown blocks carry one line of
+        # text and no bullets, and they stay.
+        last = kept[-1]
+        if not last.strip() or last.startswith("###"):
+            return True
+        if last.startswith("- "):
+            return False
+        above = next((line for line in reversed(kept[:-1]) if line.strip()), "")
+        below = lines[len(kept)] if len(kept) < len(lines) else ""
+        return above.startswith("###") and below.startswith("- ")
+
     for tail in (footer, []):
         kept = list(lines)
         while kept:
-            # A cut must not end on a blank line or on a ### heading whose bullets all went.
-            while kept and (not kept[-1].strip() or kept[-1].startswith("###")):
+            # A cut must not end on a blank line, a ### heading, or the note under a heading whose
+            # bullets all went.
+            while kept and dangling(kept):
                 kept.pop()
             if not kept:
                 break

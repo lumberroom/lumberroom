@@ -15,6 +15,7 @@ use lumberroom_server::adapters::postgres;
 use lumberroom_server::config::{self, Config};
 use lumberroom_server::crypto::kek::{EnvKeyProvider, KeyProvider};
 use lumberroom_server::domain::policy::NamespaceGrant;
+use lumberroom_server::domain::similarity;
 use lumberroom_server::domain::types::{Invocation, Principal};
 use lumberroom_server::http::INVOCATION_HEADER;
 use lumberroom_server::mcp::AppState;
@@ -416,6 +417,33 @@ async fn a_digest_that_overflows_carries_its_left_out_rows_whole() {
         let created_at = row["created_at"].as_str().unwrap_or_default();
         assert!(created_at.contains('.'), "{id} created_at {created_at:?} lost its fraction");
     }
+}
+
+/// The tool takes the person's request as `query` and answers with the rows related to it, in the
+/// text and in the structured copy (decision 0034).
+///
+/// Fails if `BootstrapArgs` drops `query` or the handler stops passing it to the service.
+#[tokio::test]
+async fn context_bootstrap_takes_a_query_and_answers_with_related_rows() {
+    // The hash embedder's floor is a guess, which leaves the related section out.
+    let h = harness_or_skip!(|cfg: &mut Config| cfg.embed.thresholds =
+        similarity::parse_overrides("route_max_top=0.65").unwrap());
+    let asked = format!("how do we rotate the backup keys {}", nonce("related"));
+    let written =
+        h.call("memory_write", json!({ "content": asked, "namespace": "project:beta" })).await;
+    let id = structured(&written)["id"].as_str().unwrap().to_string();
+
+    bootstrap::clear_cache();
+    let answer = h.call("context_bootstrap", json!({ "query": asked, "rows": true })).await;
+    let rows = structured(&answer);
+    let related: Vec<&str> = rows["related"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no related section: {answer}"))
+        .iter()
+        .filter_map(|f| f["id"].as_str())
+        .collect();
+    assert_eq!(related, vec![id.as_str()]);
+    assert!(text(&answer).contains("### Related to this request"), "{answer}");
 }
 
 /// A plugin built against another release sends arguments this server does not declare, such as

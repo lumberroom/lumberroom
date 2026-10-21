@@ -58,7 +58,9 @@ where
     })
 }
 
-/// The log record for one digest: its three memory sections, in the order the payload carries them.
+/// The log record for one digest: its four memory sections. A call with a `related` row carried a
+/// query (decision 0034). The converse does not hold: a queried call whose rows all missed the
+/// floor logs no `related` row and looks like a call without a query.
 pub(crate) fn digest_call(ctx: &Ctx, d: &super::bootstrap::Digest) -> Option<RecallCall> {
     if !ctx.cfg.recall_events.enabled {
         return None;
@@ -73,6 +75,7 @@ pub(crate) fn digest_call(ctx: &Ctx, d: &super::bootstrap::Digest) -> Option<Rec
             (Some("profile"), rows(&d.profile)),
             (Some("project"), rows(&d.project_context)),
             (Some("recent"), rows(&d.recent)),
+            (Some("related"), rows(&d.related)),
         ],
     )
 }

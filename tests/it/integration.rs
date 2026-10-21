@@ -11,6 +11,7 @@ use lumberroom_server::adapters::postgres;
 use lumberroom_server::config::{self, Config};
 use lumberroom_server::crypto::kek::{EnvKeyProvider, KeyProvider};
 use lumberroom_server::domain::policy::{NamespaceGrant, SensitivityDefaults};
+use lumberroom_server::domain::similarity;
 use lumberroom_server::domain::types::{Invocation, Principal, Sensitivity, ToolCall};
 use lumberroom_server::ports::registry::RegistryUpsert;
 use lumberroom_server::ports::RegistryWrite;
@@ -1241,11 +1242,14 @@ async fn two_clients_with_different_ceilings_do_not_share_a_cached_digest() {
 async fn a_private_row_reaches_every_digest_section_it_belongs_to_and_no_further() {
     let (ctx, _pool, _serial) = ctx_or_skip!();
     let secret = nonce("bothsections");
+    // Recent prints user rows only when they carry a rule tag (decision 0034), so every user row
+    // in this test carries one.
+    let rule = || Some(vec!["rule".to_string()]);
     write::run(
         &ctx,
         &format!("the private note says {secret}"),
         "user:me",
-        None,
+        rule(),
         None,
         Some("private"),
         None,
@@ -1308,7 +1312,7 @@ async fn a_private_row_reaches_every_digest_section_it_belongs_to_and_no_further
     ];
     assert!(fillers.len() as i64 >= ctx.cfg.bootstrap.profile_limit);
     for line in fillers {
-        write::run(&ctx, line, "user:me", None, None, None, None).await.unwrap();
+        write::run(&ctx, line, "user:me", rule(), None, None, None).await.unwrap();
     }
     bootstrap::clear_cache();
     let d = bootstrap::run(&high, None).await.unwrap();
@@ -1441,11 +1445,16 @@ async fn the_tripwire_refuses_a_credential_at_open_and_never_echoes_it() {
 ///
 /// The second half is the trap the fix could have walked into: a shape that validates but is
 /// invisible to the digest is worse than a shape that does not validate, because the write reports
-/// success and the fact is never seen again.
+/// success and the fact is never seen again. Since decision 0034 recent keeps to the active
+/// project, `user:me` and `global`, so the namespace stays visible through the inventory line and
+/// the row through a matching query. The shape is never invisible.
 #[tokio::test]
 async fn a_personal_namespace_is_writable_lands_private_and_reaches_the_digest() {
-    let (ctx, _pool, _serial) =
-        ctx_or_skip!(|cfg: &mut Config| cfg.policy.defaults = SensitivityDefaults::seeded());
+    let (ctx, _pool, _serial) = ctx_or_skip!(|cfg: &mut Config| {
+        cfg.policy.defaults = SensitivityDefaults::seeded();
+        // The hash embedder's floor is a guess, which leaves the related section out.
+        cfg.embed.thresholds = similarity::parse_overrides("route_max_top=0.65").unwrap();
+    });
     let secret = nonce("personalfinance");
 
     // No explicit level: the namespace default is what classifies it. That is the product claim,
@@ -1467,14 +1476,20 @@ async fn a_personal_namespace_is_writable_lands_private_and_reaches_the_digest()
     bootstrap::clear_cache();
     let d = bootstrap::run(&ctx, None).await.unwrap();
     assert!(
-        d.recent.iter().any(|f| f.content.contains(&secret)),
-        "a private personal fact the owner may read has to reach the digest: {}",
-        digest_json(&d)
-    );
-    assert!(
         d.inventory.contains_key("personal:finance"),
         "the namespace has to appear in the inventory the model is shown: {:?}",
         d.inventory
+    );
+    assert!(d.text.contains("personal:finance"), "the inventory line names it: {}", d.text);
+    assert!(!digest_json(&d).contains(&secret), "without a query the row is in no section");
+
+    bootstrap::clear_cache();
+    let asked = format!("the retainer is {secret}");
+    let d = bootstrap::run_with_query(&ctx, None, Some(&asked)).await.unwrap();
+    assert!(
+        d.related.iter().any(|f| f.content.contains(&secret)),
+        "a private personal fact the owner may read has to reach the digest through a query: {}",
+        digest_json(&d)
     );
 
     // And the ceiling still holds on it, the same as any other private row.
@@ -1642,7 +1657,9 @@ async fn a_namespace_the_ceiling_refuses_is_absent_from_the_inventory_and_from_t
 /// above and break the digest, so the count has to survive for a ceiling that reaches the row.
 #[tokio::test]
 async fn a_ceiling_that_reaches_the_row_is_still_told_the_count() {
-    let (ctx, _pool, _serial) = ctx_or_skip!();
+    // The hash embedder's floor is a guess, which leaves the related section out.
+    let (ctx, _pool, _serial) = ctx_or_skip!(|cfg: &mut Config| cfg.embed.thresholds =
+        similarity::parse_overrides("route_max_top=0.65").unwrap());
     let secret = nonce("inventoryreaches");
     write::run(
         &ctx,
@@ -1667,8 +1684,15 @@ async fn a_ceiling_that_reaches_the_row_is_still_told_the_count() {
         d.inventory
     );
     assert_eq!(d.counts.by_namespace.get("personal:finance"), Some(&1));
-    assert!(d.recent.iter().any(|f| f.content.contains(&secret)), "and the row itself comes back");
     assert!(d.text.contains("personal:finance"), "named in the text as well: {}", d.text);
+
+    bootstrap::clear_cache();
+    let asked = format!("the retainer is {secret}");
+    let d = bootstrap::run_with_query(&at_private, None, Some(&asked)).await.unwrap();
+    assert!(
+        d.related.iter().any(|f| f.content.contains(&secret)),
+        "and a matching query brings the row itself back"
+    );
 }
 
 /// The same shape in the recall monitor, found by reading every caller of `namespace_counts`.

@@ -1,24 +1,30 @@
-//! context_bootstrap(project?) -> digest     [PRD §5]
+//! context_bootstrap(project?, query?) -> digest     [PRD §5]
 //!
 //! The "check memory first" primitive. One cacheable answer, under ~200ms. A slow bootstrap
-//! trains models to skip it, so there is no embedding call here and the SQL is index-served.
+//! trains models to skip it, so the SQL is index-served and the path makes one embedding call at
+//! most: only on a cache miss, and only when the caller sent a query.
 //!
-//! Scope note: profile facts come from the user namespace and global, project context from the
-//! active project, and recent writes from every namespace this client may read. That last part
-//! matters. A model files a fact under the project it is discussing, which is not always the
-//! directory it is sitting in, so a digest limited to the active project would silently hide it.
-//! Namespaces holding readable rows that no section printed get an inventory line instead.
+//! Scope (decision 0034). The active project prints first and takes the dominant share of the
+//! budget. Profile reads the user namespace and global. The newest rule-tagged rows in the user
+//! namespace lead it, and the rest rank by similarity to the query, or with none to the active
+//! project's newest rows, and by recency with neither. Related holds the rows nearest the
+//! query across every namespace this client may read, at or above the model's floor. Recent keeps
+//! to the active project and the tagged rows in the user namespace and global, so personal facts
+//! and a burst of writes elsewhere cannot fill it. A model files a fact under
+//! the project it is discussing, which is not always the directory it is sitting in; such a row
+//! reaches the digest through a matching query or as a count on the inventory line, which names
+//! every namespace holding readable rows that no section printed.
 //!
 //! Every subquery takes the namespace *and* the ceiling. Phase 1 shipped a bug where the profile
 //! and project subqueries skipped the namespace filter, and the leak path in a memory system is the
 //! convenience surface rather than the obvious one, so the digest is where the grant has to be
 //! checked hardest.
 //!
-//! Ranking is recency (decision 0025). Each memory section reads a pool of candidates three times
-//! its limit, newest first. Across all three pools, the older row of every pair at or above
-//! `BOOTSTRAP_DEDUP_COSINE` is dropped, and each section then fills from what is left: profile,
-//! project, recent, with recent skipping every row the first two chose. The database compares the
-//! stored vectors and returns pairs of ids, so there is still no embedding call on this path.
+//! Each memory section reads a pool of candidates larger than its limit. Across every pool the
+//! digest can print from, the older row of every pair at or above `BOOTSTRAP_DEDUP_COSINE` is
+//! dropped (decision 0025), and the sections then fill from what is left: project, profile, recent,
+//! related, each skipping every row an earlier one chose. The database compares the stored vectors
+//! and returns pairs of ids.
 //!
 //! Ceilings on the rendered text differ by surface, and `render_report` names every row the text
 //! left out or shortened. The brief structured payload carries each of those rows with its exact
@@ -26,13 +32,14 @@
 //! from (decision 0031). `rows: true` adds the full sections and every id.
 
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use super::Ctx;
 use crate::adapters::auth::filter_readable;
 use crate::domain::digest_dedup::Selection;
+use crate::domain::digest_rank;
 use crate::domain::errors::Result;
 use crate::domain::policy::NamespaceCeiling;
 use crate::domain::types::{Memory, Sensitivity};
@@ -42,6 +49,14 @@ use crate::ports::{DigestQuery, RegistrySummary};
 /// The name this tool records its emissions under, and the same string `recall_emission.tool`
 /// holds. Kept beside the code that writes it so the two cannot drift.
 pub const BOOTSTRAP_TOOL: &str = "context_bootstrap";
+
+/// The profile heading's second line (decision 0034). It says what the store holds and which tool
+/// reaches it, and gives no order: the MCP directory review rejects tool text that tells a model
+/// how to behave, and `tests/it/mcp_tool_annotations.rs` checks this line beside the tool
+/// descriptions. It rides the heading, so it prints whenever a profile entry prints, costs what
+/// the heading costs, and never becomes a row.
+pub const PROFILE_NOTE: &str = "lumberroom stores more standing preferences than this list, and \
+memory_search finds the one that covers a convention.";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Fact {
@@ -72,6 +87,13 @@ pub struct Digest {
     pub sealed_inventory: HashMap<String, i64>,
     pub profile: Vec<Fact>,
     pub project_context: Vec<Fact>,
+    /// Rows related to the caller's query, from any readable namespace. Empty without one.
+    pub related: Vec<Fact>,
+    /// Why a query produced no related section: `embed_failed` or `no_measured_floor`. `None`
+    /// when no query came, when the section ran, or when `BOOTSTRAP_RELATED_LIMIT` is 0 and a
+    /// query came.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_unavailable: Option<String>,
     pub recent: Vec<Fact>,
     pub registry: Vec<RegistrySummary>,
     pub counts: Counts,
@@ -91,7 +113,8 @@ pub struct Digest {
 /// What one render printed, and which rows it did not print whole.
 pub struct Rendered {
     pub text: String,
-    /// Memory ids from profile, project_context and recent that the layout left out or shortened.
+    /// Memory ids from project_context, related, profile and recent that the layout left out or
+    /// shortened.
     pub left_out: Vec<String>,
     /// `(namespace, kind, key)` of registry entries the layout left out.
     pub left_out_registry: Vec<(String, String, String)>,
@@ -102,18 +125,29 @@ pub struct Rendered {
 pub fn render_report(d: &Digest, max_chars: usize) -> Rendered {
     let header = header(d);
     let mut seen = std::collections::HashSet::new();
-    let mut sections = vec![memory_section(
+    // Without an active project the section stays empty and its share flows on to related.
+    let project: &[Fact] = if d.project.is_some() { &d.project_context } else { &[] };
+    let title = format!("Project {}", d.project.as_deref().unwrap_or_default());
+    let mut sections = vec![memory_section("project", &title, project, SHARES[0], &mut seen)];
+    sections.push(memory_section(
+        "related",
+        "Related to this request",
+        &d.related,
+        SHARES[1],
+        &mut seen,
+    ));
+    let mut profile = memory_section(
         "profile",
         "About the user and standing preferences",
         &d.profile,
-        SHARES[0],
+        SHARES[2],
         &mut seen,
-    )];
-    // Without an active project the section stays empty and its share flows on to recent.
-    let project: &[Fact] = if d.project.is_some() { &d.project_context } else { &[] };
-    let title = format!("Project {}", d.project.as_deref().unwrap_or_default());
-    sections.push(memory_section("project", &title, project, SHARES[1], &mut seen));
-    sections.push(memory_section("recent", "Recently learned", &d.recent, SHARES[2], &mut seen));
+    );
+    profile.heading.push('\n');
+    profile.heading.push_str(PROFILE_NOTE);
+    profile.floor = true;
+    sections.push(profile);
+    sections.push(memory_section("recent", "Recently learned", &d.recent, SHARES[3], &mut seen));
     sections.push(registry_section(d));
 
     let every: Picks = sections.iter().map(|s| vec![Pick::Whole; s.entries.len()]).collect();
@@ -170,9 +204,10 @@ fn report(d: &Digest, sections: &[Section], picks: &[Vec<Pick>], text: String) -
     }
     let mut named = std::collections::HashSet::new();
     let left_out = d
-        .profile
+        .project_context
         .iter()
-        .chain(&d.project_context)
+        .chain(&d.related)
+        .chain(&d.profile)
         .chain(&d.recent)
         .filter(|f| !whole.contains(f.id.as_str()) && named.insert(f.id.as_str()))
         .map(|f| f.id.clone())
@@ -204,6 +239,17 @@ pub fn clear_cache() {
 }
 
 pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
+    run_with_query(ctx, project, None).await
+}
+
+/// The digest, with `query` as the caller's request when it sent one. A query adds the related
+/// section and orders each profile group by relevance to it (decision 0034).
+pub async fn run_with_query(
+    ctx: &Ctx,
+    project: Option<&str>,
+    query: Option<&str>,
+) -> Result<Digest> {
+    let query = query.map(str::trim).filter(|q| !q.is_empty());
     let project_ns = match project {
         Some(p) if !p.trim().is_empty() => Some(namespaces::project_namespace(p)?),
         _ => None,
@@ -226,7 +272,7 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
     let u = ctx.embedders.for_unit(ctx.tenant())?;
     let model = u.embedder.id();
     let cache_key =
-        cache_key(&ctx.principal.client, project_ns.as_deref(), &readable, budget, &model);
+        cache_key(&ctx.principal.client, project_ns.as_deref(), &readable, budget, &model, query);
     if let Ok(c) = cache().lock() {
         if let Some(entry) = c.get(&cache_key) {
             if entry.at.elapsed().as_millis() < ctx.cfg.bootstrap.cache_ms as u128 {
@@ -249,6 +295,53 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
     }
 
     let b = &ctx.cfg.bootstrap;
+    let floor = &u.thresholds.values[similarity::ROUTE_MAX_TOP];
+    let trusted = digest_rank::floor_is_trusted(floor.source);
+    let mut related_unavailable = None;
+    // Only on a miss: the key already carries the query. A failed embed leaves the related section
+    // out and the profile on the project's centroid, or on recency without a project, and the
+    // digest still serves. Decision 0034 narrows 0028 for this one optional section; nothing
+    // embeds with a second model.
+    let query_embedding = match query {
+        Some(q) => match u.embedder.embed_query(q).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e.log_message(),
+                    "the digest query did not embed; serving the digest without the related section"
+                );
+                related_unavailable = Some("embed_failed".to_string());
+                None
+            }
+        },
+        None => None,
+    };
+    let ranked = query_embedding.is_some();
+    if ranked && !trusted && b.related_limit > 0 {
+        warn_untrusted_floor_once(&model);
+        related_unavailable = Some("no_measured_floor".to_string());
+    }
+    // An operator who set the limit to 0 turned the section off, so no reason applies. The embed
+    // still ran for the profile order.
+    if b.related_limit <= 0 {
+        related_unavailable = None;
+    }
+    let others = b.profile_limit.max(0) + b.project_limit.max(0) + b.recent_limit.max(0);
+    // At most profile_limit preferences lead, so a larger setting cannot push past the section.
+    let preference_limit = b.preference_limit.clamp(0, b.profile_limit.max(0));
+    // The nearest arm orders before its LIMIT (decision 0034), so no arm needs widening.
+    let profile_arm = pool(b.profile_limit, 0);
+    let preference_pool = pool(preference_limit, 0);
+    // Recent's pool overlaps profile and project, and under a query it drops every profile-pool
+    // row, so its reserve covers all three profile arms and the project.
+    let recent_pool_size = pool(
+        b.recent_limit,
+        preference_pool + profile_arm.saturating_mul(2) + b.project_limit.max(0),
+    );
+    // 0 turns the section off, so the scan never runs.
+    let related_pool_size =
+        if ranked && trusted && b.related_limit > 0 { pool(b.related_limit, others) } else { 0 };
+
     // The digest compares stored vectors, so the cosine belongs to the model that wrote them.
     let mut data = ctx
         .repos
@@ -258,31 +351,37 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
             user_namespace: namespaces::user_namespace(),
             project_namespace: project_ns.clone(),
             readable: readable.clone(),
-            profile_limit: pool(b.profile_limit, 0),
+            profile_limit: profile_arm,
             project_limit: pool(b.project_limit, 0),
-            // Recent spans every namespace, so its newest rows are often the ones profile and
-            // project already took. The pool carries room for all of those on top of its own.
-            recent_limit: pool(b.recent_limit, b.profile_limit.max(0) + b.project_limit.max(0)),
+            recent_limit: recent_pool_size,
             registry_limit: b.registry_limit,
             recent_days: b.recent_days,
             dedup_cosine: u.thresholds.get(similarity::BOOTSTRAP_DEDUP),
+            query_embedding,
+            related_floor: floor.value,
+            related_limit: related_pool_size,
+            rule_tags: b.rule_tags.clone(),
+            preference_limit: preference_pool,
             slot: u.slot,
         })
         .await?;
 
-    // Private rows the caller may read come back without their plaintext. One pass over all three
-    // sections, so the digest costs one ciphertext round trip rather than three.
+    // Private rows the caller may read come back without their plaintext. One pass over every
+    // section, so the digest costs one ciphertext round trip rather than four.
     let unopened = super::decrypt(
         ctx,
         data.profile
             .iter_mut()
             .chain(data.project_context.iter_mut())
             .chain(data.recent.iter_mut())
+            .chain(data.related.iter_mut())
             .collect(),
     )
     .await;
     if !unopened.is_empty() {
-        for section in [&mut data.profile, &mut data.project_context, &mut data.recent] {
+        for section in
+            [&mut data.profile, &mut data.project_context, &mut data.recent, &mut data.related]
+        {
             section.retain(|m| !unopened.contains(&m.id));
         }
     }
@@ -294,15 +393,81 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
             .iter()
             .chain(data.project_context.iter())
             .chain(data.recent.iter())
+            .chain(data.related.iter())
             .map(|m| (m.id.as_str(), m.created_at)),
         &data.near_duplicates,
     );
-    data.profile = choose(&mut selection, std::mem::take(&mut data.profile), b.profile_limit);
-    data.project_context =
-        choose(&mut selection, std::mem::take(&mut data.project_context), b.project_limit);
-    data.recent = choose(&mut selection, std::mem::take(&mut data.recent), b.recent_limit);
+    let related_candidates = data.related.len();
+    let profile_pool: HashSet<String> = data.profile.iter().map(|m| m.id.clone()).collect();
+    // A preference is a rule-tagged row in the user's own namespace (decision 0034). A survivor
+    // takes the mark of a preference twin it dropped. Without that, a newer untagged restatement
+    // dropped the rule and then ranked with the untagged rows, past the limit. The twin can sit
+    // in any pool, so the set reads all four.
+    let user_ns = namespaces::user_namespace();
+    let preferences: HashSet<&str> = data
+        .profile
+        .iter()
+        .chain(data.project_context.iter())
+        .chain(data.recent.iter())
+        .chain(data.related.iter())
+        .filter(|m| m.namespace == user_ns && digest_rank::is_standing(&m.tags, &b.rule_tags))
+        .map(|m| m.id.as_str())
+        .collect();
+    let rows: Vec<digest_rank::ProfileRow> = data
+        .profile
+        .iter()
+        .map(|m| digest_rank::ProfileRow {
+            id: m.id.as_str(),
+            created_at: m.created_at,
+            preference: preferences.contains(m.id.as_str())
+                || selection.displaced_by(&m.id).iter().any(|t| preferences.contains(t.as_str())),
+        })
+        .collect();
+    let lead = usize::try_from(preference_limit).unwrap_or(0);
+    let order = digest_rank::profile_order(&rows, &data.profile_similarity, lead);
+    let mut slots: Vec<Option<Memory>> =
+        std::mem::take(&mut data.profile).into_iter().map(Some).collect();
+    data.profile = order.into_iter().filter_map(|i| slots[i].take()).collect();
+    // The dropped twins each section would have printed. Only a related row that replaced one of
+    // these jumps the related order.
+    let mut lost = HashSet::new();
+    data.project_context = choose(
+        &mut selection,
+        std::mem::take(&mut data.project_context),
+        b.project_limit,
+        &mut lost,
+    );
+    data.profile =
+        choose(&mut selection, std::mem::take(&mut data.profile), b.profile_limit, &mut lost);
+    // With a query, a profile-pool row the query rank left out does not come back through recent.
+    if ranked {
+        data.recent.retain(|m| !profile_pool.contains(&m.id));
+    }
+    data.recent =
+        choose(&mut selection, std::mem::take(&mut data.recent), b.recent_limit, &mut lost);
+    // A related row that dropped a twin another section would have printed restates a fact the
+    // page would have carried, so it goes first and the fact stays. Related picks last, so a
+    // chosen row never repeats here. The sort is stable, so nearest first holds inside each group.
+    data.related.sort_by_key(|m| !selection.displaced_one_of(&m.id, &lost));
+    data.related = choose(
+        &mut selection,
+        std::mem::take(&mut data.related),
+        b.related_limit,
+        &mut HashSet::new(),
+    );
     if selection.dropped() > 0 {
         tracing::debug!(dropped = selection.dropped(), "digest collapsed near-duplicate rows");
+    }
+    // The reversal data for decision 0034: how often a query finds rows past the floor, and how
+    // many of them print.
+    if ranked {
+        tracing::info!(
+            related_candidates,
+            related_printed = data.related.len(),
+            floor = floor.value,
+            floor_source = ?floor.source,
+            "digest built for a query"
+        );
     }
 
     // The digest's own count, which carries the namespace and the ceiling into the query. Built
@@ -323,6 +488,7 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
         .iter()
         .chain(data.project_context.iter())
         .chain(data.recent.iter())
+        .chain(data.related.iter())
         .map(|m| m.source_client.clone())
         .collect();
     let names = super::sources::labels(ctx, &writers).await;
@@ -336,6 +502,8 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
         sealed_inventory,
         profile: data.profile.iter().map(|m| to_fact(m, &names)).collect(),
         project_context: data.project_context.iter().map(|m| to_fact(m, &names)).collect(),
+        related: data.related.iter().map(|m| to_fact(m, &names)).collect(),
+        related_unavailable,
         recent: data.recent.iter().map(|m| to_fact(m, &names)).collect(),
         registry: data.registry,
         counts: Counts {
@@ -361,9 +529,10 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
     let emissions = super::search::emissions_for(
         ctx,
         digest
-            .profile
+            .project_context
             .iter()
-            .chain(digest.project_context.iter())
+            .chain(digest.related.iter())
+            .chain(digest.profile.iter())
             .chain(digest.recent.iter())
             .map(|f| (f.id.as_str(), f.content.as_str(), f.sensitivity)),
     )
@@ -377,9 +546,32 @@ pub async fn run(ctx: &Ctx, project: Option<&str>) -> Result<Digest> {
     );
 
     if let Ok(mut c) = cache().lock() {
-        c.insert(cache_key, CacheEntry { at: Instant::now(), digest: digest.clone() });
+        insert_fresh(
+            &mut c,
+            cache_key,
+            CacheEntry { at: Instant::now(), digest: digest.clone() },
+            ctx.cfg.bootstrap.cache_ms,
+        );
     }
     Ok(digest)
+}
+
+/// A borrowed floor on a model with a different score distribution fills the related section with
+/// noise or empties it, so the section stays out until someone measures or sets one. The message
+/// names no value: bge's number is the one that is wrong here. Once per process, because every
+/// queried digest would repeat it.
+fn warn_untrusted_floor_once(model: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            model,
+            "route_max_top for this model was carried or guessed from bge-base, so the digest \
+             leaves its related section out. Measure the model's query-to-row scores first \
+             (docs/switching-embedding-models.md, scripts/embedding-thresholds.sql), then set \
+             EMBED_THRESHOLDS=route_max_top=<value>. The graph router reads the same key, so the \
+             value moves it too"
+        );
+    }
 }
 
 /// How many candidates a section reads for each slot it fills. Dropped twins and rows an earlier
@@ -390,10 +582,18 @@ fn pool(limit: i64, extra: i64) -> i64 {
     limit.max(0).saturating_mul(POOL_FACTOR).saturating_add(extra)
 }
 
-/// One section's rows, newest first, cut to `limit` by the shared selection.
-fn choose(selection: &mut Selection, pool: Vec<Memory>, limit: i64) -> Vec<Memory> {
+/// One section's rows in pool order, cut to `limit` by the shared selection. Adds to `lost` the
+/// dropped twins this section would have printed.
+fn choose(
+    selection: &mut Selection,
+    pool: Vec<Memory>,
+    limit: i64,
+    lost: &mut HashSet<String>,
+) -> Vec<Memory> {
     let ids: Vec<&str> = pool.iter().map(|m| m.id.as_str()).collect();
-    let keep = selection.pick(&ids, usize::try_from(limit).unwrap_or(0));
+    let limit = usize::try_from(limit).unwrap_or(0);
+    lost.extend(selection.lost_from(&ids, limit));
+    let keep = selection.pick(&ids, limit);
     let mut pool: Vec<Option<Memory>> = pool.into_iter().map(Some).collect();
     keep.into_iter().filter_map(|i| pool[i].take()).collect()
 }
@@ -406,16 +606,28 @@ fn choose(selection: &mut Selection, pool: Vec<Memory>, limit: i64) -> Vec<Memor
 /// in the key because the rendered text is part of the cached value. The model is in it because
 /// the near-duplicate drop compares the unit's slot at that model's cosine: a digest cached before
 /// a flip would keep answering with the other model's pairs until it expired.
+///
+/// The query is `q:` plus the trimmed text, or `-`. It goes last so no text in it can reach an
+/// earlier field, and the prefix keeps a query of "-" apart from no query.
 fn cache_key(
     client: &str,
     project: Option<&str>,
     readable: &[NamespaceCeiling],
     budget: usize,
     model: &str,
+    query: Option<&str>,
 ) -> String {
     let grant =
         readable.iter().map(|c| format!("{}@{}", c.namespace, c.max)).collect::<Vec<_>>().join(",");
-    format!("{client}|{}|{budget}|{model}|{grant}", project.unwrap_or("-"))
+    let query = query.map_or_else(|| "-".to_string(), |q| format!("q:{q}"));
+    format!("{client}|{}|{budget}|{model}|{grant}|{query}", project.unwrap_or("-"))
+}
+
+/// A query is part of the key, so a client sending a new one with every prompt adds an entry each
+/// time. Expired entries leave on the next insert, which bounds the map to what `cache_ms` holds.
+fn insert_fresh(c: &mut HashMap<String, CacheEntry>, key: String, entry: CacheEntry, ttl_ms: u64) {
+    c.retain(|_, e| e.at.elapsed().as_millis() < u128::from(ttl_ms));
+    c.insert(key, entry);
 }
 
 /// Sealed counts, only for namespaces where this client's ceiling actually reaches sealed.
@@ -522,6 +734,8 @@ struct Section {
     entries: Vec<Entry>,
     /// Percent of the section budget this section may claim before anything flows to it.
     share: usize,
+    /// Keeps one whole entry ahead of every share. Only profile sets it (see `FLOOR_CAP`).
+    floor: bool,
 }
 
 /// What the layout printed for one entry.
@@ -535,17 +749,20 @@ enum Pick {
 /// One `Pick` per entry, one row per section.
 type Picks = Vec<Vec<Pick>>;
 
-/// Profile 40, project 25, recent 20, registry 15, as percentages of what the header and the
-/// tail leave over.
+/// Project 55, related 10, profile 15, recent 5, registry 15, as percentages of what the header
+/// and the tail leave over (decision 0034).
 ///
-/// Profile holds the standing rules, which bind every task in every project, and nothing else in
-/// the digest says them, so it takes the largest share and first claim. The active project's rows
-/// come next because the session is about that codebase. Recent spans every namespace and is the
-/// section `memory_search` replaces best, so it gets less. A registry line runs about 50 to 70
-/// characters, so 15 percent of 6,000 still prints a dozen of them. A share a section does not
-/// use flows to the next section, and whatever is left at the end goes back through the
-/// sections in the same order, so a store with no project rows loses nothing.
-const SHARES: [usize; 4] = [40, 25, 20, 15];
+/// A share is a budget, not a rank: every section spends its own before leftovers move. Project
+/// takes the dominant share and, as the first section, first claim on the leftovers, so its rows
+/// survive the budget ahead of the rest. The other shares are floors. Profile's comes to about 700
+/// to 800 characters at a 6,000-character budget, and its heading with the reminder line takes
+/// about 160 of that. On `realistic()` at 6,000 characters, five of five long preferences print
+/// without a related section and three with four related rows. The floor keeps a leading
+/// preference whenever one of them fits in `FLOOR_CAP` percent of the room.
+/// A profile with none is how a session skips the rule that binds it. A registry line runs about
+/// 50 to 70 characters, so 15 percent still prints a dozen. A share a section does not use flows
+/// to the next.
+const SHARES: [usize; 5] = [55, 10, 15, 5, 15];
 
 /// What a shortened body ends with: a space and U+2026, two characters.
 const ELLIPSIS: &str = " \u{2026}";
@@ -597,7 +814,7 @@ fn memory_section(
             registry: None,
         });
     }
-    Section { noun, heading: format!("\n\n### {title}"), entries, share }
+    Section { noun, heading: format!("\n\n### {title}"), entries, share, floor: false }
 }
 
 fn registry_section(d: &Digest) -> Section {
@@ -618,14 +835,22 @@ fn registry_section(d: &Digest) -> Section {
             registry: Some((r.namespace.clone(), r.kind.clone(), r.key.clone())),
         })
         .collect();
-    Section { noun: "registry", heading: "\n\n### Registry".into(), entries, share: SHARES[3] }
+    Section {
+        noun: "registry",
+        heading: "\n\n### Registry".into(),
+        entries,
+        share: SHARES[4],
+        floor: false,
+    }
 }
 
 /// The longest prefix of `body` that fits in `room` characters, cut in this order of preference:
 /// at a sentence end in the back half of the room, at a word end in the back half, or at a
 /// grapheme boundary. The last covers CJK, which puts no spaces between words, and a long URL,
 /// whose first space can sit three characters in. A grapheme cut never splits an accent from its
-/// letter or an emoji sequence joined by U+200D. `None` when not one grapheme fits.
+/// letter or an emoji sequence joined by U+200D. `None` when not one grapheme fits, or when the cut
+/// would split the first word of a body that has spaces: a small section budget made ordinary rules
+/// oversized, and "Standin" told the reader nothing.
 fn shorten(body: &str, room: usize) -> Option<String> {
     use unicode_segmentation::UnicodeSegmentation;
     if chars(body) <= room {
@@ -651,6 +876,10 @@ fn shorten(body: &str, room: usize) -> Option<String> {
     });
     let word = (half..=fits).rev().find(|&i| space(gs[i]) && !space(gs[i - 1]));
     let cut = sentence.or(word).unwrap_or(fits);
+    let inside_first_word = !space(gs[cut]) && gs[..cut].iter().all(|g| !space(g));
+    if inside_first_word && gs[cut..].iter().any(|g| space(g)) {
+        return None;
+    }
     let kept = gs[..cut].concat().trim_end().to_string();
     (!kept.is_empty()).then_some(kept)
 }
@@ -742,14 +971,39 @@ fn try_shorten(s: &Section, picks: &mut [Pick], i: usize, budget: &mut usize) ->
     true
 }
 
+/// Percent of `avail` a section's floor entry may take. Profile's 15 percent share held no
+/// ordinary preference below about 1,400 characters, and a digest with no preference is how a
+/// session skips the rule that binds it. Half keeps the other half for the project at any budget.
+const FLOOR_CAP: usize = 50;
+
+/// The first whole entry, in rank order, that fits in both `room` and `cap`. The lead preferences
+/// rank first, so this is a leading preference whenever one of them fits. One entry only: the
+/// floor exists so profile never prints nothing, and the shares decide everything past that.
+fn fill_floor(s: &Section, picks: &mut [Pick], room: &mut usize, cap: usize) {
+    for i in 0..s.entries.len() {
+        let cost = entry_cost(s, picks, chars(&s.entries[i].line));
+        if cost <= cap && cost <= *room {
+            picks[i] = Pick::Whole;
+            *room -= cost;
+            return;
+        }
+    }
+}
+
 /// Which entries print within `avail` characters.
 fn layout(sections: &[Section], avail: usize) -> Vec<Vec<Pick>> {
     let mut picks: Vec<Vec<Pick>> =
         sections.iter().map(|s| vec![Pick::Out; s.entries.len()]).collect();
+    // Floors come out of `avail` before any share is cut, so the project's share shrinks by the
+    // floor entry and no section can spend it first.
+    let mut room = avail;
+    for (s, p) in sections.iter().zip(picks.iter_mut()).filter(|(s, _)| s.floor) {
+        fill_floor(s, p, &mut room, avail * FLOOR_CAP / 100);
+    }
     let mut carry = 0;
     let mut budgets = Vec::with_capacity(sections.len());
     for (s, p) in sections.iter().zip(picks.iter_mut()) {
-        let mut budget = avail * s.share / 100 + carry;
+        let mut budget = room * s.share / 100 + carry;
         budgets.push(budget);
         let whole = budget;
         fill_whole(s, p, &mut budget);
@@ -844,7 +1098,7 @@ const TAIL_SHARE: usize = 20;
 /// The tail and the footer change with what prints: the inventory line names every namespace
 /// that lost all its rows, and the footer's counts grow with what was left out. The first pass
 /// reserves the most either can take, nothing printed. The second reserves what the first
-/// actually produced and usually prints more. It is not guaranteed to: a larger profile share can
+/// actually produced and usually prints more. It is not guaranteed to: a larger project share can
 /// take the carry a later section needed, a namespace stops printing, and the inventory line
 /// grows. The second pass is kept only when it fits.
 ///
@@ -1075,6 +1329,8 @@ mod tests {
             sealed_inventory: HashMap::new(),
             profile: vec![],
             project_context: vec![],
+            related: vec![],
+            related_unavailable: None,
             recent: vec![],
             registry: vec![],
             counts: Counts { memories: 0, registry: 0, by_namespace: HashMap::new() },
@@ -1227,6 +1483,12 @@ mod tests {
                 fact(&format!("r{i}"), &body, "project:atlas", &["recent"])
             })
             .collect();
+        d.related = (0..3)
+            .map(|i| {
+                let body = format!("Related note {i} about {}", first_words(words, 3 + i));
+                fact(&format!("x{i}"), &body, "project:atlas", &[])
+            })
+            .collect();
         d.registry = (0..25)
             .map(|i| RegistrySummary {
                 namespace: "global".into(),
@@ -1303,6 +1565,7 @@ mod tests {
         let text = render(&crowded(), 1_000_000);
         assert!(!text.contains("left out"), "{text}");
         assert_eq!(bullets_under(&text, "### About the user"), 12);
+        assert_eq!(bullets_under(&text, "### Related"), 3);
         assert_eq!(bullets_under(&text, "### Registry"), 25);
     }
 
@@ -1342,27 +1605,14 @@ mod tests {
 
     /// Guards the second layout pass. When a smaller reserve shifts the shares so the inventory
     /// line grows past the ceiling, the first pass has to stand, not the header-only fallback.
-    /// A digest that fits renders exactly what origin/main rendered before the layout change. The
-    /// literal came from that render run over this fixture.
+    /// A digest that fits renders this literal byte for byte. The literal came from the render
+    /// before decision 0034, rearranged by hand into that decision's section order: project,
+    /// related, profile, recent, registry.
     #[test]
-    fn a_digest_that_fits_matches_the_old_render_byte_for_byte() {
+    fn a_digest_that_fits_matches_its_golden_render_byte_for_byte() {
         let golden = r##"## Memory digest
 Store: 33 memories, 25 registry entries across user:me, global, project:warden.
 Active project namespace: `project:warden`. Pass project:"warden" to memory_search and use it as the namespace for project-scoped memory_write calls.
-
-### About the user and standing preferences
-- Standing rule 0: the owner wants every. [preference] _(user:me, 2026-08-18, via mac)_
-- Standing rule 1: the owner wants every handoff. [preference] _(user:me, 2026-08-18, via mac)_
-- Standing rule 2: the owner wants every handoff to. [preference] _(user:me, 2026-08-18, via mac)_
-- Standing rule 3: the owner wants every handoff to carry. [preference] _(user:me, 2026-08-18, via mac)_
-- Standing rule 4: the owner wants every handoff to carry the. [preference] _(user:me, 2026-08-18, via mac)_
-- Standing rule 5: the owner wants every handoff to carry the command. [preference] _(user:me, 2026-08-18, via mac)_
-- Standing rule 6: the owner wants every handoff to carry the command and. [preference] _(user:me, 2026-08-18, via mac)_
-- Standing rule 7: the owner wants every handoff to carry the command and its. [preference] _(user:me, 2026-08-18, via mac)_
-- Standing rule 8: the owner wants every handoff to carry the command and its captured. [preference] _(user:me, 2026-08-18, via mac)_
-- Standing rule 9: the owner wants every. [preference] _(user:me, 2026-08-18, via mac)_
-- Standing rule 10: the owner wants every handoff. [preference] _(user:me, 2026-08-18, via mac)_
-- Standing rule 11: the owner wants every handoff to. [preference] _(user:me, 2026-08-18, via mac)_
 
 ### Project project:warden
 - Warden fact 0. the owner wants every handoff to carry the command and its captured output. Measured on build 100. _(project:warden, 2026-08-18, via mac)_
@@ -1375,6 +1625,26 @@ Active project namespace: `project:warden`. Pass project:"warden" to memory_sear
 - Warden fact 7. the owner wants every handoff to carry the command and its captured output. Measured on build 107. _(project:warden, 2026-08-18, via mac)_
 - Warden fact 8. the owner wants every handoff to carry the command and its captured output. Measured on build 108. _(project:warden, 2026-08-18, via mac)_
 - Warden fact 9. the owner wants every handoff to carry the command and its captured output. Measured on build 109. _(project:warden, 2026-08-18, via mac)_
+
+### Related to this request
+- Related note 0 about the owner wants _(project:atlas, 2026-08-18, via mac)_
+- Related note 1 about the owner wants every _(project:atlas, 2026-08-18, via mac)_
+- Related note 2 about the owner wants every handoff _(project:atlas, 2026-08-18, via mac)_
+
+### About the user and standing preferences
+lumberroom stores more standing preferences than this list, and memory_search finds the one that covers a convention.
+- Standing rule 0: the owner wants every. [preference] _(user:me, 2026-08-18, via mac)_
+- Standing rule 1: the owner wants every handoff. [preference] _(user:me, 2026-08-18, via mac)_
+- Standing rule 2: the owner wants every handoff to. [preference] _(user:me, 2026-08-18, via mac)_
+- Standing rule 3: the owner wants every handoff to carry. [preference] _(user:me, 2026-08-18, via mac)_
+- Standing rule 4: the owner wants every handoff to carry the. [preference] _(user:me, 2026-08-18, via mac)_
+- Standing rule 5: the owner wants every handoff to carry the command. [preference] _(user:me, 2026-08-18, via mac)_
+- Standing rule 6: the owner wants every handoff to carry the command and. [preference] _(user:me, 2026-08-18, via mac)_
+- Standing rule 7: the owner wants every handoff to carry the command and its. [preference] _(user:me, 2026-08-18, via mac)_
+- Standing rule 8: the owner wants every handoff to carry the command and its captured. [preference] _(user:me, 2026-08-18, via mac)_
+- Standing rule 9: the owner wants every. [preference] _(user:me, 2026-08-18, via mac)_
+- Standing rule 10: the owner wants every handoff. [preference] _(user:me, 2026-08-18, via mac)_
+- Standing rule 11: the owner wants every handoff to. [preference] _(user:me, 2026-08-18, via mac)_
 
 ### Recently learned
 - Recent note 0 about the owner [recent] _(project:atlas, 2026-08-18, via mac)_
@@ -1422,6 +1692,18 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
     }
 
     #[test]
+    fn every_budget_with_room_for_the_tail_prints_project() {
+        let d = crowded();
+        let full = render(&d, 1_000_000).chars().count();
+        for max in 1200..full {
+            let text = render(&d, max);
+            assert!(bullets_under(&text, "### Project") > 0, "{max}:\n{text}");
+        }
+    }
+
+    /// Profile's share is 15 percent, and below about 1,400 characters that share alone held no
+    /// rule from this fixture. The floor in `layout` keeps one.
+    #[test]
     fn every_budget_with_room_for_the_tail_prints_profile() {
         let d = crowded();
         let full = render(&d, 1_000_000).chars().count();
@@ -1432,12 +1714,113 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
     }
 
     #[test]
+    fn the_profile_note_prints_exactly_when_a_profile_bullet_prints() {
+        let d = crowded();
+        let full = render(&d, 1_000_000).chars().count();
+        let under = format!("### About the user and standing preferences\n{PROFILE_NOTE}\n- ");
+        for max in 200..full {
+            let text = render(&d, max);
+            let bullets = bullets_under(&text, "### About the user");
+            assert_eq!(text.contains(PROFILE_NOTE), bullets > 0, "{max}:\n{text}");
+            if bullets > 0 {
+                assert!(text.contains(&under), "{max}:\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_digest_without_profile_rows_prints_no_note() {
+        let mut d = base();
+        d.profile.clear();
+        assert!(!render(&d, 1_000_000).contains(PROFILE_NOTE));
+    }
+
+    /// Five preferences and ten project rows at the lengths a working store carries: a preference
+    /// line with its tag and provenance runs past 300 characters, as decision 0034 assumes.
+    /// `related` adds that many related rows, which a queried digest prints ahead of profile.
+    fn realistic(related: usize) -> Digest {
+        let mut d = base();
+        d.project = Some("project:warden".into());
+        d.namespaces.push("project:warden".into());
+        let rule = "stage files by explicit path and never with a blanket add, because a blanket \
+                    add once swept another agent's half-written files into a commit that had to \
+                    be reverted by hand on the shared branch, and the owner reads every staged \
+                    path before the commit goes out";
+        d.profile = (0..5)
+            .map(|i| {
+                let body = format!("Preference {i}: {rule}.");
+                fact(&format!("p{i}"), &body, "user:me", &["preference"])
+            })
+            .collect();
+        let body = "the warden service reads its schedule from the registry at boot, retries a \
+                    failed upstream three times with jittered backoff, and writes one audit row \
+                    per run so the nightly report can tell a skipped run from a failed one";
+        let rows = |prefix: &str, ns: &str, n: usize| -> Vec<Fact> {
+            (0..n)
+                .map(|i| {
+                    fact(&format!("{prefix}{i}"), &format!("Note {prefix}{i}: {body}."), ns, &[])
+                })
+                .collect()
+        };
+        d.project_context = rows("w", "project:warden", 10);
+        d.related = rows("x", "project:atlas", related);
+        d.recent = rows("r", "project:warden", 5);
+        d.registry = (0..15)
+            .map(|i| RegistrySummary {
+                namespace: "global".into(),
+                kind: "host".into(),
+                key: format!("box-{i}"),
+                value: serde_json::json!({"host": format!("10.0.0.{i}"), "port": 5432}),
+            })
+            .collect();
+        d.inventory.insert("user:me".into(), 5);
+        d.inventory.insert("project:warden".into(), 15);
+        d.counts.memories = 25;
+        d.counts.registry = 15;
+        d
+    }
+
+    /// How many of five long preferences print at the default 6,000-character budget, without a
+    /// related section and with four related rows. The structured rows carry all five either
+    /// way. The two counts are the observed render, pinned so a change to the shares, the
+    /// heading or the note shows up here and in decision 0034's costs.
+    #[test]
+    fn the_default_budget_prints_the_observed_count_of_five_realistic_preferences() {
+        for (related, printed) in [(0, 5), (4, 3)] {
+            let text = render(&realistic(related), 6_000);
+            assert_eq!(bullets_under(&text, "### About the user"), printed, "{related}:\n{text}");
+        }
+    }
+
+    #[test]
+    fn the_project_section_prints_before_every_other_section() {
+        let text = render(&crowded(), 1_000_000);
+        let at = |h: &str| text.find(h).unwrap_or_else(|| panic!("{h} missing:\n{text}"));
+        assert!(at("### Project") < at("### Related"));
+        assert!(at("### Related") < at("### About the user"));
+        assert!(at("### About the user") < at("### Recently learned"));
+        assert!(at("### Recently learned") < at("### Registry"));
+    }
+
+    #[test]
+    fn a_left_out_related_row_is_named_in_the_footer() {
+        let mut d = base();
+        d.related = (0..40)
+            .map(|i| fact(&format!("x{i}"), &"z ".repeat(150), "project:beta", &[]))
+            .collect();
+        d.counts.memories = 40;
+        let text = render(&d, 1500);
+        assert!(text.contains("more related entries"), "{text}");
+    }
+
+    #[test]
     fn the_footer_counts_every_entry_it_left_out() {
         let d = crowded();
         let full = render(&d, 1_000_000).chars().count();
         let sections = [
             ("profile", "### About the user", d.profile.len()),
             ("project", "### Project", d.project_context.len()),
+            ("related", "### Related to this request", d.related.len()),
             ("recent", "### Recently learned", d.recent.len()),
             ("registry", "### Registry", d.registry.len()),
         ];
@@ -1478,21 +1861,28 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
         );
     }
 
+    /// Forty profile rows fill whatever share profile gets, so project cannot live on profile's
+    /// carry. Under the shares before decision 0034, profile first at 40 percent and project at 25,
+    /// this fixture printed two whole project rows. Ten rows of about 530 characters exceed
+    /// `avail`, so the test asserts first claim and the profile floor, never "every project row".
     #[test]
-    fn profile_survives_when_project_recent_and_registry_are_huge() {
+    fn project_rows_take_first_claim_and_profile_keeps_its_floor() {
         let mut d = base();
         d.project = Some("project:warden".into());
-        d.profile = (0..5)
+        d.project_context = (0..10)
+            .map(|i| {
+                let body = format!("Warden rule {i}: {}", "hand back evidence ".repeat(25));
+                fact(&format!("w{i}"), &body, "project:warden", &[])
+            })
+            .collect();
+        d.profile = (0..40)
             .map(|i| {
                 let body = format!("Standing rule {i}: {}", "hand back evidence ".repeat(5));
                 fact(&format!("p{i}"), &body, "user:me", &[])
             })
             .collect();
-        // Entries small enough to pack every other share tight, so profile cannot live on
-        // whatever the other sections fail to use.
         let note = "a project note that keeps going ".repeat(4);
-        d.project_context =
-            (0..200).map(|i| fact(&format!("w{i}"), &note, "project:warden", &[])).collect();
+        d.related = (0..200).map(|i| fact(&format!("x{i}"), &note, "project:beta", &[])).collect();
         d.recent = (0..200).map(|i| fact(&format!("r{i}"), &note, "project:atlas", &[])).collect();
         d.registry = (0..200)
             .map(|i| RegistrySummary {
@@ -1502,14 +1892,17 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
                 value: serde_json::json!(format!("10.0.{}.{}", i / 250, i % 250)),
             })
             .collect();
-        d.counts.memories = 405;
+        d.counts.memories = 650;
         d.counts.registry = 200;
         let text = render(&d, 6000);
-        for i in 0..5 {
-            assert!(text.contains(&format!("- Standing rule {i}: ")), "rule {i} fell out:\n{text}");
-        }
+        let warden = text
+            .lines()
+            .filter(|l| l.starts_with("- Warden rule") && !l.contains(ELLIPSIS))
+            .count();
+        assert!(warden >= 4, "{warden} whole project rows:\n{text}");
+        assert!(text.lines().any(|l| l.starts_with("- Standing rule")), "{text}");
         assert!(text.chars().count() <= 6000);
-        assert!(left_out(&text, "project") > 0 && left_out(&text, "recent") > 0, "{text}");
+        assert!(text.find("### Project").unwrap() < text.find("### About the user").unwrap());
     }
 
     #[test]
@@ -1647,12 +2040,15 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
     }
 
     /// The second rung: the capped list would cost the only entry, the count alone does not.
+    /// The budgets carry the profile note on top, because the note rides the heading and costs
+    /// what the heading costs.
     #[test]
     fn the_count_only_list_wins_when_the_capped_list_crowds_out_every_entry() {
         let mut d = one_sealed_and_thirty_namespaces();
         d.sealed_inventory.clear();
         d.profile = vec![fact("p0", &"word ".repeat(120), "user:me", &[])];
-        for max in [900, 910] {
+        let note = chars(PROFILE_NOTE) + 1;
+        for max in [900 + note, 910 + note] {
             let text = render(&d, max);
             assert_eq!(whole_bullets(&text), 1, "{max}:\n{text}");
             assert!(
@@ -1663,10 +2059,11 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
     }
 
     /// The third rung: only dropping the namespace list leaves room for an entry, and Sealed
-    /// keeps its count.
+    /// keeps its count. The budget carries the profile note on top of the 400 the rung needed
+    /// before the note.
     #[test]
     fn the_sealed_count_alone_wins_when_every_list_crowds_out_every_entry() {
-        let text = render(&one_sealed_and_thirty_namespaces(), 400);
+        let text = render(&one_sealed_and_thirty_namespaces(), 400 + chars(PROFILE_NOTE) + 1);
         assert!(whole_bullets(&text) >= 1, "{text}");
         assert!(!text.contains("### Not shown above"), "{text}");
         assert!(line_after(&text, "### Sealed").ends_with(": 1 namespace."), "{text}");
@@ -1781,6 +2178,30 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
         assert!(kept.chars().count() > 400, "kept only {kept:?}");
     }
 
+    /// The first-word rule also covers a body that opens with a long URL and has spaces after it.
+    /// When the room is shorter than the URL the entry stays out rather than print a cut URL, and
+    /// the footer and `left_out` still name it.
+    #[test]
+    fn a_leading_url_longer_than_the_room_keeps_the_entry_out() {
+        let body = format!("https://example.com/{} is the repo", "a".repeat(300));
+        assert_eq!(shorten(&body, 50), None);
+        assert_eq!(
+            shorten(&body, 325).as_deref(),
+            Some(&body[..323]),
+            "a room past the URL cuts at a word"
+        );
+    }
+
+    /// A small section budget can make an ordinary rule oversized. A grapheme cut inside its first
+    /// word printed "- Standin \u{2026}", which tells the reader nothing, so the entry stays out.
+    #[test]
+    fn a_cut_never_splits_the_first_word_of_a_body_with_spaces() {
+        let rule = "Standing rule 0: the owner wants every";
+        assert_eq!(shorten(rule, 7), None);
+        assert_eq!(shorten(rule, 8).as_deref(), Some("Standing"));
+        assert!(shorten(&"\u{6771}\u{4eac}".repeat(50), 7).is_some(), "CJK has no first word");
+    }
+
     #[test]
     fn a_character_cut_never_splits_a_grapheme() {
         use unicode_segmentation::UnicodeSegmentation;
@@ -1880,7 +2301,7 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
     fn render_report_names_every_row_not_printed_whole_and_nothing_printed_whole() {
         let d = overflowing_digest();
         let r = render_report(&d, 1000);
-        for f in d.profile.iter().chain(&d.project_context).chain(&d.recent) {
+        for f in d.profile.iter().chain(&d.project_context).chain(&d.related).chain(&d.recent) {
             let whole = printed_whole(&r.text, f);
             assert_eq!(!whole, r.left_out.contains(&f.id), "{}", f.id);
         }
@@ -1922,7 +2343,7 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
         let full = render(&d, 1_000_000).chars().count();
         for max in (0..=full + 11).step_by(13) {
             let r = render_report(&d, max);
-            for f in d.profile.iter().chain(&d.project_context).chain(&d.recent) {
+            for f in d.profile.iter().chain(&d.project_context).chain(&d.related).chain(&d.recent) {
                 let whole = printed_whole(&r.text, f);
                 assert_eq!(!whole, r.left_out.contains(&f.id), "{} at {max}:\n{}", f.id, r.text);
             }
@@ -1997,19 +2418,47 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
 
     #[test]
     fn two_clients_with_the_same_namespaces_at_different_ceilings_do_not_share_a_cache_entry() {
-        let open = cache_key("chatgpt", None, &[ceiling("user:me", Sensitivity::Open)], 6000, BGE);
-        let private =
-            cache_key("chatgpt", None, &[ceiling("user:me", Sensitivity::Private)], 6000, BGE);
+        let open =
+            cache_key("chatgpt", None, &[ceiling("user:me", Sensitivity::Open)], 6000, BGE, None);
+        let private = cache_key(
+            "chatgpt",
+            None,
+            &[ceiling("user:me", Sensitivity::Private)],
+            6000,
+            BGE,
+            None,
+        );
         assert_ne!(open, private, "a cache shared across ceilings is a policy hole");
     }
 
     #[test]
     fn the_cache_key_separates_clients_projects_and_budgets() {
         let grant = vec![ceiling("user:me", Sensitivity::Open)];
-        let base = cache_key("mac", None, &grant, 6000, BGE);
-        assert_ne!(base, cache_key("chatgpt", None, &grant, 6000, BGE));
-        assert_ne!(base, cache_key("mac", Some("project:lumberroom"), &grant, 6000, BGE));
-        assert_ne!(base, cache_key("mac", None, &grant, 150_000, BGE));
+        let base = cache_key("mac", None, &grant, 6000, BGE, None);
+        assert_ne!(base, cache_key("chatgpt", None, &grant, 6000, BGE, None));
+        assert_ne!(base, cache_key("mac", Some("project:lumberroom"), &grant, 6000, BGE, None));
+        assert_ne!(base, cache_key("mac", None, &grant, 150_000, BGE, None));
+    }
+
+    #[test]
+    fn the_cache_key_separates_queries() {
+        let grant = vec![ceiling("user:me", Sensitivity::Open)];
+        let keys: std::collections::HashSet<String> =
+            [None, Some("deploy"), Some("-"), Some("other")]
+                .into_iter()
+                .map(|q| cache_key("mac", None, &grant, 6000, BGE, q))
+                .collect();
+        assert_eq!(keys.len(), 4, "{keys:?}");
+    }
+
+    #[test]
+    fn inserting_a_digest_sweeps_expired_entries() {
+        let mut c = HashMap::new();
+        let old = Instant::now() - std::time::Duration::from_millis(50);
+        c.insert("old".to_string(), CacheEntry { at: old, digest: base() });
+        insert_fresh(&mut c, "new".into(), CacheEntry { at: Instant::now(), digest: base() }, 10);
+        assert_eq!(c.len(), 1);
+        assert!(c.contains_key("new"));
     }
 
     const BGE: &str = "Xenova/bge-base-en-v1.5@q8";
@@ -2021,8 +2470,8 @@ Encrypted by the client and unreadable by this server. Retrievable only by exact
     fn a_flip_never_serves_a_digest_built_under_the_other_model() {
         let grant = vec![ceiling("user:me", Sensitivity::Open)];
         assert_ne!(
-            cache_key("mac", None, &grant, 6000, BGE),
-            cache_key("mac", None, &grant, 6000, "openai:embeddinggemma-2"),
+            cache_key("mac", None, &grant, 6000, BGE, None),
+            cache_key("mac", None, &grant, 6000, "openai:embeddinggemma-2", None),
         );
     }
 }

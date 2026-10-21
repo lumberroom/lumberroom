@@ -331,6 +331,10 @@ source: `override` (your line), `legacy` (an old single variable), `shipped`, `s
   guessed key. An acting key (`dedupe`, `conflict`, `cleanup_near_certain`) changes or merges data
   with nobody reading it first, so the server will not flip a unit onto a model whose acting keys
   are guessed, and `start` will not leave one.
+- **`route_max_top` has two readers.** The graph router compares it with fused search scores, and
+  the digest's related section reads it as the least query-to-row cosine a row needs (decision
+  0034). A `carried` or `guessed` value leaves the related section out. Setting it, through
+  `EMBED_THRESHOLDS` or `GRAPH_ROUTE_MAX_TOP`, moves both.
 - **Override per block.** `EMBED_THRESHOLDS=dedupe=0.98,conflict=0.92` sets keys for the model
   `EMBED_*` names. `EMBED_PREVIOUS_THRESHOLDS` does the same for `EMBED_PREVIOUS_*`'s model. Neither
   line reaches the other model, and boot refuses a key it does not know.

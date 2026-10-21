@@ -43,8 +43,9 @@ pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// What a client reads at `initialize`. Facts about the server and its tools, with no orders.
 pub const SERVER_INSTRUCTIONS: &str = "Durable memory for this user, shared across the agents and \
-machines they use. context_bootstrap returns what is already known: the user's preferences, the \
-active project and the infrastructure registry. memory_search finds facts by meaning, and \
+machines they use. context_bootstrap returns what is already known: the active project, the \
+user's preferences and the infrastructure registry, and the facts related to a request sent as \
+query. memory_search finds facts by meaning, and \
 registry_get looks up an exact operational value. memory_write records one durable fact per call: \
 a decision, preference, constraint or convention, with its numbers and identifiers. Which tools \
 appear depends on what the client's credential grants.";
@@ -168,6 +169,10 @@ pub struct BootstrapArgs {
     /// Absolute path or slug of the project you are working in, so its memory is promoted.
     #[serde(default)]
     pub project: Option<String>,
+    /// What the person asked, in their own words; their first message works. The digest adds the
+    /// facts most related to it and orders the profile by relevance to it.
+    #[serde(default)]
+    pub query: Option<String>,
     /// true adds every fact the digest drew from, with its id and exact text. The digest text
     /// carries no ids.
     #[serde(default)]
@@ -295,10 +300,11 @@ impl Lumberroom {
     #[tool(
         name = "context_bootstrap",
         title = "Load session context",
-        description = "Returns what is already known about this user: standing preferences, the \
-active project's memory and the infrastructure registry, in one call. It suits the start of a \
+        description = "Returns what is already known about this user: the active project's memory \
+first, standing preferences and the infrastructure registry, in one call. It suits the start of a \
 session, or the moment before asking a question an earlier session may have answered. project, a \
-path or slug, promotes that project's memory.",
+path or slug, promotes that project's memory. query, the person's request, adds the facts most \
+related to it.",
         annotations(
             title = "Load session context",
             read_only_hint = true,
@@ -312,7 +318,9 @@ path or slug, promotes that project's memory.",
         rc: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         self.run("context_bootstrap", None, &rc, |ctx| async move {
-            let digest = bootstrap::run(&ctx, args.project.as_deref()).await?;
+            let digest =
+                bootstrap::run_with_query(&ctx, args.project.as_deref(), args.query.as_deref())
+                    .await?;
             let text = digest.text.clone();
             let rows = views::rows_for(ctx.invocation, args.rows);
             Ok((text, views::digest(&digest, rows)))

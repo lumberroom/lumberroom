@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 
 use lumberroom_server::mcp::capability::TOOL_CAPABILITIES;
 use lumberroom_server::mcp::{tool_definitions, SERVER_INSTRUCTIONS};
+use lumberroom_server::services::bootstrap;
 
 /// Tools that only read. `readOnlyHint: true`.
 const READS: [&str; 7] = [
@@ -261,6 +262,7 @@ fn no_description_or_instruction_orders_the_model_to_act() {
         .map(|t| (t.name.to_string(), t.description.clone().unwrap_or_default().to_string()))
         .collect();
     texts.push(("server instructions".into(), SERVER_INSTRUCTIONS.to_string()));
+    texts.push(("digest profile note".into(), bootstrap::PROFILE_NOTE.to_string()));
     for (what, text) in texts {
         let lower = text.to_lowercase();
         for order in ORDERS {

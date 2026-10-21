@@ -1040,21 +1040,30 @@ const SAMPLE_CONTENT_SQL: &str = r#"
      ORDER BY random() LIMIT $4
 "#;
 
-/// The digest, as one statement with seven filtered subqueries.
+/// The digest, as one statement with ten filtered subqueries.
 ///
-/// The three memory arms are candidate pools, newest first, which the service trims to its
-/// section limits (decision 0025). Profile has no tag preference: recency alone ranks it.
+/// The profile, project and recent arms are candidate pools, which the service trims to its
+/// section limits (decisions 0025 and 0034). Project and recent read newest first. Profile reads
+/// three arms: the newest `user:me` rows tagged with one of `$15` (at most `$16`), the `user:me`
+/// and `global` rows nearest the anchor (the query `$12`, or the active project's centroid), and
+/// the newest rows; the service orders the union. Recent keeps to the active project `$4` and the
+/// rows in the user namespace `$2` and `global` that carry one of those tags. The related arm
+/// returns the rows nearest the query vector `$12` across every readable namespace, at most `$14`
+/// of them, and keeps those whose cosine reaches the floor `$13`; with `$12` NULL it returns
+/// nothing. `profile_similarity` gives each profile-pool row's cosine to the anchor, by id, so
+/// the service can reorder that pool.
 ///
 /// `near_duplicates` names the pairs of pooled rows whose cosine is at or above `$11`, and sends
 /// ids rather than vectors. A vector in a pool's select list cost twice over: under a generic plan
 /// Postgres detoasted and cast every candidate row before the LIMIT, and the JSON payload grew by
-/// more than thirty times on a synthetic store of 4,500 rows. The pairs come only from rows the three pools already admitted, so the grant and the
-/// ceiling bound them the same way they bound the pools. A zero vector gives a NaN distance, and
-/// NaN fails `<=`, so it pairs with nothing. `$11 < 1` gates the comparison, which is how 1.0
-/// turns the pass off without a second statement.
+/// more than thirty times on a synthetic store of 4,500 rows. The pairs come only from rows the
+/// four pools already admitted, so the grant and the ceiling bound them the same way they bound the
+/// pools. A zero vector gives a NaN distance, and NaN fails `<=`, so it pairs with nothing. The
+/// vector copy opens when the dedup pass runs (`$11 < 1`) or an anchor exists, and the pair join
+/// stays gated on `$11 < 1` alone, which is how 1.0 turns the pass off without a second statement.
 ///
 /// Deliberately not decomposed: the bootstrap latency budget depends on this staying a single round
-/// trip. Every one of the seven joins `reachable` and compares `sensitivity_rank`, including the
+/// trip. Every one of the ten joins `reachable` and compares `sensitivity_rank`, including the
 /// two counts and the namespace inventory. Phase 1 shipped a version where the profile and project
 /// subqueries skipped the namespace filter, and the leak path in a memory system is the convenience
 /// surface rather than the obvious one; the unit test at the bottom of this file counts the joins so
@@ -1070,24 +1079,6 @@ macro_rules! digest_sql {
         SELECT namespace, min(sensitivity_rank(max)) AS max_rank
           FROM unnest($6::text[], $7::text[]) AS g(namespace, max)
          GROUP BY namespace
-    ),
-    profile_pool AS (
-        SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
-               m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
-               m.access_count, m.last_accessed_at, m.last_confirmed_at, m.created_at,
-               m.occurred_at, m.occurred_until
-          FROM memory m
-          JOIN reachable rg ON rg.namespace = m.namespace
-         WHERE m.tenant_id = $1
-           AND sensitivity_rank(m.sensitivity) <= rg.max_rank
-           AND "#,
-            live!(),
-            r#"
-           -- 'global' is a namespace like any other and has to be granted. The join is what
-           -- enforces that; this line only narrows which granted namespaces are profile.
-           AND m.namespace IN ($2, 'global')
-         ORDER BY m.created_at DESC
-         LIMIT $3
     ),
     project_pool AS (
         SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
@@ -1105,6 +1096,87 @@ macro_rules! digest_sql {
          ORDER BY m.created_at DESC
          LIMIT $5
     ),
+    profile_anchor AS (
+        -- What profile ranks by (decision 0034): the query, or with none the centroid of the
+        -- active project's pooled rows. avg reads each pooled row's vector once and no vector
+        -- leaves the statement. project_pool already carries the grant and the ceiling, so a row
+        -- this caller may not read never moves the centroid. NULL with neither, which leaves
+        -- profile on recency.
+        SELECT COALESCE($12::vector, (
+            SELECT avg(m."#,
+            $col,
+            r#")
+              FROM project_pool p
+              JOIN memory m ON m.id = p.id AND m.tenant_id = $1
+             WHERE m."#,
+            $col,
+            r#" IS NOT NULL)) AS v
+    ),
+    profile_preferences AS (
+        SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
+               m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
+               m.access_count, m.last_accessed_at, m.last_confirmed_at, m.created_at,
+               m.occurred_at, m.occurred_until
+          FROM memory m
+          JOIN reachable rg ON rg.namespace = m.namespace
+         WHERE m.tenant_id = $1
+           AND sensitivity_rank(m.sensitivity) <= rg.max_rank
+           AND "#,
+            live!(),
+            r#"
+           -- The user's own standing preferences, which lead profile. An empty $15 matches none.
+           AND m.namespace = $2 AND m.tags && $15::text[]
+         ORDER BY m.created_at DESC
+         LIMIT $16
+    ),
+    profile_near AS (
+        SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
+               m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
+               m.access_count, m.last_accessed_at, m.last_confirmed_at, m.created_at,
+               m.occurred_at, m.occurred_until
+          FROM memory m
+          JOIN reachable rg ON rg.namespace = m.namespace
+         WHERE (SELECT v FROM profile_anchor) IS NOT NULL
+           AND m.tenant_id = $1
+           AND m.namespace IN ($2, 'global')
+           AND sensitivity_rank(m.sensitivity) <= rg.max_rank
+           AND m."#,
+            $col,
+            r#" IS NOT NULL
+           AND "#,
+            live!(),
+            r#"
+         -- Distance orders the arm before its LIMIT, so a burst of newer rows cannot push an
+         -- older near row out of the pool. The scalar subquery plans as an InitPlan parameter,
+         -- which an HNSW scan can order by.
+         ORDER BY m."#,
+            $col,
+            r#" <=> (SELECT v FROM profile_anchor)
+         LIMIT $3
+    ),
+    profile_newest AS (
+        SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
+               m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
+               m.access_count, m.last_accessed_at, m.last_confirmed_at, m.created_at,
+               m.occurred_at, m.occurred_until
+          FROM memory m
+          JOIN reachable rg ON rg.namespace = m.namespace
+         WHERE m.tenant_id = $1
+           AND sensitivity_rank(m.sensitivity) <= rg.max_rank
+           AND "#,
+            live!(),
+            r#"
+           -- 'global' is a namespace like any other and has to be granted. The join is what
+           -- enforces that; this line only narrows which granted namespaces are profile.
+           AND m.namespace IN ($2, 'global')
+         ORDER BY m.created_at DESC
+         LIMIT $3
+    ),
+    profile_pool AS (
+        SELECT * FROM profile_preferences
+        UNION SELECT * FROM profile_near
+        UNION SELECT * FROM profile_newest
+    ),
     recent_pool AS (
         SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
                m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
@@ -1118,8 +1190,50 @@ macro_rules! digest_sql {
             live!(),
             r#"
            AND m.created_at > now() - ($8 || ' days')::interval
+           -- Recent prints the active project and the caller's standing rules (decision 0034). Rows
+           -- elsewhere, and untagged personal rows, reach the digest through the related arm, the
+           -- profile's tail or the inventory line, so a burst of writes cannot fill this pool. An
+           -- empty $15 keeps every user and global row.
+           AND (($4::text IS NOT NULL AND m.namespace = $4)
+                OR (m.namespace IN ($2, 'global')
+                    AND (cardinality($15::text[]) = 0 OR m.tags && $15::text[])))
          ORDER BY m.created_at DESC
          LIMIT $9
+    ),
+    related_near AS (
+        -- The caller's request, matched across every namespace it may read. $12 is NULL without a
+        -- query or after a failed embed, and a qual on parameters alone plans as a one-time filter,
+        -- so the scan never runs then, under a generic plan too.
+        SELECT m.id, m.namespace, m.content, m.tags, m.source_client, m.embedding_model,
+               m.sensitivity, m.supersedes, m.superseded_by, m.superseded_at,
+               m.access_count, m.last_accessed_at, m.last_confirmed_at, m.created_at,
+               m.occurred_at, m.occurred_until,
+               (1 - (m."#,
+            $col,
+            r#" <=> $12::vector))::float8 AS similarity
+          FROM memory m
+          JOIN reachable rg ON rg.namespace = m.namespace
+         WHERE $12::vector IS NOT NULL
+           AND m.tenant_id = $1
+           -- Redundant with the join and kept on purpose, as in search_sql!'s vec arm: as a qual on
+           -- the base relation the namespace test reaches the vector index scan.
+           AND m.namespace = ANY($6::text[])
+           AND sensitivity_rank(m.sensitivity) <= rg.max_rank
+           AND m."#,
+            $col,
+            r#" IS NOT NULL
+           AND "#,
+            live!(),
+            r#"
+         ORDER BY m."#,
+            $col,
+            r#" <=> $12::vector
+         LIMIT $14
+    ),
+    related_pool AS (
+        -- The floor sits outside the LIMIT. A distance test inside the arm stops pgvector ordering
+        -- by the index.
+        SELECT * FROM related_near WHERE similarity >= $13::float8
     ),
     pooled_vectors AS MATERIALIZED (
         -- The cast round trip is a copy on purpose. A stored vector is a TOAST pointer, and the
@@ -1131,9 +1245,10 @@ macro_rules! digest_sql {
             r#")::real[]::vector AS v
           FROM (SELECT id FROM profile_pool
                 UNION SELECT id FROM project_pool
-                UNION SELECT id FROM recent_pool) p
+                UNION SELECT id FROM recent_pool
+                UNION SELECT id FROM related_pool) p
           JOIN memory m ON m.id = p.id AND m.tenant_id = $1
-         WHERE $11::float8 < 1 AND m."#,
+         WHERE ($11::float8 < 1 OR (SELECT v FROM profile_anchor) IS NOT NULL) AND m."#,
             $col,
             r#" IS NOT NULL
     )
@@ -1144,11 +1259,22 @@ macro_rules! digest_sql {
             SELECT json_agg(f ORDER BY f.created_at DESC) FROM project_pool f), '[]'::json),
         'recent', COALESCE((
             SELECT json_agg(f ORDER BY f.created_at DESC) FROM recent_pool f), '[]'::json),
+        'related', COALESCE((
+            SELECT json_agg(f ORDER BY f.similarity DESC, f.created_at DESC)
+              FROM related_pool f), '[]'::json),
+        'profile_similarity', COALESCE((
+            SELECT json_object_agg(pv.id::text, 1 - (pv.v <=> a.v))
+              FROM pooled_vectors pv
+              JOIN profile_pool p ON p.id = pv.id
+              CROSS JOIN profile_anchor a
+             WHERE a.v IS NOT NULL
+               -- A zero vector gives NaN, and NaN fails <=, so that row gets no score.
+               AND (pv.v <=> a.v) <= 2), '{}'::json),
         'near_duplicates', COALESCE((
             SELECT json_agg(json_build_array(a.id, b.id))
               FROM pooled_vectors a
               JOIN pooled_vectors b ON a.id < b.id
-             WHERE (a.v <=> b.v) <= 1 - $11::float8), '[]'::json),
+             WHERE $11::float8 < 1 AND (a.v <=> b.v) <= 1 - $11::float8), '[]'::json),
         'registry', COALESCE((
             SELECT json_agg(r) FROM (
               -- The registry carries its own sensitivity column and holds credential locations.
@@ -2312,6 +2438,11 @@ impl MemoryRepository for PgMemoryRepository {
             .bind(q.recent_limit)
             .bind(q.registry_limit)
             .bind(q.dedup_cosine)
+            .bind(q.query_embedding.map(pgvector::Vector::from))
+            .bind(q.related_floor)
+            .bind(q.related_limit)
+            .bind(&q.rule_tags)
+            .bind(q.preference_limit)
             .fetch_one(&self.pool)
             .await?;
 
@@ -2334,10 +2465,18 @@ impl MemoryRepository for PgMemoryRepository {
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect();
 
+        // Scores that fail to parse cost the profile its query order and nothing else.
+        let profile_similarity: HashMap<String, f64> = payload
+            .get("profile_similarity")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
         Ok(DigestData {
             profile: parse("profile"),
             project_context: parse("project_context"),
             recent: parse("recent"),
+            related: parse("related"),
+            profile_similarity,
             near_duplicates,
             registry: payload
                 .get("registry")
@@ -3825,16 +3964,17 @@ mod tests {
     fn every_digest_subquery_filters_on_the_callers_ceiling() {
         assert_eq!(
             DIGEST_SQL.matches("JOIN reachable rg").count(),
-            7,
-            "seven subqueries: profile, project, recent, registry, both counts, the inventory"
+            10,
+            "ten subqueries: three profile arms, project, recent, related, registry, both counts, \
+             the inventory"
         );
-        assert_eq!(DIGEST_SQL.matches("<= rg.max_rank").count(), 7);
+        assert_eq!(DIGEST_SQL.matches("<= rg.max_rank").count(), 10);
     }
 
     #[test]
     fn every_digest_memory_subquery_returns_live_rows_only() {
-        // Four memory arms plus the inventory: the two registry arms have no supersession.
-        assert_eq!(DIGEST_SQL.matches("m.superseded_by IS NULL").count(), 5);
+        // Seven memory arms plus the inventory: the two registry arms have no supersession.
+        assert_eq!(DIGEST_SQL.matches("m.superseded_by IS NULL").count(), 8);
     }
 
     #[test]
@@ -4418,7 +4558,7 @@ mod tests {
         ("SEARCH_RRF_AS_OF", SEARCH_RRF_AS_OF, 1),
         ("RECENT_LIVE", RECENT_LIVE, 1),
         ("RECENT_ALL", RECENT_ALL, 1),
-        ("DIGEST_SQL", DIGEST_SQL, 3),
+        ("DIGEST_SQL", DIGEST_SQL, 6),
         ("SUPERSESSION_HEAD_SQL", SUPERSESSION_HEAD_SQL, 1),
         ("SUBJECT_HISTORY_SQL", SUBJECT_HISTORY_SQL, 1),
     ];
@@ -4871,32 +5011,98 @@ mod tests {
         }
     }
 
-    /// Decision 0025. No pool carries a vector, profile orders by recency alone, and the pairs
-    /// compare one vector expression on both sides, gated by the threshold.
+    /// Decisions 0025 and 0034. No pool carries a vector, and the pairs compare one vector
+    /// expression on both sides.
     #[test]
-    fn the_digest_pools_send_ids_not_vectors_and_profile_orders_by_recency_alone() {
+    fn the_digest_pools_send_ids_not_vectors() {
         for (sql, column) in [(DIGEST_SQL, "m.embedding"), (DIGEST_B_SQL, "m.embedding_b")] {
             // One cast, in the pair CTE. A vector in a pool's select list is detoasted before LIMIT.
             assert_eq!(sql.matches("::real[]").count(), 1);
             let pools = &sql[..sql.find("pooled_vectors AS").unwrap()];
             assert!(!pools.contains("embedding AS") && !pools.contains("embedding_b AS"));
-            assert!(!pools.contains("::vector"));
-            assert!(!sql.contains("m.tags &&"), "no tag sorts a row above a newer one");
-            assert_eq!(sql.matches("ORDER BY m.created_at DESC").count(), 3);
+            // The related arm compares the column with the query vector; no pool selects it.
+            assert!(!pools.contains(")::real[]"));
+            assert!(!pools.contains(&format!("({column})::")));
+            assert_eq!(
+                sql.matches("ORDER BY m.created_at DESC").count(),
+                4,
+                "project, recent, preferences, newest"
+            );
+            assert!(sql.contains("AND m.namespace = $2 AND m.tags && $15::text[]"));
+            assert!(sql.contains("LIMIT $16"));
             assert_eq!(sql.matches(&format!("({column})::real[]::vector AS v")).count(), 1);
-            assert_eq!(sql.matches(&format!("{column} IS NOT NULL")).count(), 1);
-            assert!(sql.contains("WHERE $11::float8 < 1 AND"));
-            assert!(sql.contains("(a.v <=> b.v) <= 1 - $11::float8"));
+            assert_eq!(sql.matches(&format!("{column} IS NOT NULL")).count(), 4);
+            assert!(sql.contains(
+                "WHERE ($11::float8 < 1 OR (SELECT v FROM profile_anchor) IS NOT NULL) AND"
+            ));
+            assert!(sql.contains("WHERE $11::float8 < 1 AND (a.v <=> b.v) <= 1 - $11::float8"));
         }
     }
 
-    /// Three digest select lists gained two columns each. The join count is what says no arm lost
+    /// Six digest select lists carry the valid-time pair. The join count is what says no arm lost
     /// its grant filter on the way.
     #[test]
-    fn the_digest_gains_columns_and_keeps_its_seven_filtered_subqueries() {
-        assert_eq!(DIGEST_SQL.matches("m.occurred_at, m.occurred_until").count(), 3);
-        assert_eq!(DIGEST_SQL.matches("JOIN reachable rg").count(), 7);
-        assert_eq!(DIGEST_SQL.matches("m.superseded_by IS NULL").count(), 5);
+    fn the_digest_gains_columns_and_keeps_its_ten_filtered_subqueries() {
+        assert_eq!(DIGEST_SQL.matches("m.occurred_at, m.occurred_until").count(), 6);
+        assert_eq!(DIGEST_SQL.matches("JOIN reachable rg").count(), 10);
+        assert_eq!(DIGEST_SQL.matches("m.superseded_by IS NULL").count(), 8);
+    }
+
+    #[test]
+    fn the_vector_copy_opens_for_dedup_or_an_anchor() {
+        for sql in [DIGEST_SQL, DIGEST_B_SQL] {
+            assert!(sql.contains(
+                "WHERE ($11::float8 < 1 OR (SELECT v FROM profile_anchor) IS NOT NULL) AND"
+            ));
+            assert!(sql.contains("WHERE $11::float8 < 1 AND (a.v <=> b.v) <= 1 - $11::float8"));
+        }
+    }
+
+    #[test]
+    fn the_related_arm_reads_every_readable_namespace_and_waits_for_a_query() {
+        for (sql, column) in [(DIGEST_SQL, "m.embedding"), (DIGEST_B_SQL, "m.embedding_b")] {
+            let arm =
+                &sql[sql.find("related_near AS").unwrap()..sql.find("related_pool AS").unwrap()];
+            assert!(arm.contains("WHERE $12::vector IS NOT NULL"));
+            assert!(arm.contains("JOIN reachable rg") && arm.contains("<= rg.max_rank"));
+            assert!(arm.contains("m.namespace = ANY($6::text[])"));
+            assert!(arm.contains(&format!("ORDER BY {column} <=> $12::vector")));
+            assert!(arm.contains("LIMIT $14"));
+            assert!(sql.contains("SELECT * FROM related_near WHERE similarity >= $13::float8"));
+        }
+    }
+
+    /// The new profile arms carry the grant and the ceiling, and the nearest arm waits for an
+    /// anchor and orders by it before its LIMIT. The anchor reads the project pool, which carries
+    /// both filters already.
+    #[test]
+    fn the_profile_arms_keep_to_the_profile_namespaces_and_wait_for_an_anchor() {
+        for (sql, column) in [(DIGEST_SQL, "m.embedding"), (DIGEST_B_SQL, "m.embedding_b")] {
+            let region =
+                |from: &str, to: &str| &sql[sql.find(from).unwrap()..sql.find(to).unwrap()];
+            let near = region("profile_near AS", "profile_newest AS");
+            assert!(near.contains("WHERE (SELECT v FROM profile_anchor) IS NOT NULL"));
+            assert!(near.contains("m.namespace IN ($2, 'global')"));
+            assert!(near.contains("JOIN reachable rg") && near.contains("<= rg.max_rank"));
+            assert!(near.contains(&format!("ORDER BY {column} <=> (SELECT v FROM profile_anchor)")));
+            assert!(near.contains("LIMIT $3"));
+            let preferences = region("profile_preferences AS", "profile_near AS");
+            assert!(preferences.contains("JOIN reachable rg"));
+            assert!(preferences.contains("<= rg.max_rank"));
+            let anchor = region("profile_anchor AS", "profile_preferences AS");
+            assert!(anchor.contains("COALESCE($12::vector"));
+            assert!(anchor.contains("FROM project_pool p"));
+        }
+    }
+
+    #[test]
+    fn recent_keeps_to_the_active_project_and_the_callers_own_namespaces() {
+        for sql in [DIGEST_SQL, DIGEST_B_SQL] {
+            let arm =
+                &sql[sql.find("recent_pool AS").unwrap()..sql.find("related_near AS").unwrap()];
+            assert!(arm.contains("($4::text IS NOT NULL AND m.namespace = $4)"));
+            assert!(arm.contains("AND (cardinality($15::text[]) = 0 OR m.tags && $15::text[])"));
+        }
     }
 
     /// One statement retires a predecessor, and it ends that row's validity in the same breath.

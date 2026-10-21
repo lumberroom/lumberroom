@@ -1,5 +1,9 @@
 # 28. No embedding fallback
 
+> **20 October 2026:** decision [0034](0034-the-digest-leads-with-the-project.md) makes one
+> exception. When `context_bootstrap` cannot embed its optional query, the digest serves without
+> the related section and reports `related_unavailable`. The rest of this record stands.
+
 **Date:** 10 October 2026 · **Status:** accepted, implemented · **Decided by:** the owner
 
 ## Decision
