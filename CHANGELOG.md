@@ -4,6 +4,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-21
+
 ### Added
 
 - **The console's retired list pages and filters.** `/console/retired` takes `ns`, a namespace
@@ -51,6 +53,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **`crates/lumberroom` moved from 0.5.0 to 0.6.0** with the server. The 0.6.0 client reads
+  `CLEANUP_MIN_SIMILARITY` for the cleanup daemon's floor.
 - **The digest leads with the active project and follows the request.** `context_bootstrap` prints
   the project first, with 55 percent of the budget and first claim on what the other sections
   leave; related, profile, recent and the registry follow at 10, 15, 5 and 15 percent. An optional
@@ -184,9 +188,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   any other model on bge's scale. Empty them before you change `EMBED_MODEL` or `EMBED_PROVIDER`.
   Boot logs a warning for each of the first three whose value differs from the model's table. The
   compose `cleanup` service now hands `CLEANUP_MIN_SIMILARITY` to the daemon as an environment
-  variable instead of `--min-similarity`, because the 0.5.0 client refuses an empty flag. The 0.5.0
-  client image ignores the variable and sends no floor, so a number set there takes effect from the
-  next client release.
+  variable instead of `--min-similarity`, because the 0.5.0 client refuses an empty flag. The 0.6.0
+  client reads the variable; a 0.5.0 client image ignores it and sends no floor.
 - **A local model that fails to load stops the boot.** A remote embedder (`EMBED_PROVIDER=openai`)
   is not probed at boot: a down endpoint fails each write and search with an error, and `/readyz`
   stays green because it checks only the database.
@@ -995,6 +998,7 @@ softened for a release note.
 - `submit` collapses exact duplicate proposals on a content hash and misses near-duplicates, so
   overlapping chunks queue the same fact more than once.
 
+[0.6.0]: https://github.com/lumberroom/lumberroom/releases/tag/v0.6.0
 [0.5.0]: https://github.com/lumberroom/lumberroom/releases/tag/v0.5.0
 [0.4.0]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.4.0
 [0.3.1]: https://github.com/the-cybersapien/lumberroom/releases/tag/v0.3.1
