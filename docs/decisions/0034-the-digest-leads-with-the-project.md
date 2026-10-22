@@ -356,8 +356,11 @@ plans another client had tagged `preference`, above older standing coding rules.
 newest first, and any writer can set the tag. A `memory_search` over the same `user:me` rows, with
 a query shaped like the session's project, ranked fifteen working rules first on its fused score,
 at cosines of 0.64 to 0.74, and left both plans out of its top fifteen. That observation covers the
-query path. The digest that misfired sent no query and ranks by the project's centroid, and nobody
-had measured how the centroid scores those two rows when this amendment was written.
+query path. The digest that misfired sent no query and ranks by the project's centroid. Measured
+on 22 October 2026 on the same store, read only: against the centroid of the project's 30 newest
+rows, the two plans ranked 61st and 63rd of 63 rule-tagged `user:me` rows, at cosines of 0.711 and
+0.699, while the five nearest rules scored 0.845 to 0.888. The centroid keeps both out of a
+five-row lead.
 
 **No similarity floor on the lead.** Decision 0029 says thresholds belong to the model, and no
 model has a measured centroid-to-row cosine; `route_max_top` was set for a query. A floor would
