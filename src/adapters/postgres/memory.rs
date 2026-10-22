@@ -1044,14 +1044,14 @@ const SAMPLE_CONTENT_SQL: &str = r#"
 ///
 /// The profile, project and recent arms are candidate pools, which the service trims to its
 /// section limits (decisions 0025 and 0034). Project and recent read newest first. Profile reads
-/// three arms: the newest `user:me` rows tagged with one of `$15` (at most `$16`), the `user:me`
-/// and `global` rows nearest the anchor (the query `$12`, or the active project's centroid), and
-/// the newest rows; the service orders the union. Recent keeps to the active project `$4` and the
-/// rows in the user namespace `$2` and `global` that carry one of those tags. The related arm
-/// returns the rows nearest the query vector `$12` across every readable namespace, at most `$14`
-/// of them, and keeps those whose cosine reaches the floor `$13`; with `$12` NULL it returns
-/// nothing. `profile_similarity` gives each profile-pool row's cosine to the anchor, by id, so
-/// the service can reorder that pool.
+/// three arms: the `user:me` rows tagged with one of `$15` nearest the anchor, or the newest with
+/// no anchor (at most `$16`), the `user:me` and `global` rows nearest the anchor (the query `$12`,
+/// or the active project's centroid), and the newest rows; the service orders the union. Recent
+/// keeps to the active project `$4` and the rows in the user namespace `$2` and `global` that
+/// carry one of those tags. The related arm returns the rows nearest the query vector `$12` across
+/// every readable namespace, at most `$14` of them, and keeps those whose cosine reaches the floor
+/// `$13`; with `$12` NULL it returns nothing. `profile_similarity` gives each profile-pool row's
+/// cosine to the anchor, by id, so the service can reorder that pool.
 ///
 /// `near_duplicates` names the pairs of pooled rows whose cosine is at or above `$11`, and sends
 /// ids rather than vectors. A vector in a pool's select list cost twice over: under a generic plan
@@ -1126,7 +1126,16 @@ macro_rules! digest_sql {
             r#"
            -- The user's own standing preferences, which lead profile. An empty $15 matches none.
            AND m.namespace = $2 AND m.tags && $15::text[]
-         ORDER BY m.created_at DESC
+         -- Nearest the anchor first (decision 0034, amended 21 October 2026), so a burst of newer
+         -- tagged rows cannot push an older rule near the session's work out of the arm. With no
+         -- anchor every distance is NULL and the arm reads the newest. A row with no vector sorts
+         -- after every row with one and stays a candidate. The second key keeps the HNSW index
+         -- out: Postgres 16 orders from an index scan only when the index matches every sort
+         -- key, so the arm sorts the tag-filtered rows. pgvector filters after its index, and an
+         -- index scan under a selective tag filter could return fewer than $16 rows.
+         ORDER BY m."#,
+            $col,
+            r#" <=> (SELECT v FROM profile_anchor) NULLS LAST, m.created_at DESC
          LIMIT $16
     ),
     profile_near AS (
@@ -5025,8 +5034,8 @@ mod tests {
             assert!(!pools.contains(&format!("({column})::")));
             assert_eq!(
                 sql.matches("ORDER BY m.created_at DESC").count(),
-                4,
-                "project, recent, preferences, newest"
+                3,
+                "project, recent, newest"
             );
             assert!(sql.contains("AND m.namespace = $2 AND m.tags && $15::text[]"));
             assert!(sql.contains("LIMIT $16"));
@@ -5074,7 +5083,8 @@ mod tests {
 
     /// The new profile arms carry the grant and the ceiling, and the nearest arm waits for an
     /// anchor and orders by it before its LIMIT. The anchor reads the project pool, which carries
-    /// both filters already.
+    /// both filters already. The preference arm orders by the anchor, then newest, and keeps rows
+    /// without a vector.
     #[test]
     fn the_profile_arms_keep_to_the_profile_namespaces_and_wait_for_an_anchor() {
         for (sql, column) in [(DIGEST_SQL, "m.embedding"), (DIGEST_B_SQL, "m.embedding_b")] {
@@ -5089,6 +5099,14 @@ mod tests {
             let preferences = region("profile_preferences AS", "profile_near AS");
             assert!(preferences.contains("JOIN reachable rg"));
             assert!(preferences.contains("<= rg.max_rank"));
+            assert!(preferences.contains(&format!(
+                "ORDER BY {column} <=> (SELECT v FROM profile_anchor) NULLS LAST, m.created_at DESC"
+            )));
+            assert!(preferences.contains("LIMIT $16"));
+            assert!(
+                !preferences.contains(&format!("{column} IS NOT NULL")),
+                "a preference without a vector stays a candidate"
+            );
             let anchor = region("profile_anchor AS", "profile_preferences AS");
             assert!(anchor.contains("COALESCE($12::vector"));
             assert!(anchor.contains("FROM project_pool p"));

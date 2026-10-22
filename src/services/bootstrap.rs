@@ -5,9 +5,9 @@
 //! most: only on a cache miss, and only when the caller sent a query.
 //!
 //! Scope (decision 0034). The active project prints first and takes the dominant share of the
-//! budget. Profile reads the user namespace and global. The newest rule-tagged rows in the user
-//! namespace lead it, and the rest rank by similarity to the query, or with none to the active
-//! project's newest rows, and by recency with neither. Related holds the rows nearest the
+//! budget. Profile reads the user namespace and global. Rule-tagged rows in the user namespace
+//! lead it. The lead and the rest each rank by similarity to the query, or with none to the
+//! active project's newest rows, and by recency with neither. Related holds the rows nearest the
 //! query across every namespace this client may read, at or above the model's floor. Recent keeps
 //! to the active project and the tagged rows in the user namespace and global, so personal facts
 //! and a burst of writes elsewhere cannot fill it. A model files a fact under
@@ -329,7 +329,8 @@ pub async fn run_with_query(
     let others = b.profile_limit.max(0) + b.project_limit.max(0) + b.recent_limit.max(0);
     // At most profile_limit preferences lead, so a larger setting cannot push past the section.
     let preference_limit = b.preference_limit.clamp(0, b.profile_limit.max(0));
-    // The nearest arm orders before its LIMIT (decision 0034), so no arm needs widening.
+    // The nearest and preference arms order by the anchor before their LIMIT (decision 0034), so
+    // no arm needs widening.
     let profile_arm = pool(b.profile_limit, 0);
     let preference_pool = pool(preference_limit, 0);
     // Recent's pool overlaps profile and project, and under a query it drops every profile-pool
@@ -421,6 +422,7 @@ pub async fn run_with_query(
             created_at: m.created_at,
             preference: preferences.contains(m.id.as_str())
                 || selection.displaced_by(&m.id).iter().any(|t| preferences.contains(t.as_str())),
+            dropped: selection.is_dropped(&m.id),
         })
         .collect();
     let lead = usize::try_from(preference_limit).unwrap_or(0);

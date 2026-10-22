@@ -517,7 +517,7 @@ pub struct DigestQuery {
     /// they carry one. Empty reads no preferences and admits every row.
     pub rule_tags: Vec<String>,
     /// Candidates for profile's leading preferences: `user:me` rows carrying one of `rule_tags`,
-    /// newest first. 0 reads none.
+    /// nearest the anchor, or newest first without one. 0 reads none.
     pub preference_limit: i64,
     /// The column this unit reads. Statements carry their column as a literal; the adapter picks
     /// the statement by slot (decision 0027).

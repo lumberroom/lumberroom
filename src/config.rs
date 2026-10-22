@@ -570,14 +570,15 @@ pub struct BootstrapConfig {
     /// Rows related to the caller's query, from any namespace it may read (decision 0034). 0 turns
     /// the section off; boot refuses anything outside 0 to 10.
     pub related_limit: i64,
-    /// `BOOTSTRAP_PREFERENCE_LIMIT`: the newest `user:me` rows carrying a rule tag that lead
-    /// profile, ahead of the ranked rows and inside `profile_limit` (decision 0034). Boot refuses
-    /// anything outside 0 to 10; 0 turns the lead off.
+    /// `BOOTSTRAP_PREFERENCE_LIMIT`: how many `user:me` rows carrying a rule tag lead profile,
+    /// ahead of the ranked rows and inside `profile_limit` (decision 0034). The lead takes the ones
+    /// nearest the query or the active project, or the newest with neither. Boot refuses anything
+    /// outside 0 to 10; 0 turns the lead off.
     pub preference_limit: i64,
-    /// `BOOTSTRAP_RULE_TAGS`, normalised. The newest `user:me` rows carrying one of these lead
-    /// profile, up to `preference_limit`, and recent prints user and global rows only when they
-    /// carry one (decision 0034). An empty value reads as the default, because compose forwards an
-    /// unset variable as empty. A single comma parses to no tags, which turns both rules off.
+    /// `BOOTSTRAP_RULE_TAGS`, normalised. `user:me` rows carrying one of these lead profile, up
+    /// to `preference_limit`, and recent prints user and global rows only when they carry one
+    /// (decision 0034). An empty value reads as the default, because compose forwards an unset
+    /// variable as empty. A single comma parses to no tags, which turns both rules off.
     pub rule_tags: Vec<String>,
     /// Hard ceiling on the rendered digest so a large store cannot blow a client's context.
     pub max_chars: usize,

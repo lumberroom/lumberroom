@@ -91,6 +91,12 @@ impl Selection {
         self.displaced.get(id).map_or(&[], Vec::as_slice)
     }
 
+    /// True when the pass dropped `id` as the older half of a pair. The profile lead reads it so a
+    /// dropped twin takes no lead slot (decision 0034, amended 21 October 2026).
+    pub fn is_dropped(&self, id: &str) -> bool {
+        self.dropped.contains(id)
+    }
+
     /// Rows dropped as the older half of a near-duplicate pair.
     pub fn dropped(&self) -> usize {
         self.dropped.len()
@@ -250,5 +256,15 @@ mod tests {
         let mut s = Selection::new(rows, &[pair("ghost", "a")]);
         assert_eq!(s.pick(&["a"], 10), vec![0]);
         assert_eq!(s.dropped(), 0);
+    }
+
+    #[test]
+    fn is_dropped_names_the_older_twin_and_nothing_else() {
+        let rows = [("new", at(1)), ("old", at(2)), ("lone", at(3))];
+        let s = Selection::new(rows, &[pair("old", "new")]);
+        assert!(s.is_dropped("old"));
+        for id in ["new", "lone", "absent"] {
+            assert!(!s.is_dropped(id), "{id}");
+        }
     }
 }

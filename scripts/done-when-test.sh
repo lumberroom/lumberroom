@@ -153,8 +153,9 @@ FILED="$($MEMCTL search "$QUESTION" --limit 5 --json | NONCE="$NONCE" node -e '
 echo "  filed in $FILED"
 case "$FILED" in
   "project:lumberroom "*) ;;
-  "user:me ["*preference*|"user:me ["*rule*|"user:me ["*convention*) ;;
-  *) echo "  WARN  a query-less digest for project:lumberroom prints that project's rows and the newest rule-tagged user:me rows; session B sees a fact filed here only as a count" ;;
+  "user:me ["*preference*|"user:me ["*rule*|"user:me ["*convention*)
+    echo "  NOTE  a query-less digest leads profile with the rule-tagged user:me rows nearest project:lumberroom's rows; a preference far from them reaches session B through recent, which prints five rows" ;;
+  *) echo "  WARN  a query-less digest for project:lumberroom prints that project's rows and the rule-tagged user:me rows nearest them; session B sees a fact filed here only as a count" ;;
 esac
 
 say "3/4 session B: fresh session, the question never mentions the fact"

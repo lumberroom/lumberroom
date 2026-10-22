@@ -250,9 +250,9 @@ active project namespace and telling the model to pass it to `memory_search`. A 
 comes back with a count and no facts.
 
 This sample also predates decision 0034. A digest today prints the active project first, leads
-profile with the newest rule-tagged `user:me` rows under a reminder line, and keeps recent to that
-project and the rule-tagged rows in `user:me` and `global`. A session whose directory is not
-`lumberroom` would see the `project:lumberroom` nonce above only as a count on the inventory line,
+profile with the rule-tagged `user:me` rows nearest the request or the project under a reminder
+line, and keeps recent to that project and the rule-tagged rows in `user:me` and `global`. A
+session whose directory is not `lumberroom` would see the `project:lumberroom` nonce above only as a count on the inventory line,
 unless the caller sends a query that matches it. `scripts/done-when-test.sh` runs its sessions from
 a directory named `lumberroom` for that reason.
 

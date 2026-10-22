@@ -1,6 +1,6 @@
 # 34. The digest leads with the project and adds rows related to the request
 
-**Date:** 20 October 2026 · **Status:** accepted; implemented, `./scripts/cargo.sh nextest` 1940 passed on 21 October 2026, not merged · **Decided by:** the owner, 20 October 2026
+**Date:** 20 October 2026 · **Status:** accepted; merged in #159, released in 0.6.0; amended 21 October 2026 (the preference lead ranks by the anchor), amendment implemented, `./scripts/cargo.sh nextest` 1948 passed · **Decided by:** the owner, 20 October 2026; the amendment by the owner, 21 October 2026
 
 This record supersedes [0025](0025-the-digest-ranks-by-recency.md). 0025's near-duplicate pass and
 its rule that the newer row wins stay, now over every row the digest can print. It narrows
@@ -313,3 +313,116 @@ lead: lower `BOOTSTRAP_PREFERENCE_LIMIT` or narrow `BOOTSTRAP_RULE_TAGS`. All fo
 design targets, not measurements. `BOOTSTRAP_PREFERENCE_LIMIT=0` removes the lead without a
 release. The shares are one constant, the floor cap is one constant, and the limits and tags are environment
 variables.
+
+## Amendment, 21 October 2026: the preference lead ranks by the anchor
+
+**Decided by:** the owner, 21 October 2026, after a live digest.
+
+**The lead ranks by the anchor the rest of profile uses.** With a query, the lead takes the
+rule-tagged `user:me` rows nearest the query. Without one, it takes the rows nearest the centroid
+of the active project's pooled rows. Equal scores fall back to newest first, then id. With no
+anchor (no active project with vectors and no query, or a failed embed outside a project) the lead
+stays newest first. A preference without a vector sorts after every scored preference. A tagged
+twin the near-duplicate pass dropped keeps its place in the order and takes no lead slot, so the
+structured rows carry `BOOTSTRAP_PREFERENCE_LIMIT` distinct preferences when the store holds them;
+the text still prints what profile's share holds. The lead keeps its size, its place ahead of the
+rest, its count inside `BOOTSTRAP_PROFILE_LIMIT`, the reminder line and the survivor's mark.
+
+**The preference arm reads the tagged rows nearest the anchor.** It orders the live rule-tagged
+`user:me` rows by distance to the anchor, then newest first, before its limit of
+`3 × min(BOOTSTRAP_PREFERENCE_LIMIT, BOOTSTRAP_PROFILE_LIMIT)`, 15 at the defaults. With no anchor
+every distance is NULL and the arm reads the newest, as before. Left newest first, the arm loses an
+older rule to more than 15 newer tagged rows, the nearest arm loses it to 24 untagged rows nearer
+the anchor, and the lead's slots fall to off-topic tagged rows by score. That is the design this
+record rejected under **Ranking inside a recency pool**, moved into the lead. The arm's second sort
+key keeps the HNSW index out of it: Postgres 16 orders from an index scan only when the index
+matches every sort key, so the arm sorts the tag-filtered rows, and pgvector's filtering after the
+index cannot shorten it. No vector enters the payload, and the grant and the ceiling stay inside
+every arm.
+
+**What it replaces in this record.** "newest first, on every path" under **Up to five preferences
+lead profile**. "the newest preferences" under **Profile reads three arms**. "newest first" for the
+lead in **How this differs from 0025**. The survivor taking its place in the lead "by its own age"
+under **Costs accepted**; it now takes it by its own score. The cost **A surface that tags every
+row it writes fills the lead**, which this amendment closes while an anchor exists. The done-when
+cost's "a `user:me` preference reaches it through the lead", which now holds only when the
+preference sits near the project's rows; otherwise a fresh preference reaches the session through
+recent. The burst clause at the end of the profile ruling's reversal condition, which named
+lowering `BOOTSTRAP_PREFERENCE_LIMIT` or narrowing `BOOTSTRAP_RULE_TAGS` as the remedy; the
+reversal condition below replaces it.
+
+**What forced it.** On 21 October 2026 a coding session's digest led profile with two personal
+plans another client had tagged `preference`, above older standing coding rules. The lead sorted
+newest first, and any writer can set the tag. A `memory_search` over the same `user:me` rows, with
+a query shaped like the session's project, ranked fifteen working rules first on its fused score,
+at cosines of 0.64 to 0.74, and left both plans out of its top fifteen. That observation covers the
+query path. The digest that misfired sent no query and ranks by the project's centroid. Measured
+on 22 October 2026 on the same store, read only: against the centroid of the project's 30 newest
+rows, the two plans ranked 61st and 63rd of 63 rule-tagged `user:me` rows, at cosines of 0.711 and
+0.699, while the five nearest rules scored 0.845 to 0.888. The centroid keeps both out of a
+five-row lead.
+
+**No similarity floor on the lead.** Decision 0029 says thresholds belong to the model, and no
+model has a measured centroid-to-row cosine; `route_max_top` was set for a query. A floor would
+also empty the lead in a project whose centroid sits far from every rule, and the lead exists to
+carry rules that bind every project.
+
+### What lost, and why
+
+**Narrowing `BOOTSTRAP_RULE_TAGS`.** `preference` is the tag surfaces use for standing rules, so
+dropping it drops most real rules, and any tag left stays open to any writer.
+
+**Retagging in review.** Someone has to find and fix each mis-tagged row, and the next chat write
+brings the problem back.
+
+**A model classifier at read time.** It adds a model call to every cache miss, a cost and latency
+the digest does not carry, and its verdict rests on a prompt nobody has evaluated.
+
+**Lowering `BOOTSTRAP_PREFERENCE_LIMIT`,** this record's stated remedy. Fewer slots still go to the
+newest tagged rows.
+
+**Reordering the newest tagged rows alone.** Ranking the arm's 15 newest rows by the anchor leaves
+out an older rule whenever a burst outgrows the arm.
+
+**A wider newest-first arm.** Any fixed count of newest rows loses to a burst one row larger, and
+every extra pooled row enters the vector copy and the near-duplicate join, which compares every
+pair.
+
+Ranking by the anchor reuses the anchor the statement already builds, costs no model call, and does
+not depend on how a client tags.
+
+### Costs accepted
+
+- **The preference arm computes one distance per live rule-tagged `user:me` row** the caller may
+  read, on each cache miss with an anchor, and sorts them. The nearest arm already orders every
+  live `user:me` and `global` row by distance, a superset, though it can walk the HNSW index while
+  this arm reads each tagged row's vector. Nobody has measured it; the pgbench method under
+  **Costs accepted** above applies.
+- **A rule that binds every project but sits far from this one can lose its lead slot** to a rule
+  near the project. It still ranks with the rest of profile, and the reminder line points at
+  `memory_search`.
+- **A store with fewer than `BOOTSTRAP_PREFERENCE_LIMIT` tagged rows near the anchor fills the
+  remaining lead slots** with the next tagged rows by score, off-topic ones included.
+- **A fresh preference far from the project reaches a session-start digest through recent,** which
+  prints five rows on a 5 percent share, and no longer through the lead.
+- **Without an anchor the lead stays newest first,** so the CLI `bootstrap` outside a project
+  still leads with the newest tagged rows.
+- **Without a query, a tagged personal row the lead drops can still print in recent** when it is
+  among the newest tagged rows within `BOOTSTRAP_RECENT_DAYS`. This amendment leaves recent alone.
+- **A preference without a vector loses its slot** to any scored preference while an anchor exists.
+
+### Out of scope
+
+The dreaming pass could label rows as working rules or personal facts, and the lead could read the
+label. That needs a labelling convention and a review flow of its own, and it is a separate
+decision.
+
+### Reversal condition
+
+This replaces the burst clause of the profile ruling's reversal condition. Over
+`context_bootstrap` calls that carried an anchor, take the five newest rule-tagged `user:me` rows
+created before each call and keep those the call's leading `profile` events do not name. A call
+counts as a miss when a `memory_search` event from the same tenant and `client` names one of them
+within 6 hours. If more than one call in five is a miss, over at least 100 such calls, return the
+lead to newest first in `profile_order` and the preference arm to newest first in the statement.
+Both numbers are design targets, not measurements.
