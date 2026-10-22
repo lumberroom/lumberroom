@@ -4,6 +4,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **Config `Debug` output no longer prints secrets.** Formatting a config struct with `{:?}`, or
+  tracing one, used to print the client bearer tokens, the database password, the owner's password
+  hash, the OAuth cookie secret and the remote embedding API key in full. They now print as
+  `<redacted>`, and the database URL keeps its scheme, user, host, port and database. No setting
+  or log line the engine writes today changes.
+
 ### Fixed
 
 - **The digest's preference lead ranks by the anchor.** With a query, or inside an active project

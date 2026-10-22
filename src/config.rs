@@ -3,6 +3,7 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::domain::errors::{DomainError, Result};
 use crate::domain::oauth::canonical_resource;
@@ -154,7 +155,63 @@ impl KekProvider {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// What a hand-written `Debug` prints in place of a secret. Unquoted, so `Some(<redacted>)` reads
+/// as the shape of the value and never as a string somebody configured.
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// An optional secret: whether it is set stays visible, the value does not.
+fn redact<T>(secret: &Option<T>) -> Option<Redacted> {
+    secret.as_ref().map(|_| Redacted)
+}
+
+/// A secret where empty means unset. Empty prints as `""`, so a boot log still shows a missing
+/// cookie secret as missing instead of as configured.
+fn redact_set(secret: &str) -> &dyn fmt::Debug {
+    if secret.is_empty() {
+        &""
+    } else {
+        &Redacted
+    }
+}
+
+/// A connection string with its password hidden. Scheme, user, host, port and database stay, so a
+/// boot log still says which database the process meant to reach. The query string goes too: a
+/// `password=` parameter is as valid as the userinfo form. Anything that does not parse is hidden
+/// whole, because a string this code cannot read is one it cannot vouch for.
+struct RedactedUrl<'a>(&'a str);
+
+impl fmt::Debug for RedactedUrl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let u = match url::Url::parse(self.0) {
+            Ok(u) if !u.cannot_be_a_base() => u,
+            _ => return Redacted.fmt(f),
+        };
+        let mut out = format!("{}://", u.scheme());
+        if !u.username().is_empty() {
+            out.push_str(u.username());
+            if u.password().is_some() {
+                out.push_str(":<redacted>");
+            }
+            out.push('@');
+        } else if u.password().is_some() {
+            out.push_str(":<redacted>@");
+        }
+        out.push_str(u.host_str().unwrap_or_default());
+        if let Some(port) = u.port() {
+            out.push_str(&format!(":{port}"));
+        }
+        out.push_str(u.path());
+        fmt::Debug::fmt(&out, f)
+    }
+}
+
+#[derive(Clone, Deserialize)]
 pub struct ClientGrant {
     /// Stable client identifier. Recorded as source_client and on every tool call.
     pub client: String,
@@ -186,6 +243,35 @@ pub struct ClientGrant {
     /// because a retired fact can be more revealing than the one that replaced it.
     #[serde(default, rename = "mayReadHistory", alias = "may_read_history")]
     pub may_read_history: bool,
+}
+
+// By hand so the bearer token prints as `<redacted>`. Every field is destructured with no `..`: a
+// field added later fails to compile here until somebody decides whether it is a secret.
+impl fmt::Debug for ClientGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            client,
+            token,
+            read,
+            write,
+            registry_write,
+            sealed_capable,
+            may_delete,
+            may_ingest,
+            may_read_history,
+        } = self;
+        f.debug_struct("ClientGrant")
+            .field("client", client)
+            .field("token", &redact(token))
+            .field("read", read)
+            .field("write", write)
+            .field("registry_write", registry_write)
+            .field("sealed_capable", sealed_capable)
+            .field("may_delete", may_delete)
+            .field("may_ingest", may_ingest)
+            .field("may_read_history", may_read_history)
+            .finish()
+    }
 }
 
 impl ClientGrant {
@@ -237,7 +323,7 @@ impl Default for DbConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub port: u16,
     pub host: String,
@@ -261,6 +347,53 @@ pub struct Config {
     pub ingest: IngestConfig,
     pub cleanup: CleanupConfig,
     pub recall_events: RecallEventConfig,
+}
+
+// By hand so the secrets print as `<redacted>`. Every field is destructured with no `..`: a
+// field added later fails to compile here until somebody decides whether it is a secret.
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            port,
+            host,
+            tenant_id,
+            database_url,
+            db,
+            run_migrations_on_boot,
+            public_url,
+            auth,
+            oauth,
+            embed,
+            bootstrap,
+            search,
+            policy,
+            crypto,
+            quality,
+            ingest,
+            cleanup,
+            recall_events,
+        } = self;
+        f.debug_struct("Config")
+            .field("port", port)
+            .field("host", host)
+            .field("tenant_id", tenant_id)
+            .field("database_url", &RedactedUrl(database_url))
+            .field("db", db)
+            .field("run_migrations_on_boot", run_migrations_on_boot)
+            .field("public_url", public_url)
+            .field("auth", auth)
+            .field("oauth", oauth)
+            .field("embed", embed)
+            .field("bootstrap", bootstrap)
+            .field("search", search)
+            .field("policy", policy)
+            .field("crypto", crypto)
+            .field("quality", quality)
+            .field("ingest", ingest)
+            .field("cleanup", cleanup)
+            .field("recall_events", recall_events)
+            .finish()
+    }
 }
 
 /// The scheduled cleanup pass, which runs inside this process.
@@ -323,7 +456,7 @@ pub struct AuthConfig {
 }
 
 /// The built-in authorization server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OauthConfig {
     /// Argon2 PHC string. The owner's password is never stored, only this.
     pub owner_password_hash: Option<String>,
@@ -356,6 +489,41 @@ pub struct OauthConfig {
     /// log all of them out. The NULLs drain within one `OAUTH_ACCESS_TTL_SECS` once the token
     /// endpoint starts stamping a default, which is what makes `strict` reachable later.
     pub resource_audience: ResourceAudience,
+}
+
+// By hand so the secrets print as `<redacted>`. Every field is destructured with no `..`: a
+// field added later fails to compile here until somebody decides whether it is a secret.
+impl fmt::Debug for OauthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            owner_password_hash,
+            dcr_enabled,
+            code_ttl_secs,
+            access_ttl_secs,
+            refresh_ttl_secs,
+            session_ttl_secs,
+            default_profile,
+            scopes_supported,
+            cookie_secret,
+            login_attempts_per_minute,
+            registrations_per_minute,
+            resource_audience,
+        } = self;
+        f.debug_struct("OauthConfig")
+            .field("owner_password_hash", &redact(owner_password_hash))
+            .field("dcr_enabled", dcr_enabled)
+            .field("code_ttl_secs", code_ttl_secs)
+            .field("access_ttl_secs", access_ttl_secs)
+            .field("refresh_ttl_secs", refresh_ttl_secs)
+            .field("session_ttl_secs", session_ttl_secs)
+            .field("default_profile", default_profile)
+            .field("scopes_supported", scopes_supported)
+            .field("cookie_secret", &redact_set(cookie_secret))
+            .field("login_attempts_per_minute", login_attempts_per_minute)
+            .field("registrations_per_minute", registrations_per_minute)
+            .field("resource_audience", resource_audience)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -498,7 +666,7 @@ fn parse_migrate() -> Result<MigrateConfig> {
 /// The prefixes a model was trained with, by name.
 
 /// An OpenAI-compatible `/embeddings` endpoint: Workers AI, OpenRouter, llama-server, TEI.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RemoteEmbedConfig {
     /// Up to and including `/v1`. The adapter appends `/embeddings`.
     pub base_url: String,
@@ -511,6 +679,29 @@ pub struct RemoteEmbedConfig {
     /// refuses an input past its window outright rather than truncating it.
     pub max_input_chars: Option<usize>,
     pub timeout_secs: u64,
+}
+
+// By hand so the secrets print as `<redacted>`. Every field is destructured with no `..`: a
+// field added later fails to compile here until somebody decides whether it is a secret.
+impl fmt::Debug for RemoteEmbedConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            base_url,
+            api_key,
+            query_prefix,
+            document_prefix,
+            max_input_chars,
+            timeout_secs,
+        } = self;
+        f.debug_struct("RemoteEmbedConfig")
+            .field("base_url", base_url)
+            .field("api_key", &redact(api_key))
+            .field("query_prefix", query_prefix)
+            .field("document_prefix", document_prefix)
+            .field("max_input_chars", max_input_chars)
+            .field("timeout_secs", timeout_secs)
+            .finish()
+    }
 }
 
 /// One embedding model's settings: the `EMBED_*` block or the `EMBED_PREVIOUS_*` block.
@@ -1955,6 +2146,100 @@ fn warn_deprecated_settings(conflict_scan_max: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_of_a_client_grant_hides_the_token() {
+        let grant = ClientGrant {
+            client: "laptop-cli".into(),
+            token: Some("tok-7f3a91c2d4e8".into()),
+            read: None,
+            write: None,
+            registry_write: false,
+            sealed_capable: false,
+            may_delete: false,
+            may_ingest: false,
+            may_read_history: false,
+        };
+        let shown = format!("{grant:?}");
+        assert!(!shown.contains("tok-7f3a91c2d4e8"), "{shown}");
+        assert!(shown.contains("token: Some(<redacted>)"), "{shown}");
+        assert!(shown.contains("laptop-cli"), "{shown}");
+        let unset = ClientGrant { token: None, ..grant };
+        assert!(format!("{unset:?}").contains("token: None"));
+    }
+
+    fn oauth_config(hash: Option<&str>, cookie_secret: &str) -> OauthConfig {
+        OauthConfig {
+            owner_password_hash: hash.map(str::to_string),
+            dcr_enabled: true,
+            code_ttl_secs: 120,
+            access_ttl_secs: 3600,
+            refresh_ttl_secs: 5_184_000,
+            session_ttl_secs: 900,
+            default_profile: "standard".into(),
+            scopes_supported: vec!["memory.read".into()],
+            cookie_secret: cookie_secret.into(),
+            login_attempts_per_minute: 5,
+            registrations_per_minute: 5,
+            resource_audience: ResourceAudience::Lenient,
+        }
+    }
+
+    #[test]
+    fn debug_of_the_oauth_config_hides_the_hash_and_the_cookie_secret() {
+        let hash = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aGFzaGJ5dGVzaGVyZQ";
+        let secret = "cookie-secret-0123456789abcdef0123456789";
+        let shown = format!("{:?}", oauth_config(Some(hash), secret));
+        assert!(!shown.contains("argon2id"), "{shown}");
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(shown.contains("owner_password_hash: Some(<redacted>)"), "{shown}");
+        assert!(shown.contains("cookie_secret: <redacted>"), "{shown}");
+        assert!(shown.contains("default_profile: \"standard\""), "{shown}");
+    }
+
+    #[test]
+    fn debug_of_the_oauth_config_shows_an_unset_cookie_secret_as_unset() {
+        let shown = format!("{:?}", oauth_config(None, ""));
+        assert!(shown.contains("owner_password_hash: None"), "{shown}");
+        assert!(shown.contains("cookie_secret: \"\""), "{shown}");
+    }
+
+    #[test]
+    fn debug_of_the_remote_embed_config_hides_the_api_key() {
+        let cfg = RemoteEmbedConfig {
+            base_url: "https://embed.example.test/v1".into(),
+            api_key: Some("sk-embed-5b2e8c1f".into()),
+            ..Default::default()
+        };
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("sk-embed-5b2e8c1f"), "{shown}");
+        assert!(shown.contains("api_key: Some(<redacted>)"), "{shown}");
+        assert!(shown.contains("https://embed.example.test/v1"), "{shown}");
+    }
+
+    #[test]
+    fn debug_of_a_database_url_hides_the_password_and_keeps_the_rest() {
+        let shown = format!(
+            "{:?}",
+            RedactedUrl("postgres://app:p%40ss-w0rd@db.example.test:5433/memory?sslmode=require")
+        );
+        assert!(!shown.contains("w0rd"), "{shown}");
+        assert_eq!(shown, "\"postgres://app:<redacted>@db.example.test:5433/memory\"");
+    }
+
+    #[test]
+    fn debug_of_a_database_url_hides_a_password_given_as_a_query_parameter() {
+        let url = "postgres://db.example.test/memory?user=app&password=hunter22";
+        let shown = format!("{:?}", RedactedUrl(url));
+        assert!(!shown.contains("hunter22"), "{shown}");
+        assert!(shown.contains("db.example.test/memory"), "{shown}");
+    }
+
+    #[test]
+    fn debug_of_a_database_url_that_does_not_parse_hides_all_of_it() {
+        let shown = format!("{:?}", RedactedUrl("app:hunter22 at db.example.test"));
+        assert_eq!(shown, "<redacted>");
+    }
 
     /// Everything `f` logs, as text. `with_default` scopes the subscriber to this thread, so tests
     /// running beside it neither add lines nor lose them.
