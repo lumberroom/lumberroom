@@ -224,7 +224,7 @@ host           machines.desktop.gpu         "RTX 4090"
 service        services.postgres.endpoint   {"host":"127.0.0.1","port":5432}
 credential-ref credentials.postgres.location {"where":"1Password","item":"lumberroom"}
 model-route    routes.coding.model          "claude-opus-5"
-dataset        datasets.vowframes.location  "s3://..."
+dataset        datasets.tidewallet.location  "s3://..."
 ```
 
 **Rules**, enforced on write:

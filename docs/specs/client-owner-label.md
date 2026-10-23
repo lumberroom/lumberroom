@@ -3,9 +3,7 @@
 3 October 2026. Status: design accepted by the owner on 3 October 2026, implemented on branch
 `feat/client-owner-label` and covered by the gates in decision 0023, not deployed. Issue
 [lumberroom/lumberroom#89](https://github.com/lumberroom/lumberroom/issues/89). Decision record:
-[0023](../decisions/0023-the-owner-names-a-client.md). Plan:
-[`client-owner-label-plan.md`](client-owner-label-plan.md). Hosted companion:
-`lumberroom-cloud/docs/superpowers/specs/2026-10-03-client-owner-label-fork.md`.
+[0023](../decisions/0023-the-owner-names-a-client.md).
 
 Every file and line reference below was read on engine `main` at `2b17048` (3 October 2026), which
 carries #95 (consent brand warnings).

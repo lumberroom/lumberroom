@@ -13,8 +13,7 @@ tests red. Nothing else is recorded here as run: the full suite is the lead's ga
 real-store half, E1-G3 and E2-G2 need the owner and a copy of a real store. E2-G2 has not run, and
 no record here says E1-G3 or the real-store parity has; until E2-G2 runs, the read's cost in
 section 7 stays a scratch figure. Decision record:
-[0022](../decisions/0022-conflict-pairs-are-recorded-when-a-row-is-written.md). Plan:
-[`write-time-conflicts-plan.md`](write-time-conflicts-plan.md).
+[0022](../decisions/0022-conflict-pairs-are-recorded-when-a-row-is-written.md).
 
 ## 1. Why
 

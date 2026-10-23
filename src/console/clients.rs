@@ -43,7 +43,7 @@
 //!
 //! The grant language is globs with a ceiling each, and asking for it in a text box is how a form
 //! gets answered by copying whatever the last client had. The shape says what a client may do and
-//! how deep it may see; the scope says where. Picking `project:sivella` and `user:me` off the list
+//! how deep it may see; the scope says where. Picking `project:tidewallet` and `user:me` off the list
 //! rewrites the shape's `*` into those two names at the level the shape already chose, so the
 //! common request, one client that only sees one project, is two clicks and no syntax.
 //!

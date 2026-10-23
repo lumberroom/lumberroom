@@ -167,9 +167,9 @@ pub fn route(s: Signals, t: Thresholds) -> Verdict {
     // works, and the walk would be paying to rediscover a row search put first.
     //
     // **This short-circuit is the weakest rule here, and a counterexample is already recorded.**
-    // The evidence for it was a by-name question scoring 0.834. On the same store, "what happened
-    // with butler", naming a recorded alias, scored 0.474 with a spread of 0.034: weak and flat,
-    // the shape that otherwise warrants a walk. It was refused anyway. Naming an entity is not the
+    // The evidence for it was one by-name question that search answered with a strong score. On the
+    // same store, a question naming a recorded alias scored weak and flat, the shape that otherwise
+    // warrants a walk. It was refused anyway. Naming an entity is not the
     // same as search having answered.
     //
     // Kept for now because the bias is toward not walking while every threshold is a guess, and a
