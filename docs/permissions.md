@@ -326,7 +326,7 @@ uses:
 
 ```bash
 docker compose exec -T db psql -U lumberroom -d lumberroom -c \
-  "UPDATE oauth_client SET grant_read = '[{\"namespace\":\"project:sivella\",\"max\":\"open\"}]'::jsonb, \
+  "UPDATE oauth_client SET grant_read = '[{\"namespace\":\"project:tidewallet\",\"max\":\"open\"}]'::jsonb, \
    grant_write = '[]'::jsonb WHERE client_id = '<client_id>';"
 ```
 

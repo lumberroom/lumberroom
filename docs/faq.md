@@ -41,7 +41,7 @@ else it may do, with a **Change access** editor behind it.
 
 **How do I give a client access to one project only?**
 Open Change access, pick a shape, choose "Only these namespaces", tick the project. The shape decides
-how deep the client sees; the scope decides where. Ticking `project:sivella` under Read and write
+how deep the client sees; the scope decides where. Ticking `project:tidewallet` under Read and write
 grants it that namespace at `sealed` for reads and `open` for writes, and nothing else.
 
 **Does changing a grant break the client's connection?**

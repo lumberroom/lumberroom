@@ -2,7 +2,6 @@
 
 Written 22 September 2026. Design for one queue shape, one decide route, a remembered "both are
 fine", the interactive `lumberroom review` loop over it, and the same two operations as MCP tools.
-The plan sits beside this file at [`phase-8-review-queue-plan.md`](phase-8-review-queue-plan.md).
 
 Nothing below is built. Every claim about current behaviour names the file it was read from; every
 claim about new behaviour is a design target until the gates in §10 report.

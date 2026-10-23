@@ -79,7 +79,7 @@ const DOMAIN_ALIASES: &[(&str, &str)] = &[
 ///
 /// Deliberately short. `location`, `path`, `item`, `model`, `url` and `username` are all missing
 /// because each is plausible under two or more domains: `credentials.postgres.location` and
-/// `datasets.vowframes.location` both exist, and `routes.coding.model` reads exactly like the model
+/// `datasets.tidewallet.location` both exist, and `routes.coding.model` reads exactly like the model
 /// name of a machine. An entry here is a claim that no second reading exists.
 const ATTRIBUTE_DOMAINS: &[(&str, &str)] = &[
     ("os", "machines"),
@@ -388,7 +388,7 @@ mod tests {
         "services.postgres.endpoint",
         "credentials.postgres.location",
         "routes.coding.model",
-        "datasets.vowframes.location",
+        "datasets.tidewallet.location",
     ];
 
     #[test]
@@ -474,8 +474,8 @@ mod tests {
             Some("machines.desktop.location")
         );
         assert_eq!(
-            suggest_key("data.vowframes.location").as_deref(),
-            Some("datasets.vowframes.location")
+            suggest_key("data.tidewallet.location").as_deref(),
+            Some("datasets.tidewallet.location")
         );
     }
 

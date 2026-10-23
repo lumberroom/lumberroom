@@ -58,7 +58,7 @@ fn dump_clients_page() {
     ];
     let token = |_: &str, _: &str| "csrf-token-placeholder".to_string();
 
-    let namespaces: Vec<String> = ["global", "user:me", "project:lumberroom", "project:sivella"]
+    let namespaces: Vec<String> = ["global", "user:me", "project:lumberroom", "project:tidewallet"]
         .iter()
         .map(|s| s.to_string())
         .collect();

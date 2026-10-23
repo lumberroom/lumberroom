@@ -58,7 +58,7 @@ Open **Change access** on the card. The form asks three questions, and only the 
 **The shape.** Four named grants: Read only, Read and write, Ingest bot, Full. The chosen one
 explains itself in place. A shape decides the capabilities and the ceiling on each side.
 
-**The scope.** Everywhere, or only the namespaces you pick. Picking `project:sivella` rewrites the
+**The scope.** Everywhere, or only the namespaces you pick. Picking `project:tidewallet` rewrites the
 shape's `*` into that namespace at the ceiling the shape already chose, so Read and write scoped to
 one project reads it at `sealed` and writes it at `open`. The list offers the namespaces the store
 holds plus any this client already reaches; the box beside it takes a namespace with nothing in it
