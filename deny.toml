@@ -15,6 +15,14 @@ yanked = "warn"
 # actually act on, without failing the build over something three layers down that nobody here
 # chose directly.
 unmaintained = "workspace"
+ignore = [
+    # crypto-bigint 0.5 has timing variability in operations meant to be constant time. The fix
+    # is 0.7, which elliptic-curve 0.13 does not accept, so no in-range update exists. It reaches
+    # this build only through age's P-256 support (age -> p256 -> elliptic-curve), and
+    # crates/archive seals with an scrypt passphrase (container.rs:53, :69), never a P-256 key.
+    # Drop this entry when age moves to an elliptic-curve release on crypto-bigint 0.7.
+    { id = "RUSTSEC-2026-0387", reason = "no in-range fix; reached only through age's P-256 code, which the archive's passphrase sealing never calls" },
+]
 
 [licenses]
 confidence-threshold = 0.93
